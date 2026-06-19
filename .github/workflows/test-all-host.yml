@@ -1,0 +1,41 @@
+name: test-all-host
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run all host tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build CI sandbox image
+        shell: bash
+        run: |
+          docker build \
+            --file .github/ci/sandbox.Dockerfile \
+            --tag trustyclaw-ci:${{ github.run_id }} \
+            .
+
+      - name: Compile all sources in no-network sandbox
+        shell: bash
+        run: |
+          .github/ci/run-in-sandbox.sh trustyclaw-ci:${{ github.run_id }} \
+            'python3 -m py_compile $(find host tests -name "*.py")'
+
+      - name: Run unit tests in no-network sandbox
+        shell: bash
+        run: |
+          .github/ci/run-in-sandbox.sh trustyclaw-ci:${{ github.run_id }} \
+            'python3 -m unittest discover -s tests -v'
