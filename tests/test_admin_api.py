@@ -298,6 +298,191 @@ class AdminApiIntegrationTests(unittest.TestCase):
         _, events = self.request("GET", f"/v1/tasks/{task_id}/events")
         self.assertEqual([event["event_type"] for event in events["events"]], ["task.cancelled"])
 
+    def test_thread_list_combines_runtime_sessions_and_current_tasks(self) -> None:
+        state = load_state()
+        state["tasks"] = [
+            {
+                "task_id": "task_1",
+                "status": "completed",
+                "agent_runtime": "codex",
+                "thread_id": "t1",
+                "input_message": "done 1",
+                "steer_messages": [],
+                "created_at": "2026-06-08T00:00:00Z",
+                "updated_at": "2026-06-08T00:00:01Z",
+            },
+            {
+                "task_id": "task_2",
+                "status": "queued",
+                "agent_runtime": "codex",
+                "thread_id": "t2",
+                "input_message": "live",
+                "steer_messages": [],
+                "created_at": "2026-06-08T00:00:02Z",
+                "updated_at": "2026-06-08T00:00:04Z",
+            },
+        ]
+        state["codex_threads"] = {"t1": {"codex_thread_id": "codex-t1", "last_used_at": "2026-06-08T00:00:03Z"}}
+        state["claude_sessions"] = {"t3": {"session_id": "claude-t3", "last_used_at": "2026-06-08T00:00:05Z"}}
+        save_state(state)
+
+        _, body = self.request("GET", "/v1/threads")
+
+        self.assertEqual(
+            [(thread["thread_id"], thread["agent_runtime"]) for thread in body["threads"]],
+            [("t3", "claude_code"), ("t2", "codex"), ("t1", "codex")],
+        )
+        self.assertEqual(body["threads"][0]["task_count"], 0)
+        self.assertEqual(body["threads"][1]["active_tasks"], [{"task_id": "task_2", "status": "queued"}])
+        self.assertEqual(body["threads"][2]["last_used_at"], "2026-06-08T00:00:03Z")
+        self.assertEqual(body["threads"][2]["task_count"], 1)
+        self.assertNotIn("retained_task_count", body["threads"][2])
+
+    def test_thread_task_list_returns_retained_tasks_for_selected_thread(self) -> None:
+        state = load_state()
+        state["tasks"] = [
+            {
+                "task_id": "task_1",
+                "status": "completed",
+                "agent_runtime": "codex",
+                "thread_id": "shared",
+                "input_message": "codex old",
+                "steer_messages": [],
+                "created_at": "2026-06-08T00:00:00Z",
+                "updated_at": "2026-06-08T00:00:07Z",
+            },
+            {
+                "task_id": "task_2",
+                "status": "completed",
+                "agent_runtime": "codex",
+                "thread_id": "shared",
+                "input_message": "codex new",
+                "output_message": "done",
+                "steer_messages": [],
+                "created_at": "2026-06-08T00:00:02Z",
+                "updated_at": "2026-06-08T00:00:03Z",
+            },
+            {
+                "task_id": "task_3",
+                "status": "failed",
+                "agent_runtime": "codex",
+                "thread_id": "other",
+                "input_message": "other",
+                "error_message": "failed",
+                "steer_messages": [],
+                "created_at": "2026-06-08T00:00:04Z",
+                "updated_at": "2026-06-08T00:00:05Z",
+            },
+        ]
+        save_state(state)
+
+        _, body = self.request("GET", "/v1/threads/shared/tasks")
+        self.assertEqual([task["task_id"] for task in body["tasks"]], ["task_1", "task_2"])
+        self.assertEqual(body["tasks"][1]["output_message"], "done")
+
+    def test_create_task_rejects_thread_runtime_conflicts(self) -> None:
+        state = load_state()
+        state["tasks"] = [
+            {
+                "task_id": "task_1",
+                "status": "completed",
+                "agent_runtime": "codex",
+                "thread_id": "used-by-task",
+                "input_message": "done",
+                "steer_messages": [],
+                "created_at": "2026-06-08T00:00:00Z",
+                "updated_at": "2026-06-08T00:00:01Z",
+            }
+        ]
+        state["claude_sessions"] = {
+            "used-by-session": {"session_id": "claude-session", "last_used_at": "2026-06-08T00:00:02Z"}
+        }
+        save_state(state)
+
+        with self.assertRaises(urllib.error.HTTPError) as task_error:
+            self.request(
+                "POST",
+                "/v1/tasks",
+                {"input_message": "bad", "thread_id": "used-by-task", "agent_runtime": "claude_code"},
+                idem="conflict-task",
+            )
+        self.assertEqual(task_error.exception.code, 409)
+
+        with self.assertRaises(urllib.error.HTTPError) as session_error:
+            self.request(
+                "POST",
+                "/v1/tasks",
+                {"input_message": "bad", "thread_id": "used-by-session", "agent_runtime": "codex"},
+                idem="conflict-session",
+            )
+        self.assertEqual(session_error.exception.code, 409)
+
+        _, accepted = self.request(
+            "POST",
+            "/v1/tasks",
+            {"input_message": "ok", "thread_id": "used-by-task", "agent_runtime": "codex"},
+            idem="conflict-ok",
+        )
+        self.assertEqual(accepted["thread_id"], "used-by-task")
+
+        with self.assertRaises(urllib.error.HTTPError) as old_route_error:
+            self.request("GET", "/v1/tasks/finished")
+        self.assertEqual(old_route_error.exception.code, 404)
+
+    def test_task_event_history_can_be_paged_for_selected_task(self) -> None:
+        state = load_state()
+        state["tasks"] = [
+            {
+                "task_id": "task_1",
+                "status": "completed",
+                "agent_runtime": "codex",
+                "thread_id": "t1",
+                "input_message": "done",
+                "output_message": "ok",
+                "steer_messages": [],
+                "created_at": "2026-06-08T00:00:00Z",
+                "updated_at": "2026-06-08T00:00:01Z",
+            }
+        ]
+        append_agent_event(state, "task.started", "task_1", {})
+        append_agent_event(state, "task.message", "task_1", {"message": "done", "source": "user"})
+        append_agent_event(state, "task.message", "task_1", {"message": "working", "source": "agent"})
+        append_agent_event(state, "task.message", "task_1", {"message": "ok", "source": "agent"})
+        append_agent_event(state, "task.completed", "task_1", {})
+        save_state(state)
+
+        _, first = self.request("GET", "/v1/tasks/task_1/events")
+        self.assertEqual(len(first["events"]), 5)
+        self.assertEqual([event["event_type"] for event in first["events"]], [
+            "task.started",
+            "task.message",
+            "task.message",
+            "task.message",
+            "task.completed",
+        ])
+        _, second = self.request("GET", f"/v1/tasks/task_1/events?since={first['events'][-1]['seq']}")
+        self.assertEqual(second["events"], [])
+
+    def test_admin_ui_has_thread_task_event_smoke_path(self) -> None:
+        html = Path(__file__).parents[1].joinpath("host/runtime/admin_ui.html").read_text()
+        self.assertIn("<h2>Threads</h2>", html)
+        self.assertIn("/v1/threads", html)
+        self.assertIn("/v1/threads/${encodeURIComponent(threadId)}/tasks", html)
+        self.assertIn("/v1/tasks/${encodeURIComponent(taskId)}/events", html)
+        self.assertIn("thread.task_count", html)
+        self.assertIn("TASK_EVENT_PAGE_BATCH", html)
+        self.assertIn("loadTaskEventBatch", html)
+        self.assertIn("loadMoreTaskEvents", html)
+        self.assertIn('onclick="showThread', html)
+        self.assertIn('onclick="showTaskEvents', html)
+        self.assertIn('$("new-task-thread").value = threadId', html)
+        self.assertIn('$("new-task-runtime").value = agentRuntime', html)
+        self.assertIn("await loadThreads();", html)
+        self.assertNotIn("loadAllTaskEvents", html)
+        self.assertNotIn("/v1/tasks/finished", html)
+        self.assertNotIn("loadFinishedTasks", html)
+        self.assertNotIn("retained_task_count", html)
+
     def test_task_create_requires_valid_agent_runtime(self) -> None:
         for index, body in enumerate(
             (

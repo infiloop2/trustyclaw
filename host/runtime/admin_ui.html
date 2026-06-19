@@ -82,6 +82,16 @@
   </section>
 
   <section>
+    <h2>Threads</h2>
+    <table id="threads"></table>
+    <div class="actions">
+      <button onclick="loadThreads()">Refresh</button>
+    </div>
+    <div id="thread-detail"></div>
+    <div id="task-events-detail"></div>
+  </section>
+
+  <section>
     <h2>Agent events</h2>
     <table id="events"></table>
   </section>
@@ -108,6 +118,12 @@ const $ = id => document.getElementById(id);
 let eventsSince = null, netSince = null;
 const events = [], netEvents = [];
 let runtimeType = "codex";
+let threads = [], threadTasks = [];
+let selectedTask = null;
+let selectedTaskEvents = [];
+let selectedTaskEventsSince = null;
+let selectedTaskEventsHasMore = false;
+const TASK_EVENT_PAGE_BATCH = 10;
 
 function getPassword() {
   const match = document.cookie.match(/(?:^|; )trustyclaw_admin=([^;]*)/);
@@ -224,6 +240,7 @@ async function createTask() {
     await api("POST", "/v1/tasks", { input_message: message, thread_id: threadId, agent_runtime: agentRuntime });
     $("new-task").value = "";
     await refreshTasks();
+    await loadThreads();
   }
   catch (error) { notice(error.message); }
 }
@@ -263,6 +280,116 @@ async function refreshTasks() {
                  <button class="danger" onclick="killTask('${esc(task.task_id)}')">Kill</button>`
               : `<button onclick="cancelTask('${esc(task.task_id)}')">Cancel</button>`}</td>
       </tr>`).join("");
+}
+
+async function loadThreads() {
+  const listed = await api("GET", "/v1/threads");
+  threads = listed.threads || [];
+  renderThreads();
+}
+
+function renderThreads() {
+  if (!threads.length) {
+    $("threads").innerHTML = `<tr><td class="muted">No recent threads.</td></tr>`;
+    return;
+  }
+  $("threads").innerHTML = `<tr><th>thread</th><th>runtime</th><th>last used</th><th>tasks</th><th>active</th><th></th></tr>` +
+    threads.map(thread => `
+      <tr>
+        <td>${esc(thread.thread_id)}</td>
+        <td>${esc(thread.agent_runtime)}</td>
+        <td class="muted">${esc(thread.last_used_at)}</td>
+        <td>${esc(thread.task_count)}</td>
+        <td>${(thread.active_tasks || []).map(task => badge(task.status)).join(" ")}</td>
+        <td><button onclick="showThread('${esc(thread.thread_id)}', '${esc(thread.agent_runtime)}')">Open</button></td>
+      </tr>`).join("");
+}
+
+async function showThread(threadId, agentRuntime) {
+  $("new-task-thread").value = threadId;
+  $("new-task-runtime").value = agentRuntime;
+  $("task-events-detail").innerHTML = "";
+  const response = await api(
+    "GET",
+    `/v1/threads/${encodeURIComponent(threadId)}/tasks`
+  );
+  threadTasks = response.tasks || [];
+  $("thread-detail").innerHTML = `
+    <h2>${esc(threadId)} tasks</h2>
+    <table>
+      <tr><th>task</th><th>status</th><th>updated</th><th>message</th><th></th></tr>
+      ${threadTasks.length ? threadTasks.map(task => `
+        <tr>
+          <td>${esc(task.task_id)}</td>
+          <td>${badge(task.status)}</td>
+          <td class="muted">${esc(task.updated_at)}</td>
+          <td><pre>${esc(task.input_message)}</pre></td>
+          <td><button onclick="showTaskEvents('${esc(task.task_id)}')">Events</button></td>
+        </tr>`).join("") : `<tr><td colspan="5" class="muted">No retained tasks for this thread.</td></tr>`}
+    </table>`;
+}
+
+async function loadTaskEventBatch(taskId) {
+  for (let page = 0; page < TASK_EVENT_PAGE_BATCH; page += 1) {
+    const response = await api(
+      "GET",
+      `/v1/tasks/${encodeURIComponent(taskId)}/events` +
+        (selectedTaskEventsSince === null ? "" : "?since=" + selectedTaskEventsSince)
+    );
+    if (!response.events.length) return false;
+    for (const event of response.events) {
+      selectedTaskEvents.push(event);
+      selectedTaskEventsSince = event.seq;
+    }
+  }
+  return true;
+}
+
+async function showTaskEvents(taskId) {
+  selectedTask = threadTasks.find(item => item.task_id === taskId) || await api("GET", `/v1/tasks/${encodeURIComponent(taskId)}`);
+  selectedTaskEvents = [];
+  selectedTaskEventsSince = null;
+  selectedTaskEventsHasMore = await loadTaskEventBatch(taskId);
+  renderTaskEventsDetail();
+}
+
+async function loadMoreTaskEvents(taskId) {
+  if (!selectedTask || selectedTask.task_id !== taskId) {
+    await showTaskEvents(taskId);
+    return;
+  }
+  selectedTaskEventsHasMore = await loadTaskEventBatch(taskId);
+  renderTaskEventsDetail();
+}
+
+function renderTaskEventsDetail() {
+  const task = selectedTask;
+  const taskEvents = selectedTaskEvents;
+  $("task-events-detail").innerHTML = `
+    <h2>${esc(task.task_id)} events</h2>
+    <table>
+      <tr><th>status</th><td>${badge(task.status)}</td></tr>
+      <tr><th>runtime</th><td>${esc(task.agent_runtime)}</td></tr>
+      <tr><th>thread</th><td>${esc(task.thread_id)}</td></tr>
+      <tr><th>created</th><td class="muted">${esc(task.created_at)}</td></tr>
+      <tr><th>updated</th><td class="muted">${esc(task.updated_at)}</td></tr>
+      <tr><th>input</th><td><pre>${esc(task.input_message)}</pre></td></tr>
+      ${task.output_message ? `<tr><th>output</th><td><pre>${esc(task.output_message)}</pre></td></tr>` : ""}
+      ${task.error_message ? `<tr><th>error</th><td><pre>${esc(task.error_message)}</pre></td></tr>` : ""}
+    </table>
+    <h2>Events</h2>
+    <table>
+      <tr><th>seq</th><th>time</th><th>type</th><th>source</th><th>payload</th></tr>
+      ${taskEvents.length ? taskEvents.map(event => `
+        <tr>
+          <td>${esc(event.seq)}</td>
+          <td class="muted">${esc(event.timestamp)}</td>
+          <td>${esc(event.event_type)}</td>
+          <td>${esc(event.payload.source || "")}</td>
+          <td><pre>${esc(event.payload.message || event.payload.error_message || JSON.stringify(event.payload))}</pre></td>
+        </tr>`).join("") : `<tr><td colspan="5" class="muted">No retained events for this task.</td></tr>`}
+    </table>
+    ${selectedTaskEventsHasMore ? `<div class="actions"><button onclick="loadMoreTaskEvents('${esc(task.task_id)}')">Load more events</button></div>` : ""}`;
 }
 
 async function refreshEvents() {
@@ -309,6 +436,7 @@ async function tick() {
   try {
     await refreshHealth();
     await refreshTasks();
+    await loadThreads();
     await refreshEvents();
     await refreshNetEvents();
   } catch (error) { /* shown via login panel or notice */ }

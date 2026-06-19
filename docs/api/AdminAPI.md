@@ -300,6 +300,8 @@ PUT  /v1/tasks/{task_id}
 POST /v1/tasks/{task_id}/steer
 POST /v1/tasks/{task_id}/cancel
 POST /v1/tasks/{task_id}/kill
+GET  /v1/threads
+GET  /v1/threads/{thread_id}/tasks
 ```
 
 Every task belongs to a client-chosen thread (`thread_id`). Tasks on the same
@@ -308,8 +310,9 @@ tasks on different threads run in parallel, up to 6 total and up to 3 per
 runtime. Codex keeps the app-server for a recently used thread warm, so a
 follow-up task on the same thread skips the app-server start; Claude Code
 resumes by the recorded session id. To start a fresh conversation with no prior
-context, use a new `thread_id`. `agent_runtime` chooses which runtime should
-execute the task. A queued task is claimed only when its chosen runtime is
+context, use a new `thread_id`. A `thread_id` belongs to the first runtime that
+uses it; creating a task for the same `thread_id` with another runtime returns
+`409`. `agent_runtime` chooses which runtime should execute the task. A queued task is claimed only when its chosen runtime is
 `active`; tasks for a `deactivated`, `loading`, `awaiting_login`, or `error`
 runtime remain queued. If a runtime leaves `active` while tasks are running
 because its provider is disabled, its login expires, or its health check fails,
@@ -327,6 +330,8 @@ Task endpoints:
 | `POST` | `/v1/tasks/{task_id}/steer` | Steer task request | Steer task response | Sends additional steering to one running task. Only tasks with status `running` can be steered. |
 | `POST` | `/v1/tasks/{task_id}/cancel` | none | Task cancel response | Requests cancellation for one pending task. Only tasks with status `queued` can be cancelled. |
 | `POST` | `/v1/tasks/{task_id}/kill` | none | Task kill response | Kills one running task: its runtime process is terminated and the task becomes `cancelled`. Only tasks with status `running` can be killed; returns `409` otherwise. The thread itself survives — a later task on the same `thread_id` resumes the conversation. |
+| `GET` | `/v1/threads` | none | Thread list response | Lists recent runtime threads, including active queued/running work and retained runtime session mappings. |
+| `GET` | `/v1/threads/{thread_id}/tasks` | none | Task list response | Lists retained tasks for one thread, newest first by `updated_at` with task id as a tiebreaker. |
 
 Create task request:
 
@@ -344,7 +349,7 @@ Create task request fields:
 | --- | --- | --- | --- |
 | `agent_runtime` | Yes | enum | Runtime to execute the task: `codex` or `claude_code`. |
 | `input_message` | Yes | string | Task message for the agent runtime. Must be 1 to 50,000 characters. |
-| `thread_id` | Yes | string | Client-generated conversation id this task belongs to. Must be 1 to 64 characters of `A-Z`, `a-z`, `0-9`, `-`, or `_`. The first task on a thread starts a new runtime conversation; later tasks on the same thread continue it. The host retains the 200 most recently used thread mappings; a task on an older thread starts a fresh conversation. |
+| `thread_id` | Yes | string | Client-generated conversation id this task belongs to. Must be 1 to 64 characters of `A-Z`, `a-z`, `0-9`, `-`, or `_`. The first task on a thread starts a new runtime conversation; later tasks on the same thread continue it. A thread id cannot be reused across runtimes. The host retains the 1,000 most recently used thread mappings; a task on an older thread starts a fresh conversation. |
 
 Task response:
 
@@ -416,6 +421,39 @@ Task list response fields:
 | --- | --- | --- |
 | `tasks` | Task response array | Up to 5 tasks. The first page starts with the running tasks followed by pending tasks in creation order. Later pages continue after `last_seen_task_id`. Completed, failed, and cancelled tasks are not included. |
 | `tasks[].queue_position` | integer | Queue position for this task. `0` marks every currently running task (up to 6 total and up to 3 per runtime run in parallel). Pending tasks use `1`, `2`, `3`, and so on in creation order. If no task is running, pending tasks still start at `1`. A pending task can run ahead of an earlier one when the earlier task waits on a busy thread or when an earlier task's runtime is already at its per-runtime cap. |
+
+Thread list response:
+
+```json
+{
+  "threads": [
+    {
+      "thread_id": "feature-chat-1",
+      "agent_runtime": "codex",
+      "last_used_at": "2026-06-08T00:05:00Z",
+      "active_tasks": [{"task_id": "task_125", "status": "running"}],
+      "task_count": 4
+    }
+  ]
+}
+```
+
+Thread list response fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `threads` | thread array | Recent known threads sorted by `last_used_at` descending. |
+| `threads[].thread_id` | string | Client-generated conversation id. |
+| `threads[].agent_runtime` | enum | Runtime for this thread entry: `codex` or `claude_code`. |
+| `threads[].last_used_at` | string | Latest retained task update or runtime session use timestamp known for this thread/runtime. |
+| `threads[].active_tasks` | array | Queued or running retained tasks on this thread/runtime. Empty when no task is currently active. |
+| `threads[].task_count` | integer | Number of retained task records for this thread/runtime. Older finished tasks can be pruned. |
+
+Thread task list response fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `tasks` | Task response array | Up to 1,000 retained tasks for the selected thread, newest first by `updated_at` with task id as a tiebreaker. The host keeps active tasks and the 1,000 most recently updated finished tasks globally before pruning older task records. |
 
 Update task request:
 
