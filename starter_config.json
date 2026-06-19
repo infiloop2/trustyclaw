@@ -1,0 +1,15 @@
+{
+  "agent_name": "trustyclaw-dev-agent",
+  "aws_region": "us-east-1",
+  "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
+  "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
+  "ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleTrustyClawPublicKey operator@example",
+  "network_controls": {
+    "ssh_port_opened": true,
+    "managed_ai_provider_network_access": {
+      "claude": true,
+      "openai": true
+    },
+    "allowed_network_access": {}
+  }
+}

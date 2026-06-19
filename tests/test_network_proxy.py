@@ -1,0 +1,658 @@
+from __future__ import annotations
+
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from contextlib import contextmanager, ExitStack
+import json
+from pathlib import Path
+import socket
+import ssl
+import subprocess
+import tempfile
+import threading
+import unittest
+from unittest.mock import patch
+
+from host.runtime.network_policy import load_policy, save_policy, save_status
+from host.runtime.state import read_network_events
+from host.runtime import network_proxy
+
+
+class UpstreamHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.headers.get("Upgrade", "").lower() == "websocket":
+            # A real WebSocket server rejects handshakes whose Connection
+            # header was rewritten by an intermediary.
+            if "upgrade" not in self.headers.get("Connection", "").lower():
+                self.send_error(400, "missing Connection: Upgrade")
+                return
+            self.send_response(101)
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Upgrade", "websocket")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(f"{self.path}".encode())
+
+    def do_POST(self) -> None:
+        # Echo the body back; requires Content-Length, like most upstreams that
+        # reject chunked bodies the proxy is expected to decode.
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.end_headers()
+        self.wfile.write(b"echo:" + body)
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        return
+
+
+class NetworkProxyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.env_patch = patch.dict("os.environ", {"TRUSTYCLAW_STATE_DIR": self.temp_dir.name})
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+        save_status("active")
+
+    def save_policy(self, allowed_network_access: dict) -> None:
+        save_policy(
+            {
+                "ssh_port_opened": True,
+                "managed_ai_provider_network_access": {"openai": True},
+                "allowed_network_access": allowed_network_access,
+            },
+            "2026-06-08T00:00:00Z",
+        )
+
+    def start_http_server(self, tls: bool = False) -> ThreadingHTTPServer:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+        if tls:
+            cert, key = self.self_signed_cert("upstream")
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(cert, key)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def start_proxy(self) -> ThreadingHTTPServer:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), network_proxy.ProxyHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def test_proxy_expands_managed_openai_rules_in_memory_only(self) -> None:
+        self.save_policy({})
+
+        stored = load_policy()
+        enforcement = network_proxy._load_enforcement_policy()
+
+        for host in ("api.openai.com", "auth.openai.com", "chatgpt.com"):
+            self.assertNotIn(host, stored["allowed_network_access"])
+            self.assertIn(host, enforcement["allowed_network_access"])
+
+    def self_signed_cert(self, name: str) -> tuple[str, str]:
+        cert = Path(self.temp_dir.name) / f"{name}.crt"
+        key = Path(self.temp_dir.name) / f"{name}.key"
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(key), "-out", str(cert), "-days", "1", "-subj", "/CN=127.0.0.1",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return str(cert), str(key)
+
+    def proxy_ca(self) -> None:
+        ca_cert = Path(self.temp_dir.name) / "network_proxy_ca.crt"
+        ca_key = Path(self.temp_dir.name) / "network_proxy_ca.key"
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(ca_key), "-out", str(ca_cert), "-days", "1",
+                "-subj", "/CN=TrustyClaw Test Proxy",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def send_raw(self, host: str, port: int, data: bytes) -> bytes:
+        with socket.create_connection((host, port), timeout=5) as sock:
+            sock.sendall(data)
+            sock.shutdown(socket.SHUT_WR)
+            chunks: list[bytes] = []
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks)
+
+    def test_http_allow_deny_and_event_log(self) -> None:
+        upstream = self.start_http_server()
+        proxy = self.start_proxy()
+        proxy_port = proxy.server_address[1]
+        self.save_policy(
+            {
+                "127.0.0.1": {
+                    "allow_http_methods": ["GET"],
+                    "path_guards": ["^/allowed(?:\\?.*)?$"],
+                }
+            }
+        )
+
+        with self.map_upstream(80, upstream.server_address[1]):
+            allowed = self.send_raw(
+                "127.0.0.1",
+                proxy_port,
+                b"GET http://127.0.0.1/allowed?x=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            )
+            denied = self.send_raw(
+                "127.0.0.1",
+                proxy_port,
+                b"GET http://127.0.0.1/denied HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            )
+
+        self.assertIn(b"200 OK", allowed)
+        self.assertIn(b"/allowed?x=1", allowed)
+        self.assertIn(b"403", denied)
+        events = read_network_events()
+        self.assertEqual([event["decision"] for event in events], ["allowed", "denied"])
+        self.assertEqual(events[0]["protocol"], "http")
+        self.assertEqual(events[0]["query"], "x=1")
+        self.assertEqual(events[1]["seq"], events[0]["seq"] + 1)
+
+    def test_chunked_request_body_is_decoded_and_forwarded_with_content_length(self) -> None:
+        upstream = self.start_http_server()
+        proxy = self.start_proxy()
+        self.save_policy({"127.0.0.1": {"allow_http_methods": ["POST"]}})
+        request = (
+            b"POST http://127.0.0.1/upload HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+            b"5\r\nhello\r\n"
+            b"6\r\n world\r\n"
+            b"0\r\n\r\n"
+        )
+
+        with self.map_upstream(80, upstream.server_address[1]):
+            response = self.send_raw("127.0.0.1", proxy.server_address[1], request)
+
+        self.assertIn(b"200 OK", response)
+        self.assertIn(b"echo:hello world", response)
+
+    def test_invalid_content_length_is_denied_without_reading_body(self) -> None:
+        class Reader:
+            def read(self, _amount: int) -> bytes:
+                raise AssertionError("malformed Content-Length should not read")
+
+        self.assertEqual(
+            network_proxy.read_body(Reader(), [("Content-Length", "not-a-number")]),
+            (b"", "malformed Content-Length"),
+        )
+        self.assertEqual(
+            network_proxy.read_body(Reader(), [("Content-Length", "-1")]),
+            (b"", "malformed Content-Length"),
+        )
+
+    def test_plain_http_body_parse_denial_is_logged(self) -> None:
+        proxy = self.start_proxy()
+        self.save_policy({"127.0.0.1": {"allow_http_methods": ["GET"]}})
+
+        response = self.send_raw(
+            "127.0.0.1",
+            proxy.server_address[1],
+            b"GET http://127.0.0.1/ HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Length: nope\r\n\r\n",
+        )
+
+        self.assertIn(b"400", response)
+        self.assertIn(b"malformed Content-Length", response)
+        event = read_network_events()[-1]
+        self.assertEqual(event["decision"], "denied")
+        self.assertEqual(event["reason"], "malformed Content-Length")
+        self.assertEqual(event["host"], "127.0.0.1")
+
+    def test_malformed_request_line_raises_controlled_parse_error(self) -> None:
+        class Reader:
+            def __init__(self, lines: list[bytes]) -> None:
+                self._lines = iter(lines)
+
+            def readline(self, _limit: int) -> bytes:
+                return next(self._lines, b"")
+
+        for request_line in (b"GET\r\n", b"GET / missing-version\r\n", b" / HTTP/1.1\r\n"):
+            with self.subTest(request_line=request_line), self.assertRaisesRegex(OSError, "malformed request line"):
+                network_proxy.read_request_head(Reader([request_line, b"\r\n"]))
+
+    def test_http_to_non_default_port_is_denied(self) -> None:
+        proxy = self.start_proxy()
+        self.save_policy({"127.0.0.1": {"allow_http_methods": ["GET"]}})
+
+        denied = self.send_raw(
+            "127.0.0.1",
+            proxy.server_address[1],
+            b"GET http://127.0.0.1:8080/allowed HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n",
+        )
+
+        self.assertIn(b"403", denied)
+        self.assertEqual(read_network_events()[-1]["port"], 8080)
+
+    def test_http_host_header_must_match_absolute_request_uri(self) -> None:
+        proxy = self.start_proxy()
+        self.save_policy({"127.0.0.1": {"allow_http_methods": ["GET"]}})
+
+        denied = self.send_raw(
+            "127.0.0.1",
+            proxy.server_address[1],
+            b"GET http://127.0.0.1/allowed HTTP/1.1\r\nHost: evil.example.org\r\n\r\n",
+        )
+
+        self.assertIn(b"403", denied)
+        event = read_network_events()[-1]
+        self.assertEqual(event["decision"], "denied")
+        self.assertIn("Host header", event["reason"])
+
+    def test_malformed_ports_get_400_instead_of_killing_the_handler(self) -> None:
+        # A non-numeric port in the CONNECT target or an absolute request URI
+        # must produce an HTTP error, not an unhandled ValueError that kills
+        # the handler thread with no response.
+        proxy = self.start_proxy()
+        self.save_policy({"127.0.0.1": {"allow_http_methods": ["GET"]}})
+
+        connect = self.send_raw(
+            "127.0.0.1",
+            proxy.server_address[1],
+            b"CONNECT 127.0.0.1:4a3 HTTP/1.1\r\nHost: 127.0.0.1:4a3\r\n\r\n",
+        )
+        absolute = self.send_raw(
+            "127.0.0.1",
+            proxy.server_address[1],
+            b"GET http://127.0.0.1:8x0/allowed HTTP/1.1\r\nHost: 127.0.0.1:8x0\r\n\r\n",
+        )
+
+        self.assertIn(b"400", connect)
+        self.assertIn(b"400", absolute)
+
+    def test_connect_to_unlisted_host_is_denied_before_any_dial(self) -> None:
+        proxy = self.start_proxy()
+        self.save_policy({"allowed.example.com": {"allow_http_methods": ["GET"]}})
+
+        real_create_connection = socket.create_connection
+
+        def must_not_dial(*args, **kwargs):  # type: ignore[no-untyped-def]
+            raise AssertionError("proxy dialed upstream for a denied host")
+
+        with patch("host.runtime.network_proxy.socket.create_connection", must_not_dial):
+            with real_create_connection(("127.0.0.1", proxy.server_address[1]), timeout=5) as sock:
+                sock.sendall(b"CONNECT evil.example.org:443 HTTP/1.1\r\nHost: evil.example.org:443\r\n\r\n")
+                response = sock.recv(4096)
+
+        self.assertIn(b"403", response)
+        event = read_network_events()[-1]
+        self.assertEqual(event["decision"], "denied")
+        self.assertEqual(event["host"], "evil.example.org")
+        self.assertEqual(event["method"], "CONNECT")
+        # Denied events carry a reason so a failed request is diagnosable.
+        self.assertIn("policy", event["reason"])
+
+    def test_https_request_is_inspected_and_logged(self) -> None:
+        self.proxy_ca()
+        upstream = self.start_http_server(tls=True)
+        proxy = self.start_proxy()
+        self.save_policy(
+            {
+                "127.0.0.1": {
+                    "allow_http_methods": ["GET"],
+                    "path_guards": ["^/secure$"],
+                }
+            }
+        )
+
+        with self.map_upstream(443, upstream.server_address[1], tls=True):
+            response = self.https_via_proxy(
+                proxy.server_address[1], b"GET /secure HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            )
+
+        self.assertIn(b"200 OK", response)
+        events = read_network_events()
+        self.assertEqual(events[-1]["protocol"], "https")
+        self.assertEqual(events[-1]["path"], "/secure")
+        self.assertEqual(events[-1]["decision"], "allowed")
+
+    def test_https_host_header_must_match_connect_host(self) -> None:
+        self.proxy_ca()
+        proxy = self.start_proxy()
+        self.save_policy({"127.0.0.1": {"allow_http_methods": ["GET"]}})
+
+        response = self.https_via_proxy(
+            proxy.server_address[1], b"GET /secure HTTP/1.1\r\nHost: evil.example.org\r\n\r\n"
+        )
+
+        self.assertIn(b"403 Forbidden", response)
+        event = read_network_events()[-1]
+        self.assertEqual(event["decision"], "denied")
+        self.assertIn("Host header", event["reason"])
+
+    def test_https_absolute_target_must_match_connect_host(self) -> None:
+        self.proxy_ca()
+        proxy = self.start_proxy()
+        self.save_policy({"127.0.0.1": {"allow_http_methods": ["GET"]}})
+
+        response = self.https_via_proxy(
+            proxy.server_address[1],
+            b"GET https://evil.example.org/secure HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+
+        self.assertIn(b"403 Forbidden", response)
+        event = read_network_events()[-1]
+        self.assertEqual(event["decision"], "denied")
+        self.assertIn("request target", event["reason"])
+
+    def test_https_malformed_target_port_is_denied(self) -> None:
+        # Inside the TLS tunnel the same malformed-port shape is a policy
+        # denial (logged, 403) rather than a dropped connection.
+        self.proxy_ca()
+        proxy = self.start_proxy()
+        self.save_policy({"127.0.0.1": {"allow_http_methods": ["GET"]}})
+
+        response = self.https_via_proxy(
+            proxy.server_address[1],
+            b"GET https://127.0.0.1:4a3/secure HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+
+        self.assertIn(b"403 Forbidden", response)
+        event = read_network_events()[-1]
+        self.assertEqual(event["decision"], "denied")
+        self.assertIn("request target is invalid", event["reason"])
+
+    def test_is_public_ip_rejects_internal_ranges(self) -> None:
+        for good in ("93.184.216.34", "8.8.8.8", "1.1.1.1"):
+            self.assertTrue(network_proxy._is_public_ip(good), good)
+        for bad in (
+            "127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.1.1", "169.254.169.254",
+            "0.0.0.0", "::1", "fc00::1", "fe80::1", "not-an-ip",
+        ):
+            self.assertFalse(network_proxy._is_public_ip(bad), bad)
+
+    def test_connect_public_refuses_non_public_resolution_without_dialing(self) -> None:
+        # An allowed domain pointed at the metadata IP must not be dialed.
+        resolved = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 443))]
+        with (
+            patch("host.runtime.network_proxy.socket.getaddrinfo", return_value=resolved),
+            patch("host.runtime.network_proxy.socket.create_connection") as create_connection,
+        ):
+            with self.assertRaises(OSError):
+                network_proxy.connect_public("metadata.evil.test", 443, 5)
+            create_connection.assert_not_called()
+
+    def test_live_web_search_payload_is_denied_with_specific_reason(self) -> None:
+        self.proxy_ca()
+        proxy = self.start_proxy()
+        self.save_policy(
+            {"127.0.0.1": {"allow_http_methods": ["POST"], "openai_disable_live_web_search": True}}
+        )
+        body = b'{"tools":[{"type":"web_search","external_web_access":true}]}'
+        request = (
+            b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+        )
+
+        # No upstream is needed: the guard denies before any upstream connection.
+        response = self.https_via_proxy(proxy.server_address[1], request)
+
+        self.assertIn(b"403", response)
+        self.assertIn(b"live web search is disabled", response)
+        self.assertEqual(read_network_events()[-1]["decision"], "denied")
+
+    def test_wss_handshake_is_classified_as_wss_and_keeps_upgrade_headers(self) -> None:
+        self.proxy_ca()
+        upstream = self.start_http_server(tls=True)
+        proxy = self.start_proxy()
+        self.save_policy(
+            {
+                "127.0.0.1": {
+                    "allow_http_methods": ["GET"],
+                    "path_guards": ["^/socket$"],
+                }
+            }
+        )
+        request = (
+            b"GET /socket HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n\r\n"
+        )
+
+        with self.map_upstream(443, upstream.server_address[1], tls=True):
+            response = self.https_via_proxy(proxy.server_address[1], request)
+
+        self.assertIn(b"101 Switching Protocols", response)
+        self.assertEqual(read_network_events()[-1]["protocol"], "wss")
+
+    def test_connection_slot_is_released_when_the_handler_thread_cannot_start(self) -> None:
+        server = network_proxy.BoundedThreadingHTTPServer(("127.0.0.1", 0), network_proxy.ProxyHandler)
+        self.addCleanup(server.server_close)
+        client, request = socket.socketpair()
+        self.addCleanup(client.close)
+        self.addCleanup(request.close)
+        slots = threading.BoundedSemaphore(1)
+
+        with (
+            patch.object(network_proxy, "CONNECTION_SLOTS", slots),
+            patch.object(ThreadingHTTPServer, "process_request", side_effect=RuntimeError("cannot start thread")),
+            self.assertRaises(RuntimeError),
+        ):
+            server.process_request(request, ("127.0.0.1", 65000))
+
+        # The slot must come back even though process_request_thread (the
+        # normal release point) never ran; a leak here eventually makes the
+        # proxy silently drop every connection.
+        self.assertTrue(slots.acquire(blocking=False))
+
+    @contextmanager
+    def map_upstream(self, port_from: int, upstream_port: int, tls: bool = False):
+        """Redirect the proxy's upstream dials for 127.0.0.1:<port_from> to the
+        local test server, so requests can target the default ports."""
+        real_create_connection = socket.create_connection
+
+        def mapped_create_connection(address, timeout=None, source_address=None, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if address == ("127.0.0.1", port_from):
+                return real_create_connection(("127.0.0.1", upstream_port), timeout=timeout, source_address=source_address)
+            return real_create_connection(address, timeout=timeout, source_address=source_address)
+
+        # The tests use loopback as a stand-in upstream, which the SSRF guard
+        # would otherwise refuse; allow it here. connect_public's own refusal is
+        # covered by dedicated tests below.
+        with ExitStack() as stack:
+            stack.enter_context(patch("host.runtime.network_proxy.socket.create_connection", mapped_create_connection))
+            stack.enter_context(patch("host.runtime.network_proxy._is_public_ip", lambda ip: True))
+            if tls:
+                stack.enter_context(patch("host.runtime.network_proxy.ssl.create_default_context", ssl._create_unverified_context))
+            yield
+
+    def https_via_proxy(self, proxy_port: int, request: bytes) -> bytes:
+        raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw.settimeout(5)
+        raw.connect(("127.0.0.1", proxy_port))
+        try:
+            raw.sendall(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
+            connect_response = raw.recv(4096)
+            self.assertIn(b"200 Connection Established", connect_response)
+            context = ssl._create_unverified_context()
+            tls = context.wrap_socket(raw, server_hostname="127.0.0.1")
+            try:
+                tls.sendall(request)
+                chunks: list[bytes] = []
+                while True:
+                    chunk = tls.recv(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                return b"".join(chunks)
+            finally:
+                tls.close()
+        finally:
+            raw.close()
+
+
+LIVE_SEARCH = json.dumps({"tools": [{"type": "web_search", "external_web_access": True}]}).encode()
+CACHED_SEARCH = json.dumps({"tools": [{"type": "web_search", "external_web_access": False}]}).encode()
+
+
+def masked_frame(payload: bytes, opcode: int = 0x1, fin: bool = True, rsv: int = 0, masked: bool = True) -> bytes:
+    """Build a (client-side) WebSocket frame; payloads under 126 bytes only."""
+    assert len(payload) < 126
+    mask = b"\x21\x07\x42\x9a"
+    head = bytes([(0x80 if fin else 0) | (rsv << 4) | opcode])
+    if not masked:
+        return head + bytes([len(payload)]) + payload
+    return head + bytes([0x80 | len(payload)]) + mask + bytes(
+        byte ^ mask[index % 4] for index, byte in enumerate(payload)
+    )
+
+
+class WebSocketHandshakeTests(unittest.TestCase):
+    def test_extension_offer_is_not_forwarded_upstream(self) -> None:
+        # If the upstream accepted permessage-deflate, frames would carry RSV
+        # bits the message guard must deny mid-stream. Dropping the client's
+        # offer keeps both sides on plain, inspectable frames.
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        network_proxy.send_http_request(
+            ours,
+            "GET",
+            "/socket",
+            [
+                ("Host", "chatgpt.com"),
+                ("Upgrade", "websocket"),
+                ("Connection", "Upgrade"),
+                ("Sec-WebSocket-Key", "c2VjcmV0LWtleQ=="),
+                ("Sec-WebSocket-Version", "13"),
+                ("Sec-WebSocket-Extensions", "permessage-deflate; client_max_window_bits"),
+            ],
+            b"",
+            websocket=True,
+        )
+        sent = b""
+        while b"\r\n\r\n" not in sent:
+            sent += theirs.recv(65536)
+        self.assertNotIn(b"sec-websocket-extensions", sent.lower())
+        self.assertIn(b"Upgrade: websocket", sent)
+        self.assertIn(b"Sec-WebSocket-Key", sent)
+
+
+class WebSocketGuardTests(unittest.TestCase):
+    POLICY = {
+        "ssh_port_opened": True,
+        "allowed_network_access": {
+            "chatgpt.com": {"allow_http_methods": ["GET"], "openai_disable_live_web_search": True},
+            "example.com": {"allow_http_methods": ["GET"]},
+        },
+    }
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.env_patch = patch.dict("os.environ", {"TRUSTYCLAW_STATE_DIR": self.temp_dir.name})
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+
+    def guard(self) -> network_proxy.WebSocketClientGuard:
+        return network_proxy.WebSocketClientGuard(self.POLICY, "chatgpt.com")
+
+    def test_cached_web_search_message_is_forwarded_unchanged(self) -> None:
+        frame = masked_frame(CACHED_SEARCH)
+        self.assertEqual(self.guard().feed(frame), frame)
+
+    def test_live_web_search_message_is_denied(self) -> None:
+        with self.assertRaises(network_proxy.WebSocketDenied) as denied:
+            self.guard().feed(masked_frame(LIVE_SEARCH))
+        self.assertIn("live web search is disabled", denied.exception.reason)
+
+    def test_web_search_preview_marker_is_denied_in_any_message(self) -> None:
+        with self.assertRaises(network_proxy.WebSocketDenied):
+            self.guard().feed(masked_frame(b"plain text mentioning web_search_preview"))
+
+    def test_fragmented_message_is_reassembled_before_the_check(self) -> None:
+        guard = self.guard()
+        held = guard.feed(masked_frame(LIVE_SEARCH[:10], opcode=0x1, fin=False))
+        self.assertEqual(held, b"")  # nothing forwarded until the message completes
+        with self.assertRaises(network_proxy.WebSocketDenied):
+            guard.feed(masked_frame(LIVE_SEARCH[10:], opcode=0x0, fin=True))
+
+    def test_control_frames_pass_through_mid_message(self) -> None:
+        guard = self.guard()
+        ping = masked_frame(b"", opcode=0x9)
+        cleared = guard.feed(masked_frame(b"{", opcode=0x1, fin=False) + ping)
+        self.assertEqual(cleared, ping)
+
+    def test_unmasked_and_extension_frames_are_denied(self) -> None:
+        with self.assertRaises(network_proxy.WebSocketDenied):
+            self.guard().feed(masked_frame(b"{}", masked=False))
+        with self.assertRaises(network_proxy.WebSocketDenied):
+            self.guard().feed(masked_frame(b"{}", rsv=0x4))  # e.g. permessage-deflate
+
+    def run_tunnel(self, host: str) -> tuple[socket.socket, socket.socket, threading.Thread]:
+        client_side, proxy_client = socket.socketpair()
+        proxy_upstream, upstream_side = socket.socketpair()
+        client_side.settimeout(5)
+        upstream_side.settimeout(5)
+        thread = threading.Thread(
+            target=network_proxy.tunnel_websocket,
+            args=(proxy_client, proxy_upstream, self.POLICY, "wss", host, 443, "/ws"),
+            daemon=True,
+        )
+        thread.start()
+        self.addCleanup(client_side.close)
+        self.addCleanup(upstream_side.close)
+        return client_side, upstream_side, thread
+
+    def test_tunnel_denies_live_search_and_logs_the_decision(self) -> None:
+        client, upstream, thread = self.run_tunnel("chatgpt.com")
+        client.sendall(masked_frame(LIVE_SEARCH))
+
+        close_frame = client.recv(1024)
+        self.assertEqual(close_frame[0], 0x88)
+        self.assertEqual(int.from_bytes(close_frame[2:4], "big"), 1008)
+        self.assertEqual(upstream.recv(1024), b"")  # nothing reached the upstream side
+        thread.join(timeout=5)
+
+        event = read_network_events()[-1]
+        self.assertEqual(event["decision"], "denied")
+        self.assertEqual(event["method"], "MESSAGE")
+        self.assertIn("live web search is disabled", event["reason"])
+
+    def test_tunnel_forwards_allowed_messages_both_ways(self) -> None:
+        client, upstream, thread = self.run_tunnel("chatgpt.com")
+        frame = masked_frame(CACHED_SEARCH)
+        client.sendall(frame)
+        self.assertEqual(upstream.recv(1024), frame)
+        upstream.sendall(b"\x81\x03abc")  # unmasked server frame passes through untouched
+        self.assertEqual(client.recv(1024), b"\x81\x03abc")
+        client.close()
+        thread.join(timeout=5)
+
+    def test_tunnel_stays_opaque_for_unguarded_domains(self) -> None:
+        client, upstream, thread = self.run_tunnel("example.com")
+        client.sendall(b"\x00not a websocket frame at all")
+        self.assertEqual(upstream.recv(1024), b"\x00not a websocket frame at all")
+        client.close()
+        thread.join(timeout=5)
+
+
+if __name__ == "__main__":
+    unittest.main()
