@@ -140,7 +140,7 @@ curl -H "Authorization: Bearer $(jq -r .admin_password <agent_name>.json)" \
 Full admin API documentation is in
 [`docs/api/AdminAPI.md`](docs/api/AdminAPI.md).
 
-To give the agent files from your laptop, upload them as the operator and then
+To give the agent files from your machine, upload them as the operator and then
 move them into the agent-owned home directory:
 
 ```bash
