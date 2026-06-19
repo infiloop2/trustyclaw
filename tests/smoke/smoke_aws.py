@@ -561,7 +561,22 @@ class AwsSmoke:
             raise AssertionError(f"UI page content type is {content_type!r}")
         if "TrustyClaw" not in page:
             raise AssertionError("UI page does not look like the admin UI")
-        self._ok("static UI page served unauthenticated; API routes still require auth")
+        for expected in (
+            "<h2>Threads</h2>",
+            "/v1/threads",
+            "/v1/threads/${encodeURIComponent(threadId)}/tasks",
+            "/v1/tasks/${encodeURIComponent(taskId)}/events",
+            "showThread",
+            "showTaskEvents",
+            "TASK_EVENT_PAGE_BATCH",
+            "loadMoreTaskEvents",
+        ):
+            if expected not in page:
+                raise AssertionError(f"UI page is missing thread history path {expected!r}")
+        for removed in ("/v1/tasks/finished", "loadFinishedTasks", "loadAllTaskEvents", "retained_task_count"):
+            if removed in page:
+                raise AssertionError(f"UI page still contains removed finished-task path {removed!r}")
+        self._ok("static UI page served unauthenticated; thread history UI routes present; API routes still require auth")
 
     def check_admin_auth(self) -> None:
         self._step("admin API authentication")
@@ -834,7 +849,39 @@ class AwsSmoke:
             raise AssertionError(f"queued cancel should only emit task.cancelled, got: {events}")
         if any(event["task_id"] != task_id for event in events):
             raise AssertionError("per-task events leaked another task's events")
-        self._ok("queued update/cancel/kill honored; thread_id validated; terminal transitions rejected; events scoped")
+
+        thread = self._api("GET", "/v1/threads")["threads"]
+        matching = [item for item in thread if item["thread_id"] == "smoke-lifecycle"]
+        if len(matching) != 1:
+            raise AssertionError(f"lifecycle thread missing from /v1/threads: {thread}")
+        if matching[0]["agent_runtime"] != self.agent_runtime:
+            raise AssertionError(f"lifecycle thread runtime mismatch: {matching[0]}")
+        if matching[0].get("task_count") != 1:
+            raise AssertionError(f"lifecycle thread task_count mismatch: {matching[0]}")
+        if "retained_task_count" in matching[0] or "continuable" in matching[0]:
+            raise AssertionError(f"thread response contains removed fields: {matching[0]}")
+
+        thread_tasks = self._api("GET", "/v1/threads/smoke-lifecycle/tasks")["tasks"]
+        if [item["task_id"] for item in thread_tasks] != [task_id]:
+            raise AssertionError(f"thread task list did not return the lifecycle task only: {thread_tasks}")
+        if thread_tasks[0]["status"] != "cancelled":
+            raise AssertionError(f"thread task list did not retain cancelled task status: {thread_tasks}")
+
+        status, _ = self._api_status(
+            "POST",
+            "/v1/tasks",
+            self.task_body("wrong runtime for existing thread (smoke)", "smoke-lifecycle", runtime="claude_code"),
+            idem=self._idem("thread-runtime-conflict"),
+        )
+        if status != 409:
+            raise AssertionError(f"creating a claude task on a codex thread returned {status}, expected 409")
+        status, _ = self._api_status("GET", "/v1/tasks/finished")
+        if status != 404:
+            raise AssertionError(f"removed finished-task endpoint returned {status}, expected 404")
+        self._ok(
+            "queued update/cancel/kill honored; thread_id validated; terminal transitions rejected; "
+            "events scoped; thread list/task history covered"
+        )
 
     def check_task_pagination(self) -> None:
         """last_seen_task_id paging over a stable, pre-login queue (the runtime

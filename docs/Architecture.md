@@ -299,7 +299,7 @@ claim cap of three tasks per agent runtime:
   and an `agent_runtime` (`codex` or `claude_code`). The first task on a
   runtime/thread pair starts a runtime conversation; later tasks on that same
   runtime/thread pair resume the recorded Codex thread id or Claude session id
-  (the maps live in `state.json`, capped at the 200 most recently used). Tasks
+  (the maps live in `state.json`, capped at the 1,000 most recently used). Tasks
   on one runtime/thread pair run serially in creation order; tasks on different
   pairs run in parallel, up to six total and up to three per runtime.
 - Each running task gets its own runtime process, spawned through the sudo

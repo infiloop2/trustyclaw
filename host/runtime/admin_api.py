@@ -64,8 +64,9 @@ MAX_REQUEST_BODY_BYTES = 1024 * 1024
 IDEMPOTENCY_RETENTION_SECONDS = 24 * 3600
 IDEMPOTENCY_ENTRY_LIMIT = 10_000
 MAINTENANCE_INTERVAL_SECONDS = 3600  # scheduled state cleanup cadence (not per-request)
-FINISHED_TASK_LIMIT = 200  # finished tasks kept as history before the oldest are pruned
-THREAD_MAP_LIMIT = 200  # user thread -> runtime session mappings kept before LRU pruning
+FINISHED_TASK_LIMIT = 1000  # finished tasks kept as history before the oldest are pruned
+THREAD_TASK_LIMIT = 1000
+THREAD_MAP_LIMIT = 1000  # user thread -> runtime session mappings kept before LRU pruning
 # Queued tasks and undelivered steers are the two operator-driven inputs that
 # would otherwise grow state.json without bound (active tasks are never
 # pruned; steers queue until the worker delivers them). Both caps return 409.
@@ -254,6 +255,10 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> Any
             return list_tasks(_one(query, "last_seen_task_id"))
     if path.startswith("/v1/tasks/"):
         return task_route(method, path, query, body)
+    if path == "/v1/threads" and method == "GET":
+        return list_threads()
+    if path.startswith("/v1/threads/"):
+        return thread_route(method, path, query)
     if path == "/v1/events" and method == "GET":
         return {"events": page_agent_events(_since(query)).items}
     if path == "/v1/network/policy":
@@ -315,6 +320,16 @@ def task_route(method: str, path: str, query: dict[str, list[str]], body: Any) -
     raise ApiError(HTTPStatus.NOT_FOUND, "task route not found")
 
 
+def thread_route(method: str, path: str, query: dict[str, list[str]]) -> Any:
+    parts = path.strip("/").split("/")
+    if len(parts) == 4 and parts[3] == "tasks" and method == "GET":
+        thread_id = parts[2]
+        if not THREAD_ID_RE.fullmatch(thread_id):
+            raise ApiError(HTTPStatus.NOT_FOUND, "thread route not found")
+        return list_thread_tasks(thread_id)
+    raise ApiError(HTTPStatus.NOT_FOUND, "thread route not found")
+
+
 def health() -> dict[str, Any]:
     runtime = agent_runtime_status()
     network_status = proxy_state_client.network_status()
@@ -348,6 +363,10 @@ def _task_number(task: dict[str, Any]) -> int:
         return 0
 
 
+def _task_history_key(task: dict[str, Any]) -> tuple[str, int]:
+    return (str(task.get("updated_at", "")), _task_number(task))
+
+
 def prune_idempotency(entries: dict[str, Any], *, now: float, preserve_key: str | None = None) -> None:
     for old_key in [
         k
@@ -375,7 +394,7 @@ def prune_state() -> None:
         active = [t for t in tasks if t["status"] in ACTIVE_STATUSES]
         finished = sorted(
             (t for t in tasks if t["status"] not in ACTIVE_STATUSES),
-            key=_task_number,
+            key=_task_history_key,
         )
         kept_finished = finished[-FINISHED_TASK_LIMIT:]
         pruned_tasks = {_task_number(t) for t in finished[:-FINISHED_TASK_LIMIT]}
@@ -551,6 +570,12 @@ def create_task(body: Any) -> dict[str, Any]:
     thread_id = _thread_id(body)
     agent_runtime = _agent_runtime(body)
     with state_update() as state:
+        existing_runtime = thread_runtime_in_state(state, thread_id)
+        if existing_runtime is not None and existing_runtime != agent_runtime:
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                f"thread_id is already used by {existing_runtime}; use that runtime or choose a new thread_id",
+            )
         if sum(1 for t in state["tasks"] if t["status"] == QUEUED) >= QUEUED_TASK_LIMIT:
             raise ApiError(
                 HTTPStatus.CONFLICT,
@@ -584,6 +609,74 @@ def list_tasks(last_seen_task_id: str | None) -> dict[str, Any]:
                 start = index + 1
                 break
     return {"tasks": [public_task(task, queue_position=position) for position, task in ordered[start : start + TASK_LIMIT]]}
+
+
+def list_threads() -> dict[str, Any]:
+    state = read_state()
+    threads: dict[str, dict[str, Any]] = {}
+    for task in state["tasks"]:
+        thread_id = task["thread_id"]
+        runtime = task["agent_runtime"]
+        entry = threads.setdefault(
+            thread_id,
+            {
+                "thread_id": thread_id,
+                "agent_runtime": runtime,
+                "last_used_at": task["updated_at"],
+                "active_tasks": [],
+                "task_count": 0,
+            },
+        )
+        entry["last_used_at"] = max(str(entry["last_used_at"]), str(task["updated_at"]))
+        entry["task_count"] = int(entry["task_count"]) + 1
+        if task["status"] in ACTIVE_STATUSES:
+            entry["active_tasks"].append({"task_id": task["task_id"], "status": task["status"]})
+    for thread_id, mapping in state.get("codex_threads", {}).items():
+        _merge_thread_mapping(threads, thread_id, "codex", mapping)
+    for thread_id, mapping in state.get("claude_sessions", {}).items():
+        _merge_thread_mapping(threads, thread_id, "claude_code", mapping)
+    ordered = sorted(
+        threads.values(),
+        key=lambda item: (str(item["last_used_at"]), item["agent_runtime"], item["thread_id"]),
+        reverse=True,
+    )
+    return {"threads": ordered}
+
+
+def _merge_thread_mapping(
+    threads: dict[str, dict[str, Any]], thread_id: str, runtime: str, mapping: Any
+) -> None:
+    if not isinstance(mapping, dict):
+        return
+    last_used_at = str(mapping.get("last_used_at", ""))
+    entry = threads.setdefault(
+        thread_id,
+        {
+            "thread_id": thread_id,
+            "agent_runtime": runtime,
+            "last_used_at": last_used_at,
+            "active_tasks": [],
+            "task_count": 0,
+        },
+    )
+    entry["last_used_at"] = max(str(entry["last_used_at"]), last_used_at)
+
+
+def list_thread_tasks(thread_id: str) -> dict[str, Any]:
+    tasks = [task for task in read_state()["tasks"] if task["thread_id"] == thread_id]
+    ordered = sorted(tasks, key=_task_history_key, reverse=True)
+    return {"tasks": [public_task(task) for task in ordered[:THREAD_TASK_LIMIT]]}
+
+
+def thread_runtime_in_state(state: dict[str, Any], thread_id: str) -> str | None:
+    for task in state["tasks"]:
+        if task["thread_id"] == thread_id:
+            return str(task["agent_runtime"])
+    if thread_id in state.get("codex_threads", {}):
+        return "codex"
+    if thread_id in state.get("claude_sessions", {}):
+        return "claude_code"
+    return None
 
 
 def get_task(task_id: str) -> dict[str, Any]:
