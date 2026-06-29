@@ -133,7 +133,7 @@ Response fields:
 | `agent_runtime.runtimes[].type` | enum | `codex`, `claude_code` | Agent runtime type. |
 | `agent_runtime.runtimes[].status` | enum | `deactivated`, `loading`, `awaiting_login`, `active`, `error` | Current agent runtime supervisor state. |
 | `agent_runtime.runtimes[].active_task_ids` | string array |  | Currently running task ids for this runtime. |
-| `network_controls.status` | enum | `loading`, `active`, `reloading`, `error` | Current network policy enforcement state. |
+| `network_controls.status` | enum | `active`, `error` | Derived network policy enforcement state. |
 | `host_runtime.cpu.usage_percent` | number | 0-100 | Current host CPU usage percentage. |
 | `host_runtime.memory.used_bytes` | integer |  | Current host memory used, in bytes. |
 | `host_runtime.memory.total_bytes` | integer |  | Total host memory, in bytes. |
@@ -153,11 +153,10 @@ access is false, `loading` while the runtime is starting, `awaiting_login` while
 the runtime needs operator login, `active` while it can accept work, and `error`
 when the runtime supervisor cannot make it healthy.
 
-`network_controls.status` is `loading` while the initial policy is being applied and
-`reloading` after a policy replacement is accepted; during both states, all network
-access is denied. It is `active` while policy enforcement is active and `error` when
-policy enforcement is not healthy. The `error` state also fails closed and denies all
-network access.
+`network_controls.status` is derived, not stored. It is `active` when the
+persisted network policy is valid and the proxy process is listening. It is
+`error` when the policy cannot be parsed or policy enforcement is not healthy.
+The `error` state fails closed and denies all network access.
 
 ## Agent Runtime
 
@@ -660,14 +659,13 @@ Network endpoints:
 | Method | Path | Request | Response | Behavior |
 | --- | --- | --- | --- | --- |
 | `GET` | `/v1/network/policy` | none | Network policy response | Returns active network policy. |
-| `PUT` | `/v1/network/policy` | Network policy request | Network policy response | Replaces network policy and reloads policy enforcement. Allowed unless policy is still initializing (`409` while `network_controls.status` is `loading`); recovers a stuck `reloading`/`error`. Setting `ssh_port_opened` to `false` returns `400` because SSH is currently the only supported admin access path. Disabling a managed provider deactivates its runtime, clears its account pin, closes its live runtime processes, and fails its running tasks. |
+| `PUT` | `/v1/network/policy` | Network policy request | Network policy response | Replaces network policy atomically. Disabling a managed provider deactivates its runtime, clears its account pin, closes its live runtime processes, and fails its running tasks. |
 | `GET` | `/v1/network/events?since=<seq>` | `since` query parameter is optional | Network event response | Lists network decision events. |
 
 Network policy request:
 
 ```json
 {
-  "ssh_port_opened": true,
   "managed_ai_provider_network_access": {
     "openai": true
   },
@@ -680,12 +678,12 @@ Network policy request:
 }
 ```
 
-The request body is the replacement `network_controls` object using the schema from
-[`InputConfig.md`](InputConfig.md).
+The request body is the replacement runtime network controls object using the
+schema from [`NetworkControls.md`](NetworkControls.md).
 
-When `PUT /v1/network/policy` is accepted, `network_controls.status` becomes
-`reloading` until the replacement policy is active. It returns `409` when
-`network_controls.status` is not `active`.
+When `PUT /v1/network/policy` is accepted, the replacement policy has been
+validated and atomically written. Concurrent replacements are serialized; a
+request can return `409` if another replacement is already in progress.
 
 Network policy response:
 
@@ -696,7 +694,6 @@ only in the internal enforcement policy.
 ```json
 {
   "network_controls": {
-    "ssh_port_opened": true,
     "managed_ai_provider_network_access": {
       "openai": true
     },
@@ -715,7 +712,7 @@ Network policy response fields:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `network_controls` | object | Network controls using the `network_controls` schema from [`InputConfig.md`](InputConfig.md). |
+| `network_controls` | object | Runtime network controls using the schema from [`NetworkControls.md`](NetworkControls.md). |
 | `updated_at` | string | RFC 3339 timestamp for the last policy update. Present in responses only. |
 
 Network event response:

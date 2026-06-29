@@ -1,0 +1,743 @@
+"use strict";
+const $ = id => document.getElementById(id);
+let eventsSince = null, netSince = null;
+const events = [], netEvents = [];
+let runtimeType = "codex";
+let threads = [], threadTasks = [];
+let activeTab = "home";
+let activeNetworkPolicy = {"managed_ai_provider_network_access": {}, "allowed_network_access": {}};
+let proposedNetworkPolicy = {"managed_ai_provider_network_access": {}, "allowed_network_access": {}};
+let latestRuntimes = [];
+let selectedTask = null;
+let selectedTaskEvents = [];
+let selectedTaskEventsSince = null;
+let selectedTaskEventsHasMore = false;
+const TASK_EVENT_PAGE_BATCH = 10;
+const POLICY_PRESETS = {
+  openai: { managed: { openai: true }, rules: {} },
+  claude: { managed: { claude: true }, rules: {} },
+  github: {
+    managed: {},
+    rules: {
+      "github.com": {"allow_http_methods": ["GET", "POST"]},
+      "api.github.com": {"allow_http_methods": ["GET", "POST", "PATCH", "PUT", "DELETE"]},
+      "codeload.github.com": {"allow_http_methods": ["GET", "HEAD"]},
+      "objects.githubusercontent.com": {"allow_http_methods": ["GET", "HEAD"]},
+      "raw.githubusercontent.com": {"allow_http_methods": ["GET", "HEAD"]},
+      "release-assets.githubusercontent.com": {"allow_http_methods": ["GET", "HEAD"]},
+    },
+  },
+  python: {
+    managed: {},
+    rules: {
+      "pypi.org": {
+        "allow_http_methods": ["GET", "HEAD"],
+        "path_guards": ["^/simple(?:/.*)?$", "^/pypi/[^/]+/json$"],
+      },
+      "files.pythonhosted.org": {
+        "allow_http_methods": ["GET", "HEAD"],
+        "path_guards": ["^/packages(?:/.*)?$"],
+      },
+    },
+  },
+  npm: {
+    managed: {},
+    rules: {
+      "nodejs.org": {
+        "allow_http_methods": ["GET", "HEAD"],
+        "path_guards": ["^/dist(?:/.*)?$"],
+      },
+      "registry.npmjs.org": {"allow_http_methods": ["GET", "HEAD"]},
+    },
+  },
+};
+const POLICY_PRESET_BUTTONS = {
+  openai: { label: "OpenAI", proposed: "OpenAI in proposal", partial: "OpenAI partial proposal" },
+  claude: { label: "Claude", proposed: "Claude in proposal", partial: "Claude partial proposal" },
+  github: { label: "GitHub", proposed: "GitHub in proposal", partial: "GitHub partial proposal" },
+  python: { label: "Python packages", proposed: "Python packages in proposal", partial: "Python packages partial proposal" },
+  npm: { label: "npm packages", proposed: "npm packages in proposal", partial: "npm packages partial proposal" },
+};
+const RUNTIME_PROVIDERS = {
+  codex: { label: "Codex", provider: "openai", providerLabel: "OpenAI" },
+  claude_code: { label: "Claude Code", provider: "claude", providerLabel: "Claude" },
+};
+const PRESET_INFO = {
+  openai: {
+    heading: "OpenAI expands internally",
+    rows: [
+      ["api.openai.com", "POST; account guard; live web search disabled"],
+      ["auth.openai.com", "GET, POST"],
+      ["chatgpt.com", "GET, POST; account guard; live web search disabled"],
+    ],
+  },
+  claude: {
+    heading: "Claude expands internally",
+    rows: [
+      ["api.anthropic.com", "GET, POST; account guard"],
+      ["platform.claude.com", "GET, POST; only /v1/oauth paths"],
+    ],
+  },
+  github: {
+    heading: "GitHub expands",
+    rows: [
+      ["github.com", "GET, POST"],
+      ["api.github.com", "GET, POST, PATCH, PUT, DELETE"],
+      ["codeload.github.com", "GET, HEAD"],
+      ["objects.githubusercontent.com", "GET, HEAD"],
+      ["raw.githubusercontent.com", "GET, HEAD"],
+      ["release-assets.githubusercontent.com", "GET, HEAD"],
+    ],
+  },
+  python: {
+    heading: "Python packages expands",
+    rows: [
+      ["pypi.org", "GET, HEAD; only /simple and /pypi/<package>/json paths"],
+      ["files.pythonhosted.org", "GET, HEAD; only /packages paths"],
+    ],
+  },
+  npm: {
+    heading: "npm packages expands",
+    rows: [
+      ["nodejs.org", "GET, HEAD; only /dist paths"],
+      ["registry.npmjs.org", "GET, HEAD"],
+    ],
+  },
+};
+
+function getPassword() {
+  const match = document.cookie.match(/(?:^|; )trustyclaw_admin=([^;]*)/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function login() {
+  const value = $("password").value.trim();
+  if (!value) return;
+  document.cookie = "trustyclaw_admin=" + encodeURIComponent(value) + "; path=/; max-age=2592000; samesite=strict";
+  $("password").value = "";
+  start();
+}
+
+function logout() {
+  document.cookie = "trustyclaw_admin=; path=/; max-age=0";
+  location.reload();
+}
+
+async function api(method, path, body) {
+  const headers = { "Authorization": "Bearer " + getPassword() };
+  if (method !== "GET") headers["Idempotency-Key"] = crypto.randomUUID();
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const response = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  const data = await response.json();
+  if (response.status === 401) { showLogin(); throw new Error("unauthorized"); }
+  if (!response.ok) throw new Error(data.error ? data.error.message : response.statusText);
+  return data;
+}
+
+function notice(message) {
+  $("notice").textContent = message || "";
+  if (message) setTimeout(() => { $("notice").textContent = ""; }, 8000);
+}
+
+function policyMessage(message) {
+  $("policy-message").textContent = message || "";
+}
+
+function badge(value) { return `<span class="status ${value}">${value}</span>`; }
+function esc(value) {
+  const div = document.createElement("div");
+  div.textContent = value == null ? "" : String(value);
+  return div.innerHTML;
+}
+
+function showLogin() { $("login").hidden = false; $("app").hidden = true; }
+
+function showTab(name) {
+  activeTab = name;
+  for (const tabName of ["home", "agent", "network"]) {
+    $(`tab-${tabName}`).classList.toggle("active-tab", tabName === name);
+    $(`panel-${tabName}`).hidden = tabName !== name;
+  }
+}
+
+function togglePresetInfo(preset, button) {
+  const panel = $("preset-info-popover");
+  const isOpen = !panel.hidden && panel.dataset.preset === preset;
+  panel.hidden = isOpen;
+  panel.dataset.preset = isOpen ? "" : preset;
+  panel.innerHTML = isOpen ? "" : renderPresetInfo(PRESET_INFO[preset]);
+  if (!isOpen) {
+    const rect = button.getBoundingClientRect();
+    panel.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 400))}px`;
+    panel.style.top = `${rect.bottom + 8}px`;
+  }
+  for (const button of document.querySelectorAll(".info-button")) {
+    button.setAttribute("aria-expanded", String(!isOpen && button.dataset.info === preset));
+  }
+}
+
+function renderPresetInfo(info) {
+  return `
+    <h3>${esc(info.heading)}</h3>
+    <table>
+      ${info.rows.map(([domain, scope]) => `
+        <tr>
+          <td><strong>${esc(domain)}</strong></td>
+          <td>${esc(scope)}</td>
+        </tr>`).join("")}
+    </table>`;
+}
+
+async function refreshHealth() {
+  const health = await api("GET", "/v1/health");
+  $("agent-name").textContent = health.agent_name;
+  const runtimes = Array.isArray(health.agent_runtime.runtimes) ? health.agent_runtime.runtimes : [];
+  latestRuntimes = runtimes;
+  runtimeType = runtimes.find(r => r.status === "active")?.type || runtimes[0]?.type || "codex";
+  const host = health.host_runtime;
+  const gib = bytes => (bytes / 1073741824).toFixed(1) + " GiB";
+  $("health").innerHTML = `
+    <tr><th>overall</th><td>${badge(health.status)}</td></tr>
+    <tr><th>network controls</th><td>${badge(health.network_controls.status)}</td></tr>
+    <tr><th>cpu</th><td>${esc(host.cpu.usage_percent)}%</td></tr>
+    <tr><th>memory</th><td>${gib(host.memory.used_bytes)} / ${gib(host.memory.total_bytes)}</td></tr>
+    <tr><th>filesystem</th><td>${gib(host.filesystem.used_bytes)} / ${gib(host.filesystem.total_bytes)}</td></tr>
+    <tr><th>swap</th><td>${gib(host.swap.used_bytes)} / ${gib(host.swap.allocated_bytes)}</td></tr>`;
+  $("runtime").innerHTML = `<tr><th>type</th><th>status</th><th>active tasks</th></tr>` +
+    runtimes.map(runtime => `
+      <tr>
+        <td>${esc(runtime.type)}</td>
+        <td>${badge(runtime.status)}</td>
+        <td>${esc((runtime.active_task_ids || []).join(", "))}</td>
+      </tr>`).join("");
+  updateLoginButtons(runtimes);
+  renderRuntimeGuidance(runtimes);
+  const pending = runtimes.find(runtime => runtime.status === "awaiting_login");
+  if (pending) await showOauth(false, pending.type);
+  else $("oauth").textContent = "";
+}
+
+function updateLoginButtons(runtimes) {
+  const statuses = Object.fromEntries(runtimes.map(runtime => [runtime.type, runtime.status]));
+  $("start-codex-login").disabled = statuses.codex !== "awaiting_login";
+  $("start-claude-login").disabled = statuses.claude_code !== "awaiting_login";
+}
+
+function providerEnabled(policy, provider) {
+  const managed = objectValue(policy ? policy.managed_ai_provider_network_access : null);
+  return managed[provider] === true;
+}
+
+function renderRuntimeGuidance(runtimes = latestRuntimes) {
+  const messages = [];
+  for (const runtime of runtimes) {
+    const meta = RUNTIME_PROVIDERS[runtime.type];
+    if (!meta || runtime.status !== "deactivated") continue;
+    const activeEnabled = providerEnabled(activeNetworkPolicy, meta.provider);
+    const proposedEnabled = providerEnabled(proposedNetworkPolicy, meta.provider);
+    if (!activeEnabled && proposedEnabled) {
+      messages.push(`
+        <div class="runtime-guidance">
+          <p>${esc(meta.label)} is deactivated because ${esc(meta.providerLabel)} provider access is disabled in the active network policy. The proposal enables it; replace the active policy to activate this runtime.</p>
+          <div class="actions">
+            <button data-action="show-tab" data-tab="network">Open Network settings</button>
+          </div>
+        </div>`);
+    } else if (!activeEnabled) {
+      messages.push(`
+        <div class="runtime-guidance">
+          <p>${esc(meta.label)} is deactivated because ${esc(meta.providerLabel)} provider access is disabled in the active network policy. Add ${esc(meta.providerLabel)} to the proposed policy before starting login.</p>
+          <div class="actions">
+            <button data-action="show-tab" data-tab="network">Open Network settings</button>
+          </div>
+        </div>`);
+    }
+  }
+  $("runtime-guidance").innerHTML = messages.length ? `<div class="runtime-guidance-list">${messages.join("")}</div>` : "";
+}
+
+async function showOauth(start, runtime) {
+  runtime = runtime || runtimeType;
+  try {
+    if (runtime === "claude_code") {
+      const login = await api(start ? "POST" : "GET", "/v1/agent-runtime/claude-oauth-login");
+      $("oauth").innerHTML =
+        `Claude Code login: open ` +
+        `<a href="${esc(login.login_url)}" target="_blank">${esc(login.login_url)}</a> ` +
+        `(expires ${esc(login.expires_at)}) ` +
+        `<button data-action="complete-claude-login">Submit code</button>`;
+      return;
+    }
+    const login = await api(start ? "POST" : "GET", "/v1/agent-runtime/codex-oauth-login");
+    $("oauth").innerHTML =
+      `Codex login: enter code <b>${esc(login.device_code)}</b> at ` +
+      `<a href="${esc(login.login_url)}" target="_blank">${esc(login.login_url)}</a> (expires ${esc(login.expires_at)})`;
+  } catch (error) { if (start) notice(error.message); }
+}
+
+async function startLogin(runtime) { await showOauth(true, runtime); }
+
+async function completeClaudeLogin() {
+  const code = prompt("Claude Code login code:");
+  if (!code) return;
+  try {
+    await api("POST", "/v1/agent-runtime/claude-oauth-login/complete", { code });
+    notice("Claude Code login submitted.");
+    await refreshHealth();
+  } catch (error) { notice(error.message); }
+}
+
+async function rebootHost() {
+  if (!confirm("Reboot the host machine?")) return;
+  try { await api("POST", "/v1/host-runtime/reboot"); notice("Reboot accepted; the host will be back shortly."); }
+  catch (error) { notice(error.message); }
+}
+
+async function createTask() {
+  const message = $("new-task").value.trim();
+  const threadId = $("new-task-thread").value.trim();
+  const agentRuntime = $("new-task-runtime").value;
+  if (!message || !threadId) return;
+  try {
+    await api("POST", "/v1/tasks", { input_message: message, thread_id: threadId, agent_runtime: agentRuntime });
+    $("new-task").value = "";
+    await refreshTasks();
+    await loadThreads();
+  }
+  catch (error) { notice(error.message); }
+}
+
+async function steerTask(taskId) {
+  const message = prompt("Steering message for " + taskId + ":");
+  if (!message) return;
+  try { await api("POST", `/v1/tasks/${taskId}/steer`, { steer_message: message }); notice("Steering accepted."); }
+  catch (error) { notice(error.message); }
+}
+
+async function cancelTask(taskId) {
+  try { await api("POST", `/v1/tasks/${taskId}/cancel`); await refreshTasks(); }
+  catch (error) { notice(error.message); }
+}
+
+async function killTask(taskId) {
+  if (!confirm("Kill running task " + taskId + "? Its runtime process is terminated and the task is cancelled.")) return;
+  try { await api("POST", `/v1/tasks/${taskId}/kill`); await refreshTasks(); }
+  catch (error) { notice(error.message); }
+}
+
+async function refreshTasks() {
+  const listed = await api("GET", "/v1/tasks");
+  if (!listed.tasks.length) { $("tasks").innerHTML = `<tr><td class="muted">No running or queued tasks.</td></tr>`; return; }
+  $("tasks").innerHTML = `<tr><th>#</th><th>task</th><th>runtime</th><th>thread</th><th>status</th><th>message</th><th></th></tr>` +
+    listed.tasks.map(task => `
+      <tr>
+        <td>${task.queue_position}</td>
+        <td>${esc(task.task_id)}</td>
+        <td>${esc(task.agent_runtime)}</td>
+        <td>${esc(task.thread_id)}</td>
+        <td>${badge(task.status)}</td>
+        <td><pre>${esc(task.input_message)}</pre></td>
+        <td>${task.status === "running"
+              ? `<button data-action="steer-task" data-task-id="${esc(task.task_id)}">Steer</button>
+                 <button class="danger" data-action="kill-task" data-task-id="${esc(task.task_id)}">Kill</button>`
+              : `<button data-action="cancel-task" data-task-id="${esc(task.task_id)}">Cancel</button>`}</td>
+      </tr>`).join("");
+}
+
+async function loadThreads() {
+  const listed = await api("GET", "/v1/threads");
+  threads = listed.threads || [];
+  renderThreads();
+}
+
+function renderThreads() {
+  if (!threads.length) {
+    $("threads").innerHTML = `<tr><td class="muted">No recent threads.</td></tr>`;
+    return;
+  }
+  $("threads").innerHTML = `<tr><th>thread</th><th>runtime</th><th>last used</th><th>tasks</th><th>active</th><th></th></tr>` +
+    threads.map(thread => `
+      <tr>
+        <td>${esc(thread.thread_id)}</td>
+        <td>${esc(thread.agent_runtime)}</td>
+        <td class="muted">${esc(thread.last_used_at)}</td>
+        <td>${esc(thread.task_count)}</td>
+        <td>${(thread.active_tasks || []).map(task => badge(task.status)).join(" ")}</td>
+        <td><button data-action="show-thread" data-thread-id="${esc(thread.thread_id)}" data-runtime="${esc(thread.agent_runtime)}">Open</button></td>
+      </tr>`).join("");
+}
+
+async function showThread(threadId, agentRuntime) {
+  $("new-task-thread").value = threadId;
+  $("new-task-runtime").value = agentRuntime;
+  $("task-events-detail").innerHTML = "";
+  const response = await api(
+    "GET",
+    `/v1/threads/${encodeURIComponent(threadId)}/tasks`
+  );
+  threadTasks = response.tasks || [];
+  $("thread-detail").innerHTML = `
+    <h2>${esc(threadId)} tasks</h2>
+    <table>
+      <tr><th>task</th><th>status</th><th>updated</th><th>message</th><th></th></tr>
+      ${threadTasks.length ? threadTasks.map(task => `
+        <tr>
+          <td>${esc(task.task_id)}</td>
+          <td>${badge(task.status)}</td>
+          <td class="muted">${esc(task.updated_at)}</td>
+          <td><pre>${esc(task.input_message)}</pre></td>
+          <td><button data-action="show-task-events" data-task-id="${esc(task.task_id)}">Events</button></td>
+        </tr>`).join("") : `<tr><td colspan="5" class="muted">No retained tasks for this thread.</td></tr>`}
+    </table>`;
+}
+
+async function loadTaskEventBatch(taskId) {
+  for (let page = 0; page < TASK_EVENT_PAGE_BATCH; page += 1) {
+    const response = await api(
+      "GET",
+      `/v1/tasks/${encodeURIComponent(taskId)}/events` +
+        (selectedTaskEventsSince === null ? "" : "?since=" + selectedTaskEventsSince)
+    );
+    if (!response.events.length) return false;
+    for (const event of response.events) {
+      selectedTaskEvents.push(event);
+      selectedTaskEventsSince = event.seq;
+    }
+  }
+  return true;
+}
+
+async function showTaskEvents(taskId) {
+  selectedTask = threadTasks.find(item => item.task_id === taskId) || await api("GET", `/v1/tasks/${encodeURIComponent(taskId)}`);
+  selectedTaskEvents = [];
+  selectedTaskEventsSince = null;
+  selectedTaskEventsHasMore = await loadTaskEventBatch(taskId);
+  renderTaskEventsDetail();
+}
+
+async function loadMoreTaskEvents(taskId) {
+  if (!selectedTask || selectedTask.task_id !== taskId) {
+    await showTaskEvents(taskId);
+    return;
+  }
+  selectedTaskEventsHasMore = await loadTaskEventBatch(taskId);
+  renderTaskEventsDetail();
+}
+
+function renderTaskEventsDetail() {
+  const task = selectedTask;
+  const taskEvents = selectedTaskEvents;
+  $("task-events-detail").innerHTML = `
+    <h2>${esc(task.task_id)} events</h2>
+    <table>
+      <tr><th>status</th><td>${badge(task.status)}</td></tr>
+      <tr><th>runtime</th><td>${esc(task.agent_runtime)}</td></tr>
+      <tr><th>thread</th><td>${esc(task.thread_id)}</td></tr>
+      <tr><th>created</th><td class="muted">${esc(task.created_at)}</td></tr>
+      <tr><th>updated</th><td class="muted">${esc(task.updated_at)}</td></tr>
+      <tr><th>input</th><td><pre>${esc(task.input_message)}</pre></td></tr>
+      ${task.output_message ? `<tr><th>output</th><td><pre>${esc(task.output_message)}</pre></td></tr>` : ""}
+      ${task.error_message ? `<tr><th>error</th><td><pre>${esc(task.error_message)}</pre></td></tr>` : ""}
+    </table>
+    <h2>Events</h2>
+    <table>
+      <tr><th>seq</th><th>time</th><th>type</th><th>source</th><th>payload</th></tr>
+      ${taskEvents.length ? taskEvents.map(event => `
+        <tr>
+          <td>${esc(event.seq)}</td>
+          <td class="muted">${esc(event.timestamp)}</td>
+          <td>${esc(event.event_type)}</td>
+          <td>${esc(event.payload.source || "")}</td>
+          <td><pre>${esc(event.payload.message || event.payload.error_message || JSON.stringify(event.payload))}</pre></td>
+        </tr>`).join("") : `<tr><td colspan="5" class="muted">No retained events for this task.</td></tr>`}
+    </table>
+    ${selectedTaskEventsHasMore ? `<div class="actions"><button data-action="load-more-task-events" data-task-id="${esc(task.task_id)}">Load more events</button></div>` : ""}`;
+}
+
+async function refreshEvents() {
+  const response = await api("GET", "/v1/events" + (eventsSince === null ? "" : "?since=" + eventsSince));
+  for (const event of response.events) { events.push(event); eventsSince = event.seq; }
+  while (events.length > 50) events.shift();
+  $("events").innerHTML = `<tr><th>time</th><th>type</th><th>task</th><th>payload</th></tr>` +
+    events.slice().reverse().map(event => `
+      <tr>
+        <td class="muted">${esc(event.timestamp)}</td>
+        <td>${esc(event.event_type)}</td>
+        <td>${esc(event.task_id || "")}</td>
+        <td><pre>${esc(event.payload.message || event.payload.error_message || "")}</pre></td>
+      </tr>`).join("");
+}
+
+async function refreshNetEvents() {
+  const response = await api("GET", "/v1/network/events" + (netSince === null ? "" : "?since=" + netSince));
+  for (const event of response.events) { netEvents.push(event); netSince = event.seq; }
+  while (netEvents.length > 50) netEvents.shift();
+  $("net-events").innerHTML = `<tr><th>time</th><th>request</th><th>decision</th></tr>` +
+    netEvents.slice().reverse().map(event => `
+      <tr>
+        <td class="muted">${esc(event.timestamp)}</td>
+        <td>${esc(event.method)} ${esc(event.protocol)}://${esc(event.host)}${esc(event.path)}</td>
+        <td>${badge(event.decision)}</td>
+      </tr>`).join("");
+}
+
+async function loadPolicy() {
+  const response = await api("GET", "/v1/network/policy");
+  activeNetworkPolicy = normalizePolicy(response.network_controls);
+  proposedNetworkPolicy = clonePolicy(activeNetworkPolicy);
+  renderPolicyControls();
+}
+
+function normalizePolicy(policy) {
+  const managed = objectValue(policy && policy.managed_ai_provider_network_access);
+  const rules = objectValue(policy && policy.allowed_network_access);
+  return {
+    "managed_ai_provider_network_access": managed,
+    "allowed_network_access": rules,
+  };
+}
+
+function objectValue(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function clonePolicy(policy) {
+  return normalizePolicy(JSON.parse(JSON.stringify(policy || {})));
+}
+
+function policiesEqual(left, right) {
+  return JSON.stringify(normalizePolicy(left)) === JSON.stringify(normalizePolicy(right));
+}
+
+function renderPolicyControls(options = {}) {
+  const updateEditor = options.updateEditor !== false;
+  renderActivePolicy();
+  renderPolicyPresets();
+  renderProposalStatus();
+  renderRuntimeGuidance();
+  if (updateEditor) $("policy").value = JSON.stringify(proposedNetworkPolicy, null, 2);
+}
+
+function renderActivePolicy() {
+  $("active-policy").value = JSON.stringify(activeNetworkPolicy, null, 2);
+}
+
+function renderProposalStatus() {
+  policyMessage("");
+  if (policiesEqual(activeNetworkPolicy, proposedNetworkPolicy)) {
+    $("policy-status").textContent = "Proposal matches current policy. Nothing changes until Replace active policy with proposal runs.";
+    return;
+  }
+  $("policy-status").textContent = "Proposal has unapplied changes. The active proxy policy is unchanged until you replace it.";
+}
+
+function resetProposedPolicy() {
+  proposedNetworkPolicy = clonePolicy(activeNetworkPolicy);
+  clearWebsiteRuleForm();
+  renderPolicyControls();
+}
+
+function sameStringArray(left, right) {
+  left = left || [];
+  right = right || [];
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function rulesEqual(left, right) {
+  return sameStringArray(left && left.allow_http_methods, right && right.allow_http_methods) &&
+    sameStringArray(left && left.path_guards, right && right.path_guards);
+}
+
+function wildcardCoversDomain(pattern, domain) {
+  return pattern.startsWith("*.") && domain.endsWith(pattern.slice(1)) && domain !== pattern.slice(2);
+}
+
+function hasWildcardOverlap(rules, domain) {
+  return Object.keys(rules).some(pattern => wildcardCoversDomain(pattern, domain));
+}
+
+function policyPresetState(name) {
+  const preset = POLICY_PRESETS[name];
+  if (!preset) return "missing";
+  const managed = proposedNetworkPolicy.managed_ai_provider_network_access || {};
+  const managedEntries = Object.entries(preset.managed || {}).filter(([_provider, enabled]) => enabled);
+  if (managedEntries.length) {
+    return managedEntries.every(([provider]) => managed[provider] === true) ? "active" : "missing";
+  }
+  const rules = proposedNetworkPolicy.allowed_network_access || {};
+  const domains = Object.keys(preset.rules || {});
+  const existing = domains.filter(domain => Object.prototype.hasOwnProperty.call(rules, domain));
+  if (existing.length === domains.length && domains.every(domain => rulesEqual(rules[domain], preset.rules[domain]))) {
+    return "active";
+  }
+  const wildcardCovered = domains.filter(domain =>
+    !Object.prototype.hasOwnProperty.call(rules, domain) && hasWildcardOverlap(rules, domain)
+  );
+  if (!existing.length && !wildcardCovered.length) return "missing";
+  return "partial";
+}
+
+function renderPolicyPresets() {
+  for (const [name, copy] of Object.entries(POLICY_PRESET_BUTTONS)) {
+    const button = $(`policy-preset-${name}`);
+    const state = policyPresetState(name);
+    button.classList.remove("preset-active", "preset-partial");
+    button.disabled = state === "partial";
+    if (state === "active") {
+      button.classList.add("preset-active");
+      button.textContent = `Remove ${copy.label}`;
+      button.title = "Remove this preset from the proposed policy.";
+    } else if (state === "partial") {
+      button.classList.add("preset-partial");
+      button.textContent = copy.partial;
+      button.title = "One or more preset domains already exist or are covered by a wildcard in the proposal. Edit website rules manually to avoid overwriting custom policy.";
+    } else {
+      button.textContent = `Add ${copy.label}`;
+      button.title = "Add this preset to the proposed policy. It will not take effect until you replace the active policy.";
+    }
+  }
+}
+
+function cloneRule(rule) {
+  const cloned = {"allow_http_methods": [...(rule.allow_http_methods || [])]};
+  if (rule.path_guards && rule.path_guards.length) cloned.path_guards = [...rule.path_guards];
+  return cloned;
+}
+
+function applyPolicyPreset(name) {
+  const preset = POLICY_PRESETS[name];
+  if (!preset) return;
+  const state = policyPresetState(name);
+  if (state === "active") {
+    removePolicyPreset(preset);
+    renderPolicyControls();
+    return;
+  }
+  if (state !== "missing") {
+    policyMessage("Preset overlaps the proposed policy. Edit the website rules manually.");
+    return;
+  }
+  proposedNetworkPolicy.managed_ai_provider_network_access = objectValue(proposedNetworkPolicy.managed_ai_provider_network_access);
+  for (const [provider, enabled] of Object.entries(preset.managed || {})) {
+    if (enabled) proposedNetworkPolicy.managed_ai_provider_network_access[provider] = true;
+  }
+  proposedNetworkPolicy.allowed_network_access = objectValue(proposedNetworkPolicy.allowed_network_access);
+  for (const [domain, rule] of Object.entries(preset.rules || {})) {
+    proposedNetworkPolicy.allowed_network_access[domain] = cloneRule(rule);
+  }
+  renderPolicyControls();
+}
+
+function removePolicyPreset(preset) {
+  const managed = objectValue(proposedNetworkPolicy.managed_ai_provider_network_access);
+  for (const [provider, enabled] of Object.entries(preset.managed || {})) {
+    if (enabled) delete managed[provider];
+  }
+  proposedNetworkPolicy.managed_ai_provider_network_access = managed;
+
+  const rules = objectValue(proposedNetworkPolicy.allowed_network_access);
+  for (const [domain, rule] of Object.entries(preset.rules || {})) {
+    if (rulesEqual(rules[domain], rule)) delete rules[domain];
+  }
+  proposedNetworkPolicy.allowed_network_access = rules;
+}
+
+function clearWebsiteRuleForm() {
+  $("policy-domain").value = "";
+  $("policy-methods").value = "";
+  $("policy-path-guards").value = "";
+}
+
+function saveWebsiteRule() {
+  const domain = $("policy-domain").value.trim().toLowerCase();
+  const methods = $("policy-methods").value.split(",").map(value => value.trim().toUpperCase()).filter(Boolean);
+  const pathGuards = $("policy-path-guards").value.split("\n").map(value => value.trim()).filter(Boolean);
+  if (!domain || !methods.length) { policyMessage("Website and at least one HTTP method are required."); return; }
+  proposedNetworkPolicy.allowed_network_access = proposedNetworkPolicy.allowed_network_access || {};
+  const rule = {"allow_http_methods": methods};
+  if (pathGuards.length) rule.path_guards = pathGuards;
+  proposedNetworkPolicy.allowed_network_access[domain] = rule;
+  clearWebsiteRuleForm();
+  renderPolicyControls();
+}
+
+function loadPolicyFromJsonEditor() {
+  try {
+    proposedNetworkPolicy = normalizePolicy(JSON.parse($("policy").value));
+    renderPolicyPresets();
+    renderProposalStatus();
+    renderRuntimeGuidance();
+  } catch (_error) {
+    // Keep raw JSON editing permissive until Save validates the exact payload.
+  }
+}
+
+async function savePolicy() {
+  if (!confirm("Replace the active network policy with the proposed policy?")) return;
+  try {
+    const response = await api("PUT", "/v1/network/policy", JSON.parse($("policy").value));
+    activeNetworkPolicy = normalizePolicy(response.network_controls || proposedNetworkPolicy);
+    proposedNetworkPolicy = clonePolicy(activeNetworkPolicy);
+    renderPolicyControls();
+    policyMessage("Active network policy replaced.");
+  } catch (error) { policyMessage(error.message); }
+}
+
+async function tick() {
+  try {
+    await refreshHealth();
+    await refreshTasks();
+    await loadThreads();
+    await refreshEvents();
+    await refreshNetEvents();
+  } catch (error) { /* shown via login panel or notice */ }
+}
+
+function start() {
+  if (!getPassword()) { showLogin(); return; }
+  $("login").hidden = true;
+  $("app").hidden = false;
+  loadPolicy().catch(() => {});
+  tick();
+  setInterval(tick, 5000);
+}
+
+document.addEventListener("click", event => {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const button = target.closest("button[data-action]");
+  if (!button) return;
+  const { action } = button.dataset;
+  const taskId = button.dataset.taskId;
+  const threadId = button.dataset.threadId;
+  const runtime = button.dataset.runtime;
+  const preset = button.dataset.preset || button.dataset.info;
+  const actions = {
+    "login": () => login(),
+    "logout": () => logout(),
+    "show-tab": () => showTab(button.dataset.tab),
+    "start-login": () => startLogin(runtime),
+    "complete-claude-login": () => completeClaudeLogin(),
+    "reboot-host": () => rebootHost(),
+    "create-task": () => createTask(),
+    "steer-task": () => steerTask(taskId),
+    "kill-task": () => killTask(taskId),
+    "cancel-task": () => cancelTask(taskId),
+    "load-threads": () => loadThreads(),
+    "show-thread": () => showThread(threadId, runtime),
+    "show-task-events": () => showTaskEvents(taskId),
+    "load-more-task-events": () => loadMoreTaskEvents(taskId),
+    "load-policy": () => loadPolicy(),
+    "reset-proposed-policy": () => resetProposedPolicy(),
+    "apply-policy-preset": () => applyPolicyPreset(preset),
+    "toggle-preset-info": () => togglePresetInfo(preset, button),
+    "save-website-rule": () => saveWebsiteRule(),
+    "save-policy": () => savePolicy(),
+  };
+  const handler = actions[action];
+  if (handler) handler();
+});
+
+$("policy").addEventListener("input", loadPolicyFromJsonEditor);
+$("password").addEventListener("keydown", event => { if (event.key === "Enter") login(); });
+start();

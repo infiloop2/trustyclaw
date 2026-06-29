@@ -57,6 +57,11 @@ from host.runtime.task_status import (
 
 HOST = LOOPBACK
 PORT = ADMIN_API_PORT
+UI_ASSETS = {
+    "/": ("admin_ui.html", "text/html; charset=utf-8"),
+    "/admin_ui.css": ("admin_ui.css", "text/css; charset=utf-8"),
+    "/admin_ui.js": ("admin_ui.js", "application/javascript; charset=utf-8"),
+}
 IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 THREAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MESSAGE_LIMIT = 50_000
@@ -118,14 +123,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         self._handle("DELETE")
 
-    def log_message(self, fmt: str, *args: object) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         return
 
     def _handle(self, method: str) -> None:
         try:
             path = urlparse(self.path)
-            if method == "GET" and path.path == "/":
-                self._send_ui()
+            if method == "GET" and path.path in UI_ASSETS:
+                self._send_ui_asset(path.path)
                 return
             self._authenticate()
             if method in {"POST", "PUT", "DELETE"}:
@@ -187,10 +192,11 @@ class Handler(BaseHTTPRequestHandler):
             prune_idempotency(entries, now=now, preserve_key=key)
         return response
 
-    def _send_ui(self) -> None:
-        data = (Path(__file__).parent / "admin_ui.html").read_bytes()
+    def _send_ui_asset(self, path: str) -> None:
+        filename, content_type = UI_ASSETS[path]
+        data = (Path(__file__).parent / filename).read_bytes()
         self.send_response(HTTPStatus.OK.value)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -747,26 +753,6 @@ def replace_network_policy(body: Any) -> dict[str, Any]:
     if not NETWORK_POLICY_LOCK.acquire(timeout=NETWORK_POLICY_LOCK_TIMEOUT_SECONDS):
         raise ApiError(HTTPStatus.CONFLICT, "network policy update already in progress")
     try:
-        if not parsed.ssh_port_opened:
-            raise ApiError(
-                HTTPStatus.BAD_REQUEST,
-                "network_controls.ssh_port_opened must be true because SSH is currently "
-                "the only supported way to access the host",
-            )
-        # ssh_port_opened is enforced by nftables and the security group, both
-        # set once at deploy time; the runtime cannot change them. Reject a
-        # changed value rather than silently accepting it and reporting a false
-        # success.
-        current = proxy_state_client.network_policy()
-        if parsed.ssh_port_opened != current.get("ssh_port_opened", False):
-            raise ApiError(
-                HTTPStatus.BAD_REQUEST,
-                "ssh_port_opened can only be set at deploy time; it cannot be changed through the API",
-            )
-        # Allow recovery from a stuck "reloading" (crash mid-update) or "error":
-        # only "loading" (no policy applied yet) blocks a replace.
-        if proxy_state_client.network_status() == "loading":
-            raise ApiError(HTTPStatus.CONFLICT, "network policy is not initialized yet")
         result = apply_network_policy_as_root(parsed.to_json())
         orchestrator.reconcile_runtime_status_after_policy_change()
         return result
@@ -791,7 +777,7 @@ def apply_network_policy_as_root(policy: dict[str, Any]) -> dict[str, Any]:
         # The timeout path kills the child, but the helper starts as root via
         # sudo before demoting to the proxy user, so the unprivileged service
         # user's kill can raise PermissionError in place of TimeoutExpired.
-        # The helper keeps running; its own file lock and "reloading" status
+        # The helper keeps running; its own file lock and atomic policy replace
         # keep the policy files consistent.
         raise ApiError(
             HTTPStatus.GATEWAY_TIMEOUT,

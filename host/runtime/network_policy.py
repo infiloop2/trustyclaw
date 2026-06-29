@@ -5,7 +5,6 @@ The active policy lives in two proxy-owned files that only the
 ``trustyclaw-proxy``:
 
 - ``network_controls.json``: ``{"network_controls": {...}, "updated_at": ...}``
-- ``network_status.json``: ``{"status": "loading" | "reloading" | "active" | "error"}``
 
 The proxy reads them to decide requests. The admin API answers health, policy,
 and event-log routes through the ``read-network-state`` helper instead of
@@ -56,13 +55,9 @@ def policy_path():
     return network_policy_files().controls
 
 
-def status_path():
-    return network_policy_files().status
-
-
 def load_policy() -> dict[str, Any]:
     if not policy_path().exists():
-        return {"ssh_port_opened": False, "managed_ai_provider_network_access": {}, "allowed_network_access": {}}
+        return {"managed_ai_provider_network_access": {}, "allowed_network_access": {}}
     return json.loads(policy_path().read_text())["network_controls"]
 
 
@@ -74,17 +69,6 @@ def load_policy_updated_at() -> str | None:
 
 def save_policy(policy: dict[str, Any], updated_at: str) -> None:
     write_json(policy_path(), {"network_controls": policy, "updated_at": updated_at})
-
-
-def load_status() -> str:
-    if not status_path().exists():
-        return "loading"
-    status = json.loads(status_path().read_text()).get("status")
-    return status if isinstance(status, str) else "loading"
-
-
-def save_status(status: str) -> None:
-    write_json(status_path(), {"status": status})
 
 
 def domain_matches(pattern: str, host: str) -> bool:
@@ -198,8 +182,12 @@ def anthropic_request_denied(
         return None
     if method.upper() == "GET" and path == "/api/hello":
         return None
-    presented = [_bearer_token(value) for key, value in headers if key.lower() == "authorization"]
-    presented = [value for value in presented if value]
+    presented = [
+        bearer for key, value in headers
+        if key.lower() == "authorization"
+        for bearer in [_bearer_token(value)]
+        if bearer is not None
+    ]
     account = read_proxy_claude_account()
     expected_hash = account.get("access_token_sha256")
     if not isinstance(expected_hash, str) or not expected_hash:

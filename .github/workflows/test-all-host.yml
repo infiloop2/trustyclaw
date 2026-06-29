@@ -34,8 +34,20 @@ jobs:
           .github/ci/run-in-sandbox.sh trustyclaw-ci:${{ github.run_id }} \
             'python3 -m py_compile $(find host tests -name "*.py")'
 
+      - name: Run host type checks in no-network sandbox
+        shell: bash
+        run: |
+          .github/ci/run-in-sandbox.sh trustyclaw-ci:${{ github.run_id }} \
+            'python3 -m mypy --config-file mypy.ini && python3 -m pyright --project pyrightconfig.json'
+
       - name: Run unit tests in no-network sandbox
         shell: bash
         run: |
           .github/ci/run-in-sandbox.sh trustyclaw-ci:${{ github.run_id }} \
             'python3 -m unittest discover -s tests -v'
+
+      - name: Run admin UI smoke in no-network sandbox
+        shell: bash
+        run: |
+          .github/ci/run-in-sandbox.sh trustyclaw-ci:${{ github.run_id }} \
+            'python3 tests/smoke-ui/admin_ui_smoke.py --port 3100'

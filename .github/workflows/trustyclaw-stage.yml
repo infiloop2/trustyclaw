@@ -1,0 +1,203 @@
+name: trustyclaw-stage
+
+on:
+  workflow_dispatch:
+  issue_comment:
+    types:
+      - created
+
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: trustyclaw-stage
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: Authorize AWS stage
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request && github.event.comment.body == '/trustyclaw-stage')
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      - name: Checkout trusted workflow actions
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Authorize repo admin
+        uses: ./.github/actions/authorize-repo-admin
+
+      - name: Resolve safe ref
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_SHA: ${{ github.sha }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "issue_comment" ]]; then
+            pr="$(curl -fsS \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${{ github.api_url }}/repos/${REPO}/pulls/${ISSUE_NUMBER}")"
+            head_repo="$(jq -r .head.repo.full_name <<<"${pr}")"
+            if [[ "${head_repo}" != "${REPO}" ]]; then
+              echo "Refusing to run AWS stage secrets against fork PR code from ${head_repo}." >&2
+              exit 1
+            fi
+            ref="$(jq -r .head.sha <<<"${pr}")"
+          else
+            ref="${DISPATCH_SHA}"
+          fi
+          echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+          echo "Deploying ref ${ref} to trustyclaw-stage"
+          {
+            echo "## TrustyClaw stage authorization"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Event | ${EVENT_NAME} |"
+            echo "| Ref | ${ref} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Rate limit live AWS runs
+        uses: ./.github/actions/rate-limit-live-aws-runs
+        with:
+          workflow-file: trustyclaw-stage.yml
+          authorized-job-name: Authorize AWS stage
+
+  stage:
+    needs: authorize
+    name: Upgrade stage and run tests
+    if: ${{ needs.authorize.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          ref: ${{ needs.authorize.outputs.ref }}
+          persist-credentials: false
+
+      - name: Prepare stage SSH key and config
+        shell: bash
+        env:
+          TRUSTYCLAW_STAGE_SSH_PRIVATE_KEY: ${{ secrets.TRUSTYCLAW_STAGE_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 0700 -d "${RUNNER_TEMP}/trustyclaw-stage"
+          key_path="${RUNNER_TEMP}/trustyclaw-stage/operator_key"
+          printf '%s\n' "${TRUSTYCLAW_STAGE_SSH_PRIVATE_KEY}" > "${key_path}"
+          chmod 0600 "${key_path}"
+          public_key="$(ssh-keygen -y -f "${key_path}")"
+          cat > stage_config.json <<JSON
+          {
+            "agent_name": "trustyclaw-stage",
+            "aws_region": "us-east-1",
+            "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
+            "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
+            "ssh_public_key": "${public_key}",
+            "ssh_port_opened": true
+          }
+          JSON
+          echo "TRUSTYCLAW_STAGE_SSH_KEY=${key_path}" >> "${GITHUB_ENV}"
+
+      - name: Upgrade or recover stage
+        id: deploy
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TRUSTYCLAW_STAGE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TRUSTYCLAW_STAGE_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+          TRUSTYCLAW_STAGE_ADMIN_PASSWORD: ${{ secrets.TRUSTYCLAW_STAGE_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 -m host.deploy \
+            --config stage_config.json \
+            --allow-upgrade-or-recover \
+            --admin-password-env TRUSTYCLAW_STAGE_ADMIN_PASSWORD
+
+      - name: Run stage tests
+        id: stage_tests
+        shell: bash
+        env:
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          python3 tests/stage/stage_aws.py \
+            --result-file trustyclaw-stage.json \
+            --ssh-key "${TRUSTYCLAW_STAGE_SSH_KEY}" 2>&1 | tee stage-test.log
+
+      - name: Stop stage instance
+        id: stop_stage
+        if: ${{ always() }}
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TRUSTYCLAW_STAGE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TRUSTYCLAW_STAGE_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          instance_id="$(jq -r '.instance_id // empty' trustyclaw-stage.json 2>/dev/null || true)"
+          if [[ -z "${instance_id}" ]]; then
+            echo "No stage deploy result found; nothing to stop."
+            exit 0
+          fi
+          echo "Stopping stage instance ${instance_id}."
+          aws ec2 stop-instances --instance-ids "${instance_id}" >/dev/null
+          aws ec2 wait instance-stopped --instance-ids "${instance_id}"
+
+      - name: Write stage summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          TEST_OUTCOME: ${{ steps.stage_tests.outcome }}
+          STOP_OUTCOME: ${{ steps.stop_stage.outcome }}
+          TRUSTYCLAW_STAGE_REF: ${{ needs.authorize.outputs.ref }}
+        run: |
+          set -euo pipefail
+          instance_id="n/a"
+          public_dns="n/a"
+          public_ip="n/a"
+          region="us-east-1"
+          if [[ -f trustyclaw-stage.json ]]; then
+            instance_id="$(jq -r '.instance_id // "n/a"' trustyclaw-stage.json)"
+            public_dns="$(jq -r '.public_dns // "n/a"' trustyclaw-stage.json)"
+            public_ip="$(jq -r '.public_ip // "n/a"' trustyclaw-stage.json)"
+            region="$(jq -r '.region // "us-east-1"' trustyclaw-stage.json)"
+          fi
+          test_result="not available"
+          if [[ -f stage-test.log ]]; then
+            test_result="$(grep -E '^[0-9]+/[0-9]+ checks passed$' stage-test.log | tail -n 1 || true)"
+            if [[ -z "${test_result}" ]]; then
+              test_result="no final check count found"
+            fi
+          fi
+
+          {
+            echo "## TrustyClaw stage"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Ref | ${TRUSTYCLAW_STAGE_REF:-n/a} |"
+            echo "| Region | ${region} |"
+            echo "| Instance | ${instance_id} |"
+            echo "| Public DNS | ${public_dns} |"
+            echo "| Public IP | ${public_ip} |"
+            echo "| Deploy | ${DEPLOY_OUTCOME:-skipped} |"
+            echo "| Tests | ${TEST_OUTCOME:-skipped} |"
+            echo "| Test result | ${test_result} |"
+            echo "| Stop instance | ${STOP_OUTCOME:-skipped} |"
+          } >> "${GITHUB_STEP_SUMMARY}"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import errno
 import json
 import os
@@ -14,7 +15,7 @@ from unittest.mock import patch
 from host.config import ConfigError, parse_input_config
 from host import deploy
 from host.runtime import read_network_state, update_network_policy, update_provider_account
-from host.runtime.network_policy import load_policy, load_policy_updated_at, load_status, save_policy, save_status
+from host.runtime.network_policy import load_policy, load_policy_updated_at, save_policy
 from host.runtime.state import (
     append_network_event,
     read_proxy_claude_account,
@@ -29,15 +30,7 @@ def sample_config() -> dict[str, object]:
         "aws_access_key_id_env": "TEST_AWS_ACCESS_KEY_ID",
         "aws_secret_access_key_env": "TEST_AWS_SECRET_ACCESS_KEY",
         "ssh_public_key": "ssh-ed25519 AAAATEST operator@example",
-        "network_controls": {
-            "ssh_port_opened": True,
-            "managed_ai_provider_network_access": {"openai": True, "claude": True},
-            "allowed_network_access": {
-                "api.github.com": {
-                    "allow_http_methods": ["GET"],
-                }
-            },
-        },
+        "ssh_port_opened": True,
     }
 
 
@@ -155,14 +148,84 @@ class DeployUnitTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "not tagged as a TrustyClaw resource"):
                 deploy._ensure_security_group(config, {}, "vpc-1")
 
-    def test_smoke_iam_policy_cannot_tag_arbitrary_resources_into_destroy_scope(self) -> None:
-        policy = json.loads(Path("tests/smoke/iam_policy_smoke.json").read_text())
+    def test_iam_policies_restrict_trustyclaw_resource_access(self) -> None:
+        policy = json.loads(Path("iam_policy.json").read_text())
+        smoke_policy = json.loads(Path("tests/smoke/iam_policy_smoke.json").read_text())
+        stage_policy = json.loads(Path("tests/stage/iam_policy_stage.json").read_text())
+        for scoped_policy, agent_name in ((smoke_policy, "trustyclaw-smoke"), (stage_policy, "trustyclaw-stage")):
+            policy_without_agent_name = copy.deepcopy(scoped_policy)
+            scoped_statements = {statement["Sid"]: statement for statement in policy_without_agent_name["Statement"]}
+            self.assertEqual(
+                scoped_statements["CreateTaggedTrustyClawResources"]["Condition"]["StringEquals"].pop(
+                    "aws:RequestTag/trustyclaw-host-agent-name"
+                ),
+                agent_name,
+            )
+            self.assertEqual(
+                scoped_statements["RunInstancesWithTrustyClawSecurityGroups"]["Condition"]["StringEquals"].pop(
+                    "aws:ResourceTag/trustyclaw-host-agent-name"
+                ),
+                agent_name,
+            )
+            self.assertEqual(
+                scoped_statements["TagOnlyDuringTrustyClawResourceCreation"]["Condition"]["StringEquals"].pop(
+                    "aws:RequestTag/trustyclaw-host-agent-name"
+                ),
+                agent_name,
+            )
+            self.assertEqual(
+                scoped_statements["ManageOnlyTrustyClawResources"]["Condition"]["StringEquals"].pop(
+                    "aws:ResourceTag/trustyclaw-host-agent-name"
+                ),
+                agent_name,
+            )
+            self.assertEqual(policy, policy_without_agent_name)
+        self.assertNotIn("aws:RequestedRegion", json.dumps(policy))
         statements = {statement["Sid"]: statement for statement in policy["Statement"]}
 
-        read_actions = statements["ReadAndProvision"]["Action"]
-        self.assertNotIn("ec2:CreateTags", read_actions)
-        self.assertNotIn("ec2:AuthorizeSecurityGroupIngress", read_actions)
-        self.assertNotIn("ec2:AuthorizeSecurityGroupEgress", read_actions)
+        discovery_actions = statements["Ec2Discovery"]["Action"]
+        self.assertNotIn("ec2:RunInstances", discovery_actions)
+        self.assertNotIn("ec2:CreateVolume", discovery_actions)
+        self.assertNotIn("ec2:CreateSecurityGroup", discovery_actions)
+        self.assertNotIn("ec2:CreateTags", discovery_actions)
+        self.assertNotIn("ec2:AuthorizeSecurityGroupIngress", discovery_actions)
+        self.assertNotIn("ec2:AuthorizeSecurityGroupEgress", discovery_actions)
+
+        create_statement = statements["CreateTaggedTrustyClawResources"]
+        create_conditions = create_statement["Condition"]
+        self.assertEqual(
+            sorted(create_statement["Action"]),
+            ["ec2:CreateSecurityGroup", "ec2:CreateVolume", "ec2:RunInstances"],
+        )
+        self.assertEqual(create_statement["Resource"], "*")
+        self.assertEqual(create_conditions["StringEquals"]["aws:RequestTag/trustyclaw-host"], "true")
+        self.assertNotIn("ec2:InstanceType", create_conditions["StringEquals"])
+        self.assertNotIn("aws:RequestTag/trustyclaw-host-volume-role", create_conditions["StringEquals"])
+        self.assertNotIn("ForAllValues:StringEquals", create_conditions)
+
+        dependency_statement = statements["UseEc2CreateDependencies"]
+        self.assertEqual(
+            sorted(dependency_statement["Action"]),
+            ["ec2:CreateSecurityGroup", "ec2:RunInstances"],
+        )
+        self.assertEqual(
+            sorted(dependency_statement["Resource"]),
+            [
+                "arn:aws:ec2:*:*:network-interface/*",
+                "arn:aws:ec2:*:*:subnet/*",
+                "arn:aws:ec2:*:*:vpc/*",
+                "arn:aws:ec2:*::image/*",
+            ],
+        )
+        self.assertNotIn("Condition", dependency_statement)
+
+        launch_security_group_statement = statements["RunInstancesWithTrustyClawSecurityGroups"]
+        self.assertEqual(launch_security_group_statement["Action"], "ec2:RunInstances")
+        self.assertEqual(launch_security_group_statement["Resource"], "arn:aws:ec2:*:*:security-group/*")
+        self.assertEqual(
+            launch_security_group_statement["Condition"]["StringEquals"]["aws:ResourceTag/trustyclaw-host"],
+            "true",
+        )
 
         tag_statement = statements["TagOnlyDuringTrustyClawResourceCreation"]
         self.assertEqual(tag_statement["Action"], "ec2:CreateTags")
@@ -172,17 +235,32 @@ class DeployUnitTests(unittest.TestCase):
             sorted(tag_conditions["StringEquals"]["ec2:CreateAction"]),
             ["CreateSecurityGroup", "CreateVolume", "RunInstances"],
         )
-        self.assertEqual(
-            sorted(tag_conditions["ForAllValues:StringEquals"]["aws:TagKeys"]),
-            ["Name", "trustyclaw-host", "trustyclaw-host-agent-name", "trustyclaw-host-volume-role"],
-        )
+        self.assertNotIn("ForAllValues:StringEquals", tag_conditions)
 
-        sg_statement = statements["UpdateOnlyTrustyClawSecurityGroups"]
+        manage_statement = statements["ManageOnlyTrustyClawResources"]
         self.assertEqual(
-            sorted(sg_statement["Action"]),
-            ["ec2:AuthorizeSecurityGroupEgress", "ec2:AuthorizeSecurityGroupIngress"],
+            sorted(manage_statement["Action"]),
+            [
+                "ec2:AttachVolume",
+                "ec2:AuthorizeSecurityGroupEgress",
+                "ec2:AuthorizeSecurityGroupIngress",
+                "ec2:DeleteSecurityGroup",
+                "ec2:DeleteVolume",
+                "ec2:GetConsoleOutput",
+                "ec2:RevokeSecurityGroupEgress",
+                "ec2:RevokeSecurityGroupIngress",
+                "ec2:StartInstances",
+                "ec2:StopInstances",
+                "ec2:TerminateInstances",
+            ],
         )
-        self.assertEqual(sg_statement["Condition"]["StringEquals"]["aws:ResourceTag/trustyclaw-host"], "true")
+        self.assertEqual(manage_statement["Resource"], "*")
+        self.assertEqual(manage_statement["Condition"]["StringEquals"]["aws:ResourceTag/trustyclaw-host"], "true")
+
+        self.assertEqual(
+            statements["UbuntuAmiLookup"]["Resource"],
+            "arn:aws:ssm:*::parameter/aws/service/canonical/*",
+        )
 
     def test_storage_volumes_are_created_tagged_and_attached(self) -> None:
         config = parse_input_config(sample_config())
@@ -245,6 +323,35 @@ class DeployUnitTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "multiple TrustyClaw admin volumes"):
                 deploy._find_available_storage_volume(config, {}, "admin", "us-east-1a")
 
+    def test_storage_volume_lookup_can_wait_for_detach_after_replacing_instance(self) -> None:
+        config = parse_input_config(sample_config())
+        calls: list[tuple[str, ...]] = []
+        describe_count = 0
+
+        def fake_aws(_env, *args):  # type: ignore[no-untyped-def]
+            nonlocal describe_count
+            calls.append(args)
+            if args[:2] == ("ec2", "describe-volumes"):
+                describe_count += 1
+                state = "in-use" if describe_count == 1 else "available"
+                return {"Volumes": [{"VolumeId": "vol-admin", "State": state, "AvailabilityZone": "us-east-1a"}]}
+            if args[:3] == ("ec2", "wait", "volume-available"):
+                return {}
+            raise AssertionError(f"unexpected AWS call: {args}")
+
+        with patch("host.deploy._aws", side_effect=fake_aws):
+            volume_id = deploy._find_available_storage_volume(
+                config,
+                {},
+                "admin",
+                "us-east-1a",
+                wait_for_detach=True,
+            )
+
+        self.assertEqual(volume_id, "vol-admin")
+        self.assertIn(("ec2", "wait", "volume-available", "--volume-ids", "vol-admin"), calls)
+        self.assertEqual(describe_count, 2)
+
     def test_existing_storage_volume_az_steers_redeploy_and_detects_split_volumes(self) -> None:
         config = parse_input_config(sample_config())
         responses = [
@@ -274,7 +381,7 @@ class DeployUnitTests(unittest.TestCase):
                 with patch.dict(os.environ, {"TEST_AWS_ACCESS_KEY_ID": "AKIATEST", "TEST_AWS_SECRET_ACCESS_KEY": "secret"}), \
                         patch("host.deploy._find_existing_instances", side_effect=lambda *_args: calls.append("find_instances") or ["i-old"]), \
                         patch("host.deploy._existing_storage_volume_availability_zone", side_effect=lambda *_args: calls.append("validate_storage") or "us-east-1a"), \
-                        patch("host.deploy._confirm_redeploy", side_effect=lambda *_args: calls.append("confirm")), \
+                        patch("host.deploy._confirm_upgrade", side_effect=lambda *_args, **_kwargs: calls.append("confirm")), \
                         patch("host.deploy._default_network", side_effect=lambda *_args, **_kwargs: calls.append("preflight_network") or ("vpc-1", "subnet-1")), \
                         patch("host.deploy._terminate_instances", side_effect=lambda *_args: calls.append("terminate")), \
                         patch("host.deploy._generate_deploy_key", side_effect=lambda workdir: Path(workdir) / "deploy_key"), \
@@ -309,7 +416,7 @@ class DeployUnitTests(unittest.TestCase):
                 with patch.dict(os.environ, {"TEST_AWS_ACCESS_KEY_ID": "AKIATEST", "TEST_AWS_SECRET_ACCESS_KEY": "secret"}), \
                         patch("host.deploy._find_existing_instances", side_effect=lambda *_args: calls.append("find_instances") or ["i-old"]), \
                         patch("host.deploy._existing_storage_volume_availability_zone", side_effect=lambda *_args: calls.append("validate_storage") or "us-east-1a"), \
-                        patch("host.deploy._confirm_redeploy", side_effect=lambda *_args: calls.append("confirm")), \
+                        patch("host.deploy._confirm_upgrade", side_effect=lambda *_args, **_kwargs: calls.append("confirm")), \
                         patch("host.deploy._default_network", side_effect=ConfigError("AWS default VPC has no public subnet in us-east-1a")), \
                         patch("host.deploy._terminate_instances", side_effect=lambda *_args: calls.append("terminate")), \
                         patch("host.deploy._launch_instance", side_effect=AssertionError("_launch_instance should not run")), \
@@ -320,6 +427,81 @@ class DeployUnitTests(unittest.TestCase):
                 os.chdir(cwd)
 
         self.assertEqual(calls, ["validate_storage", "find_instances", "confirm"])
+
+    def test_main_allow_upgrade_skips_prompt_and_can_use_stable_admin_password(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text(json.dumps(sample_config()))
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                with patch.dict(
+                    os.environ,
+                    {
+                        "TEST_AWS_ACCESS_KEY_ID": "AKIATEST",
+                        "TEST_AWS_SECRET_ACCESS_KEY": "secret",
+                        "STAGE_ADMIN_PASSWORD": "stable-admin",
+                    },
+                ), \
+                        patch("host.deploy._find_existing_instances", return_value=["i-old"]), \
+                        patch("host.deploy._existing_storage_volume_availability_zone", return_value="us-east-1a"), \
+                        patch("host.deploy._default_network", return_value=("vpc-1", "subnet-1")), \
+                        patch("host.deploy._terminate_instances"), \
+                        patch("host.deploy._generate_deploy_key", side_effect=lambda workdir: Path(workdir) / "deploy_key"), \
+                        patch("host.deploy._launch_instance", return_value=("i-123", "sg-1")), \
+                        patch(
+                            "host.deploy._wait_for_instance",
+                            return_value={"PublicDnsName": "ec2.example", "Placement": {"AvailabilityZone": "us-east-1a"}},
+                        ), \
+                        patch("host.deploy._ensure_storage_volumes", return_value=({"admin": "vol-admin", "agent": "vol-agent"}, [])), \
+                        patch("host.deploy._provision_over_ssh") as provision, \
+                        patch("host.deploy._aws", return_value={}), \
+                        patch("builtins.input", side_effect=AssertionError("input should not be called")), \
+                        patch("sys.stdout", _StringOutput()):
+                    self.assertEqual(
+                        deploy.main(
+                            [
+                                "--config",
+                                str(config_path),
+                                "--allow-upgrade-or-recover",
+                                "--admin-password-env",
+                                "STAGE_ADMIN_PASSWORD",
+                            ]
+                        ),
+                        0,
+                    )
+            finally:
+                os.chdir(cwd)
+
+        self.assertEqual(provision.call_args.args[1], "stable-admin")
+
+    def test_reset_storage_dangerous_delete_deletes_available_data_volumes(self) -> None:
+        config = parse_input_config(sample_config())
+        calls: list[tuple[str, ...]] = []
+        volumes = {
+            "admin": {"VolumeId": "vol-admin", "State": "available", "AvailabilityZone": "us-east-1a"},
+            "agent": {"VolumeId": "vol-agent", "State": "available", "AvailabilityZone": "us-east-1a"},
+        }
+
+        def fake_aws(_env, *args):  # type: ignore[no-untyped-def]
+            calls.append(args)
+            if args[:2] == ("ec2", "describe-volumes"):
+                role = next(value.split("=")[-1] for value in args if value.startswith("Name=tag:trustyclaw-host-volume-role"))
+                return {"Volumes": [volumes[role]]}
+            return {}
+
+        with patch("host.deploy._aws", side_effect=fake_aws):
+            self.assertEqual(deploy._delete_storage_volumes(config, {}), ["vol-admin", "vol-agent"])
+        deletes = [call for call in calls if call[:2] == ("ec2", "delete-volume")]
+        waits = [call for call in calls if call[:3] == ("ec2", "wait", "volume-deleted")]
+        self.assertEqual(deletes, [
+            ("ec2", "delete-volume", "--volume-id", "vol-admin"),
+            ("ec2", "delete-volume", "--volume-id", "vol-agent"),
+        ])
+        self.assertEqual(waits, [
+            ("ec2", "wait", "volume-deleted", "--volume-ids", "vol-admin"),
+            ("ec2", "wait", "volume-deleted", "--volume-ids", "vol-agent"),
+        ])
 
     def test_user_data_contains_only_account_setup_and_no_secrets(self) -> None:
         config = parse_input_config(sample_config())
@@ -390,12 +572,26 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn('oif lo tcp dport 7445 meta skuid "trustyclaw-agent" accept', bootstrap)
         self.assertIn('oif lo meta skuid "trustyclaw-agent" drop', bootstrap)
         self.assertIn("rm -f /home/trustyclaw-operator/.ssh/authorized_keys2", bootstrap)
-        # The initial policy is activated through the same root helper the
-        # admin API uses, before services start; a reused admin volume never
-        # starts the proxy under stale network_controls.json.
-        activation = "/usr/local/lib/trustyclaw-host/update-network-policy \\\n  < /tmp/trustyclaw_initial_policy.json"
-        self.assertIn(activation, bootstrap)
-        self.assertLess(bootstrap.index(activation), bootstrap.index("systemctl enable --now trustyclaw-network-proxy.service"))
+        # A reused admin volume keeps its existing policy; a fresh volume starts
+        # with an empty policy through the same validated proxy-owned writer the
+        # admin API uses. Network status is derived by the proxy/admin from
+        # policy validity and proxy liveness.
+        self.assertIn('proxy_state / "network_controls.json"', bootstrap)
+        self.assertIn("if [ -f /mnt/trustyclaw-admin/proxy-state/network_controls.json ]; then", bootstrap)
+        self.assertIn("else", bootstrap)
+        self.assertIn("cat > /tmp/trustyclaw_initial_policy.json <<'JSON'", bootstrap)
+        self.assertIn('"managed_ai_provider_network_access": {},', bootstrap)
+        self.assertIn('"allowed_network_access": {}', bootstrap)
+        self.assertIn(
+            "/usr/local/lib/trustyclaw-host/update-network-policy < /tmp/trustyclaw_initial_policy.json >/dev/null",
+            bootstrap,
+        )
+        self.assertNotIn("network_status.json", bootstrap)
+        self.assertLess(
+            bootstrap.index("/usr/local/lib/trustyclaw-host/update-network-policy < /tmp/trustyclaw_initial_policy.json"),
+            bootstrap.index("systemctl enable --now trustyclaw-network-proxy.service"),
+        )
+        self.assertNotIn("network_policy.write_text", bootstrap)
         # Provider account files are pre-created in the admin-owned metadata
         # directory and the proxy-owned guard directory; neither service user
         # gets direct group access to the other directory.
@@ -422,8 +618,13 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("chmod 600 /mnt/trustyclaw-admin/admin-state/config.json /mnt/trustyclaw-admin/admin-state/state.json /mnt/trustyclaw-admin/admin-state/openai_account.json", bootstrap)
         self.assertNotIn("chmod 640 /mnt/trustyclaw-admin/admin-state/openai_account.json", bootstrap)
         self.assertNotIn("trustyclaw-proxy:trustyclaw-admin", bootstrap)
-        self.assertIn("chmod 600 /mnt/trustyclaw-admin/proxy-state/.network_policy.lock /mnt/trustyclaw-admin/proxy-state/network_events.jsonl", bootstrap)
+        self.assertIn("touch /mnt/trustyclaw-admin/proxy-state/.network_policy.lock", bootstrap)
         self.assertIn("chown trustyclaw-proxy:trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state/.network_policy.lock", bootstrap)
+        self.assertIn("chmod 600 /mnt/trustyclaw-admin/proxy-state/.network_policy.lock", bootstrap)
+        self.assertIn("if [ -f /mnt/trustyclaw-admin/proxy-state/network_controls.json ]; then", bootstrap)
+        self.assertIn("chown trustyclaw-proxy:trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state/network_controls.json", bootstrap)
+        self.assertIn("chmod 600 /mnt/trustyclaw-admin/proxy-state/network_controls.json", bootstrap)
+        self.assertNotIn("for path in \\", bootstrap)
         self.assertIn("/mnt/trustyclaw-admin/proxy-state/network_proxy_ca.key", bootstrap)
         self.assertIn("chown trustyclaw-agent:trustyclaw-agent /mnt/trustyclaw-agent/agent-home", bootstrap)
         self.assertNotIn("chown -R trustyclaw-admin:trustyclaw-admin /mnt/trustyclaw-admin/admin-state", bootstrap)
@@ -493,23 +694,16 @@ class DeployUnitTests(unittest.TestCase):
             self.addCleanup(lambda path=script_path: Path(path).unlink(missing_ok=True))
             subprocess.run(["bash", "-n", script_path], check=True)
 
-    def test_bootstrap_payload_keeps_managed_openai_domains_user_facing(self) -> None:
+    def test_bootstrap_payload_omits_runtime_network_policy(self) -> None:
         config = parse_input_config(sample_config())
         payload = deploy._bootstrap_payload(config, "admin-password", {"admin": "vol-admin", "agent": "vol-agent"})
-        network_controls = payload["network_controls"]
         self.assertEqual(payload["storage_volumes"], {"admin": "vol-admin", "agent": "vol-agent"})
-        self.assertEqual(network_controls["managed_ai_provider_network_access"], {"openai": True, "claude": True})
-        self.assertEqual(network_controls["allowed_network_access"], {
-            "api.github.com": {"allow_http_methods": ["GET"]}
-        })
-        for domain in ("api.openai.com", "auth.openai.com", "chatgpt.com"):
-            self.assertNotIn(domain, network_controls["allowed_network_access"])
+        self.assertNotIn("network_controls", payload)
 
     def test_update_network_policy_helper_validates_and_writes_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"TRUSTYCLAW_STATE_DIR": tmp}):
                 payload = {
-                    "ssh_port_opened": True,
                     "managed_ai_provider_network_access": {"openai": True},
                     "allowed_network_access": {
                         "api.example.com": {"allow_http_methods": ["GET"]}
@@ -521,12 +715,9 @@ class DeployUnitTests(unittest.TestCase):
                 self.assertEqual(load_policy()["allowed_network_access"]["api.example.com"]["allow_http_methods"], ["GET"])
                 for domain in ("api.openai.com", "auth.openai.com", "chatgpt.com"):
                     self.assertNotIn(domain, load_policy()["allowed_network_access"])
-                self.assertEqual(load_status(), "active")
                 self.assertIsNotNone(load_policy_updated_at())
                 self.assertEqual(oct((Path(tmp) / "network_controls.json").stat().st_mode & 0o777), "0o600")
-                self.assertEqual(oct((Path(tmp) / "network_status.json").stat().st_mode & 0o777), "0o600")
                 response = json.loads(stdout.value)
-                self.assertEqual(response["network_controls"]["ssh_port_opened"], True)
                 self.assertNotIn("api.openai.com", response["network_controls"]["allowed_network_access"])
 
     def test_update_network_policy_helper_rejects_invalid_policy(self) -> None:
@@ -534,7 +725,7 @@ class DeployUnitTests(unittest.TestCase):
             with patch.dict(os.environ, {"TRUSTYCLAW_STATE_DIR": tmp}):
                 with patch("sys.stdin", _StringInput('{"bogus": true}')):
                     self.assertEqual(update_network_policy.main(), 1)
-                self.assertEqual(load_status(), "loading")
+                self.assertFalse((Path(tmp) / "network_controls.json").exists())
 
     def test_update_network_policy_helper_lock_timeout_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -554,10 +745,9 @@ class DeployUnitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"TRUSTYCLAW_STATE_DIR": tmp}):
                 save_policy(
-                    {"ssh_port_opened": True, "managed_ai_provider_network_access": {}, "allowed_network_access": {}},
+                    {"managed_ai_provider_network_access": {}, "allowed_network_access": {}},
                     "2026-06-08T00:00:00Z",
                 )
-                save_status("active")
                 append_network_event("https", "GET", "api.example.com", 443, "/", "", True)
 
                 with patch("sys.argv", ["read-network-state", "status"]), patch("sys.stdout", _StringOutput()) as stdout:

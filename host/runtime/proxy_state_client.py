@@ -7,7 +7,8 @@ import os
 import subprocess
 from typing import Any
 
-from host.runtime.network_policy import load_policy, load_policy_updated_at, load_status
+from host.config import ConfigError, parse_network_controls
+from host.runtime.network_policy import load_policy, load_policy_updated_at
 from host.runtime.state import page_network_events
 
 READ_NETWORK_STATE_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/read-network-state"]
@@ -43,8 +44,12 @@ def _run_json(command: list[str], *, input_value: dict[str, Any] | None = None) 
 def network_status() -> str:
     if _helper_available(READ_NETWORK_STATE_COMMAND):
         value = _run_json([*READ_NETWORK_STATE_COMMAND, "status"]).get("status")
-        return value if isinstance(value, str) else "loading"
-    return load_status()
+        return value if isinstance(value, str) else "error"
+    try:
+        parse_network_controls(load_policy())
+    except (ConfigError, json.JSONDecodeError, OSError, KeyError, TypeError):
+        return "error"
+    return "active"
 
 
 def network_policy_response() -> dict[str, Any]:

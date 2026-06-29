@@ -212,7 +212,6 @@ for path in (
     proxy_state / "claude_account.json",
     proxy_state / "network_events.jsonl",
     proxy_state / "network_controls.json",
-    proxy_state / "network_status.json",
     proxy_state / ".network_policy.lock",
     proxy_state / "network_proxy_ca.key",
     proxy_state / "network_proxy_ca.crt",
@@ -258,7 +257,6 @@ for name, content in proxy_pin_files.items():
 network_events = proxy_state / 'network_events.jsonl'
 if not network_events.exists():
     network_events.write_text('')
-pathlib.Path('/tmp/trustyclaw_initial_policy.json').write_text(json.dumps(payload['network_controls']) + '\n')
 PY
 
 # Base OS packages and security updates.
@@ -378,6 +376,20 @@ chown trustyclaw-proxy:trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state/.netwo
 chmod 600 /mnt/trustyclaw-admin/proxy-state/.network_policy.lock /mnt/trustyclaw-admin/proxy-state/network_events.jsonl /mnt/trustyclaw-admin/proxy-state/network_proxy_ca.key /mnt/trustyclaw-admin/proxy-state/openai_account.json /mnt/trustyclaw-admin/proxy-state/claude_account.json
 chmod 644 /mnt/trustyclaw-admin/proxy-state/network_proxy_ca.crt
 
+if [ -f /mnt/trustyclaw-admin/proxy-state/network_controls.json ]; then
+  chown trustyclaw-proxy:trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state/network_controls.json
+  chmod 600 /mnt/trustyclaw-admin/proxy-state/network_controls.json
+else
+  cat > /tmp/trustyclaw_initial_policy.json <<'JSON'
+{
+  "managed_ai_provider_network_access": {},
+  "allowed_network_access": {}
+}
+JSON
+  /usr/local/lib/trustyclaw-host/update-network-policy < /tmp/trustyclaw_initial_policy.json >/dev/null
+  rm -f /tmp/trustyclaw_initial_policy.json
+fi
+
 cat > /etc/sudoers.d/trustyclaw-host <<'SUDOERS'
 trustyclaw-admin ALL=(root) NOPASSWD: /usr/local/lib/trustyclaw-host/reboot-host, /usr/local/lib/trustyclaw-host/run-codex-app-server, /usr/local/lib/trustyclaw-host/read-codex-account-id, /usr/local/lib/trustyclaw-host/run-claude-code, /usr/local/lib/trustyclaw-host/read-claude-account, /usr/local/lib/trustyclaw-host/update-network-policy, /usr/local/lib/trustyclaw-host/read-network-state, /usr/local/lib/trustyclaw-host/update-provider-account
 SUDOERS
@@ -475,16 +487,10 @@ RestartSec=3
 WantedBy=multi-user.target
 UNIT
 
-# Activate the initial network policy before the proxy/admin services start. A
-# redeploy can reuse an admin volume whose previous policy was active; writing
-# the new policy first prevents any startup window under stale network controls.
-/usr/local/lib/trustyclaw-host/update-network-policy \
-  < /tmp/trustyclaw_initial_policy.json
-
 systemctl daemon-reload
 systemctl enable --now trustyclaw-network-proxy.service
 systemctl enable --now trustyclaw-admin-api.service
 
 # Provisioning is done: drop the single-use deploy key and the staged files.
 rm -f /home/trustyclaw-operator/.ssh/authorized_keys2
-rm -f /tmp/trustyclaw_payload.json /tmp/trustyclaw_initial_policy.json /tmp/trustyclaw-host-code.tar.gz /tmp/trustyclaw_bootstrap.sh
+rm -f /tmp/trustyclaw_payload.json /tmp/trustyclaw-host-code.tar.gz /tmp/trustyclaw_bootstrap.sh

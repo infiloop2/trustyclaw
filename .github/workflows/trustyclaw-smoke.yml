@@ -1,0 +1,93 @@
+name: trustyclaw-smoke
+
+on:
+  workflow_dispatch:
+  issue_comment:
+    types:
+      - created
+
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: trustyclaw-smoke
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: Authorize AWS smoke
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request && github.event.comment.body == '/trustyclaw-smoke')
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      - name: Checkout trusted workflow actions
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Authorize repo admin
+        uses: ./.github/actions/authorize-repo-admin
+
+      - name: Resolve safe ref
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_SHA: ${{ github.sha }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "issue_comment" ]]; then
+            pr="$(curl -fsS \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${{ github.api_url }}/repos/${REPO}/pulls/${ISSUE_NUMBER}")"
+            head_repo="$(jq -r .head.repo.full_name <<<"${pr}")"
+            if [[ "${head_repo}" != "${REPO}" ]]; then
+              echo "Refusing to run AWS smoke secrets against fork PR code from ${head_repo}." >&2
+              exit 1
+            fi
+            ref="$(jq -r .head.sha <<<"${pr}")"
+          else
+            ref="${DISPATCH_SHA}"
+          fi
+          echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+          echo "Testing ref ${ref}"
+
+      - name: Rate limit live AWS runs
+        uses: ./.github/actions/rate-limit-live-aws-runs
+        with:
+          workflow-file: trustyclaw-smoke.yml
+          authorized-job-name: Authorize AWS smoke
+
+  smoke:
+    needs: authorize
+    name: Fresh AWS smoke
+    if: ${{ needs.authorize.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          ref: ${{ needs.authorize.outputs.ref }}
+          persist-credentials: false
+
+      - name: Run fresh smoke
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TRUSTYCLAW_SMOKE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TRUSTYCLAW_SMOKE_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          python3 tests/smoke/smoke_aws.py

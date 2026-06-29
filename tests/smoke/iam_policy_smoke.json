@@ -2,7 +2,7 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "ReadAndProvision",
+      "Sid": "Ec2Discovery",
       "Effect": "Allow",
       "Action": [
         "ec2:DescribeInstances",
@@ -11,17 +11,49 @@
         "ec2:DescribeRouteTables",
         "ec2:DescribeSecurityGroups",
         "ec2:DescribeVolumes",
-        "ec2:DescribeInstanceAttribute",
-        "ec2:GetConsoleOutput",
+        "ec2:DescribeInstanceAttribute"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CreateTaggedTrustyClawResources",
+      "Effect": "Allow",
+      "Action": [
         "ec2:RunInstances",
         "ec2:CreateVolume",
-        "ec2:AttachVolume",
         "ec2:CreateSecurityGroup"
       ],
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:RequestedRegion": "us-east-1"
+          "aws:RequestTag/trustyclaw-host": "true",
+          "aws:RequestTag/trustyclaw-host-agent-name": "trustyclaw-smoke"
+        }
+      }
+    },
+    {
+      "Sid": "UseEc2CreateDependencies",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances",
+        "ec2:CreateSecurityGroup"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*::image/*",
+        "arn:aws:ec2:*:*:subnet/*",
+        "arn:aws:ec2:*:*:network-interface/*",
+        "arn:aws:ec2:*:*:vpc/*"
+      ]
+    },
+    {
+      "Sid": "RunInstancesWithTrustyClawSecurityGroups",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:*:*:security-group/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/trustyclaw-host": "true",
+          "aws:ResourceTag/trustyclaw-host-agent-name": "trustyclaw-smoke"
         }
       }
     },
@@ -32,50 +64,27 @@
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:RequestedRegion": "us-east-1",
           "aws:RequestTag/trustyclaw-host": "true",
+          "aws:RequestTag/trustyclaw-host-agent-name": "trustyclaw-smoke",
           "ec2:CreateAction": [
             "RunInstances",
             "CreateVolume",
             "CreateSecurityGroup"
           ]
-        },
-        "ForAllValues:StringEquals": {
-          "aws:TagKeys": [
-            "Name",
-            "trustyclaw-host",
-            "trustyclaw-host-agent-name",
-            "trustyclaw-host-volume-role"
-          ]
         }
       }
     },
     {
-      "Sid": "UpdateOnlyTrustyClawSecurityGroups",
+      "Sid": "ManageOnlyTrustyClawResources",
       "Effect": "Allow",
       "Action": [
+        "ec2:GetConsoleOutput",
+        "ec2:AttachVolume",
         "ec2:AuthorizeSecurityGroupIngress",
-        "ec2:AuthorizeSecurityGroupEgress"
-      ],
-      "Resource": "*",
-      "Condition": {
-        "StringEquals": {
-          "aws:RequestedRegion": "us-east-1",
-          "aws:ResourceTag/trustyclaw-host": "true"
-        }
-      }
-    },
-    {
-      "Sid": "UbuntuAmiLookup",
-      "Effect": "Allow",
-      "Action": "ssm:GetParameter",
-      "Resource": "arn:aws:ssm:*::parameter/aws/service/canonical/*"
-    },
-    {
-      "Sid": "DestroyOnlyTrustyClawResources",
-      "Effect": "Allow",
-      "Action": [
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:StartInstances",
         "ec2:TerminateInstances",
+        "ec2:StopInstances",
         "ec2:DeleteSecurityGroup",
         "ec2:DeleteVolume",
         "ec2:RevokeSecurityGroupIngress",
@@ -84,10 +93,16 @@
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:RequestedRegion": "us-east-1",
-          "aws:ResourceTag/trustyclaw-host": "true"
+          "aws:ResourceTag/trustyclaw-host": "true",
+          "aws:ResourceTag/trustyclaw-host-agent-name": "trustyclaw-smoke"
         }
       }
+    },
+    {
+      "Sid": "UbuntuAmiLookup",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:*::parameter/aws/service/canonical/*"
     }
   ]
 }

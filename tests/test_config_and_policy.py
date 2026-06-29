@@ -34,97 +34,71 @@ class ConfigTests(unittest.TestCase):
                 "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
                 "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
                 "ssh_public_key": "ssh-ed25519 AAAATEST",
-                "network_controls": {
-                    "ssh_port_opened": True,
-                    "managed_ai_provider_network_access": {"openai": True, "claude": True},
-                    "allowed_network_access": {
-                        "api.github.com": {
-                            "allow_http_methods": ["GET", "HEAD"],
-                            "path_guards": ["^/repos/[^/]+/[^/]+(?:\\?.*)?$"],
-                        }
-                    },
-                },
+                "ssh_port_opened": True,
             }
         )
 
         self.assertEqual(config.agent_name, "trustyclaw-dev_1")
-        self.assertEqual(config.network_controls.allowed_network_access["api.github.com"].allow_http_methods, ("GET", "HEAD"))
+        self.assertTrue(config.ssh_port_opened)
 
-    def test_input_config_requires_ssh_access_and_allows_disabled_managed_providers(self) -> None:
+    def test_input_config_requires_ssh_access_and_rejects_network_controls(self) -> None:
         base = {
             "agent_name": "trustyclaw-dev_1",
             "aws_region": "us-east-1",
             "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
             "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
             "ssh_public_key": "ssh-ed25519 AAAATEST",
-            "network_controls": {
-                "ssh_port_opened": True,
-                "managed_ai_provider_network_access": {"openai": True, "claude": True},
-                "allowed_network_access": {},
-            },
         }
+        with self.assertRaisesRegex(ConfigError, "ssh_port_opened must be true or false"):
+            parse_input_config(base)
 
-        invalid = dict(base)
-        invalid["network_controls"] = {
-            "ssh_port_opened": False,
-            "managed_ai_provider_network_access": {"openai": True, "claude": True},
-            "allowed_network_access": {},
-        }
         with self.assertRaisesRegex(ConfigError, "ssh_port_opened must be true"):
-            parse_input_config(invalid)
+            parse_input_config({**base, "ssh_port_opened": False})
 
-        for managed in (
-            {},
-            {"openai": False, "claude": False},
-            {"openai": True},
-            {"claude": True},
-            {"openai": False, "claude": True},
-            {"openai": True, "claude": False},
-        ):
-            with self.subTest(managed=managed):
-                config = parse_input_config(
-                    {
-                        **base,
-                        "network_controls": {
-                            "ssh_port_opened": True,
-                            "managed_ai_provider_network_access": managed,
-                            "allowed_network_access": {},
-                        },
-                    }
-                )
-                self.assertEqual(config.network_controls.managed_ai_provider_network_access.to_json(), {
-                    key: value for key, value in managed.items() if value
-                })
+        with self.assertRaisesRegex(ConfigError, "config has unsupported fields: network_controls"):
+            parse_input_config(
+                {
+                    **base,
+                    "network_controls": {
+                        "managed_ai_provider_network_access": {"openai": True},
+                        "allowed_network_access": {},
+                    },
+                }
+            )
 
     def test_agent_name_restrictions(self) -> None:
         with self.assertRaises(ConfigError):
-            parse_network_controls({"ssh_port_opened": True, "managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {"*": {}}})
+            parse_network_controls({"managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {"*": {}}})
 
     def test_managed_providers_are_independently_optional(self) -> None:
         for controls in (
-            {"ssh_port_opened": True, "allowed_network_access": {}},
-            {"ssh_port_opened": True, "managed_ai_provider_network_access": {}, "allowed_network_access": {}},
+            {"allowed_network_access": {}},
+            {"managed_ai_provider_network_access": {}, "allowed_network_access": {}},
             {
-                "ssh_port_opened": True,
                 "managed_ai_provider_network_access": {"openai": False, "claude": False},
                 "allowed_network_access": {},
             },
-            {"ssh_port_opened": True, "managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}},
-            {"ssh_port_opened": True, "managed_ai_provider_network_access": {"claude": True}, "allowed_network_access": {}},
+            {"managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}},
+            {"managed_ai_provider_network_access": {"claude": True}, "allowed_network_access": {}},
         ):
             with self.subTest(controls=controls):
                 parsed = parse_network_controls(controls)
                 self.assertIsInstance(parsed.managed_ai_provider_network_access.openai, bool)
                 self.assertIsInstance(parsed.managed_ai_provider_network_access.claude, bool)
 
-        disabled = parse_network_controls({"ssh_port_opened": True, "allowed_network_access": {}})
+        disabled = parse_network_controls({"allowed_network_access": {}})
         self.assertEqual(disabled.to_json()["managed_ai_provider_network_access"], {})
         self.assertEqual(expand_network_controls(disabled)["allowed_network_access"], {})
+
+    def test_runtime_network_controls_reject_ssh_port_field(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "network_controls has unsupported fields: ssh_port_opened"):
+            parse_network_controls(
+                {"ssh_port_opened": True, "managed_ai_provider_network_access": {}, "allowed_network_access": {}}
+            )
 
     def test_parse_preserves_user_policy_and_expansion_adds_managed_domain_rules(self) -> None:
         controls = parse_network_controls(
             {
-                "ssh_port_opened": True,
                 "managed_ai_provider_network_access": {"openai": True},
                 "allowed_network_access": {},
             }
@@ -150,7 +124,6 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(domain=domain), self.assertRaisesRegex(ConfigError, "managed_ai_provider_network_access.openai"):
                 parse_network_controls(
                     {
-                        "ssh_port_opened": True,
                         "managed_ai_provider_network_access": {"openai": True},
                         "allowed_network_access": {domain: {"allow_http_methods": ["GET"]}},
                     }
@@ -160,7 +133,6 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaisesRegex(ConfigError, "unsupported fields"):
                 parse_network_controls(
                     {
-                        "ssh_port_opened": True,
                         "managed_ai_provider_network_access": {"openai": True},
                         "allowed_network_access": {"github.com": {"allow_http_methods": ["GET"], field: True}},
                     }
@@ -169,7 +141,6 @@ class ConfigTests(unittest.TestCase):
     def test_claude_provider_expands_and_rejects_managed_domains(self) -> None:
         controls = parse_network_controls(
             {
-                "ssh_port_opened": True,
                 "managed_ai_provider_network_access": {"claude": True},
                 "allowed_network_access": {},
             }
@@ -187,7 +158,6 @@ class ConfigTests(unittest.TestCase):
             ):
                 parse_network_controls(
                     {
-                        "ssh_port_opened": True,
                         "managed_ai_provider_network_access": {"claude": True},
                         "allowed_network_access": {domain: {"allow_http_methods": ["GET"]}},
                     }
@@ -197,7 +167,6 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "wildcard domains must not overlap"):
             parse_network_controls(
                 {
-                    "ssh_port_opened": True,
                     "managed_ai_provider_network_access": {"openai": True},
                     "allowed_network_access": {
                         "*.example.com": {"allow_http_methods": ["GET"]},
@@ -209,7 +178,6 @@ class ConfigTests(unittest.TestCase):
     def test_non_overlapping_wildcard_domain_rules_are_allowed(self) -> None:
         controls = parse_network_controls(
             {
-                "ssh_port_opened": True,
                 "managed_ai_provider_network_access": {"openai": True},
                 "allowed_network_access": {
                     "*.api.example.com": {"allow_http_methods": ["GET"]},
@@ -224,7 +192,6 @@ class ConfigTests(unittest.TestCase):
     def test_exact_domain_override_under_wildcard_is_allowed(self) -> None:
         controls = parse_network_controls(
             {
-                "ssh_port_opened": True,
                 "managed_ai_provider_network_access": {"openai": True},
                 "allowed_network_access": {
                     "*.example.com": {"allow_http_methods": ["GET"]},
@@ -238,7 +205,6 @@ class ConfigTests(unittest.TestCase):
     def test_domain_keys_are_normalized_and_case_duplicates_rejected(self) -> None:
         controls = parse_network_controls(
             {
-                "ssh_port_opened": True,
                 "managed_ai_provider_network_access": {"openai": True},
                 "allowed_network_access": {
                     "API.Example.COM": {"allow_http_methods": ["GET"]},
@@ -251,7 +217,6 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "duplicate domain rules"):
             parse_network_controls(
                 {
-                    "ssh_port_opened": True,
                     "managed_ai_provider_network_access": {"openai": True},
                     "allowed_network_access": {
                         "api.example.com": {"allow_http_methods": ["GET"]},
@@ -264,7 +229,6 @@ class ConfigTests(unittest.TestCase):
 class PolicyTests(unittest.TestCase):
     def test_policy_matches_domain_method_and_path(self) -> None:
         policy = {
-            "ssh_port_opened": True,
             "allowed_network_access": {
                 "*.example.com": {
                     "allow_http_methods": ["GET"],

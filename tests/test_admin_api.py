@@ -17,7 +17,7 @@ import urllib.request
 
 from host.config import parse_network_controls
 from host.runtime import admin_api, orchestrator, proxy_state_client
-from host.runtime.network_policy import save_policy, save_status
+from host.runtime.network_policy import save_policy
 from host.runtime.state import (
     append_agent_event,
     load_state,
@@ -53,10 +53,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
             },
         )
         save_policy(
-            {"ssh_port_opened": True, "managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}},
+            {"managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}},
             "2026-06-08T00:00:00Z",
         )
-        save_status("active")
         state = load_state()
         state["agent_runtime_statuses"]["codex"]["status"] = "active"
         state["agent_runtime_statuses"]["claude_code"]["status"] = "deactivated"
@@ -250,7 +249,19 @@ class AdminApiIntegrationTests(unittest.TestCase):
             self.assertIn("text/html", response.headers["Content-Type"])
             page = response.read().decode()
         self.assertIn("TrustyClaw", page)
-        self.assertIn("/v1/health", page)
+        self.assertIn('/admin_ui.css', page)
+        self.assertIn('/admin_ui.js', page)
+
+        for path, content_type, expected in (
+            ("/admin_ui.css", "text/css", ".shell"),
+            ("/admin_ui.js", "application/javascript", "/v1/health"),
+        ):
+            request = urllib.request.Request(f"{self.base_url}{path}")
+            with urllib.request.urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn(content_type, response.headers["Content-Type"])
+                body = response.read().decode()
+            self.assertIn(expected, body)
 
     def test_idempotency_key_replay_returns_original_response(self) -> None:
         _, first = self.request("POST", "/v1/tasks", {"input_message": "do it", "thread_id": "t1", "agent_runtime": "codex"}, idem="same-key")
@@ -464,24 +475,104 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(second["events"], [])
 
     def test_admin_ui_has_thread_task_event_smoke_path(self) -> None:
-        html = Path(__file__).parents[1].joinpath("host/runtime/admin_ui.html").read_text()
+        runtime = Path(__file__).parents[1] / "host/runtime"
+        html = (runtime / "admin_ui.html").read_text()
+        ui = "\n".join(
+            (runtime / filename).read_text()
+            for filename in ("admin_ui.html", "admin_ui.css", "admin_ui.js")
+        )
         self.assertIn("<h2>Threads</h2>", html)
-        self.assertIn("/v1/threads", html)
-        self.assertIn("/v1/threads/${encodeURIComponent(threadId)}/tasks", html)
-        self.assertIn("/v1/tasks/${encodeURIComponent(taskId)}/events", html)
-        self.assertIn("thread.task_count", html)
-        self.assertIn("TASK_EVENT_PAGE_BATCH", html)
-        self.assertIn("loadTaskEventBatch", html)
-        self.assertIn("loadMoreTaskEvents", html)
-        self.assertIn('onclick="showThread', html)
-        self.assertIn('onclick="showTaskEvents', html)
-        self.assertIn('$("new-task-thread").value = threadId', html)
-        self.assertIn('$("new-task-runtime").value = agentRuntime', html)
-        self.assertIn("await loadThreads();", html)
-        self.assertNotIn("loadAllTaskEvents", html)
-        self.assertNotIn("/v1/tasks/finished", html)
-        self.assertNotIn("loadFinishedTasks", html)
-        self.assertNotIn("retained_task_count", html)
+        self.assertIn('<link rel="stylesheet" href="/admin_ui.css">', html)
+        self.assertIn('<script src="/admin_ui.js"></script>', html)
+        self.assertIn("/v1/threads", ui)
+        self.assertIn("/v1/threads/${encodeURIComponent(threadId)}/tasks", ui)
+        self.assertIn("/v1/tasks/${encodeURIComponent(taskId)}/events", ui)
+        self.assertIn("thread.task_count", ui)
+        self.assertIn("TASK_EVENT_PAGE_BATCH", ui)
+        self.assertIn("loadTaskEventBatch", ui)
+        self.assertIn("loadMoreTaskEvents", ui)
+        self.assertIn('data-action="show-thread"', ui)
+        self.assertIn('data-action="show-task-events"', ui)
+        self.assertIn('$("new-task-thread").value = threadId', ui)
+        self.assertIn('$("new-task-runtime").value = agentRuntime', ui)
+        self.assertIn("await loadThreads();", ui)
+        self.assertIn('button[data-action]', ui)
+        self.assertNotIn("onclick=", ui)
+        self.assertNotIn("oninput=", ui)
+        self.assertIn('id="policy-preset-openai"', html)
+        self.assertIn('id="policy-preset-claude"', html)
+        for label in (
+            "OpenAI preset domains",
+            "Claude preset domains",
+            "GitHub preset domains",
+            "Python packages preset domains",
+            "npm packages preset domains",
+        ):
+            self.assertIn(f'aria-label="{label}"', html)
+        self.assertIn("togglePresetInfo", ui)
+        self.assertIn("renderPresetInfo", ui)
+        self.assertIn('id="preset-info-popover"', html)
+        self.assertIn("OpenAI expands internally", ui)
+        self.assertIn("Claude expands internally", ui)
+        self.assertIn("GitHub expands", ui)
+        self.assertIn("api.openai.com", ui)
+        self.assertIn("POST; account guard; live web search disabled", ui)
+        self.assertIn("auth.openai.com", ui)
+        self.assertIn("GET, POST", ui)
+        self.assertIn("api.anthropic.com", ui)
+        self.assertIn("GET, POST; account guard", ui)
+        self.assertIn("api.github.com", ui)
+        self.assertIn("GET, POST, PATCH, PUT, DELETE", ui)
+        self.assertIn("pypi.org", ui)
+        self.assertIn("GET, HEAD; only /simple and /pypi/<package>/json paths", ui)
+        self.assertIn("registry.npmjs.org", ui)
+        self.assertIn("manual-domain", ui)
+        self.assertIn("Add manual domain", html)
+        self.assertIn("POLICY_PRESETS", ui)
+        self.assertIn("POLICY_PRESET_BUTTONS", ui)
+        self.assertIn("objectValue", ui)
+        self.assertIn("!Array.isArray(value)", ui)
+        self.assertIn("policyPresetState", ui)
+        self.assertIn("renderPolicyPresets", ui)
+        self.assertIn("rulesEqual", ui)
+        self.assertIn("wildcardCoversDomain", ui)
+        self.assertIn("hasWildcardOverlap", ui)
+        self.assertIn('pattern.startsWith("*.")', ui)
+        self.assertIn("domain.endsWith(pattern.slice(1))", ui)
+        self.assertIn("domain !== pattern.slice(2)", ui)
+        self.assertIn("covered by a wildcard", ui)
+        self.assertIn('button.disabled = state === "partial"', ui)
+        self.assertIn("Remove ${copy.label}", ui)
+        self.assertIn("removePolicyPreset", ui)
+        self.assertIn("preset-active", ui)
+        self.assertIn("preset-partial", ui)
+        self.assertIn("applyPolicyPreset(preset)", ui)
+        self.assertIn('data-preset="openai"', ui)
+        self.assertIn('data-preset="claude"', ui)
+        self.assertIn('data-preset="github"', ui)
+        self.assertIn('data-preset="python"', ui)
+        self.assertIn('data-preset="npm"', ui)
+        for domain in (
+            "github.com",
+            "api.github.com",
+            "codeload.github.com",
+            "objects.githubusercontent.com",
+            "raw.githubusercontent.com",
+            "release-assets.githubusercontent.com",
+            "pypi.org",
+            "files.pythonhosted.org",
+            "nodejs.org",
+            "registry.npmjs.org",
+        ):
+            self.assertIn(domain, ui)
+        self.assertIn("saveWebsiteRule", ui)
+        self.assertNotIn("editWebsiteRule", ui)
+        self.assertNotIn("removeWebsiteRule", ui)
+        self.assertNotIn("loadAllTaskEvents", ui)
+        self.assertNotIn("/v1/tasks/finished", ui)
+        self.assertNotIn("loadFinishedTasks", ui)
+        self.assertNotIn("retained_task_count", ui)
+        self.assertNotIn("ssh_port_opened", ui)
 
     def test_task_create_requires_valid_agent_runtime(self) -> None:
         for index, body in enumerate(
@@ -504,7 +595,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
     def test_network_policy_replace_and_events(self) -> None:
         body = {
-            "ssh_port_opened": True,
             "managed_ai_provider_network_access": {"openai": True},
             "allowed_network_access": {
                 "api.example.com": {"allow_http_methods": ["GET"], "path_guards": ["^/v1$"]}
@@ -537,9 +627,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], admin_api.NETWORK_POLICY_HELPER_TIMEOUT_SECONDS)
         self.mock_reconcile.assert_called_once()
 
-    def test_network_policy_rejects_runtime_ssh_port_change(self) -> None:
-        # Deploy-time set ssh_port_opened=True (setUp). A runtime PUT that flips
-        # it must be rejected, not falsely reported as applied.
+    def test_network_policy_rejects_ssh_port_field(self) -> None:
         body = {"ssh_port_opened": False, "managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}}
         with patch("host.runtime.admin_api.subprocess.run") as run:
             with self.assertRaises(urllib.error.HTTPError) as error:
@@ -547,11 +635,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 400)
         run.assert_not_called()
 
-    def test_network_policy_replace_recovers_from_stuck_reloading(self) -> None:
-        # A crash mid-update can leave status at "reloading"; the operator must
-        # still be able to push a fixed policy (not be locked out with 409).
-        save_status("reloading")
-        body = {"ssh_port_opened": True, "managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}}
+    def test_network_policy_replace_succeeds_when_existing_policy_is_error(self) -> None:
+        save_policy({"bogus": True}, "2026-06-08T00:00:01Z")
+        body = {"managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}}
         completed = subprocess.CompletedProcess(
             args=[], returncode=0,
             stdout=json.dumps({"network_controls": body, "updated_at": "2026-06-08T00:00:02Z"}), stderr="",
@@ -562,7 +648,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         run.assert_called_once()
 
     def test_network_policy_replacements_are_serialized(self) -> None:
-        body = {"ssh_port_opened": True, "managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}}
+        body = {"managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}}
         active = 0
         max_active = 0
         lock = threading.Lock()
@@ -589,7 +675,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(max_active, 1)
 
     def test_network_policy_replace_fails_fast_when_update_is_in_progress(self) -> None:
-        body = {"ssh_port_opened": True, "managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}}
+        body = {"managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}}
         self.assertTrue(admin_api.NETWORK_POLICY_LOCK.acquire(blocking=False))
         self.addCleanup(admin_api.NETWORK_POLICY_LOCK.release)
 
@@ -606,7 +692,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         ):
             with self.assertRaises(admin_api.ApiError) as error:
                 admin_api.apply_network_policy_as_root(
-                    {"ssh_port_opened": True, "managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}}
+                    {"managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}}
                 )
 
         self.assertEqual(error.exception.status, HTTPStatus.GATEWAY_TIMEOUT)
@@ -622,7 +708,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         ):
             with self.assertRaises(admin_api.ApiError) as error:
                 admin_api.apply_network_policy_as_root(
-                    {"ssh_port_opened": True, "managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}}
+                    {"managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}}
                 )
 
         self.assertEqual(error.exception.status, HTTPStatus.GATEWAY_TIMEOUT)
@@ -729,7 +815,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
     def test_runtime_expiry_clears_claude_account(self) -> None:
         save_policy(
             {
-                "ssh_port_opened": True,
                 "managed_ai_provider_network_access": {"claude": True},
                 "allowed_network_access": {},
             },
@@ -752,7 +837,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
     def test_active_claude_runtime_refresh_updates_token_hash(self) -> None:
         save_policy(
             {
-                "ssh_port_opened": True,
                 "managed_ai_provider_network_access": {"claude": True},
                 "allowed_network_access": {},
             },
@@ -855,7 +939,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 409)
 
     def test_oauth_start_rejects_disabled_provider_before_spawning_helper(self) -> None:
-        save_policy({"ssh_port_opened": True, "managed_ai_provider_network_access": {}, "allowed_network_access": {}}, "t")
+        save_policy({"managed_ai_provider_network_access": {}, "allowed_network_access": {}}, "t")
         state = load_state()
         state["agent_runtime_statuses"]["codex"]["status"] = "awaiting_login"
         state["agent_runtime_statuses"]["claude_code"]["status"] = "awaiting_login"
@@ -877,7 +961,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 self.assertEqual(error.exception.code, 409)
 
     def test_current_oauth_rejects_disabled_provider_even_with_stale_oauth_state(self) -> None:
-        save_policy({"ssh_port_opened": True, "managed_ai_provider_network_access": {}, "allowed_network_access": {}}, "t")
+        save_policy({"managed_ai_provider_network_access": {}, "allowed_network_access": {}}, "t")
         state = load_state()
         state["agent_runtime_statuses"]["codex"]["status"] = "awaiting_login"
         state["agent_runtime_statuses"]["claude_code"]["status"] = "awaiting_login"
@@ -923,7 +1007,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertIsNone(load_state().get("codex_oauth"))
 
     def test_claude_oauth_complete_rejects_disabled_provider_before_touching_helper(self) -> None:
-        save_policy({"ssh_port_opened": True, "managed_ai_provider_network_access": {}, "allowed_network_access": {}}, "t")
+        save_policy({"managed_ai_provider_network_access": {}, "allowed_network_access": {}}, "t")
 
         with (
             patch(
@@ -955,7 +1039,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
     def test_claude_oauth_start_reuses_existing_login(self) -> None:
         save_policy(
-            {"ssh_port_opened": True, "managed_ai_provider_network_access": {"claude": True}, "allowed_network_access": {}},
+            {"managed_ai_provider_network_access": {"claude": True}, "allowed_network_access": {}},
             "2026-06-08T00:00:01Z",
         )
         state = load_state()
@@ -1066,7 +1150,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
         save_policy(
             parse_network_controls(
                 {
-                    "ssh_port_opened": True,
                     "managed_ai_provider_network_access": {"openai": True},
                     "allowed_network_access": {
                         "api.example.com": {"allow_http_methods": ["GET"]},
@@ -1076,7 +1159,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
             "2026-06-08T00:00:03Z",
         )
         _, body = self.request("GET", "/v1/network/policy")
-        self.assertEqual(body["network_controls"]["ssh_port_opened"], True)
         self.assertEqual(body["network_controls"]["managed_ai_provider_network_access"], {"openai": True})
         self.assertEqual(
             body["network_controls"]["allowed_network_access"],

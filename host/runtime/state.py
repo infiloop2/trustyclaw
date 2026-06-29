@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, TypedDict
 
 
 DEFAULT_STATE_DIR = Path("/mnt/trustyclaw-admin/admin-state")
@@ -55,7 +55,12 @@ _JSONL_THREAD_LOCKS_GUARD = threading.Lock()
 # instead of state.json, so proxy threads need one in-process lock around
 # read-max/increment/append.
 _NETWORK_EVENT_LOCK = threading.Lock()
-_NETWORK_EVENT_SEQ = {"path": None, "seq": 0}
+class _NetworkEventSeq(TypedDict):
+    path: Path | None
+    seq: int
+
+
+_NETWORK_EVENT_SEQ: _NetworkEventSeq = {"path": None, "seq": 0}
 
 
 def _jsonl_thread_lock(path: Path) -> threading.RLock:
@@ -97,7 +102,6 @@ def _network_events_path() -> Path:
 @dataclass(frozen=True)
 class NetworkPolicyFiles:
     controls: Path
-    status: Path
     lock: Path
 
 
@@ -115,7 +119,6 @@ class NetworkProxyCertFiles:
 def network_policy_files() -> NetworkPolicyFiles:
     return NetworkPolicyFiles(
         controls=_proxy_state_dir() / "network_controls.json",
-        status=_proxy_state_dir() / "network_status.json",
         lock=_proxy_state_dir() / ".network_policy.lock",
     )
 

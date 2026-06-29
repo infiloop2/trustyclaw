@@ -12,9 +12,10 @@ Provisioning happens in two stages:
 SSH port 22 must stay open because SSH tunneling is currently the only
 supported access path for the admin UI and API.
 
-The generated admin password appears only in the local deploy result file.
-The host receives just its SHA-256 hash, so nothing on the instance ever
-contains the cleartext.
+By default, the generated admin password appears only in the local deploy
+result file. The host receives just its SHA-256 hash, so nothing on the
+instance ever contains the cleartext. Persistent environments can instead pass
+``--admin-password-env`` to reuse a stable password across upgrades.
 """
 
 from __future__ import annotations
@@ -63,25 +64,45 @@ def _log(message: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Deploy TrustyClaw to AWS EC2")
     parser.add_argument("--config", required=True, help="Path to input config JSON")
+    parser.add_argument(
+        "--allow-upgrade-or-recover",
+        action="store_true",
+        help="Non-interactively approve upgrading/recovering an existing host.",
+    )
+    parser.add_argument(
+        "--admin-password-env",
+        help="Environment variable containing the admin password to install instead of generating one.",
+    )
+    parser.add_argument(
+        "--reset-storage-dangerous-delete",
+        action="store_true",
+        help="Delete and recreate existing durable admin/agent data volumes.",
+    )
     args = parser.parse_args(argv)
 
     try:
         config = load_input_config(args.config)
-        admin_password = secrets.token_urlsafe(32)
+        admin_password = _admin_password(args.admin_password_env)
         aws_env = _aws_env(config)
         _log(f"region {config.aws_region}; checking for an existing '{config.agent_name}' host")
-        preferred_availability_zone = _existing_storage_volume_availability_zone(config, aws_env)
+        preferred_availability_zone = (
+            None if args.reset_storage_dangerous_delete else _existing_storage_volume_availability_zone(config, aws_env)
+        )
         existing = _find_existing_instances(config, aws_env)
         replacement_network: tuple[str, str] | None = None
         if existing:
-            _confirm_redeploy(config.agent_name, existing)
+            _confirm_upgrade(config.agent_name, existing, assume_yes=args.allow_upgrade_or_recover)
             replacement_network = _default_network(
                 config,
                 aws_env,
                 preferred_availability_zone=preferred_availability_zone,
             )
-            _log(f"terminating existing instance(s): {', '.join(existing)}")
+            _log(f"upgrading/recovering by terminating existing instance(s): {', '.join(existing)}")
             _terminate_instances(existing, aws_env)
+        elif args.allow_upgrade_or_recover:
+            _log("no existing instance found; continuing with a fresh deploy")
+        if args.reset_storage_dangerous_delete:
+            _delete_storage_volumes(config, aws_env)
         with tempfile.TemporaryDirectory() as workdir_name:
             workdir = Path(workdir_name)
             deploy_key = _generate_deploy_key(workdir)
@@ -104,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
                     aws_env,
                     instance_id=instance_id,
                     availability_zone=availability_zone,
+                    wait_for_detach=bool(existing),
                 )
                 _provision_over_ssh(config, admin_password, public_dns, deploy_key, workdir, storage_volumes)
             except BaseException:
@@ -162,6 +184,15 @@ def _aws_env(config: InputConfig) -> dict[str, str]:
     return env
 
 
+def _admin_password(env_name: str | None) -> str:
+    if env_name is None:
+        return secrets.token_urlsafe(32)
+    value = os.environ.get(env_name)
+    if not value:
+        raise ConfigError(f"environment variable {env_name} is not set or is empty")
+    return value
+
+
 def _aws(env: dict[str, str], *args: str) -> Any:
     proc = subprocess.run(
         ["aws", *args],
@@ -191,9 +222,12 @@ def _find_existing_instances(config: InputConfig, env: dict[str, str]) -> list[s
     return ids
 
 
-def _confirm_redeploy(agent_name: str, instance_ids: list[str]) -> None:
+def _confirm_upgrade(agent_name: str, instance_ids: list[str], *, assume_yes: bool = False) -> None:
     print(f"TrustyClaw deployment {agent_name!r} already exists: {', '.join(instance_ids)}")
-    answer = input("Delete and recreate it? Type the agent name to confirm: ")
+    if assume_yes:
+        _log("approved upgrade/recover with --allow-upgrade-or-recover")
+        return
+    answer = input("Upgrade/recover it by replacing the EC2 root volume? Type the agent name to confirm: ")
     if answer != agent_name:
         raise SystemExit("aborted")
 
@@ -201,6 +235,29 @@ def _confirm_redeploy(agent_name: str, instance_ids: list[str]) -> None:
 def _terminate_instances(instance_ids: list[str], env: dict[str, str]) -> None:
     _aws(env, "ec2", "terminate-instances", "--instance-ids", *instance_ids)
     _aws(env, "ec2", "wait", "instance-terminated", "--instance-ids", *instance_ids)
+
+
+def _delete_storage_volumes(config: InputConfig, env: dict[str, str]) -> list[str]:
+    deleted: list[str] = []
+    for role in ("admin", "agent"):
+        volume = _find_storage_volume(config, env, role)
+        if volume is None:
+            continue
+        state = volume.get("State")
+        volume_id = volume["VolumeId"]
+        if state != "available":
+            raise ConfigError(
+                f"cannot reset {role} storage volume {volume_id} for {config.agent_name}: "
+                f"volume is {state}, expected available"
+            )
+        _log(
+            f"deleting existing {role} storage volume {volume_id} "
+            "because --reset-storage-dangerous-delete was requested"
+        )
+        _aws(env, "ec2", "delete-volume", "--volume-id", volume_id)
+        _aws(env, "ec2", "wait", "volume-deleted", "--volume-ids", volume_id)
+        deleted.append(volume_id)
+    return deleted
 
 
 def _generate_deploy_key(workdir: Path) -> Path:
@@ -278,6 +335,7 @@ def _ensure_storage_volumes(
     *,
     instance_id: str,
     availability_zone: str,
+    wait_for_detach: bool = False,
 ) -> tuple[dict[str, str], list[str]]:
     volumes: dict[str, str] = {}
     created: list[str] = []
@@ -285,7 +343,13 @@ def _ensure_storage_volumes(
         ("admin", ADMIN_VOLUME_SIZE_GB, ADMIN_VOLUME_DEVICE),
         ("agent", AGENT_VOLUME_SIZE_GB, AGENT_VOLUME_DEVICE),
     ):
-        existing = _find_available_storage_volume(config, env, role, availability_zone)
+        existing = _find_available_storage_volume(
+            config,
+            env,
+            role,
+            availability_zone,
+            wait_for_detach=wait_for_detach,
+        )
         if existing is None:
             volume_id = _create_storage_volume(config, env, role, size_gb, availability_zone)
             created.append(volume_id)
@@ -337,11 +401,23 @@ def _find_available_storage_volume(
     env: dict[str, str],
     role: str,
     availability_zone: str,
+    *,
+    wait_for_detach: bool = False,
 ) -> str | None:
     volume = _find_storage_volume(config, env, role)
     if volume is None:
         return None
     state = volume.get("State")
+    if state != "available" and wait_for_detach:
+        volume_id = volume["VolumeId"]
+        _log(f"waiting for preserved {role} volume {volume_id} to detach")
+        _aws(env, "ec2", "wait", "volume-available", "--volume-ids", volume_id)
+        volume = _find_storage_volume(config, env, role)
+        if volume is None:
+            raise ConfigError(
+                f"TrustyClaw {role} volume {volume_id} for {config.agent_name} disappeared while waiting to detach"
+            )
+        state = volume.get("State")
     if state != "available":
         raise ConfigError(
             f"TrustyClaw {role} volume {volume['VolumeId']} for {config.agent_name} is {state}; "
@@ -643,7 +719,6 @@ def _bootstrap_payload(config: InputConfig, admin_password: str, storage_volumes
             "agent_name": config.agent_name,
             "admin_password_sha256": hashlib.sha256(admin_password.encode()).hexdigest(),
         },
-        "network_controls": config.network_controls.to_json(),
         "storage_volumes": storage_volumes or {},
     }
 
@@ -684,7 +759,7 @@ def _render_user_data(config: InputConfig, deploy_public_key: str) -> str:
 
 
 def _render_bootstrap(config: InputConfig) -> str:
-    ssh_rule = "tcp dport 22 accept"
+    ssh_rule = "tcp dport 22 accept" if config.ssh_port_opened else ""
     return (
         BOOTSTRAP_TEMPLATE
         .replace("@SSH_RULE@", ssh_rule)
