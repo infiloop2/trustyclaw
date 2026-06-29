@@ -11,7 +11,7 @@ ALLOWED_HTTP_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"}
 AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,50}$")
 EXACT_DOMAIN_RE = re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 WILDCARD_DOMAIN_RE = re.compile(r"^\*\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
-OPENAI_PROVIDER_RULES = {
+OPENAI_PROVIDER_RULES: dict[str, dict[str, Any]] = {
     "api.openai.com": {
         "allow_http_methods": ("POST",),
         "openai_account_guard": True,
@@ -26,7 +26,7 @@ OPENAI_PROVIDER_RULES = {
         "openai_disable_live_web_search": True,
     },
 }
-CLAUDE_PROVIDER_RULES = {
+CLAUDE_PROVIDER_RULES: dict[str, dict[str, Any]] = {
     "api.anthropic.com": {
         "allow_http_methods": ("GET", "POST"),
         "anthropic_account_guard": True,
@@ -82,13 +82,11 @@ class ManagedAiProviderNetworkAccess:
 
 @dataclass(frozen=True)
 class NetworkControls:
-    ssh_port_opened: bool
     managed_ai_provider_network_access: ManagedAiProviderNetworkAccess
     allowed_network_access: dict[str, DomainRule]
 
     def to_json(self) -> dict[str, Any]:
         return {
-            "ssh_port_opened": self.ssh_port_opened,
             "managed_ai_provider_network_access": self.managed_ai_provider_network_access.to_json(),
             "allowed_network_access": {
                 domain: rule.to_json() for domain, rule in sorted(self.allowed_network_access.items())
@@ -103,7 +101,7 @@ class InputConfig:
     aws_access_key_id_env: str
     aws_secret_access_key_env: str
     ssh_public_key: str
-    network_controls: NetworkControls
+    ssh_port_opened: bool
 
 
 def load_input_config(path: str | Path) -> InputConfig:
@@ -123,7 +121,7 @@ def parse_input_config(raw: dict[str, Any]) -> InputConfig:
         "aws_access_key_id_env",
         "aws_secret_access_key_env",
         "ssh_public_key",
-        "network_controls",
+        "ssh_port_opened",
     }
     _reject_extra(raw, allowed_keys, "config")
     agent_name = _string(raw, "agent_name")
@@ -135,10 +133,10 @@ def parse_input_config(raw: dict[str, Any]) -> InputConfig:
     ssh_public_key = _string(raw, "ssh_public_key")
     if not (ssh_public_key.startswith("ssh-ed25519 ") or ssh_public_key.startswith("ssh-rsa ")):
         raise ConfigError("ssh_public_key must be an OpenSSH public key")
-    network_controls = parse_network_controls(_object(raw, "network_controls"))
-    if not network_controls.ssh_port_opened:
+    ssh_port_opened = _bool(raw, "ssh_port_opened")
+    if not ssh_port_opened:
         raise ConfigError(
-            "network_controls.ssh_port_opened must be true because SSH is currently "
+            "ssh_port_opened must be true because SSH is currently "
             "the only supported way to access the host"
         )
     return InputConfig(
@@ -147,12 +145,12 @@ def parse_input_config(raw: dict[str, Any]) -> InputConfig:
         aws_access_key_id_env=_string(raw, "aws_access_key_id_env"),
         aws_secret_access_key_env=_string(raw, "aws_secret_access_key_env"),
         ssh_public_key=ssh_public_key,
-        network_controls=network_controls,
+        ssh_port_opened=ssh_port_opened,
     )
 
 
 def parse_network_controls(raw: dict[str, Any]) -> NetworkControls:
-    _reject_extra(raw, {"ssh_port_opened", "managed_ai_provider_network_access", "allowed_network_access"}, "network_controls")
+    _reject_extra(raw, {"managed_ai_provider_network_access", "allowed_network_access"}, "network_controls")
     managed_ai_provider_network_access = parse_managed_ai_provider_network_access(
         _object(raw, "managed_ai_provider_network_access", required=False)
     )
@@ -184,7 +182,6 @@ def parse_network_controls(raw: dict[str, Any]) -> NetworkControls:
         allowed[normalized_domain] = parse_domain_rule(_object(allowed_raw, domain), normalized_domain)
     _reject_overlapping_wildcards(allowed)
     return NetworkControls(
-        ssh_port_opened=_bool(raw, "ssh_port_opened"),
         managed_ai_provider_network_access=managed_ai_provider_network_access,
         allowed_network_access=allowed,
     )

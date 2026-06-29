@@ -1,0 +1,55 @@
+name: rate-limit-live-aws-runs
+description: Reject live AWS workflow runs when too many started recently.
+
+inputs:
+  workflow-file:
+    description: Workflow file name, for example trustyclaw-smoke.yml.
+    required: true
+  authorized-job-name:
+    description: Authorize job display name that must have completed successfully for a run to count.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Rate limit live AWS runs
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        WORKFLOW_FILE: ${{ inputs.workflow-file }}
+        AUTHORIZED_JOB_NAME: ${{ inputs.authorized-job-name }}
+        CURRENT_RUN_ID: ${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        window_start="$(date -u -d '60 minutes ago' +'%Y-%m-%dT%H:%M:%SZ')"
+        run_ids="$(curl -fsS --get \
+          -H "Authorization: Bearer ${GH_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          --data-urlencode "per_page=100" \
+          --data-urlencode "created=>=${window_start}" \
+          "${{ github.api_url }}/repos/${REPO}/actions/workflows/${WORKFLOW_FILE}/runs" \
+          | jq -r '.workflow_runs[].id')"
+
+        count=0
+        while IFS= read -r run_id; do
+          if [[ -z "${run_id}" || "${run_id}" == "${CURRENT_RUN_ID}" ]]; then
+            continue
+          fi
+          authorized_count="$(curl -fsS --get \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            --data-urlencode "per_page=100" \
+            "${{ github.api_url }}/repos/${REPO}/actions/runs/${run_id}/jobs" \
+            | jq --arg name "${AUTHORIZED_JOB_NAME}" \
+              '[.jobs[] | select(.name == $name and .conclusion == "success")] | length')"
+          if (( authorized_count > 0 )); then
+            count=$((count + 1))
+          fi
+        done <<<"${run_ids}"
+
+        if (( count >= 10 )); then
+          echo "Rate limit exceeded: ${count} authorized ${WORKFLOW_FILE} runs started in the last hour; limit is 10." >&2
+          exit 1
+        fi
+        echo "${count}/10 authorized ${WORKFLOW_FILE} runs started in the last hour."

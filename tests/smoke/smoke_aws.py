@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """The smoke test: deploy a real host, validate it end to end, tear it down.
 
-This is the single manual smoke test for the project. It validates everything
-the unit tests cannot — including live agent runtime behavior exercised through
-the deployed admin API. It always runs both Codex and Claude Code paths.
+This is the fresh-host smoke test for the project. It validates the deploy,
+bootstrap, admin API, proxy, and state-management paths that unit tests cannot.
+It deliberately does not require Codex or Claude OAuth login; persistent,
+login-dependent runtime checks live in ``tests/stage/stage_aws.py``.
 
   - the deploy path (subnet selection, security group, IMDSv2, SSH provisioning)
   - the bootstrap on real Ubuntu 22.04 (apt, npm, user/permission setup,
@@ -24,45 +25,29 @@ the deployed admin API. It always runs both Codex and Claude Code paths.
     only through the proxy, a denied path is blocked, direct external egress is
     dropped by nftables, and non-proxy loopback access to the admin API is
     blocked
-  - deploy-time config schema on the real host: agent_runtime and agent_type
-    are gone; managed providers omitted at first boot leave both runtimes
-    deactivated until the runtime policy enables them
+  - deploy-time config schema on the real host: agent_runtime, agent_type,
+    ssh_port_opened, and network_controls are absent from persisted runtime
+    config; first boot creates an empty runtime network policy, with no
+    network_status.json, and both runtimes stay deactivated until the runtime
+    policy enables their managed providers
   - proxy protocol edge cases: CONNECT port pinning, unknown hosts, Host
     header mismatch, percent-encoded paths against path guards, wildcard
     domain rules, malformed request lengths, and plain-HTTP proxying
-  - OpenAI account pinning: data-plane traffic fails closed before login;
-    after login, missing/wrong account headers are denied, live web search is
-    denied, and the cached variant is allowed
-  - after an interactive Codex login: a real Codex web search
-    task (which completes only if the agent's real ChatGPT traffic passes the
-    live web search guard), then the live Codex behavior the host depends on,
-    with small tasks running alongside Claude Code tasks through independent
-    per-runtime 3-worker pools (peak concurrency proven from event timestamps,
-    never above 6 total), steering a
-    running task mid-turn, killing a running task and resuming its thread
-    afterwards, and thread context surviving warm app-server reuse, pool
-    eviction (a fresh process resuming a persisted thread), and a full host
-    reboot
-  - after an interactive Claude Code OAuth login: Anthropic API
-    traffic fails closed before the account token hash is known, missing/wrong
-    bearer tokens are denied after login, a real Claude task completes through
-    the proxy, and the same steering, kill, thread recall, reboot, and prune
-    checks run against Claude session resume
-  - host reboot recovery: services restart enabled, task history, provider
-    login, and the thread map all survive on the EBS volume
+  - provider guard pre-login behavior: managed OpenAI/Claude access wakes
+    runtimes but does not require completing OAuth
   - the cross-process event log locking: the network event log is pushed past
     its prune threshold so the proxy rewrites it by rename mid-storm
     while the admin API concurrently reads it through its narrow proxy-state
     helper — reads stay consistent, seqs stay unique and ordered, and the
     pruned file remains proxy-private
 
-DO NOT run this in CI. It creates real billable AWS resources and needs real
-network. CI runs with no network on purpose.
+Only run this from the dedicated smoke GitHub Action or manually with the
+scoped smoke AWS credentials. It creates real billable AWS resources and needs
+real network. Unit-test CI runs with no network on purpose.
 
-This script tears down what it created (terminates the instance, deletes the
-security group, and deletes the data volumes when deploy reached the point of
-writing their ids), even on failure. If deploy fails before the result file is
-written, the tagged data volumes remain visible to the next deploy run.
+This script starts by resetting any stale smoke data volumes, then tears down
+all resources tagged for the smoke agent (instances, volumes, and security
+groups), even if deploy failed before writing its result file.
 
 The smoke owns its own deploy config: it deploys an agent named
 ``trustyclaw-smoke`` into ``SMOKE_REGION`` (below), which is pinned to the
@@ -79,8 +64,7 @@ Environment assumptions (each is checked, with a clear failure if missing):
 
 Cost: one t3.small plus a 16 GiB root gp3 volume and two 8 GiB encrypted data
 gp3 volumes for the few minutes the test runs (about one US cent). Teardown
-removes the instance root volume and, when their ids are known, both data
-volumes.
+removes the instance root volume and all tagged smoke data volumes.
 
 Usage:
     export AWS_ACCESS_KEY_ID=...
@@ -156,20 +140,7 @@ def main(argv: list[str] | None = None) -> int:
         smoke.check_enforcement()
         smoke.check_proxy_edge_cases()
         smoke.check_proxy_concurrency()
-        smoke.check_web_search_guard()
-        smoke.agent_runtime = "codex"
-        smoke.check_task()
-        smoke.agent_runtime = "claude_code"
-        smoke.check_claude_auth_and_task()
-        smoke.check_both_runtimes_active()
-        smoke.check_agent_parallelism()
-        for runtime in SMOKE_RUNTIMES:
-            smoke.agent_runtime = runtime
-            smoke.check_agent_steering()
-            smoke.check_agent_kill_and_thread_survival()
-        smoke.check_agent_thread_recall()
-        smoke.check_runtime_deactivation_stops_running_tasks()
-        smoke.check_reboot_recovery()
+        smoke.check_pre_login_provider_guards()
         smoke.check_network_event_prune_race()
         print(f"\n{smoke.passed}/{smoke.total} checks passed")
         return 0 if smoke.passed == smoke.total else 1
@@ -189,7 +160,7 @@ class AwsSmoke:
         self.ssh_key: str | None = None
         self.effective_config = self.workdir / "effective_config.json"
         self.config = None
-        self.region = ""
+        self.region = SMOKE_REGION
         self.result: dict | None = None
         self.tunnel_open = False
         self.passed = 0
@@ -222,7 +193,6 @@ class AwsSmoke:
         so Codex and Claude Code can be logged in and interwoven in one run.
         """
         return {
-            "ssh_port_opened": True,
             "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
             "allowed_network_access": {
                 "api.github.com": {"allow_http_methods": ["GET"], "path_guards": ["^/$", "^/zen$"]},
@@ -248,10 +218,7 @@ class AwsSmoke:
             "aws_access_key_id_env": ACCESS_KEY_ENV,
             "aws_secret_access_key_env": SECRET_KEY_ENV,
             "ssh_public_key": public_key,
-            "network_controls": {
-                "ssh_port_opened": True,
-                "allowed_network_access": {},
-            },
+            "ssh_port_opened": True,
         }
         self.effective_config.write_text(json.dumps(raw))
         self.config = load_input_config(self.effective_config)
@@ -262,7 +229,15 @@ class AwsSmoke:
         env = os.environ.copy()
         env["PYTHONPATH"] = str(REPO_ROOT)
         subprocess.run(
-            [sys.executable, "-m", "host.deploy", "--config", str(self.effective_config)],
+            [
+                sys.executable,
+                "-m",
+                "host.deploy",
+                "--config",
+                str(self.effective_config),
+                "--allow-upgrade-or-recover",
+                "--reset-storage-dangerous-delete",
+            ],
             cwd=self.workdir,
             env=env,
             check=True,
@@ -309,35 +284,105 @@ class AwsSmoke:
         self._start_tunnel()
 
     def teardown(self) -> None:
-        if self.tunnel_open:
+        if self.tunnel_open and self.result:
             subprocess.run(
                 ["ssh", "-S", str(self.control_socket), "-O", "exit", f"trustyclaw-operator@{self.result['public_dns']}"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
             )
-        if self.result:
-            print("\nTearing down...")
-            self._aws("ec2", "terminate-instances", "--instance-ids", self.result["instance_id"])
-            self._aws("ec2", "wait", "instance-terminated", "--instance-ids", self.result["instance_id"])
-            deleted_volumes: list[str] = []
-            for key in ("admin_volume_id", "agent_volume_id"):
-                volume_id = self.result.get(key)
-                if not isinstance(volume_id, str) or not volume_id:
-                    continue
-                try:
-                    self._aws("ec2", "wait", "volume-available", "--volume-ids", volume_id)
-                    self._aws("ec2", "delete-volume", "--volume-id", volume_id)
-                    deleted_volumes.append(volume_id)
-                except subprocess.CalledProcessError as exc:
-                    print(f"warning: could not delete {key} {volume_id}: {exc}", file=sys.stderr)
-            groups = self._aws(
-                "ec2", "describe-security-groups",
-                "--filters", f"Name=group-name,Values=trustyclaw-host-{self.config.agent_name}",
-            ).get("SecurityGroups", [])
-            for group in groups:
-                self._aws("ec2", "delete-security-group", "--group-id", group["GroupId"])
-            volume_note = f" and deleted data volumes {', '.join(deleted_volumes)}" if deleted_volumes else ""
-            print(f"terminated {self.result['instance_id']}, deleted its security group{volume_note}")
-        shutil.rmtree(self.workdir, ignore_errors=True)
+        try:
+            self._destroy_tagged_smoke_resources()
+        finally:
+            shutil.rmtree(self.workdir, ignore_errors=True)
+
+    def _destroy_tagged_smoke_resources(self) -> None:
+        print("\nTearing down tagged smoke AWS resources...")
+        instance_ids = self._tagged_instance_ids("pending,running,stopping,stopped")
+        if instance_ids:
+            print(f"  terminating instances: {', '.join(instance_ids)}", flush=True)
+            self._aws("ec2", "terminate-instances", "--instance-ids", *instance_ids)
+            self._aws("ec2", "wait", "instance-terminated", "--instance-ids", *instance_ids)
+        shutting_down_ids = self._tagged_instance_ids("shutting-down")
+        if shutting_down_ids:
+            print(f"  waiting for already-shutting-down instances: {', '.join(shutting_down_ids)}", flush=True)
+            self._aws("ec2", "wait", "instance-terminated", "--instance-ids", *shutting_down_ids)
+
+        volume_ids = self._tagged_volume_ids()
+        deleted_volumes: list[str] = []
+        for volume_id in volume_ids:
+            try:
+                self._aws("ec2", "wait", "volume-available", "--volume-ids", volume_id)
+                self._aws("ec2", "delete-volume", "--volume-id", volume_id)
+                self._aws("ec2", "wait", "volume-deleted", "--volume-ids", volume_id)
+                deleted_volumes.append(volume_id)
+            except subprocess.CalledProcessError as exc:
+                print(f"warning: could not delete volume {volume_id}: {exc}", file=sys.stderr)
+
+        group_ids = self._tagged_security_group_ids()
+        deleted_groups: list[str] = []
+        for group_id in group_ids:
+            try:
+                self._aws("ec2", "delete-security-group", "--group-id", group_id)
+                deleted_groups.append(group_id)
+            except subprocess.CalledProcessError as exc:
+                print(f"warning: could not delete security group {group_id}: {exc}", file=sys.stderr)
+
+        remaining = {
+            "instances": self._tagged_instance_ids(),
+            "volumes": self._tagged_volume_ids(),
+            "security_groups": self._tagged_security_group_ids(),
+        }
+        if any(remaining.values()):
+            raise AssertionError(f"tagged smoke AWS resources remain after teardown: {remaining}")
+        print(
+            "  destroyed tagged smoke resources"
+            f" (instances={len(instance_ids)}, volumes={len(deleted_volumes)}, security_groups={len(deleted_groups)})",
+            flush=True,
+        )
+
+    def _smoke_tag_filters(self) -> list[str]:
+        return [
+            f"Name=tag:trustyclaw-host-agent-name,Values={SMOKE_AGENT_NAME}",
+            "Name=tag:trustyclaw-host,Values=true",
+        ]
+
+    def _tagged_instance_ids(
+        self,
+        states: str = "pending,running,stopping,stopped,shutting-down",
+    ) -> list[str]:
+        response = self._aws(
+            "ec2",
+            "describe-instances",
+            "--filters",
+            *self._smoke_tag_filters(),
+            f"Name=instance-state-name,Values={states}",
+        )
+        ids: list[str] = []
+        for reservation in response.get("Reservations", []):
+            for instance in reservation.get("Instances", []):
+                instance_id = instance.get("InstanceId")
+                if isinstance(instance_id, str):
+                    ids.append(instance_id)
+        return sorted(ids)
+
+    def _tagged_volume_ids(self) -> list[str]:
+        response = self._aws("ec2", "describe-volumes", "--filters", *self._smoke_tag_filters())
+        ids: list[str] = []
+        for volume in response.get("Volumes", []):
+            if volume.get("State") in {"deleted", "deleting"}:
+                continue
+            volume_id = volume.get("VolumeId")
+            if isinstance(volume_id, str):
+                ids.append(volume_id)
+        return sorted(ids)
+
+    def _tagged_security_group_ids(self) -> list[str]:
+        response = self._aws("ec2", "describe-security-groups", "--filters", *self._smoke_tag_filters())
+        ids: list[str] = []
+        for group in response.get("SecurityGroups", []):
+            group_id = group.get("GroupId")
+            if isinstance(group_id, str):
+                ids.append(group_id)
+        return sorted(ids)
 
     # --- checks ------------------------------------------------------------
 
@@ -389,8 +434,15 @@ class AwsSmoke:
             raise AssertionError(f"host config still persists agent_runtime: {config}")
         if "agent_type" in config:
             raise AssertionError(f"host config still persists agent_type: {config}")
+        if "ssh_port_opened" in config:
+            raise AssertionError(f"host config still persists deployment-only ssh_port_opened: {config}")
+        if "network_controls" in config:
+            raise AssertionError(f"host config still persists deployment-time network_controls: {config}")
         if "admin_password_sha256" not in config:
             raise AssertionError(f"host config missing password hash: {config}")
+        expected_config_keys = {"agent_name", "admin_password_sha256"}
+        if set(config) != expected_config_keys:
+            raise AssertionError(f"host runtime config has unexpected keys: {config}")
         account_files = json.loads(self._ssh_code(
             "sudo python3 - <<'PY'\n"
             "import grp, json, os, pwd\n"
@@ -430,7 +482,6 @@ class AwsSmoke:
             "    '/mnt/trustyclaw-admin/admin-state',\n"
             "    '/mnt/trustyclaw-admin/proxy-state',\n"
             "    '/mnt/trustyclaw-admin/proxy-state/network_controls.json',\n"
-            "    '/mnt/trustyclaw-admin/proxy-state/network_status.json',\n"
             "    '/mnt/trustyclaw-admin/proxy-state/openai_account.json',\n"
             "    '/mnt/trustyclaw-admin/proxy-state/claude_account.json',\n"
             "    '/mnt/trustyclaw-admin/proxy-state/.network_policy.lock',\n"
@@ -481,7 +532,6 @@ class AwsSmoke:
             "/mnt/trustyclaw-admin/admin-state": ("trustyclaw-admin", "trustyclaw-admin", "0o700", False),
             "/mnt/trustyclaw-admin/proxy-state": ("trustyclaw-proxy", "trustyclaw-proxy", "0o700", False),
             "/mnt/trustyclaw-admin/proxy-state/network_controls.json": ("trustyclaw-proxy", "trustyclaw-proxy", "0o600", False),
-            "/mnt/trustyclaw-admin/proxy-state/network_status.json": ("trustyclaw-proxy", "trustyclaw-proxy", "0o600", False),
             "/mnt/trustyclaw-admin/proxy-state/openai_account.json": ("trustyclaw-proxy", "trustyclaw-proxy", "0o600", False),
             "/mnt/trustyclaw-admin/proxy-state/claude_account.json": ("trustyclaw-proxy", "trustyclaw-proxy", "0o600", False),
             "/mnt/trustyclaw-admin/proxy-state/.network_policy.lock": ("trustyclaw-proxy", "trustyclaw-proxy", "0o600", False),
@@ -523,7 +573,26 @@ class AwsSmoke:
 
     def check_initial_disabled_provider_deploy(self) -> None:
         self._step("initial deploy with managed providers disabled")
+        stored = json.loads(self._ssh_code("sudo cat /mnt/trustyclaw-admin/proxy-state/network_controls.json"))
+        expected_empty_policy = {
+            "managed_ai_provider_network_access": {},
+            "allowed_network_access": {},
+        }
+        if stored.get("network_controls") != expected_empty_policy:
+            raise AssertionError(f"initial stored policy should be empty: {stored}")
+        if not isinstance(stored.get("updated_at"), str) or not stored["updated_at"]:
+            raise AssertionError(f"initial stored policy missing updated_at: {stored}")
+        status_path = self._ssh_code(
+            "sudo bash -c '! test -e /mnt/trustyclaw-admin/proxy-state/network_status.json && echo absent'"
+        ).strip()
+        if status_path != "absent":
+            raise AssertionError("network_status.json should not exist; network status is derived")
         policy = self._api("GET", "/v1/network/policy")["network_controls"]
+        if policy != expected_empty_policy:
+            raise AssertionError(f"initial API policy should be empty: {policy}")
+        health = self._api("GET", "/v1/health")
+        if health["network_controls"]["status"] != "active":
+            raise AssertionError(f"empty valid policy should report derived active network status: {health}")
         if policy.get("managed_ai_provider_network_access", {}) != {}:
             raise AssertionError(f"initial policy should keep managed providers disabled: {policy}")
         if policy.get("allowed_network_access") != {}:
@@ -549,7 +618,7 @@ class AwsSmoke:
             status = self._wait_for_runtime_status({"loading", "awaiting_login", "active"}, runtime=runtime, timeout=120)
             if status not in {"loading", "awaiting_login", "active"}:
                 raise AssertionError(f"{runtime} did not wake after enabling provider access, got {status}")
-        self._ok("first boot fails closed with providers omitted; enabling policy wakes both runtimes")
+        self._ok("first boot creates an empty derived-active policy; providers omitted keep runtimes deactivated")
 
     def check_ui_page(self) -> None:
         self._step("admin UI page served at / without auth")
@@ -561,22 +630,135 @@ class AwsSmoke:
             raise AssertionError(f"UI page content type is {content_type!r}")
         if "TrustyClaw" not in page:
             raise AssertionError("UI page does not look like the admin UI")
+        for path, expected_type in (
+            ("/admin_ui.css", "text/css"),
+            ("/admin_ui.js", "application/javascript"),
+        ):
+            request = urllib.request.Request(f"http://127.0.0.1:{ADMIN_PORT}{path}")
+            with urllib.request.urlopen(request, timeout=30) as response:
+                asset_type = response.headers.get("Content-Type", "")
+                asset_body = response.read().decode()
+            if expected_type not in asset_type:
+                raise AssertionError(f"UI asset {path} content type is {asset_type!r}")
+            page += "\n" + asset_body
         for expected in (
+            '<link rel="stylesheet" href="/admin_ui.css">',
+            '<script src="/admin_ui.js"></script>',
             "<h2>Threads</h2>",
             "/v1/threads",
             "/v1/threads/${encodeURIComponent(threadId)}/tasks",
             "/v1/tasks/${encodeURIComponent(taskId)}/events",
             "showThread",
             "showTaskEvents",
+            'data-action="show-thread"',
+            'data-action="show-task-events"',
+            "button[data-action]",
             "TASK_EVENT_PAGE_BATCH",
             "loadMoreTaskEvents",
+            'id="panel-home"',
+            'id="panel-agent"',
+            'id="panel-network"',
+            'id="runtime-guidance"',
+            'id="active-policy"',
+            'id="policy-message"',
+            'id="policy-status"',
+            'id="start-codex-login"',
+            'id="start-claude-login"',
+            "disabled>Start Codex login</button>",
+            "disabled>Start Claude login</button>",
+            "updateLoginButtons",
+            'id="policy-preset-openai"',
+            'id="policy-preset-claude"',
+            'id="policy-preset-github"',
+            'id="policy-preset-python"',
+            'id="policy-preset-npm"',
+            'id="preset-info-popover"',
+            'aria-label="OpenAI preset domains"',
+            'aria-label="Claude preset domains"',
+            'aria-label="GitHub preset domains"',
+            'aria-label="Python packages preset domains"',
+            'aria-label="npm packages preset domains"',
+            "Open Network settings",
+            "Reboot host",
+            "Current policy",
+            "Policy builder",
+            "Proposed policy",
+            "Proposal matches current policy",
+            "Replace active policy with proposal",
+            "POLICY_PRESETS",
+            "POLICY_PRESET_BUTTONS",
+            "PRESET_INFO",
+            "togglePresetInfo",
+            "renderPresetInfo",
+            "objectValue",
+            "!Array.isArray(value)",
+            "activeNetworkPolicy",
+            "proposedNetworkPolicy",
+            "clonePolicy",
+            "policiesEqual",
+            "renderActivePolicy",
+            "renderProposalStatus",
+            "policyPresetState",
+            "renderPolicyPresets",
+            "rulesEqual",
+            "wildcardCoversDomain",
+            "hasWildcardOverlap",
+            'pattern.startsWith("*.")',
+            "domain.endsWith(pattern.slice(1))",
+            "domain !== pattern.slice(2)",
+            "covered by a wildcard",
+            'button.disabled = state === "partial"',
+            "removePolicyPreset",
+            "preset-active",
+            "preset-partial",
+            "applyPolicyPreset(preset)",
+            'data-preset="openai"',
+            'data-preset="claude"',
+            'data-preset="github"',
+            'data-preset="python"',
+            'data-preset="npm"',
+            "OpenAI expands internally",
+            "Claude expands internally",
+            "GitHub expands",
+            "api.openai.com",
+            "auth.openai.com",
+            "chatgpt.com",
+            "api.anthropic.com",
+            "platform.claude.com",
+            "api.github.com",
+            "codeload.github.com",
+            "objects.githubusercontent.com",
+            "raw.githubusercontent.com",
+            "release-assets.githubusercontent.com",
+            "pypi.org",
+            "files.pythonhosted.org",
+            "nodejs.org",
+            "registry.npmjs.org",
+            "Add manual domain",
+            "saveWebsiteRule",
         ):
             if expected not in page:
                 raise AssertionError(f"UI page is missing thread history path {expected!r}")
-        for removed in ("/v1/tasks/finished", "loadFinishedTasks", "loadAllTaskEvents", "retained_task_count"):
+        for removed in (
+            "onclick=",
+            "oninput=",
+            "/v1/tasks/finished",
+            "loadFinishedTasks",
+            "loadAllTaskEvents",
+            "retained_task_count",
+            "ssh_port_opened",
+            "editWebsiteRule",
+            "removeWebsiteRule",
+            'id="policy-provider-openai"',
+            'id="policy-provider-claude"',
+            'id="policy-websites"',
+            "Enable GitHub",
+            "Policy preset applied",
+            "Network policy replaced",
+        ):
             if removed in page:
                 raise AssertionError(f"UI page still contains removed finished-task path {removed!r}")
-        self._ok("static UI page served unauthenticated; thread history UI routes present; API routes still require auth")
+        self._ok("static UI page served unauthenticated; thread history and network policy controls present; API routes still require auth")
 
     def check_admin_auth(self) -> None:
         self._step("admin API authentication")
@@ -615,8 +797,8 @@ class AwsSmoke:
         self._ok("401 without/with wrong credentials; UI served unauthenticated; malformed admin bodies fail closed")
 
     def check_policy_validation_and_concurrency(self) -> None:
-        self._step("policy validation, ssh pin, and concurrent replaces")
-        # The deploy-time ssh_port_opened value cannot be changed at runtime.
+        self._step("policy validation and concurrent replaces")
+        # SSH is deployment config, not runtime network policy.
         pinned = {
             "ssh_port_opened": False,
             "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
@@ -624,16 +806,15 @@ class AwsSmoke:
         }
         status, body = self._api_status("PUT", "/v1/network/policy", pinned, idem=self._idem("ssh-pin"))
         if status != 400:
-            raise AssertionError(f"ssh_port_opened change returned {status}, expected 400: {body}")
+            raise AssertionError(f"runtime ssh_port_opened field returned {status}, expected 400: {body}")
         invalid = {
-            "ssh_port_opened": True,
             "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
             "allowed_network_access": {"api.github.com": {"allow_http_methods": ["BOGUS"]}},
         }
         status, body = self._api_status("PUT", "/v1/network/policy", invalid, idem=self._idem("bad-method"))
         if status != 400:
             raise AssertionError(f"invalid policy returned {status}, expected 400: {body}")
-        disabled_provider_policy = {"ssh_port_opened": True, "allowed_network_access": {}}
+        disabled_provider_policy = {"allowed_network_access": {}}
         status, body = self._api_status(
             "PUT", "/v1/network/policy", disabled_provider_policy, idem=self._idem("provider-disabled")
         )
@@ -667,7 +848,7 @@ class AwsSmoke:
                 "/v1/agent-runtime/codex-oauth-login",
             ),
         ):
-            policy = {"ssh_port_opened": True, "managed_ai_provider_network_access": providers, "allowed_network_access": {}}
+            policy = {"managed_ai_provider_network_access": providers, "allowed_network_access": {}}
             status, body = self._api_status("PUT", "/v1/network/policy", policy, idem=self._idem(label))
             if status != 200:
                 raise AssertionError(f"{label} provider policy returned {status}, expected 200: {body}")
@@ -691,7 +872,6 @@ class AwsSmoke:
             (
                 "self-managed-openai-domain",
                 {
-                    "ssh_port_opened": True,
                     "managed_ai_provider_network_access": {"openai": True, "claude": True},
                     "allowed_network_access": {"chatgpt.com": {"allow_http_methods": ["GET"]}},
                 },
@@ -700,7 +880,6 @@ class AwsSmoke:
             (
                 "self-managed-claude-domain",
                 {
-                    "ssh_port_opened": True,
                     "managed_ai_provider_network_access": {"openai": True, "claude": True},
                     "allowed_network_access": {"api.anthropic.com": {"allow_http_methods": ["POST"]}},
                 },
@@ -709,7 +888,6 @@ class AwsSmoke:
             (
                 "user-openai-managed-flag",
                 {
-                    "ssh_port_opened": True,
                     "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
                     "allowed_network_access": {
                         "api.github.com": {
@@ -723,7 +901,6 @@ class AwsSmoke:
             (
                 "user-openai-account-guard-flag",
                 {
-                    "ssh_port_opened": True,
                     "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
                     "allowed_network_access": {
                         "api.github.com": {
@@ -746,11 +923,9 @@ class AwsSmoke:
         # Concurrent replaces must serialize: each one either succeeds or is
         # turned away with 409 (the lock wait is bounded), the final policy is
         # exactly one of the successful requests, and enforcement ends active.
-        # A torn or interleaved write would leave a policy nobody requested, or
-        # a stuck "reloading" status.
+        # A torn or interleaved write would leave a policy nobody requested.
         variants = [
             {
-                "ssh_port_opened": True,
                 "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
                 "allowed_network_access": {f"smoke-{index}.example.com": {"allow_http_methods": ["GET"]}},
             }
@@ -1252,31 +1427,52 @@ class AwsSmoke:
             raise AssertionError(f"expected 6 allowed + 6 denied events, got {decisions}")
         self._ok("12 parallel requests all decided and logged with unique, ordered seqs")
 
-    def check_web_search_guard(self) -> None:
-        self._step("OpenAI data-plane fails closed before account id is known")
+    def check_pre_login_provider_guards(self) -> None:
+        self._step("managed provider data-plane fails closed before login")
+        baseline = max((event["seq"] for event in self._network_events()), default=0)
         self._api(
             "PUT",
             "/v1/network/policy",
             {
-                "ssh_port_opened": True,
                 "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
                 "allowed_network_access": {},
             },
         )
         proxy = f"http://127.0.0.1:{PROXY_PORT}"
-        url = "https://chatgpt.com/backend-api/codex/responses"
-        payload = '{"input":"hello"}'
 
-        print(f"  POST {url} before account id is known", flush=True)
-        response = self._ssh_code(
+        openai_url = "https://chatgpt.com/backend-api/codex/responses"
+        openai_payload = '{"input":"hello"}'
+        print(f"  POST {openai_url} before account id is known", flush=True)
+        openai_response = self._ssh_code(
             f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} "
             f"curl -s --max-time 20 -X POST -H 'Content-Type: application/json' "
-            f"--data '{payload}' {url}"
+            f"--data {shlex.quote(openai_payload)} {shlex.quote(openai_url)}"
         )
-        print(f"  -> {response[:200]!r}", flush=True)
-        if "OpenAI account id is not available" not in response:
-            raise AssertionError(f"OpenAI data-plane request did not fail closed; proxy returned {response!r}")
-        events = self._network_events()
+        print(f"  -> {openai_response[:200]!r}", flush=True)
+        if "OpenAI account id is not available" not in openai_response:
+            raise AssertionError(f"OpenAI data-plane request did not fail closed; proxy returned {openai_response!r}")
+
+        claude_hello = self._ssh_code(
+            f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} "
+            "curl -s -o /dev/null -w '%{http_code}' --max-time 20 "
+            "https://api.anthropic.com/api/hello"
+        )
+        if claude_hello == "403" or claude_hello == "000" or claude_hello == "":
+            raise AssertionError(f"Claude unauthenticated readiness path returned {claude_hello!r}, expected proxy allow")
+
+        claude_url = "https://api.anthropic.com/v1/messages"
+        claude_payload = '{"model":"claude-sonnet-4-5","max_tokens":8,"messages":[{"role":"user","content":"hello"}]}'
+        print(f"  POST {claude_url} before Claude account token hash is known", flush=True)
+        claude_response = self._ssh_code(
+            f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} "
+            f"curl -s --max-time 20 -X POST -H 'Content-Type: application/json' "
+            f"--data {shlex.quote(claude_payload)} {shlex.quote(claude_url)}"
+        )
+        print(f"  -> {claude_response[:200]!r}", flush=True)
+        if "Claude account token is not available" not in claude_response:
+            raise AssertionError(f"Anthropic API request did not fail closed before login; proxy returned {claude_response!r}")
+
+        events = self._network_events(since=baseline)
         if not any(
             event["host"] == "chatgpt.com"
             and event["decision"] == "denied"
@@ -1284,7 +1480,23 @@ class AwsSmoke:
             for event in events
         ):
             raise AssertionError("no account-id-missing chatgpt.com network denial was logged")
-        self._ok("chatgpt.com denied before login because the account id is unknown")
+        if not any(
+            event["host"] == "api.anthropic.com"
+            and event["decision"] == "denied"
+            and event.get("reason") == "Claude account token is not available"
+            for event in events
+        ):
+            raise AssertionError("no token-missing api.anthropic.com network denial was logged")
+        if not any(
+            event["host"] == "api.anthropic.com"
+            and event["path"] == "/api/hello"
+            and event["decision"] == "allowed"
+            for event in events
+        ):
+            raise AssertionError("Claude unauthenticated readiness request was not logged as allowed")
+        self._ok(
+            "OpenAI and Claude data-plane requests denied before login while Claude readiness stayed allowed"
+        )
 
     def check_claude_auth_and_task(self) -> None:
         self._step("Claude OAuth + Anthropic account guard + real task (interactive)")
@@ -1293,7 +1505,6 @@ class AwsSmoke:
             "PUT",
             "/v1/network/policy",
             {
-                "ssh_port_opened": True,
                 "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
                 "allowed_network_access": {},
             },
@@ -1419,7 +1630,6 @@ class AwsSmoke:
             "PUT",
             "/v1/network/policy",
             {
-                "ssh_port_opened": True,
                 "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
                 "allowed_network_access": {},
             },
@@ -1587,7 +1797,7 @@ class AwsSmoke:
             if current["status"] != "running":
                 raise AssertionError(f"{runtime} deactivation target never started: {current}")
 
-        self._api("PUT", "/v1/network/policy", {"ssh_port_opened": True, "allowed_network_access": {}})
+        self._api("PUT", "/v1/network/policy", {"allowed_network_access": {}})
         for runtime in SMOKE_RUNTIMES:
             status = self._wait_for_runtime_status({"deactivated"}, runtime=runtime, timeout=90)
             if status != "deactivated":

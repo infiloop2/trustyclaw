@@ -30,15 +30,17 @@ To deploy TrustyClaw, you need:
 2. The AWS CLI and Python 3.11 installed locally.
 3. An SSH key pair for operator access.
 
-Start from one of the included configs:
+Start from the included example config:
 
 ```bash
-cp starter_config.json config.json
+cp example_config.json config.json
 ```
 
-`starter_config.json` creates a strict sandbox with only the managed AI provider
-domains enabled. For coding workflows, start from `coding_config.json`; it also
-allows GitHub plus Python and Node package download domains.
+The deployment config creates the host with SSH access for the operator and no
+agent network access. After deploy, use the admin UI network policy controls to
+enable managed AI providers or add website/domain rules; see
+[`docs/api/NetworkControls.md`](docs/api/NetworkControls.md) for the runtime
+policy schema.
 
 In `config.json`, set:
 
@@ -49,6 +51,7 @@ In `config.json`, set:
 | `aws_access_key_id_env` | Environment variable name containing the AWS access key id. |
 | `aws_secret_access_key_env` | Environment variable name containing the AWS secret access key. |
 | `ssh_public_key` | Public key content installed for SSH access, for example the output of `cat ~/.ssh/id_ed25519.pub`. |
+| `ssh_port_opened` | Required and must be `true`; SSH tunneling is the supported admin access path. |
 
 Deploy reads AWS credentials from the environment variables named in your config:
 
@@ -58,11 +61,11 @@ export AWS_SECRET_ACCESS_KEY=...
 ```
 
 You can use an administrator access key while evaluating the project. For regular
-use, create an IAM user or role with the policy in `iam_policy.json`; destructive
-actions in that policy are limited to resources tagged `trustyclaw-host=true`.
-
-If you changed `aws_region` away from `us-east-1`, update the region conditions
-in `iam_policy.json` before creating the policy:
+use, create an IAM user or role with the policy in `iam_policy.json`. It requires
+TrustyClaw tags on created resources, allows EC2 updates and cleanup only on
+TrustyClaw-tagged resources, and leaves region selection to your deploy config.
+See [`docs/IAMPolicy.md`](docs/IAMPolicy.md) for why each policy statement is
+needed and how its resource scope is constrained.
 
 ```bash
 aws iam create-policy \
@@ -95,10 +98,18 @@ Deploy reads the config and writes a sensitive result file named
 `<agent_name>.json`. That file contains the generated admin password and is
 created mode `0600`.
 
-If `agent_name` already identifies an existing TrustyClaw EC2 instance, deploy prompts
-before redeploying it. Redeploy is the current upgrade/recovery path: the EC2
-instance and root volume are replaced, while the admin and agent data volumes
-are reused.
+If `agent_name` already identifies an existing TrustyClaw EC2 instance, deploy
+prompts before upgrading or recovering it. Upgrade/recover replaces the EC2
+instance and root volume while reusing the admin and agent data volumes.
+
+Deploy flags:
+
+| Flag | Behavior | When to use |
+| --- | --- | --- |
+| `--config <path>` | Required. Reads the deploy input config from `<path>`. | Every deploy. |
+| `--allow-upgrade-or-recover` | If an existing host with the same `agent_name` is found, approve replacing its EC2 instance and root volume without prompting. Preserved admin and agent data volumes are reused unless the dangerous storage reset flag is also set. | Non-interactive upgrades or recovery runs. |
+| `--admin-password-env <name>` | Reads the admin password from environment variable `<name>` instead of generating a new one. The host still receives only the password hash. | Hosts where the admin password should stay stable across upgrades. |
+| `--reset-storage-dangerous-delete` | Deletes existing preserved admin and agent data volumes before creating replacements. This permanently removes admin API state, tasks, events, network policy, provider account pins, proxy CA state, provider auth/session files, CLI caches, and agent workspace data. | Intentional full state reset only. |
 
 The host uses three EBS volumes:
 

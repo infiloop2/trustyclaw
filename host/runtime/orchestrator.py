@@ -357,6 +357,7 @@ def run_next_task() -> None:
         # nothing, and the turn runs on after the operator believes it was
         # stopped.
         server, needs_start = _acquire_server(runtime_type, thread_id, task_id)
+        assert server is not None
         if needs_start:
             server.start()
         # If a kill cancelled this task while the server was starting, abandon
@@ -565,10 +566,11 @@ def _finish_task(
         if status == COMPLETED:
             task["output_message"] = output
             session_record = {"last_used_at": utc_now()}
-            if runtime_type == "claude_code":
-                session_record["session_id"] = provider_session_id
-            else:
-                session_record["codex_thread_id"] = provider_session_id
+            if provider_session_id is not None:
+                if runtime_type == "claude_code":
+                    session_record["session_id"] = provider_session_id
+                else:
+                    session_record["codex_thread_id"] = provider_session_id
             state.setdefault(_session_map_key(runtime_type), {})[thread_id] = session_record
             append_agent_event(state, "task.completed", task_id, {})
         else:

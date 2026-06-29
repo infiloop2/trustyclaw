@@ -26,7 +26,8 @@
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:RequestTag/trustyclaw-host": "true"
+          "aws:RequestTag/trustyclaw-host": "true",
+          "aws:RequestTag/trustyclaw-host-agent-name": "trustyclaw-stage"
         }
       }
     },
@@ -51,7 +52,8 @@
       "Resource": "arn:aws:ec2:*:*:security-group/*",
       "Condition": {
         "StringEquals": {
-          "aws:ResourceTag/trustyclaw-host": "true"
+          "aws:ResourceTag/trustyclaw-host": "true",
+          "aws:ResourceTag/trustyclaw-host-agent-name": "trustyclaw-stage"
         }
       }
     },
@@ -63,6 +65,7 @@
       "Condition": {
         "StringEquals": {
           "aws:RequestTag/trustyclaw-host": "true",
+          "aws:RequestTag/trustyclaw-host-agent-name": "trustyclaw-stage",
           "ec2:CreateAction": [
             "RunInstances",
             "CreateVolume",
@@ -90,7 +93,8 @@
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:ResourceTag/trustyclaw-host": "true"
+          "aws:ResourceTag/trustyclaw-host": "true",
+          "aws:ResourceTag/trustyclaw-host-agent-name": "trustyclaw-stage"
         }
       }
     },

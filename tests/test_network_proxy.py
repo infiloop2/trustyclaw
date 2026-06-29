@@ -12,8 +12,8 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from host.runtime.network_policy import load_policy, save_policy, save_status
-from host.runtime.state import read_network_events
+from host.runtime.network_policy import load_policy, save_policy
+from host.runtime.state import read_network_events, save_proxy_openai_account_id
 from host.runtime import network_proxy
 
 
@@ -56,12 +56,10 @@ class NetworkProxyTests(unittest.TestCase):
         self.env_patch = patch.dict("os.environ", {"TRUSTYCLAW_STATE_DIR": self.temp_dir.name})
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
-        save_status("active")
 
     def save_policy(self, allowed_network_access: dict) -> None:
         save_policy(
             {
-                "ssh_port_opened": True,
                 "managed_ai_provider_network_access": {"openai": True},
                 "allowed_network_access": allowed_network_access,
             },
@@ -98,6 +96,23 @@ class NetworkProxyTests(unittest.TestCase):
         for host in ("api.openai.com", "auth.openai.com", "chatgpt.com"):
             self.assertNotIn(host, stored["allowed_network_access"])
             self.assertIn(host, enforcement["allowed_network_access"])
+
+    def test_proxy_loads_valid_policy_without_status_file(self) -> None:
+        self.save_policy({})
+
+        policy, denial = network_proxy._policy_load_denial()
+
+        self.assertIsNone(denial)
+        self.assertIn("api.openai.com", policy["allowed_network_access"])
+
+    def test_proxy_reports_invalid_policy_without_status_file(self) -> None:
+        save_policy({"bogus": True}, "2026-06-08T00:00:00Z")
+
+        policy, denial = network_proxy._policy_load_denial()
+
+        self.assertEqual(policy, {})
+        self.assertIsNotNone(denial)
+        self.assertIn("network policy invalid", denial)
 
     def self_signed_cert(self, name: str) -> tuple[str, str]:
         cert = Path(self.temp_dir.name) / f"{name}.crt"
@@ -401,17 +416,20 @@ class NetworkProxyTests(unittest.TestCase):
     def test_live_web_search_payload_is_denied_with_specific_reason(self) -> None:
         self.proxy_ca()
         proxy = self.start_proxy()
-        self.save_policy(
-            {"127.0.0.1": {"allow_http_methods": ["POST"], "openai_disable_live_web_search": True}}
+        save_policy(
+            {"managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}},
+            "2026-06-08T00:00:00Z",
         )
+        save_proxy_openai_account_id("acct-test")
         body = b'{"tools":[{"type":"web_search","external_web_access":true}]}'
         request = (
-            b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            b"POST /v1/responses HTTP/1.1\r\nHost: chatgpt.com\r\n"
+            b"ChatGPT-Account-ID: acct-test\r\n"
             b"Content-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
         )
 
         # No upstream is needed: the guard denies before any upstream connection.
-        response = self.https_via_proxy(proxy.server_address[1], request)
+        response = self.https_via_proxy(proxy.server_address[1], request, host="chatgpt.com")
 
         self.assertIn(b"403", response)
         self.assertIn(b"live web search is disabled", response)
@@ -483,16 +501,16 @@ class NetworkProxyTests(unittest.TestCase):
                 stack.enter_context(patch("host.runtime.network_proxy.ssl.create_default_context", ssl._create_unverified_context))
             yield
 
-    def https_via_proxy(self, proxy_port: int, request: bytes) -> bytes:
+    def https_via_proxy(self, proxy_port: int, request: bytes, *, host: str = "127.0.0.1") -> bytes:
         raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         raw.settimeout(5)
         raw.connect(("127.0.0.1", proxy_port))
         try:
-            raw.sendall(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
+            raw.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n".encode())
             connect_response = raw.recv(4096)
             self.assertIn(b"200 Connection Established", connect_response)
             context = ssl._create_unverified_context()
-            tls = context.wrap_socket(raw, server_hostname="127.0.0.1")
+            tls = context.wrap_socket(raw, server_hostname=host)
             try:
                 tls.sendall(request)
                 chunks: list[bytes] = []
@@ -557,7 +575,6 @@ class WebSocketHandshakeTests(unittest.TestCase):
 
 class WebSocketGuardTests(unittest.TestCase):
     POLICY = {
-        "ssh_port_opened": True,
         "allowed_network_access": {
             "chatgpt.com": {"allow_http_methods": ["GET"], "openai_disable_live_web_search": True},
             "example.com": {"allow_http_methods": ["GET"]},

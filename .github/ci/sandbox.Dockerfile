@@ -4,14 +4,34 @@
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # The runtime is Python standard library only; the tests additionally need
 # openssl (proxy certificate tests), bash (rendered script checks), and
-# rsync (sandbox workspace copy).
+# rsync (sandbox workspace copy). The admin UI browser smoke needs Playwright
+# and Chromium installed while the image still has build-time network access.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
+    ca-certificates \
     openssl \
     python3.11 \
+    python3.11-venv \
     rsync \
   && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
   && rm -rf /var/lib/apt/lists/*
+
+COPY tests/smoke-ui/requirements.txt /tmp/smoke-ui-requirements.txt
+COPY tests/typecheck-requirements.txt /tmp/typecheck-requirements.txt
+
+RUN python3.11 -m venv /opt/trustyclaw-ci-venv \
+  && /opt/trustyclaw-ci-venv/bin/python -m pip install --upgrade pip \
+  && /opt/trustyclaw-ci-venv/bin/python -m pip install -r /tmp/smoke-ui-requirements.txt \
+  && /opt/trustyclaw-ci-venv/bin/python -m pip install -r /tmp/typecheck-requirements.txt \
+  && /opt/trustyclaw-ci-venv/bin/python -m mypy --version \
+  && /opt/trustyclaw-ci-venv/bin/python -m pyright --version \
+  && /opt/trustyclaw-ci-venv/bin/python -m playwright install --with-deps chromium \
+  && rm -f /tmp/smoke-ui-requirements.txt /tmp/typecheck-requirements.txt
+
+ENV PATH="/opt/trustyclaw-ci-venv/bin:${PATH}"

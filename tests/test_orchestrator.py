@@ -78,7 +78,6 @@ class OrchestratorTests(unittest.TestCase):
         self.addCleanup(orchestrator._CLOSING_THREADS.clear)
         save_policy(
             {
-                "ssh_port_opened": True,
                 "managed_ai_provider_network_access": {"openai": True, "claude": True},
                 "allowed_network_access": {},
             },
@@ -205,7 +204,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_claim_uses_current_provider_policy_not_only_cached_active_status(self) -> None:
         save_policy(
-            {"ssh_port_opened": True, "managed_ai_provider_network_access": {}, "allowed_network_access": {}},
+            {"managed_ai_provider_network_access": {}, "allowed_network_access": {}},
             "2026-06-08T00:00:01Z",
         )
         self.seed_tasks(make_task(1, "stale-active-codex"), make_task(2, "stale-active-claude", runtime="claude_code"))
@@ -560,7 +559,7 @@ class OrchestratorTests(unittest.TestCase):
 
         def status_after_policy_flip():
             save_policy(
-                {"ssh_port_opened": True, "managed_ai_provider_network_access": {}, "allowed_network_access": {}},
+                {"managed_ai_provider_network_access": {}, "allowed_network_access": {}},
                 "2026-06-08T00:00:02Z",
             )
             return "awaiting_login", None, None
@@ -719,7 +718,6 @@ class OrchestratorTests(unittest.TestCase):
     def test_policy_change_refreshes_reenabled_runtime_without_waiting_for_poll_cadence(self) -> None:
         save_policy(
             {
-                "ssh_port_opened": True,
                 "managed_ai_provider_network_access": {"openai": True},
                 "allowed_network_access": {},
             },

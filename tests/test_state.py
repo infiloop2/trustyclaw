@@ -135,7 +135,6 @@ class StateTransactionTests(unittest.TestCase):
             policy_files = network_policy_files()
             cert_files = network_proxy_cert_files("example.com")
             self.assertEqual(policy_files.controls, Path(proxy_tmp) / "network_controls.json")
-            self.assertEqual(policy_files.status, Path(proxy_tmp) / "network_status.json")
             self.assertEqual(policy_files.lock, Path(proxy_tmp) / ".network_policy.lock")
             self.assertEqual(cert_files.ca_cert, Path(proxy_tmp) / "network_proxy_ca.crt")
             self.assertEqual(cert_files.ca_key, Path(proxy_tmp) / "network_proxy_ca.key")

@@ -10,7 +10,7 @@ TrustyClaw proxy CA, then opening a separate TLS connection upstream.
 Policy checks happen before any upstream DNS resolution or connection, so a
 denied host name is never resolved (host names are otherwise a data
 exfiltration channel). Every decision is appended to network_events.jsonl.
-Requests are denied whenever the policy status is not ``active``.
+Requests are denied whenever the persisted policy cannot be parsed.
 
 On domains whose rule requires message inspection (the live web search
 guard), WebSocket connections are not opaque tunnels: each client→upstream
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
+import json
 import select
 import socket
 import ssl
@@ -30,14 +31,13 @@ import threading
 from typing import Any
 import urllib.parse
 
-from host.config import expand_network_controls
+from host.config import ConfigError, expand_network_controls, parse_network_controls
 from host.constants import LOOPBACK, PROXY_PORT
 from host.runtime.network_policy import (
     decide_http_request,
     anthropic_request_denied,
     host_allowed,
     load_policy,
-    load_status,
     openai_request_denied,
     openai_ws_message_denied,
     websocket_inspection_required,
@@ -64,7 +64,14 @@ def _load_enforcement_policy() -> dict[str, Any]:
     Managed provider domains are expanded only inside the proxy process so the
     stored config never contains generated OpenAI rules.
     """
-    return expand_network_controls(load_policy())
+    return expand_network_controls(parse_network_controls(load_policy()))
+
+
+def _policy_load_denial() -> tuple[dict[str, Any], str | None]:
+    try:
+        return _load_enforcement_policy(), None
+    except (ConfigError, OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        return {}, f"network policy invalid: {exc}"
 
 
 CERT_LOCK = threading.Lock()
@@ -90,9 +97,14 @@ def connect_public(host: str, port: int, timeout: float) -> socket.socket:
         raise OSError(f"could not resolve {host}") from exc
     for info in infos:
         ip = info[4][0]
+        if not isinstance(ip, str):
+            raise OSError(f"resolved non-string address {ip!r} for {host}")
         if not _is_public_ip(ip):
             raise OSError(f"refusing to connect to non-public address {ip} for {host}")
-    return socket.create_connection((infos[0][4][0], port), timeout=timeout)
+    connect_ip = infos[0][4][0]
+    if not isinstance(connect_ip, str):
+        raise OSError(f"resolved non-string address {connect_ip!r} for {host}")
+    return socket.create_connection((connect_ip, port), timeout=timeout)
 
 
 def request_denial_reason(
@@ -107,8 +119,6 @@ def request_denial_reason(
 ) -> str | None:
     """Why this request is denied, or None if it is allowed. The specific reason
     (e.g. a live web search denial) is returned to the client and logged."""
-    if load_status() != "active":
-        return "network policy is not active"
     if not decide_http_request(policy, protocol, method, host, path, query):
         return "network policy denied request"
     return (
@@ -143,11 +153,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_error(400, "CONNECT target is invalid")
             return
         # Deny before any DNS or upstream connection happens for this host.
+        policy, policy_error = _policy_load_denial()
         if port != 443:
             reason = "only port 443 is allowed for CONNECT"
-        elif load_status() != "active":
-            reason = "network policy is not active"
-        elif not host_allowed(_load_enforcement_policy(), host):
+        elif policy_error is not None:
+            reason = policy_error
+        elif not host_allowed(policy, host):
             reason = "host is not in the allowed network policy"
         else:
             reason = None
@@ -167,7 +178,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         self._serve_tls_request(host, port, client_tls)
 
-    def log_message(self, fmt: str, *args: object) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         return
 
     def _proxy_http(self) -> None:
@@ -207,17 +218,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
         protocol = "ws" if is_websocket else "http"
         body, error = self._read_plain_body()
         if error:
-            status, reason = error
-            record_network_event(protocol, self.command, host, port, path, query, False, reason)
-            self.send_error(status, reason)
+            status, body_error_reason = error
+            record_network_event(protocol, self.command, host, port, path, query, False, body_error_reason)
+            self.send_error(status, body_error_reason)
             return
-        policy = _load_enforcement_policy()
+        policy, policy_error = _policy_load_denial()
+        reason: str | None
         if host_error is not None:
             reason = host_error
         elif port != 80:
             reason = "only port 80 is allowed for plain HTTP"
         elif (host_reason := host_header_denial(headers, host, port)) is not None:
             reason = host_reason
+        elif policy_error is not None:
+            reason = policy_error
         else:
             reason = request_denial_reason(policy, protocol, self.command, host, path, query, headers, body)
         record_network_event(protocol, self.command, host, port, path, query, reason is None, reason)
@@ -282,11 +296,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             is_websocket = any(key.lower() == "upgrade" and value.lower() == "websocket" for key, value in headers)
             protocol = "wss" if is_websocket else "https"
             body, body_deny = read_body(reader, headers)
-            policy = _load_enforcement_policy()
+            policy, policy_error = _policy_load_denial()
             reason = (
                 body_deny
                 or target_denial
                 or host_header_denial(headers, host, port)
+                or policy_error
                 or request_denial_reason(policy, protocol, method, host, path, query, headers, body)
             )
             record_network_event(protocol, method, host, port, path, query, reason is None, reason)

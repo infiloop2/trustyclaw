@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import sys
 
-from host.runtime.network_policy import load_policy, load_policy_updated_at, load_status
+from host.config import ConfigError, parse_network_controls
+from host.runtime.network_policy import load_policy, load_policy_updated_at
 from host.runtime.state import page_network_events
 
 
@@ -16,7 +17,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     kind = args[0]
     if kind == "status" and len(args) == 1:
-        print(json.dumps({"status": load_status()}, sort_keys=True))
+        print(json.dumps(network_status(), sort_keys=True))
         return 0
     if kind == "policy" and len(args) == 1:
         print(json.dumps({"network_controls": load_policy(), "updated_at": load_policy_updated_at()}, sort_keys=True))
@@ -31,6 +32,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     print(f"unsupported read kind: {kind}", file=sys.stderr)
     return 2
+
+
+def network_status() -> dict[str, str]:
+    try:
+        parse_network_controls(load_policy())
+    except (ConfigError, json.JSONDecodeError, OSError, KeyError, TypeError) as exc:
+        return {"status": "error", "error_message": str(exc)}
+    return {"status": "active"}
 
 
 if __name__ == "__main__":

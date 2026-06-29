@@ -1,0 +1,31 @@
+name: authorize-repo-admin
+description: Verify that the triggering GitHub actor has admin access to the repository.
+
+runs:
+  using: composite
+  steps:
+    - name: Verify actor has repo admin access
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        ACTOR: ${{ github.actor }}
+      run: |
+        set -euo pipefail
+        ACTOR_ENCODED=$(python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["ACTOR"], safe=""))')
+        API_URL="${{ github.api_url }}/repos/${{ github.repository }}/collaborators/${ACTOR_ENCODED}/permission"
+        HTTP_STATUS=$(curl -sS -o /tmp/permission.json -w '%{http_code}' \
+          -H "Authorization: Bearer $GH_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "$API_URL")
+
+        if [ "$HTTP_STATUS" != "200" ]; then
+          echo "Failed to read repo permission for '${{ github.actor }}' (HTTP $HTTP_STATUS)."
+          cat /tmp/permission.json
+          exit 1
+        fi
+
+        PERMISSION=$(jq -r '.permission // empty' /tmp/permission.json)
+        if [ "$PERMISSION" != "admin" ]; then
+          echo "Actor '${{ github.actor }}' has repo permission '$PERMISSION'; admin required to run this workflow."
+          exit 1
+        fi

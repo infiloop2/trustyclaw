@@ -286,7 +286,7 @@ def run_turn(
             thread = _start_thread(server)
     else:
         thread = _start_thread(server)
-    thread_id = thread["id"]
+    thread_id = str(thread["id"])
     turn = server.call(
         "turn/start",
         {"threadId": thread_id, "input": [{"type": "text", "text": input_message}]},

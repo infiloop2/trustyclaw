@@ -7,35 +7,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TrustyClaw</title>
-<style>
-  body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-         background: #11151a; color: #d8dee6; margin: 0; padding: 1.5rem; font-size: 14px; }
-  h1 { font-size: 1.2rem; margin: 0 0 1rem; }
-  h2 { font-size: 0.95rem; margin: 0 0 0.6rem; color: #8fa1b3; text-transform: uppercase; letter-spacing: 0.05em; }
-  section { background: #1a2027; border: 1px solid #2a3340; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
-  .row { display: flex; gap: 1rem; flex-wrap: wrap; }
-  .row > section { flex: 1 1 24rem; min-width: 0; }
-  table { border-collapse: collapse; width: 100%; }
-  td, th { padding: 0.3rem 0.6rem; text-align: left; border-bottom: 1px solid #2a3340; vertical-align: top; }
-  th { color: #8fa1b3; font-weight: normal; }
-  button { background: #2d3a48; color: #d8dee6; border: 1px solid #3d4f63;
-           border-radius: 5px; padding: 0.3rem 0.8rem; cursor: pointer; font: inherit; }
-  button:hover { background: #3d4f63; }
-  button.danger { border-color: #7a3b3b; }
-  input, select, textarea { background: #11151a; color: #d8dee6; border: 1px solid #2a3340; border-radius: 5px;
-                    padding: 0.4rem; font: inherit; width: 100%; box-sizing: border-box; }
-  textarea { min-height: 9rem; white-space: pre; }
-  .status { padding: 0.1rem 0.5rem; border-radius: 4px; font-size: 0.85em; }
-  .ok, .active, .completed, .allowed { background: #1d3a2a; color: #7fd6a0; }
-  .degraded, .awaiting_login, .reloading, .queued, .running { background: #3a331d; color: #d6c47f; }
-  .error, .failed, .denied { background: #3a1d1d; color: #d67f7f; }
-  .loading, .cancelled, .deactivated { background: #2a3340; color: #8fa1b3; }
-  .muted { color: #8fa1b3; }
-  pre { white-space: pre-wrap; word-break: break-word; margin: 0.2rem 0; }
-  #login { max-width: 28rem; }
-  .actions { display: flex; gap: 0.5rem; margin-top: 0.6rem; flex-wrap: wrap; }
-  #notice { color: #d67f7f; min-height: 1.2em; }
-</style>
+<link rel="stylesheet" href="/admin_ui.css">
 </head>
 <body>
 <h1>TrustyClaw <span id="agent-name" class="muted"></span></h1>
@@ -45,414 +17,136 @@
   <h2>Login</h2>
   <p class="muted">Enter the admin password from the deploy result file.</p>
   <input id="password" type="password" placeholder="admin password" autocomplete="current-password">
-  <div class="actions"><button onclick="login()">Login</button></div>
+  <div class="actions"><button data-action="login">Login</button></div>
 </section>
 
 <div id="app" hidden>
-  <div class="row">
-    <section>
-      <h2>Health</h2>
-      <table id="health"></table>
-    </section>
-    <section>
-      <h2>Agent runtime</h2>
-      <table id="runtime"></table>
-      <div id="oauth" class="muted"></div>
+  <div class="shell">
+    <nav class="sidebar" aria-label="Admin sections">
+      <button id="tab-home" class="tab-button active-tab" data-action="show-tab" data-tab="home">Home</button>
+      <button id="tab-agent" class="tab-button" data-action="show-tab" data-tab="agent">Agent</button>
+      <button id="tab-network" class="tab-button" data-action="show-tab" data-tab="network">Network</button>
       <div class="actions">
-        <button onclick="startLogin('codex')">Start Codex login</button>
-        <button onclick="startLogin('claude_code')">Start Claude login</button>
-        <button class="danger" onclick="rebootHost()">Reboot host</button>
-        <button onclick="logout()">Logout</button>
+        <button data-action="logout">Logout</button>
       </div>
-    </section>
-  </div>
+    </nav>
 
-  <section>
-    <h2>Tasks</h2>
-    <textarea id="new-task" rows="3" placeholder="Task message for the agent..."></textarea>
-    <div class="actions">
-      <input id="new-task-thread" value="main" placeholder="thread id (letters, digits, - or _)" style="max-width: 16rem;">
-      <select id="new-task-runtime" style="max-width: 12rem;">
-        <option value="codex">Codex</option>
-        <option value="claude_code">Claude Code</option>
-      </select>
-      <button onclick="createTask()">Create task</button>
-    </div>
-    <table id="tasks"></table>
-  </section>
-
-  <section>
-    <h2>Threads</h2>
-    <table id="threads"></table>
-    <div class="actions">
-      <button onclick="loadThreads()">Refresh</button>
-    </div>
-    <div id="thread-detail"></div>
-    <div id="task-events-detail"></div>
-  </section>
-
-  <section>
-    <h2>Agent events</h2>
-    <table id="events"></table>
-  </section>
-
-  <div class="row">
-    <section>
-      <h2>Network policy</h2>
-      <textarea id="policy" spellcheck="false"></textarea>
-      <div class="actions">
-        <button onclick="loadPolicy()">Reload</button>
-        <button class="danger" onclick="savePolicy()">Replace policy</button>
+    <main>
+      <div id="panel-home" class="tab-panel">
+        <section>
+          <h2>Health</h2>
+          <table id="health"></table>
+          <div class="actions">
+            <button class="danger" data-action="reboot-host">Reboot host</button>
+          </div>
+        </section>
       </div>
-    </section>
-    <section>
-      <h2>Network events</h2>
-      <table id="net-events"></table>
-    </section>
+
+      <div id="panel-agent" class="tab-panel" hidden>
+        <section>
+          <h2>Agent runtime</h2>
+          <table id="runtime"></table>
+          <div id="runtime-guidance"></div>
+          <div id="oauth" class="muted"></div>
+          <div class="actions">
+            <button id="start-codex-login" data-action="start-login" data-runtime="codex" disabled>Start Codex login</button>
+            <button id="start-claude-login" data-action="start-login" data-runtime="claude_code" disabled>Start Claude login</button>
+          </div>
+        </section>
+
+        <section>
+          <h2>Tasks</h2>
+          <textarea id="new-task" rows="3" placeholder="Task message for the agent..."></textarea>
+          <div class="actions">
+            <input id="new-task-thread" class="thread-input" value="main" placeholder="thread id (letters, digits, - or _)">
+            <select id="new-task-runtime" class="runtime-select">
+              <option value="codex">Codex</option>
+              <option value="claude_code">Claude Code</option>
+            </select>
+            <button data-action="create-task">Create task</button>
+          </div>
+          <table id="tasks"></table>
+        </section>
+
+        <section>
+          <h2>Threads</h2>
+          <table id="threads"></table>
+          <div class="actions">
+            <button data-action="load-threads">Refresh</button>
+          </div>
+          <div id="thread-detail"></div>
+          <div id="task-events-detail"></div>
+        </section>
+
+        <section>
+          <h2>Agent events</h2>
+          <table id="events"></table>
+        </section>
+      </div>
+
+      <div id="panel-network" class="tab-panel" hidden>
+        <div class="row">
+          <section>
+            <h2>Current policy</h2>
+            <p class="muted">This is the active policy currently enforced by the proxy. To update it, build a new policy in Policy Builder and click Replace active policy with proposal.</p>
+            <textarea id="active-policy" class="readonly" readonly spellcheck="false"></textarea>
+            <div class="actions">
+              <button data-action="load-policy">Refresh</button>
+            </div>
+          </section>
+          <section>
+            <h2>Policy builder</h2>
+            <p id="policy-status" class="muted">Proposal matches current policy.</p>
+            <p id="policy-message" class="inline-message"></p>
+            <div class="actions">
+              <span class="preset-with-info">
+                <button id="policy-preset-openai" data-action="apply-policy-preset" data-preset="openai">Add OpenAI</button>
+                <button class="info-button" data-action="toggle-preset-info" data-info="openai" aria-label="OpenAI preset domains" aria-expanded="false">i</button>
+              </span>
+              <span class="preset-with-info">
+                <button id="policy-preset-claude" data-action="apply-policy-preset" data-preset="claude">Add Claude</button>
+                <button class="info-button" data-action="toggle-preset-info" data-info="claude" aria-label="Claude preset domains" aria-expanded="false">i</button>
+              </span>
+              <span class="preset-with-info">
+                <button id="policy-preset-github" data-action="apply-policy-preset" data-preset="github">Add GitHub</button>
+                <button class="info-button" data-action="toggle-preset-info" data-info="github" aria-label="GitHub preset domains" aria-expanded="false">i</button>
+              </span>
+              <span class="preset-with-info">
+                <button id="policy-preset-python" data-action="apply-policy-preset" data-preset="python">Add Python packages</button>
+                <button class="info-button" data-action="toggle-preset-info" data-info="python" aria-label="Python packages preset domains" aria-expanded="false">i</button>
+              </span>
+              <span class="preset-with-info">
+                <button id="policy-preset-npm" data-action="apply-policy-preset" data-preset="npm">Add npm packages</button>
+                <button class="info-button" data-action="toggle-preset-info" data-info="npm" aria-label="npm packages preset domains" aria-expanded="false">i</button>
+              </span>
+            </div>
+            <div id="preset-info-popover" class="info-popover" hidden></div>
+            <div class="manual-domain">
+              <input id="policy-domain" placeholder="api.example.com or *.example.com">
+              <input id="policy-methods" placeholder="GET,HEAD,POST">
+              <textarea id="policy-path-guards" class="compact" placeholder="optional path regex per line"></textarea>
+              <div class="actions">
+                <button data-action="save-website-rule">Add manual domain</button>
+              </div>
+            </div>
+            <h2 class="proposed-policy-heading">Proposed policy</h2>
+            <textarea id="policy" spellcheck="false" data-action="load-policy-from-json"></textarea>
+            <div class="actions">
+              <button data-action="reset-proposed-policy">Reset proposal from current</button>
+              <button class="danger" data-action="save-policy">Replace active policy with proposal</button>
+            </div>
+          </section>
+        </div>
+
+        <section>
+          <h2>Network events</h2>
+          <table id="net-events"></table>
+        </section>
+      </div>
+    </main>
   </div>
 </div>
 
-<script>
-"use strict";
-const $ = id => document.getElementById(id);
-let eventsSince = null, netSince = null;
-const events = [], netEvents = [];
-let runtimeType = "codex";
-let threads = [], threadTasks = [];
-let selectedTask = null;
-let selectedTaskEvents = [];
-let selectedTaskEventsSince = null;
-let selectedTaskEventsHasMore = false;
-const TASK_EVENT_PAGE_BATCH = 10;
-
-function getPassword() {
-  const match = document.cookie.match(/(?:^|; )trustyclaw_admin=([^;]*)/);
-  return match ? decodeURIComponent(match[1]) : null;
-}
-
-function login() {
-  const value = $("password").value.trim();
-  if (!value) return;
-  document.cookie = "trustyclaw_admin=" + encodeURIComponent(value) + "; path=/; max-age=2592000; samesite=strict";
-  $("password").value = "";
-  start();
-}
-
-function logout() {
-  document.cookie = "trustyclaw_admin=; path=/; max-age=0";
-  location.reload();
-}
-
-async function api(method, path, body) {
-  const headers = { "Authorization": "Bearer " + getPassword() };
-  if (method !== "GET") headers["Idempotency-Key"] = crypto.randomUUID();
-  if (body !== undefined) headers["Content-Type"] = "application/json";
-  const response = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
-  const data = await response.json();
-  if (response.status === 401) { showLogin(); throw new Error("unauthorized"); }
-  if (!response.ok) throw new Error(data.error ? data.error.message : response.statusText);
-  return data;
-}
-
-function notice(message) {
-  $("notice").textContent = message || "";
-  if (message) setTimeout(() => { $("notice").textContent = ""; }, 8000);
-}
-
-function badge(value) { return `<span class="status ${value}">${value}</span>`; }
-function esc(value) {
-  const div = document.createElement("div");
-  div.textContent = value == null ? "" : String(value);
-  return div.innerHTML;
-}
-
-function showLogin() { $("login").hidden = false; $("app").hidden = true; }
-
-async function refreshHealth() {
-  const health = await api("GET", "/v1/health");
-  $("agent-name").textContent = health.agent_name;
-  const runtimes = Array.isArray(health.agent_runtime.runtimes) ? health.agent_runtime.runtimes : [];
-  runtimeType = runtimes.find(r => r.status === "active")?.type || runtimes[0]?.type || "codex";
-  const host = health.host_runtime;
-  const gib = bytes => (bytes / 1073741824).toFixed(1) + " GiB";
-  $("health").innerHTML = `
-    <tr><th>overall</th><td>${badge(health.status)}</td></tr>
-    <tr><th>network controls</th><td>${badge(health.network_controls.status)}</td></tr>
-    <tr><th>cpu</th><td>${esc(host.cpu.usage_percent)}%</td></tr>
-    <tr><th>memory</th><td>${gib(host.memory.used_bytes)} / ${gib(host.memory.total_bytes)}</td></tr>
-    <tr><th>filesystem</th><td>${gib(host.filesystem.used_bytes)} / ${gib(host.filesystem.total_bytes)}</td></tr>
-    <tr><th>swap</th><td>${gib(host.swap.used_bytes)} / ${gib(host.swap.allocated_bytes)}</td></tr>`;
-  $("runtime").innerHTML = `<tr><th>type</th><th>status</th><th>active tasks</th></tr>` +
-    runtimes.map(runtime => `
-      <tr>
-        <td>${esc(runtime.type)}</td>
-        <td>${badge(runtime.status)}</td>
-        <td>${esc((runtime.active_task_ids || []).join(", "))}</td>
-      </tr>`).join("");
-  const pending = runtimes.find(runtime => runtime.status === "awaiting_login");
-  if (pending) await showOauth(false, pending.type);
-  else $("oauth").textContent = "";
-}
-
-async function showOauth(start, runtime) {
-  runtime = runtime || runtimeType;
-  try {
-    if (runtime === "claude_code") {
-      const login = await api(start ? "POST" : "GET", "/v1/agent-runtime/claude-oauth-login");
-      $("oauth").innerHTML =
-        `Claude Code login: open ` +
-        `<a href="${esc(login.login_url)}" target="_blank">${esc(login.login_url)}</a> ` +
-        `(expires ${esc(login.expires_at)}) ` +
-        `<button onclick="completeClaudeLogin()">Submit code</button>`;
-      return;
-    }
-    const login = await api(start ? "POST" : "GET", "/v1/agent-runtime/codex-oauth-login");
-    $("oauth").innerHTML =
-      `Codex login: enter code <b>${esc(login.device_code)}</b> at ` +
-      `<a href="${esc(login.login_url)}" target="_blank">${esc(login.login_url)}</a> (expires ${esc(login.expires_at)})`;
-  } catch (error) { if (start) notice(error.message); }
-}
-
-async function startLogin(runtime) { await showOauth(true, runtime); }
-
-async function completeClaudeLogin() {
-  const code = prompt("Claude Code login code:");
-  if (!code) return;
-  try {
-    await api("POST", "/v1/agent-runtime/claude-oauth-login/complete", { code });
-    notice("Claude Code login submitted.");
-    await refreshHealth();
-  } catch (error) { notice(error.message); }
-}
-
-async function rebootHost() {
-  if (!confirm("Reboot the host machine?")) return;
-  try { await api("POST", "/v1/host-runtime/reboot"); notice("Reboot accepted; the host will be back shortly."); }
-  catch (error) { notice(error.message); }
-}
-
-async function createTask() {
-  const message = $("new-task").value.trim();
-  const threadId = $("new-task-thread").value.trim();
-  const agentRuntime = $("new-task-runtime").value;
-  if (!message || !threadId) return;
-  try {
-    await api("POST", "/v1/tasks", { input_message: message, thread_id: threadId, agent_runtime: agentRuntime });
-    $("new-task").value = "";
-    await refreshTasks();
-    await loadThreads();
-  }
-  catch (error) { notice(error.message); }
-}
-
-async function steerTask(taskId) {
-  const message = prompt("Steering message for " + taskId + ":");
-  if (!message) return;
-  try { await api("POST", `/v1/tasks/${taskId}/steer`, { steer_message: message }); notice("Steering accepted."); }
-  catch (error) { notice(error.message); }
-}
-
-async function cancelTask(taskId) {
-  try { await api("POST", `/v1/tasks/${taskId}/cancel`); await refreshTasks(); }
-  catch (error) { notice(error.message); }
-}
-
-async function killTask(taskId) {
-  if (!confirm("Kill running task " + taskId + "? Its runtime process is terminated and the task is cancelled.")) return;
-  try { await api("POST", `/v1/tasks/${taskId}/kill`); await refreshTasks(); }
-  catch (error) { notice(error.message); }
-}
-
-async function refreshTasks() {
-  const listed = await api("GET", "/v1/tasks");
-  if (!listed.tasks.length) { $("tasks").innerHTML = `<tr><td class="muted">No running or queued tasks.</td></tr>`; return; }
-  $("tasks").innerHTML = `<tr><th>#</th><th>task</th><th>runtime</th><th>thread</th><th>status</th><th>message</th><th></th></tr>` +
-    listed.tasks.map(task => `
-      <tr>
-        <td>${task.queue_position}</td>
-        <td>${esc(task.task_id)}</td>
-        <td>${esc(task.agent_runtime)}</td>
-        <td>${esc(task.thread_id)}</td>
-        <td>${badge(task.status)}</td>
-        <td><pre>${esc(task.input_message)}</pre></td>
-        <td>${task.status === "running"
-              ? `<button onclick="steerTask('${esc(task.task_id)}')">Steer</button>
-                 <button class="danger" onclick="killTask('${esc(task.task_id)}')">Kill</button>`
-              : `<button onclick="cancelTask('${esc(task.task_id)}')">Cancel</button>`}</td>
-      </tr>`).join("");
-}
-
-async function loadThreads() {
-  const listed = await api("GET", "/v1/threads");
-  threads = listed.threads || [];
-  renderThreads();
-}
-
-function renderThreads() {
-  if (!threads.length) {
-    $("threads").innerHTML = `<tr><td class="muted">No recent threads.</td></tr>`;
-    return;
-  }
-  $("threads").innerHTML = `<tr><th>thread</th><th>runtime</th><th>last used</th><th>tasks</th><th>active</th><th></th></tr>` +
-    threads.map(thread => `
-      <tr>
-        <td>${esc(thread.thread_id)}</td>
-        <td>${esc(thread.agent_runtime)}</td>
-        <td class="muted">${esc(thread.last_used_at)}</td>
-        <td>${esc(thread.task_count)}</td>
-        <td>${(thread.active_tasks || []).map(task => badge(task.status)).join(" ")}</td>
-        <td><button onclick="showThread('${esc(thread.thread_id)}', '${esc(thread.agent_runtime)}')">Open</button></td>
-      </tr>`).join("");
-}
-
-async function showThread(threadId, agentRuntime) {
-  $("new-task-thread").value = threadId;
-  $("new-task-runtime").value = agentRuntime;
-  $("task-events-detail").innerHTML = "";
-  const response = await api(
-    "GET",
-    `/v1/threads/${encodeURIComponent(threadId)}/tasks`
-  );
-  threadTasks = response.tasks || [];
-  $("thread-detail").innerHTML = `
-    <h2>${esc(threadId)} tasks</h2>
-    <table>
-      <tr><th>task</th><th>status</th><th>updated</th><th>message</th><th></th></tr>
-      ${threadTasks.length ? threadTasks.map(task => `
-        <tr>
-          <td>${esc(task.task_id)}</td>
-          <td>${badge(task.status)}</td>
-          <td class="muted">${esc(task.updated_at)}</td>
-          <td><pre>${esc(task.input_message)}</pre></td>
-          <td><button onclick="showTaskEvents('${esc(task.task_id)}')">Events</button></td>
-        </tr>`).join("") : `<tr><td colspan="5" class="muted">No retained tasks for this thread.</td></tr>`}
-    </table>`;
-}
-
-async function loadTaskEventBatch(taskId) {
-  for (let page = 0; page < TASK_EVENT_PAGE_BATCH; page += 1) {
-    const response = await api(
-      "GET",
-      `/v1/tasks/${encodeURIComponent(taskId)}/events` +
-        (selectedTaskEventsSince === null ? "" : "?since=" + selectedTaskEventsSince)
-    );
-    if (!response.events.length) return false;
-    for (const event of response.events) {
-      selectedTaskEvents.push(event);
-      selectedTaskEventsSince = event.seq;
-    }
-  }
-  return true;
-}
-
-async function showTaskEvents(taskId) {
-  selectedTask = threadTasks.find(item => item.task_id === taskId) || await api("GET", `/v1/tasks/${encodeURIComponent(taskId)}`);
-  selectedTaskEvents = [];
-  selectedTaskEventsSince = null;
-  selectedTaskEventsHasMore = await loadTaskEventBatch(taskId);
-  renderTaskEventsDetail();
-}
-
-async function loadMoreTaskEvents(taskId) {
-  if (!selectedTask || selectedTask.task_id !== taskId) {
-    await showTaskEvents(taskId);
-    return;
-  }
-  selectedTaskEventsHasMore = await loadTaskEventBatch(taskId);
-  renderTaskEventsDetail();
-}
-
-function renderTaskEventsDetail() {
-  const task = selectedTask;
-  const taskEvents = selectedTaskEvents;
-  $("task-events-detail").innerHTML = `
-    <h2>${esc(task.task_id)} events</h2>
-    <table>
-      <tr><th>status</th><td>${badge(task.status)}</td></tr>
-      <tr><th>runtime</th><td>${esc(task.agent_runtime)}</td></tr>
-      <tr><th>thread</th><td>${esc(task.thread_id)}</td></tr>
-      <tr><th>created</th><td class="muted">${esc(task.created_at)}</td></tr>
-      <tr><th>updated</th><td class="muted">${esc(task.updated_at)}</td></tr>
-      <tr><th>input</th><td><pre>${esc(task.input_message)}</pre></td></tr>
-      ${task.output_message ? `<tr><th>output</th><td><pre>${esc(task.output_message)}</pre></td></tr>` : ""}
-      ${task.error_message ? `<tr><th>error</th><td><pre>${esc(task.error_message)}</pre></td></tr>` : ""}
-    </table>
-    <h2>Events</h2>
-    <table>
-      <tr><th>seq</th><th>time</th><th>type</th><th>source</th><th>payload</th></tr>
-      ${taskEvents.length ? taskEvents.map(event => `
-        <tr>
-          <td>${esc(event.seq)}</td>
-          <td class="muted">${esc(event.timestamp)}</td>
-          <td>${esc(event.event_type)}</td>
-          <td>${esc(event.payload.source || "")}</td>
-          <td><pre>${esc(event.payload.message || event.payload.error_message || JSON.stringify(event.payload))}</pre></td>
-        </tr>`).join("") : `<tr><td colspan="5" class="muted">No retained events for this task.</td></tr>`}
-    </table>
-    ${selectedTaskEventsHasMore ? `<div class="actions"><button onclick="loadMoreTaskEvents('${esc(task.task_id)}')">Load more events</button></div>` : ""}`;
-}
-
-async function refreshEvents() {
-  const response = await api("GET", "/v1/events" + (eventsSince === null ? "" : "?since=" + eventsSince));
-  for (const event of response.events) { events.push(event); eventsSince = event.seq; }
-  while (events.length > 50) events.shift();
-  $("events").innerHTML = `<tr><th>time</th><th>type</th><th>task</th><th>payload</th></tr>` +
-    events.slice().reverse().map(event => `
-      <tr>
-        <td class="muted">${esc(event.timestamp)}</td>
-        <td>${esc(event.event_type)}</td>
-        <td>${esc(event.task_id || "")}</td>
-        <td><pre>${esc(event.payload.message || event.payload.error_message || "")}</pre></td>
-      </tr>`).join("");
-}
-
-async function refreshNetEvents() {
-  const response = await api("GET", "/v1/network/events" + (netSince === null ? "" : "?since=" + netSince));
-  for (const event of response.events) { netEvents.push(event); netSince = event.seq; }
-  while (netEvents.length > 50) netEvents.shift();
-  $("net-events").innerHTML = `<tr><th>time</th><th>request</th><th>decision</th></tr>` +
-    netEvents.slice().reverse().map(event => `
-      <tr>
-        <td class="muted">${esc(event.timestamp)}</td>
-        <td>${esc(event.method)} ${esc(event.protocol)}://${esc(event.host)}${esc(event.path)}</td>
-        <td>${badge(event.decision)}</td>
-      </tr>`).join("");
-}
-
-async function loadPolicy() {
-  const response = await api("GET", "/v1/network/policy");
-  $("policy").value = JSON.stringify(response.network_controls, null, 2);
-}
-
-async function savePolicy() {
-  if (!confirm("Replace the active network policy?")) return;
-  try {
-    await api("PUT", "/v1/network/policy", JSON.parse($("policy").value));
-    notice("Network policy replaced.");
-  } catch (error) { notice(error.message); }
-}
-
-async function tick() {
-  try {
-    await refreshHealth();
-    await refreshTasks();
-    await loadThreads();
-    await refreshEvents();
-    await refreshNetEvents();
-  } catch (error) { /* shown via login panel or notice */ }
-}
-
-function start() {
-  if (!getPassword()) { showLogin(); return; }
-  $("login").hidden = true;
-  $("app").hidden = false;
-  loadPolicy().catch(() => {});
-  tick();
-  setInterval(tick, 5000);
-}
-
-$("password").addEventListener("keydown", event => { if (event.key === "Enter") login(); });
-start();
-</script>
+<script src="/admin_ui.js"></script>
 </body>
 </html>
