@@ -3,6 +3,10 @@
   "aws_region": "us-east-1",
   "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
   "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
-  "ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleTrustyClawPublicKey operator@example",
-  "ssh_port_opened": true
+  "operator_connections": [
+    {
+      "mode": "ssh",
+      "ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleTrustyClawPublicKey operator@example"
+    }
+  ]
 }

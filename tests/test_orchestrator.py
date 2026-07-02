@@ -7,22 +7,22 @@ import threading
 import unittest
 from unittest.mock import patch
 
+import pg_harness
+
 from host.runtime import orchestrator
 from host.runtime.network_policy import anthropic_request_denied, save_policy
 from host.runtime.state import (
-    load_state,
     read_agent_events,
     read_claude_account,
-    read_openai_account_id,
+    read_openai_account,
     read_proxy_claude_account,
     read_proxy_openai_account_id,
     save_claude_account,
-    save_openai_account_id,
+    save_openai_account,
     save_proxy_claude_account,
     save_proxy_openai_account_id,
-    save_state,
-    write_json,
 )
+from state_seed import load_state, save_state
 
 
 class FakeServer:
@@ -61,6 +61,7 @@ def make_task(number: int, thread_id: str, status: str = "queued", runtime: str 
 
 class OrchestratorTests(unittest.TestCase):
     def setUp(self) -> None:
+        pg_harness.reset_database()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.proxy_temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
@@ -111,6 +112,35 @@ class OrchestratorTests(unittest.TestCase):
 
     def task_status(self, task_id: str) -> str:
         return next(t["status"] for t in load_state()["tasks"] if t["task_id"] == task_id)
+
+    def test_active_runtime_refresh_stamps_usage_last_checked_at(self) -> None:
+        with (
+            patch.object(orchestrator, "utc_now", return_value="2026-06-29T23:10:00Z"),
+            patch.object(
+                orchestrator.codex_app_server,
+                "account_status",
+                return_value=(
+                    "active",
+                    None,
+                    {
+                        "account_id": "acct",
+                        "codex_usage": {
+                            "rate_limits": {
+                                "primary": {
+                                    "used_percent": 8,
+                                    "window_duration_mins": 300,
+                                    "resets_at": 1782788897,
+                                }
+                            }
+                        },
+                    },
+                ),
+            ),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("codex"), "active")
+
+        account = read_openai_account()
+        self.assertEqual(account["codex_usage"]["last_checked_at"], "2026-06-29T23:10:00Z")
 
     def test_delivered_steers_are_consumed_from_state(self) -> None:
         # steers() hands the worker only the undelivered queue, and each
@@ -247,7 +277,7 @@ class OrchestratorTests(unittest.TestCase):
             patch.object(
                 orchestrator.claude_code,
                 "account_status",
-                return_value=("active", None, {"account_id": "acct", "access_token_sha256": "hash"}),
+                return_value=("active", None, {"account_id": "acct", "access_token_sha256": "f" * 64}),
             ),
         ):
             threads = [threading.Thread(target=orchestrator.run_next_task) for _ in range(8)]
@@ -321,7 +351,7 @@ class OrchestratorTests(unittest.TestCase):
             patch.object(
                 orchestrator.claude_code,
                 "account_status",
-                return_value=("active", None, {"account_id": "acct", "access_token_sha256": "hash"}),
+                return_value=("active", None, {"account_id": "acct", "access_token_sha256": "f" * 64}),
             ),
         ):
             orchestrator.run_next_task()
@@ -341,7 +371,7 @@ class OrchestratorTests(unittest.TestCase):
             patch.object(
                 orchestrator.claude_code,
                 "account_status",
-                return_value=("active", None, {"account_id": "acct", "access_token_sha256": "hash"}),
+                return_value=("active", None, {"account_id": "acct", "access_token_sha256": "f" * 64}),
             ),
         ):
             orchestrator.run_next_task()
@@ -524,7 +554,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(orchestrator._CLOSING_THREADS, {})
 
     def test_runtime_status_loss_clears_account_pin_without_tearing_down_running_task(self) -> None:
-        save_openai_account_id("acct-old")
+        save_openai_account({"account_id": "acct-old"})
         save_proxy_openai_account_id("acct-old")
         codex_busy = FakeServer()
         codex_busy.started = 1
@@ -545,16 +575,40 @@ class OrchestratorTests(unittest.TestCase):
         state = load_state()
         task = state["tasks"][0]
         self.assertEqual(task["status"], "running")
-        self.assertIsNone(read_openai_account_id())
+        self.assertIsNone(read_openai_account().get("account_id"))
         self.assertIsNone(read_proxy_openai_account_id())
         self.assertFalse(codex_busy.closed)
         self.assertIn("codex:codex-running", orchestrator._POOL)
+
+    def test_codex_refresh_seeds_proxy_pin_before_guarded_account_status(self) -> None:
+        self.assertIsNone(read_proxy_openai_account_id())
+
+        def account_status():
+            self.assertEqual(read_proxy_openai_account_id(), "acct-local")
+            return "active", None, {"account_id": "acct-local"}
+
+        with (
+            patch.object(orchestrator.codex_app_server, "read_codex_account_id", return_value="acct-local"),
+            patch.object(orchestrator.codex_app_server, "account_status", side_effect=account_status),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("codex"), "active")
+
+        self.assertEqual(read_proxy_openai_account_id(), "acct-local")
+
+    def test_codex_refresh_clears_seeded_proxy_pin_when_account_is_not_active(self) -> None:
+        with (
+            patch.object(orchestrator.codex_app_server, "read_codex_account_id", return_value="acct-local"),
+            patch.object(orchestrator.codex_app_server, "account_status", return_value=("awaiting_login", None, None)),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("codex"), "awaiting_login")
+
+        self.assertIsNone(read_proxy_openai_account_id())
 
     def test_stale_runtime_refresh_cannot_overwrite_disabled_policy_state(self) -> None:
         state = load_state()
         state["agent_runtime_statuses"]["codex"]["status"] = "active"
         save_state(state)
-        save_openai_account_id("acct-old")
+        save_openai_account({"account_id": "acct-old"})
         save_proxy_openai_account_id("acct-old")
 
         def status_after_policy_flip():
@@ -569,26 +623,10 @@ class OrchestratorTests(unittest.TestCase):
 
         state = load_state()
         self.assertEqual(state["agent_runtime_statuses"]["codex"]["status"], "deactivated")
-        self.assertIsNone(read_openai_account_id())
+        self.assertIsNone(read_openai_account().get("account_id"))
         self.assertIsNone(read_proxy_openai_account_id())
 
     def test_runtime_refresh_rechecks_disabled_policy_inside_final_state_write(self) -> None:
-        state = load_state()
-        state["agent_runtime_statuses"]["codex"]["status"] = "awaiting_login"
-        save_state(state)
-
-        with (
-            patch.object(orchestrator.codex_app_server, "account_status", return_value=("active", None, "acct-new")),
-            patch.object(orchestrator, "_runtime_network_enabled", side_effect=[True, True, False]),
-        ):
-            self.assertEqual(orchestrator.refresh_runtime_status("codex"), "deactivated")
-
-        state = load_state()
-        self.assertEqual(state["agent_runtime_statuses"]["codex"]["status"], "deactivated")
-        self.assertIsNone(read_openai_account_id())
-        self.assertIsNone(read_proxy_openai_account_id())
-
-    def test_runtime_refresh_clears_pin_if_policy_disables_after_account_save(self) -> None:
         state = load_state()
         state["agent_runtime_statuses"]["codex"]["status"] = "awaiting_login"
         save_state(state)
@@ -601,7 +639,23 @@ class OrchestratorTests(unittest.TestCase):
 
         state = load_state()
         self.assertEqual(state["agent_runtime_statuses"]["codex"]["status"], "deactivated")
-        self.assertIsNone(read_openai_account_id())
+        self.assertIsNone(read_openai_account().get("account_id"))
+        self.assertIsNone(read_proxy_openai_account_id())
+
+    def test_runtime_refresh_clears_pin_if_policy_disables_after_account_save(self) -> None:
+        state = load_state()
+        state["agent_runtime_statuses"]["codex"]["status"] = "awaiting_login"
+        save_state(state)
+
+        with (
+            patch.object(orchestrator.codex_app_server, "account_status", return_value=("active", None, "acct-new")),
+            patch.object(orchestrator, "_runtime_network_enabled", side_effect=[True, True, True, True, False]),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("codex"), "deactivated")
+
+        state = load_state()
+        self.assertEqual(state["agent_runtime_statuses"]["codex"]["status"], "deactivated")
+        self.assertIsNone(read_openai_account().get("account_id"))
         self.assertIsNone(read_proxy_openai_account_id())
 
     def test_thread_stays_unclaimable_while_its_old_server_is_closing(self) -> None:

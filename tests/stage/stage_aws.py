@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import shlex
 import sys
 import tempfile
 import time
+from urllib.parse import quote
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
@@ -30,17 +32,28 @@ STAGE_AGENT_NAME = "trustyclaw-stage"
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--result-file", required=True, help="Deploy result JSON from the stage upgrade/recover run.")
-    parser.add_argument("--ssh-key", required=True, help="Private SSH key for the persistent stage operator key.")
+    parser.add_argument("--result-file", required=True, help="Result JSON from the stage deploy, upgrade, recover, or start run.")
+    ssh_key_group = parser.add_mutually_exclusive_group(required=True)
+    ssh_key_group.add_argument("--ssh-key", help="Private SSH key path for the persistent stage operator key.")
+    ssh_key_group.add_argument(
+        "--ssh-key-env",
+        help="Environment variable containing the private SSH key path for the persistent stage operator key.",
+    )
+    parser.add_argument(
+        "--admin-password-env",
+        help="Environment variable containing the stage admin password when the result file omits it.",
+    )
     args = parser.parse_args(argv)
 
-    stage = StageAwsSmoke(Path(args.result_file), Path(args.ssh_key))
+    ssh_key = Path(args.ssh_key) if args.ssh_key is not None else _required_env_path(args.ssh_key_env)
+    stage = StageAwsSmoke(Path(args.result_file), ssh_key, args.admin_password_env)
     try:
         stage.open_tunnel()
         stage.recover_baseline()
         stage.check_health()
         stage.check_ui_page()
         stage.check_admin_auth()
+        stage.check_agent_file_explorer()
         stage.check_both_runtimes_active()
         stage.agent_runtime = "codex"
         stage.check_task()
@@ -65,12 +78,24 @@ def main(argv: list[str] | None = None) -> int:
         stage.close_tunnel()
 
 
+def _required_env_path(env_name: str) -> Path:
+    value = os.environ.get(env_name)
+    if not value:
+        raise SystemExit(f"{env_name} is not set or empty")
+    return Path(value)
+
+
 class StageAwsSmoke(AwsSmoke):
-    def __init__(self, result_file: Path, ssh_key: Path) -> None:
+    def __init__(self, result_file: Path, ssh_key: Path, admin_password_env: str | None = None) -> None:
         super().__init__()
         self.result = json.loads(result_file.read_text())
         if self.result.get("agent_name") != STAGE_AGENT_NAME:
             raise AssertionError(f"stage result file is for {self.result.get('agent_name')!r}, expected {STAGE_AGENT_NAME!r}")
+        if "admin_password" not in self.result and admin_password_env is not None:
+            admin_password = os.environ.get(admin_password_env)
+            if not admin_password:
+                raise AssertionError(f"{admin_password_env} is not set or empty")
+            self.result["admin_password"] = admin_password
         self.ssh_key = str(ssh_key)
         self.region = str(self.result["region"])
         self.workdir = Path(tempfile.mkdtemp(prefix="stage-aws-"))
@@ -135,6 +160,82 @@ class StageAwsSmoke(AwsSmoke):
                 f"{runtime} runtime is {status}; manually open the stage admin UI, complete OAuth, then rerun stage"
             )
 
+    def check_agent_file_explorer(self) -> None:
+        self._step("agent file explorer API on real agent home")
+        directory_name = f".stage-file-explorer-{int(time.time())}"
+        file_name = 'quote"file.txt'
+        html_file_name = '<img src=x onerror="window.__stageFileNameXss=1">.txt'
+        symlink_name = "outside-link"
+        internal_symlink_name = "inside-file-link"
+        dir_symlink_name = "outside-dir-link"
+        file_content = f"stage file explorer content {self.thread_prefix}"
+        html_file_content = '<script>window.__stageFileContentXss=1</script>\n'
+        create_script = "\n".join([
+            "from pathlib import Path",
+            "home = Path('/mnt/trustyclaw-agent/agent-home')",
+            f"directory = home / {directory_name!r}",
+            "directory.mkdir(mode=0o700, exist_ok=True)",
+            f"(directory / {file_name!r}).write_text({file_content!r})",
+            f"(directory / {html_file_name!r}).write_text({html_file_content!r})",
+            f"(directory / {symlink_name!r}).symlink_to('/etc/passwd')",
+            f"(directory / {internal_symlink_name!r}).symlink_to({file_name!r})",
+            f"(directory / {dir_symlink_name!r}).symlink_to('/tmp', target_is_directory=True)",
+        ])
+        cleanup = (
+            "sudo -u trustyclaw-agent python3 - <<'PY'\n"
+            "import shutil\n"
+            "from pathlib import Path\n"
+            f"shutil.rmtree(Path('/mnt/trustyclaw-agent/agent-home') / {directory_name!r}, ignore_errors=True)\n"
+            "PY"
+        )
+        try:
+            self._ssh_code(f"sudo -u trustyclaw-agent python3 - <<'PY'\n{create_script}\nPY")
+            root = self._api("GET", "/v1/agent-files?path=/")
+            if not isinstance(root.get("truncated"), bool) or "max_entries" in root:
+                raise AssertionError(f"agent file list did not report expected listing metadata: {root}")
+            root_names = {entry.get("name") for entry in root.get("entries", [])}
+            if directory_name not in root_names:
+                raise AssertionError(f"agent file root did not include hidden stage directory: {root}")
+
+            directory_path = f"/{directory_name}"
+            listed = self._api("GET", f"/v1/agent-files?path={quote(directory_path, safe='')}")
+            entries = listed.get("entries", [])
+            match = next((entry for entry in entries if entry.get("name") == file_name), None)
+            if not match or match.get("type") != "file" or match.get("path") != f"{directory_path}/{file_name}":
+                raise AssertionError(f"agent file directory did not include expected file: {listed}")
+            html_match = next((entry for entry in entries if entry.get("name") == html_file_name), None)
+            if not html_match or html_match.get("type") != "file" or html_match.get("path") != f"{directory_path}/{html_file_name}":
+                raise AssertionError(f"agent file directory did not include expected HTML-looking file: {listed}")
+            symlink_names = {symlink_name, internal_symlink_name, dir_symlink_name}
+            listed_symlinks = symlink_names & {entry.get("name") for entry in entries}
+            if listed_symlinks:
+                raise AssertionError(f"agent file directory exposed symlinks {listed_symlinks}: {listed}")
+
+            file_path = f"{directory_path}/{file_name}"
+            read = self._api("GET", f"/v1/agent-files/read?path={quote(file_path, safe='')}")
+            if read.get("content") != file_content or read.get("truncated") is not False:
+                raise AssertionError(f"agent file read returned unexpected payload: {read}")
+            html_file_path = f"{directory_path}/{html_file_name}"
+            html_read = self._api("GET", f"/v1/agent-files/read?path={quote(html_file_path, safe='')}")
+            if html_read.get("content") != html_file_content or html_read.get("truncated") is not False:
+                raise AssertionError(f"agent file HTML-looking read returned unexpected payload: {html_read}")
+
+            status, body = self._api_status("GET", "/v1/agent-files?path=..")
+            if status != 400 or "escapes the agent home" not in json.dumps(body):
+                raise AssertionError(f"agent file path escape returned {status}: {body}")
+            for name in (symlink_name, internal_symlink_name):
+                symlink_path = f"{directory_path}/{name}"
+                status, body = self._api_status("GET", f"/v1/agent-files/read?path={quote(symlink_path, safe='')}")
+                if status != 400 or "symlinks are not supported" not in json.dumps(body):
+                    raise AssertionError(f"agent file symlink read returned {status}: {body}")
+            dir_symlink_path = f"{directory_path}/{dir_symlink_name}"
+            status, body = self._api_status("GET", f"/v1/agent-files?path={quote(dir_symlink_path, safe='')}")
+            if status != 400 or "symlinks are not supported" not in json.dumps(body):
+                raise AssertionError(f"agent file symlink list returned {status}: {body}")
+        finally:
+            self._ssh_code(cleanup)
+        self._ok("hidden directory listed, hostile filenames read as text, and path/symlink escapes rejected")
+
     def check_task(self) -> None:
         self._step("Codex account guard + real web-search task")
         self._api(
@@ -153,6 +254,7 @@ class StageAwsSmoke(AwsSmoke):
         account_id = account.get("account_id")
         if not account_id:
             raise AssertionError(f"GET account while active did not include account_id: {account}")
+        self._assert_provider_metadata("codex", account)
 
         proxy = f"http://127.0.0.1:{PROXY_PORT}"
         url = "https://chatgpt.com/backend-api/codex/responses"
@@ -216,6 +318,7 @@ class StageAwsSmoke(AwsSmoke):
             or "email" not in account
         ):
             raise AssertionError(f"GET account while Claude is active returned unexpected shape: {account}")
+        self._assert_provider_metadata("claude_code", account)
 
         proxy = f"http://127.0.0.1:{PROXY_PORT}"
         url = "https://api.anthropic.com/v1/messages"

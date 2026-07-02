@@ -1,0 +1,80 @@
+name: check-version
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Check VERSION increment
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check VERSION increment
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          version_re = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+
+          def parse(value: str) -> tuple[int, int, int]:
+              if not version_re.fullmatch(value):
+                  raise SystemExit(f"invalid VERSION {value!r}; expected MAJOR.MINOR.PATCH")
+              return tuple(int(part) for part in value.split("."))
+
+          head = pathlib.Path("VERSION").read_text().strip()
+          head_tuple = parse(head)
+          base_sha = os.environ["BASE_SHA"]
+          try:
+              base = subprocess.check_output(
+                  ["git", "show", f"{base_sha}:VERSION"],
+                  stderr=subprocess.DEVNULL,
+                  text=True,
+              ).strip()
+          except subprocess.CalledProcessError:
+              print("base branch has no VERSION file; accepting initial versioned PR")
+              sys.exit(0)
+          base_tuple = parse(base)
+          if head_tuple <= base_tuple:
+              raise SystemExit(f"VERSION must increase relative to base branch: base={base}, head={head}")
+          print(f"VERSION increased: {base} -> {head}")
+          PY
+
+      - name: Check migration immutability
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Applied migrations are immutable history: a migration file that
+          # exists on the base branch must be byte-identical here, and never
+          # deleted — schema changes always ship as a new NNNN+1 file.
+          changed="$(git diff --name-only --diff-filter=MDR "${BASE_SHA}"...HEAD -- host/migrations/ || true)"
+          if [ -n "${changed}" ]; then
+            echo "migration files may only be added, never edited, renamed, or deleted:" >&2
+            echo "${changed}" >&2
+            exit 1
+          fi
+          added="$(git diff --name-only --diff-filter=A "${BASE_SHA}"...HEAD -- host/migrations/ || true)"
+          if [ -n "${added}" ]; then
+            echo "new migration file(s):"
+            echo "${added}"
+          else
+            echo "no migration changes"
+          fi

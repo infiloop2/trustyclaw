@@ -8,12 +8,17 @@ Network controls govern the agent and host service users, not root-owned host
 bootstrap and maintenance work. At the host firewall, root (uid 0) has outbound
 access for package installation, security updates, and ordinary root-owned
 system traffic. The dedicated `trustyclaw-proxy` uid has outbound access only so
-it can make policy-approved upstream connections on behalf of the agent. The
-host does not install or configure the AWS SSM agent, and snapd is stopped and
-masked during bootstrap. Root and proxy egress are still bounded by the EC2
-security group, which only permits outbound TCP `80`, TCP `443`, and UDP `123`
-(NTP) to any address. The agent runs as a non-root user with no sudo, so it
-reaches root's broader path only if it first escalates to root.
+it can make policy-approved upstream connections on behalf of the agent. When
+Cloudflare Access operator access is configured, the dedicated `cloudflared` uid
+has outbound access only for DNS, TCP `443`, and TCP/UDP `7844`. The host does
+not install or configure the AWS SSM agent, and snapd is stopped and masked
+during bootstrap. Root, proxy, and optional `cloudflared` egress are still
+bounded by the EC2 security group, which keeps TCP/UDP `7844` open only when a
+`cloudflare_access` operator endpoint is configured. That `7844` rule is
+outbound-only and nftables allows it only for the `cloudflared` uid, not for the
+agent, admin API, or proxy users; it does not expose an inbound EC2 port. The
+agent runs as a non-root user with no sudo, so it reaches root's broader path
+only if it first escalates to root.
 
 Normal HTTP requests are configured per domain in `allowed_network_access`.
 `allow_http_methods` opens outbound HTTP over TCP port `80` and HTTPS over TCP

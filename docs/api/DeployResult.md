@@ -1,5 +1,14 @@
 # Deploy Result
 
+Each lifecycle command prints the result path it wrote. By default, result
+files are mode-specific: `deploy` writes `<agent_name>-deploy.json`, `upgrade`
+writes `<agent_name>-upgrade.json`, `recover` writes
+`<agent_name>-recover.json`, `reconfigure` writes
+`<agent_name>-reconfigure.json`, `start` writes `<agent_name>-start.json`, and
+`stop` writes `<agent_name>-stop.json`.
+`--result-file <path>` overrides the path explicitly and may overwrite an
+existing file.
+
 ## Result Object
 
 ```json
@@ -12,6 +21,11 @@
   "admin_ui_local_url": "http://127.0.0.1:7443",
   "admin_volume_id": "vol-0123456789abcdef0",
   "agent_volume_id": "vol-0fedcba9876543210",
+  "version": "x.y.z",
+  "operator_connections": [
+    {"mode": "ssh"},
+    {"mode": "cloudflare_access", "hostname": "trustyclaw.example.com"}
+  ],
   "admin_password": "generated-password"
 }
 ```
@@ -26,13 +40,16 @@
 | `admin_ui_local_url` | string | Localhost URL for the admin UI after port forwarding. |
 | `admin_volume_id` | string | EBS volume id for durable admin/API state and event logs. |
 | `agent_volume_id` | string | EBS volume id for durable agent home and workspace state. |
-| `admin_password` | string | Random password generated on first deploy for the localhost UI and API. |
+| `version` | string | TrustyClaw repo `VERSION` installed by this command. |
+| `operator_connections` | array | Public summary of operator endpoints installed from the input config. Present when the command takes replacement operator endpoints. Cloudflare tunnel tokens and SSH key material are omitted. |
+| `admin_password` | string | Admin password for the UI and API. Present for `deploy` and `reconfigure`. For both commands it is read from `--admin-password-env` when supplied, otherwise generated. Omitted for commands that preserve the existing password. |
 
 ## Secret Handling
 
-`admin_password` is printed only in the deploy result file. It must not be written to
-service logs.
+`admin_password` is printed only in deploy and reconfigure result files. It must
+not be written to service logs.
 
-The operator should treat the deploy result file as sensitive because it contains the
-admin password. The password is only useful with SSH access to the host, which requires
-the matching private SSH key.
+The operator should treat deploy and reconfigure result files as sensitive
+because they contain the admin password. With SSH access, the matching private
+SSH key is also required. With Cloudflare Access, the user must pass Cloudflare
+Access authentication and then enter the TrustyClaw admin password.

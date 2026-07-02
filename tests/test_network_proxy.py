@@ -12,6 +12,8 @@ import threading
 import unittest
 from unittest.mock import patch
 
+import pg_harness
+
 from host.runtime.network_policy import load_policy, save_policy
 from host.runtime.state import read_network_events, save_proxy_openai_account_id
 from host.runtime import network_proxy
@@ -51,6 +53,7 @@ class UpstreamHandler(BaseHTTPRequestHandler):
 
 class NetworkProxyTests(unittest.TestCase):
     def setUp(self) -> None:
+        pg_harness.reset_database()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.env_patch = patch.dict("os.environ", {"TRUSTYCLAW_STATE_DIR": self.temp_dir.name})
@@ -105,14 +108,55 @@ class NetworkProxyTests(unittest.TestCase):
         self.assertIsNone(denial)
         self.assertIn("api.openai.com", policy["allowed_network_access"])
 
-    def test_proxy_reports_invalid_policy_without_status_file(self) -> None:
-        save_policy({"bogus": True}, "2026-06-08T00:00:00Z")
+    def test_proxy_denies_on_invalid_stored_policy(self) -> None:
+        # The typed schema cannot hold a malformed policy document, so the
+        # residual invalid case is a structurally valid but semantically bad
+        # policy (here: an uncompilable path-guard regex). Still a policy
+        # problem, not an availability blip: it must deny (never fall back to
+        # a stale cached policy).
+        from host.runtime import db
+
+        with db.transaction() as cur:
+            cur.execute(
+                "INSERT INTO network_policy (singleton, updated_at) VALUES (TRUE, %s)"
+                " ON CONFLICT (singleton) DO UPDATE SET updated_at = EXCLUDED.updated_at",
+                ("2026-06-08T00:00:00Z",),
+            )
+            cur.execute("INSERT INTO allowed_domains (domain) VALUES ('api.example.com')")
+            cur.execute(
+                "INSERT INTO domain_methods (domain, position, method) VALUES ('api.example.com', 0, 'GET')"
+            )
+            cur.execute(
+                "INSERT INTO domain_path_guards (domain, position, pattern)"
+                " VALUES ('api.example.com', 0, '(')"
+            )
 
         policy, denial = network_proxy._policy_load_denial()
 
         self.assertEqual(policy, {})
         self.assertIsNotNone(denial)
-        self.assertIn("network policy invalid", denial)
+        self.assertIn("network policy unavailable", denial)
+
+    def test_proxy_denies_everything_through_database_outages(self) -> None:
+        # No fallback cache by design: the pins and the decision log live in
+        # the same database, so nothing could keep flowing anyway — an outage
+        # denies every request until the database returns. Simple, fail safe.
+        save_policy({"managed_ai_provider_network_access": {}, "allowed_network_access": {
+            "api.example.com": {"allow_http_methods": ["GET"]}
+        }}, "2026-06-08T00:00:00Z")
+        loaded = network_proxy._load_enforcement_policy()
+        self.assertIn("api.example.com", loaded["allowed_network_access"])
+
+        with patch("host.runtime.network_proxy.load_policy", side_effect=OSError("db down")):
+            empty, denial = network_proxy._policy_load_denial()
+        self.assertEqual(empty, {})
+        self.assertIsNotNone(denial)
+        self.assertIn("network policy unavailable", denial)
+
+        # The database coming back restores enforcement immediately.
+        restored, denial = network_proxy._policy_load_denial()
+        self.assertIsNone(denial)
+        self.assertIn("api.example.com", restored["allowed_network_access"])
 
     def self_signed_cert(self, name: str) -> tuple[str, str]:
         cert = Path(self.temp_dir.name) / f"{name}.crt"
@@ -393,6 +437,38 @@ class NetworkProxyTests(unittest.TestCase):
         self.assertEqual(event["decision"], "denied")
         self.assertIn("request target is invalid", event["reason"])
 
+    def test_connect_client_tls_abort_gets_no_http_response_bytes(self) -> None:
+        # After "200 Connection Established" the client speaks TLS or nothing.
+        # A client that aborts the MITM handshake must get a plain close — an
+        # HTTP 502 written into that stream would be garbage bytes to a TLS
+        # client and previously raised again inside the handler on a reset
+        # socket.
+        self.proxy_ca()
+        proxy = self.start_proxy()
+        self.save_policy({"127.0.0.1": {"allow_http_methods": ["GET"]}})
+
+        raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw.settimeout(5)
+        raw.connect(("127.0.0.1", proxy.server_address[1]))
+        self.addCleanup(raw.close)
+        raw.sendall(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
+        self.assertIn(b"200 Connection Established", raw.recv(4096))
+
+        raw.sendall(b"not a TLS ClientHello")
+        trailing = b""
+        while True:
+            try:
+                chunk = raw.recv(4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            trailing += chunk
+        # A TLS alert from the failed handshake is fine; an HTTP response is
+        # the bug.
+        self.assertNotIn(b"HTTP/", trailing)
+        self.assertNotIn(b"502", trailing)
+
     def test_is_public_ip_rejects_internal_ranges(self) -> None:
         for good in ("93.184.216.34", "8.8.8.8", "1.1.1.1"):
             self.assertTrue(network_proxy._is_public_ip(good), good)
@@ -582,6 +658,7 @@ class WebSocketGuardTests(unittest.TestCase):
     }
 
     def setUp(self) -> None:
+        pg_harness.reset_database()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.env_patch = patch.dict("os.environ", {"TRUSTYCLAW_STATE_DIR": self.temp_dir.name})

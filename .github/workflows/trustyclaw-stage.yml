@@ -2,15 +2,10 @@ name: trustyclaw-stage
 
 on:
   workflow_dispatch:
-  issue_comment:
-    types:
-      - created
 
 permissions:
   actions: read
   contents: read
-  issues: read
-  pull-requests: read
 
 concurrency:
   group: trustyclaw-stage
@@ -19,12 +14,9 @@ concurrency:
 jobs:
   authorize:
     name: Authorize AWS stage
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.issue.pull_request && github.event.comment.body == '/trustyclaw-stage')
     runs-on: ubuntu-latest
     outputs:
-      ref: ${{ steps.resolve.outputs.ref }}
+      ref: ${{ steps.main_ref.outputs.ref }}
     steps:
       - name: Checkout trusted workflow actions
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
@@ -35,31 +27,19 @@ jobs:
       - name: Authorize repo admin
         uses: ./.github/actions/authorize-repo-admin
 
-      - name: Resolve safe ref
-        id: resolve
+      - name: Require main dispatch
+        id: main_ref
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          EVENT_NAME: ${{ github.event_name }}
           DISPATCH_SHA: ${{ github.sha }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          DISPATCH_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          if [[ "${EVENT_NAME}" == "issue_comment" ]]; then
-            pr="$(curl -fsS \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              "${{ github.api_url }}/repos/${REPO}/pulls/${ISSUE_NUMBER}")"
-            head_repo="$(jq -r .head.repo.full_name <<<"${pr}")"
-            if [[ "${head_repo}" != "${REPO}" ]]; then
-              echo "Refusing to run AWS stage secrets against fork PR code from ${head_repo}." >&2
-              exit 1
-            fi
-            ref="$(jq -r .head.sha <<<"${pr}")"
-          else
-            ref="${DISPATCH_SHA}"
+          if [[ "${DISPATCH_REF}" != "refs/heads/main" ]]; then
+            echo "TrustyClaw stage may only be dispatched from main; got ${DISPATCH_REF}." >&2
+            exit 1
           fi
+          ref="${DISPATCH_SHA}"
           echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
           echo "Deploying ref ${ref} to trustyclaw-stage"
           {
@@ -67,7 +47,8 @@ jobs:
             echo
             echo "| Field | Value |"
             echo "| --- | --- |"
-            echo "| Event | ${EVENT_NAME} |"
+            echo "| Event | workflow_dispatch |"
+            echo "| Branch | main |"
             echo "| Ref | ${ref} |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
@@ -101,20 +82,72 @@ jobs:
           printf '%s\n' "${TRUSTYCLAW_STAGE_SSH_PRIVATE_KEY}" > "${key_path}"
           chmod 0600 "${key_path}"
           public_key="$(ssh-keygen -y -f "${key_path}")"
-          cat > stage_config.json <<JSON
+          cat > stage_upgrade_config.json <<JSON
+          {
+            "agent_name": "trustyclaw-stage",
+            "aws_region": "us-east-1",
+            "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
+            "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY"
+          }
+          JSON
+          cat > stage_deploy_config.json <<JSON
           {
             "agent_name": "trustyclaw-stage",
             "aws_region": "us-east-1",
             "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
             "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
-            "ssh_public_key": "${public_key}",
-            "ssh_port_opened": true
+            "operator_connections": [
+              {
+                "mode": "ssh",
+                "ssh_public_key": "${public_key}"
+              }
+            ]
           }
           JSON
           echo "TRUSTYCLAW_STAGE_SSH_KEY=${key_path}" >> "${GITHUB_ENV}"
 
-      - name: Upgrade or recover stage
+      - name: Upgrade stage
+        id: upgrade_stage
+        continue-on-error: true
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TRUSTYCLAW_STAGE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TRUSTYCLAW_STAGE_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          version="$(cat VERSION)"
+          same_version_failure=false
+          if ! python3 -m host.cli.upgrade \
+            --config stage_upgrade_config.json \
+            --result-file trustyclaw-stage.json 2>&1 | tee stage-upgrade.log; then
+            if grep -F "tagged with version ${version}; upgrade requires preserved state older than local VERSION ${version}" stage-upgrade.log >/dev/null \
+              || grep -F "upgrade requires admin state version lower than local VERSION; state=${version}, local=${version}" stage-upgrade.log >/dev/null; then
+              same_version_failure=true
+            fi
+            echo "same_version_failure=${same_version_failure}" >> "${GITHUB_OUTPUT}"
+            exit 1
+          fi
+          echo "same_version_failure=false" >> "${GITHUB_OUTPUT}"
+
+      - name: Start existing stage
+        if: ${{ steps.upgrade_stage.outcome == 'failure' && steps.upgrade_stage.outputs.same_version_failure == 'true' }}
+        id: start_current
+        continue-on-error: true
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TRUSTYCLAW_STAGE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TRUSTYCLAW_STAGE_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          python3 -m host.cli.start \
+            --config stage_upgrade_config.json \
+            --result-file trustyclaw-stage.json
+
+      - name: Recover or first-deploy stage
         id: deploy
+        if: ${{ steps.upgrade_stage.outcome == 'failure' && steps.start_current.outcome != 'success' }}
         shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.TRUSTYCLAW_STAGE_AWS_ACCESS_KEY_ID }}
@@ -123,21 +156,31 @@ jobs:
           TRUSTYCLAW_STAGE_ADMIN_PASSWORD: ${{ secrets.TRUSTYCLAW_STAGE_ADMIN_PASSWORD }}
         run: |
           set -euo pipefail
-          python3 -m host.deploy \
-            --config stage_config.json \
-            --allow-upgrade-or-recover \
-            --admin-password-env TRUSTYCLAW_STAGE_ADMIN_PASSWORD
+          # If upgrade failed and no already-current instance was found,
+          # recover recreates one from preserved volumes. Deploy is only for
+          # the first stage run.
+          if ! python3 -m host.cli.recover \
+            --config stage_upgrade_config.json \
+            --allow-upgrade \
+            --result-file trustyclaw-stage.json; then
+            python3 -m host.cli.deploy \
+              --config stage_deploy_config.json \
+              --admin-password-env TRUSTYCLAW_STAGE_ADMIN_PASSWORD \
+              --result-file trustyclaw-stage.json
+          fi
 
       - name: Run stage tests
         id: stage_tests
         shell: bash
         env:
           AWS_DEFAULT_REGION: us-east-1
+          TRUSTYCLAW_STAGE_ADMIN_PASSWORD: ${{ secrets.TRUSTYCLAW_STAGE_ADMIN_PASSWORD }}
         run: |
           set -euo pipefail
           python3 tests/stage/stage_aws.py \
             --result-file trustyclaw-stage.json \
-            --ssh-key "${TRUSTYCLAW_STAGE_SSH_KEY}" 2>&1 | tee stage-test.log
+            --ssh-key-env TRUSTYCLAW_STAGE_SSH_KEY \
+            --admin-password-env TRUSTYCLAW_STAGE_ADMIN_PASSWORD 2>&1 | tee stage-test.log
 
       - name: Stop stage instance
         id: stop_stage
@@ -151,17 +194,19 @@ jobs:
           set -euo pipefail
           instance_id="$(jq -r '.instance_id // empty' trustyclaw-stage.json 2>/dev/null || true)"
           if [[ -z "${instance_id}" ]]; then
-            echo "No stage deploy result found; nothing to stop."
+            echo "No stage result file found; nothing to stop."
             exit 0
           fi
-          echo "Stopping stage instance ${instance_id}."
-          aws ec2 stop-instances --instance-ids "${instance_id}" >/dev/null
-          aws ec2 wait instance-stopped --instance-ids "${instance_id}"
+          python3 -m host.cli.stop \
+            --config stage_upgrade_config.json \
+            --result-file trustyclaw-stage-stop.json
 
       - name: Write stage summary
         if: ${{ always() }}
         shell: bash
         env:
+          UPGRADE_OUTCOME: ${{ steps.upgrade_stage.outcome }}
+          START_OUTCOME: ${{ steps.start_current.outcome }}
           DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
           TEST_OUTCOME: ${{ steps.stage_tests.outcome }}
           STOP_OUTCOME: ${{ steps.stop_stage.outcome }}
@@ -196,7 +241,9 @@ jobs:
             echo "| Instance | ${instance_id} |"
             echo "| Public DNS | ${public_dns} |"
             echo "| Public IP | ${public_ip} |"
-            echo "| Deploy | ${DEPLOY_OUTCOME:-skipped} |"
+            echo "| Upgrade | ${UPGRADE_OUTCOME:-skipped} |"
+            echo "| Start existing instance | ${START_OUTCOME:-skipped} |"
+            echo "| Recover/deploy | ${DEPLOY_OUTCOME:-skipped} |"
             echo "| Tests | ${TEST_OUTCOME:-skipped} |"
             echo "| Test result | ${test_result} |"
             echo "| Stop instance | ${STOP_OUTCOME:-skipped} |"

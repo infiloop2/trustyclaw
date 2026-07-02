@@ -10,6 +10,10 @@ orchestrator keeps warm between tasks.
 A device-code login only completes while the app-server that started it keeps
 polling, so ``start_device_login`` parks its server in ``_login_server`` until
 ``account_status`` sees the login land (or a new login starts).
+
+The Codex app-server initialize request includes a fixed TrustyClaw client
+version. Keep this stable unless TrustyClaw intentionally changes the client
+contract it expects Codex to see during app-server initialization.
 """
 
 from __future__ import annotations
@@ -20,12 +24,14 @@ import json
 import queue
 import subprocess
 import threading
+import time
 from typing import Any, Callable
 
 DEFAULT_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/run-codex-app-server"]
 DEFAULT_ACCOUNT_ID_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/read-codex-account-id"]
 AGENT_CWD = "/mnt/trustyclaw-agent/agent-home"
 ACCOUNT_ID_HELPER_TIMEOUT_SECONDS = 10
+CLIENT_VERSION = "v1.0"
 
 _login_server: "CodexAppServer | None" = None
 _login_lock = threading.Lock()
@@ -68,16 +74,19 @@ class CodexAppServer:
         self.close()
 
     def start(self, init_timeout: float = 60.0) -> None:
-        self._proc = subprocess.Popen(
-            self._command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        try:
+            self._proc = subprocess.Popen(
+                self._command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as exc:
+            raise CodexAppServerError(f"failed to start Codex app-server command: {exc}") from exc
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
-        self.call("initialize", {"clientInfo": {"name": "trustyclaw-host", "version": "0.1.0"}}, timeout=init_timeout)
+        self.call("initialize", _client_info(), timeout=init_timeout)
         self.notify("initialized")
 
     def alive(self) -> bool:
@@ -162,23 +171,36 @@ class CodexAppServer:
         return self._next_message(timeout)
 
     def _next_message(self, timeout: float) -> dict[str, Any]:
-        try:
-            return self._messages.get(timeout=timeout)
-        except queue.Empty:
-            self._require_proc()
-            raise CodexTimeout("timed out waiting for Codex app-server")
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._require_proc()
+                raise CodexTimeout("timed out waiting for Codex app-server")
+            try:
+                return self._messages.get(timeout=min(0.25, remaining))
+            except queue.Empty:
+                self._require_proc()
 
     def _require_proc(self) -> subprocess.Popen[str]:
-        if self._proc is None or self._proc.poll() is not None:
-            raise CodexAppServerError("Codex app-server is not running")
-        return self._proc
+        proc = self._proc
+        if proc is None:
+            raise CodexAppServerError("Codex app-server was not started")
+        returncode = proc.poll()
+        if returncode is not None:
+            raise CodexAppServerError(f"Codex app-server exited with status {returncode}")
+        return proc
 
 
 AgentServer = CodexAppServer
 
 
-def account_status() -> tuple[str, str | None, str | None]:
-    """Return (status, detail, account_id). detail is set only for "error"."""
+def _client_info() -> dict[str, dict[str, str]]:
+    return {"clientInfo": {"name": "trustyclaw-host", "version": CLIENT_VERSION}}
+
+
+def account_status() -> tuple[str, str | None, dict[str, Any] | None]:
+    """Return (status, detail, account metadata). detail is set only for "error"."""
     # Bounded timeouts: only the background poller calls this, but a Codex
     # app-server that cannot start (e.g. its startup traffic is denied by a
     # restrictive policy) must not wedge the poller — it resolves to "error"
@@ -195,7 +217,12 @@ def account_status() -> tuple[str, str | None, str | None]:
             account_id = read_codex_account_id()
             if account_id:
                 close_login_server()
-                return "active", None, account_id
+                account_metadata = _safe_account_metadata(account if isinstance(account, dict) else {})
+                account_metadata["account_id"] = account_id
+                rate_limits = _safe_rate_limits_metadata(server.call("account/rateLimits/read", {}, timeout=15))
+                if rate_limits:
+                    account_metadata["codex_usage"] = rate_limits
+                return "active", None, account_metadata
             raise CodexAppServerError("Codex account/read returned an account without a supported account id")
         return "awaiting_login", None, None
     except CodexAppServerError as exc:
@@ -208,13 +235,99 @@ def account_status() -> tuple[str, str | None, str | None]:
                          "no account", "unauthorized", "401")
         if any(marker in message for marker in login_markers):
             return "awaiting_login", None, None
-        detail = str(exc)
-        stderr = server.stderr_tail()
-        if stderr:
-            detail = f"{detail}; app-server stderr: {stderr}"
-        return "error", detail, None
+        return "error", _error_detail(str(exc), server.stderr_tail()), None
     finally:
         server.close()
+
+
+def _error_detail(message: str, stderr: str) -> str:
+    if not stderr:
+        return message
+    if stderr in message:
+        return message
+    return f"{message}; app-server stderr: {stderr}"
+
+
+def _safe_account_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    metadata: dict[str, Any] = {}
+    email = _string_field(value, "email")
+    if email:
+        metadata["email"] = email
+    plan_type = _string_field(value, "planType")
+    if plan_type:
+        metadata["planType"] = plan_type
+    return metadata
+
+
+def _string_field(value: dict[str, Any], key: str) -> str | None:
+    item = value.get(key)
+    if not isinstance(item, str):
+        return None
+    return item.strip() or None
+
+
+def _rate_limit_scalar(value: Any) -> Any:
+    if isinstance(value, bool) or isinstance(value, int) or isinstance(value, float):
+        return value
+    if isinstance(value, str):
+        return value.strip() or None
+    return None
+
+
+def _safe_rate_limits_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    rate_limits = _safe_rate_limit_snapshot(value.get("rateLimits"))
+    if rate_limits:
+        result["rate_limits"] = rate_limits
+    return result
+
+
+def _safe_rate_limit_snapshot(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key in ("primary", "secondary"):
+        window = _safe_rate_limit_window(value.get(key))
+        if window:
+            result[key] = window
+    credits = _safe_credits_snapshot(value.get("credits"))
+    if credits:
+        result["credits"] = credits
+    return result
+
+
+def _safe_rate_limit_window(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for source_key, target_key in (
+        ("usedPercent", "used_percent"),
+        ("windowDurationMins", "window_duration_mins"),
+        ("resetsAt", "resets_at"),
+    ):
+        item = _rate_limit_scalar(value.get(source_key))
+        if item is not None:
+            result[target_key] = item
+    return result
+
+
+def _safe_credits_snapshot(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for source_key, target_key in (
+        ("hasCredits", "has_credits"),
+        ("unlimited", "unlimited"),
+        ("balance", "balance"),
+    ):
+        item = _rate_limit_scalar(value.get(source_key))
+        if item is not None:
+            result[target_key] = item
+    return result
 
 
 def read_codex_account_id(command: list[str] | None = None) -> str | None:

@@ -12,6 +12,9 @@ let selectedTask = null;
 let selectedTaskEvents = [];
 let selectedTaskEventsSince = null;
 let selectedTaskEventsHasMore = false;
+let currentFilePath = "/";
+let fileEntries = [];
+const FILE_LIST_ENTRY_LIMIT = 1000;
 const TASK_EVENT_PAGE_BATCH = 10;
 const POLICY_PRESETS = {
   openai: { managed: { openai: true }, rules: {} },
@@ -154,10 +157,11 @@ function showLogin() { $("login").hidden = false; $("app").hidden = true; }
 
 function showTab(name) {
   activeTab = name;
-  for (const tabName of ["home", "agent", "network"]) {
+  for (const tabName of ["home", "agent", "files", "network"]) {
     $(`tab-${tabName}`).classList.toggle("active-tab", tabName === name);
     $(`panel-${tabName}`).hidden = tabName !== name;
   }
+  if (name === "files" && !fileEntries.length) loadAgentFiles(currentFilePath);
 }
 
 function togglePresetInfo(preset, button) {
@@ -199,16 +203,16 @@ async function refreshHealth() {
   $("health").innerHTML = `
     <tr><th>overall</th><td>${badge(health.status)}</td></tr>
     <tr><th>network controls</th><td>${badge(health.network_controls.status)}</td></tr>
+    <tr><th>version</th><td>${renderVersion(health.version)}</td></tr>
     <tr><th>cpu</th><td>${esc(host.cpu.usage_percent)}%</td></tr>
     <tr><th>memory</th><td>${gib(host.memory.used_bytes)} / ${gib(host.memory.total_bytes)}</td></tr>
     <tr><th>filesystem</th><td>${gib(host.filesystem.used_bytes)} / ${gib(host.filesystem.total_bytes)}</td></tr>
     <tr><th>swap</th><td>${gib(host.swap.used_bytes)} / ${gib(host.swap.allocated_bytes)}</td></tr>`;
-  $("runtime").innerHTML = `<tr><th>type</th><th>status</th><th>active tasks</th></tr>` +
+  $("runtime").innerHTML = `<tr><th>type</th><th>status</th></tr>` +
     runtimes.map(runtime => `
       <tr>
         <td>${esc(runtime.type)}</td>
         <td>${badge(runtime.status)}</td>
-        <td>${esc((runtime.active_task_ids || []).join(", "))}</td>
       </tr>`).join("");
   updateLoginButtons(runtimes);
   renderRuntimeGuidance(runtimes);
@@ -217,10 +221,141 @@ async function refreshHealth() {
   else $("oauth").textContent = "";
 }
 
+function renderVersion(version) {
+  if (!version || typeof version !== "object") return `<span class="muted">not reported</span>`;
+  const status = typeof version.status === "string" && version.status ? version.status : "unknown";
+  const runtime = typeof version.runtime === "string" && version.runtime ? version.runtime : "unknown";
+  const state = typeof version.state === "string" && version.state ? version.state : "unknown";
+  return `${badge(status)} <span class="muted">runtime</span> ${esc(runtime)} <span class="muted">state</span> ${esc(state)}`;
+}
+
+async function refreshProviderAccounts() {
+  const response = await api("GET", "/v1/agent-runtime/account");
+  const accounts = Array.isArray(response.accounts) ? response.accounts : [];
+  if (!accounts.length) {
+    $("provider-accounts").innerHTML = `<tr><td class="muted">No provider accounts.</td></tr>`;
+    return;
+  }
+  $("provider-accounts").innerHTML = `
+    <tr><th>runtime</th><th>account</th><th>plan</th><th>usage</th></tr>
+    ${accounts.map(renderProviderAccountRow).join("")}`;
+}
+
+function renderProviderAccountRow(account) {
+  const identity = [];
+  if (account.account_id) identity.push(`<div>${esc(account.account_id)}</div>`);
+  if (account.email) identity.push(`<div class="muted">${esc(account.email)}</div>`);
+  const plan = account.plan_type ? esc(account.plan_type) : `<span class="muted">not reported</span>`;
+  const usage = account.agent_runtime === "claude_code"
+    ? renderClaudeUsage(account.claude_usage)
+    : renderCodexUsage(account.codex_usage);
+  return `
+    <tr>
+      <td>${esc(account.agent_runtime)}<br>${badge(account.status)}</td>
+      <td>${identity.length ? identity.join("") : `<span class="muted">not available</span>`}</td>
+      <td>${plan}</td>
+      <td>${usage}</td>
+    </tr>`;
+}
+
+function renderCodexUsage(codexUsage) {
+  if (codexUsage === undefined || codexUsage == null) return `<span class="muted">not reported</span>`;
+  if (codexUsage && typeof codexUsage === "object" && codexUsage.rate_limits) {
+    return renderRateLimits(codexUsage);
+  }
+  return renderMetadata(codexUsage);
+}
+
+function renderClaudeUsage(claudeUsage) {
+  if (claudeUsage === undefined || claudeUsage == null) return `<span class="muted">not reported</span>`;
+  if (!claudeUsage || typeof claudeUsage !== "object") return renderMetadata(claudeUsage);
+  const rows = [];
+  if (claudeUsage.current_session_used_percent !== undefined) {
+    rows.push(`<div>current session: ${esc(`${claudeUsage.current_session_used_percent}%`)}</div>`);
+  }
+  if (claudeUsage.weekly_used_percent !== undefined) {
+    rows.push(`<div>weekly: ${esc(`${claudeUsage.weekly_used_percent}%`)}</div>`);
+  }
+  if (claudeUsage.weekly_resets_at_text) {
+    rows.push(`<div class="muted">resets ${esc(claudeUsage.weekly_resets_at_text)}</div>`);
+  }
+  if (claudeUsage.last_checked_at) {
+    rows.push(`<div class="muted">checked ${esc(formatDateTime(claudeUsage.last_checked_at))}</div>`);
+  }
+  return rows.length ? rows.join("") : renderMetadata(claudeUsage);
+}
+
+function renderRateLimits(usage) {
+  const snapshot = usage.rate_limits;
+  const rows = [];
+  if (snapshot && typeof snapshot === "object") {
+    const windows = [];
+    if (snapshot.primary) windows.push(["primary", snapshot.primary]);
+    if (snapshot.secondary) windows.push(["secondary", snapshot.secondary]);
+    const renderedWindows = windows.map(([name, window]) => renderRateLimitWindow(name, window)).filter(Boolean).join("");
+    const credits = snapshot.credits ? renderCredits(snapshot.credits) : "";
+    if (renderedWindows || credits) rows.push(`<div>${renderedWindows}${credits}</div>`);
+  }
+  if (usage.last_checked_at) rows.push(`<div class="muted">checked ${esc(formatDateTime(usage.last_checked_at))}</div>`);
+  const extra = { ...usage };
+  delete extra.rate_limits;
+  delete extra.last_checked_at;
+  return rows.join("") + (Object.keys(extra).length ? `<pre class="metadata">${esc(JSON.stringify(extra, null, 2))}</pre>` : "");
+}
+
+function renderRateLimitWindow(name, window) {
+  if (!window || typeof window !== "object") return "";
+  const duration = window.window_duration_mins;
+  const label = duration === 300 ? "5 hour" : duration === 10080 ? "weekly" : `${name} (${duration ?? "unknown"} min)`;
+  const used = window.used_percent === undefined ? "not reported" : `${window.used_percent}%`;
+  const resets = window.resets_at ? `<br><span class="muted">resets ${esc(formatUnixTime(window.resets_at))}</span>` : "";
+  return `<div>${esc(label)}: ${esc(used)}${resets}</div>`;
+}
+
+function renderCredits(credits) {
+  if (!credits || typeof credits !== "object") return "";
+  if (credits.unlimited === true) return `<div>credits: unlimited</div>`;
+  if (credits.has_credits === false) return `<div>credits: none</div>`;
+  if (credits.balance !== undefined) return `<div>credits: ${esc(credits.balance)}</div>`;
+  return "";
+}
+
+function formatUnixTime(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return String(value);
+  return formatDateTime(numeric * 1000);
+}
+
+function formatDateTime(value) {
+  const date = typeof value === "number" ? new Date(value) : new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  });
+}
+
+function renderMetadata(value) {
+  if (value == null) return `<span class="muted">not reported</span>`;
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return esc(value);
+  return `<pre class="metadata">${esc(JSON.stringify(value, null, 2))}</pre>`;
+}
+
 function updateLoginButtons(runtimes) {
   const statuses = Object.fromEntries(runtimes.map(runtime => [runtime.type, runtime.status]));
-  $("start-codex-login").disabled = statuses.codex !== "awaiting_login";
-  $("start-claude-login").disabled = statuses.claude_code !== "awaiting_login";
+  for (const [runtime, buttonId] of [
+    ["codex", "start-codex-login"],
+    ["claude_code", "start-claude-login"],
+  ]) {
+    const button = $(buttonId);
+    const canStart = statuses[runtime] === "awaiting_login";
+    button.hidden = !canStart;
+    button.disabled = !canStart;
+  }
 }
 
 function providerEnabled(policy, provider) {
@@ -481,6 +616,112 @@ async function refreshNetEvents() {
       </tr>`).join("");
 }
 
+function fileMessage(message) {
+  $("file-message").textContent = message || "";
+}
+
+function parentPath(path) {
+  const normalized = path && path !== "/" ? path.replace(/\/+$/, "") : "/";
+  if (normalized === "/") return "/";
+  const index = normalized.lastIndexOf("/");
+  return index <= 0 ? "/" : normalized.slice(0, index);
+}
+
+async function loadAgentFiles(path = currentFilePath) {
+  try {
+    fileMessage("");
+    const response = await api("GET", `/v1/agent-files?path=${encodeURIComponent(path || "/")}`);
+    currentFilePath = response.path || "/";
+    fileEntries = Array.isArray(response.entries) ? response.entries : [];
+    $("file-path").value = currentFilePath;
+    renderFileList(response);
+  } catch (error) {
+    fileMessage(error.message);
+  }
+}
+
+async function readAgentFile(path) {
+  try {
+    fileMessage("");
+    const response = await api("GET", `/v1/agent-files/read?path=${encodeURIComponent(path)}`);
+    renderFileContent(response);
+  } catch (error) {
+    fileMessage(error.message);
+  }
+}
+
+async function openAgentPath(path, type) {
+  if (type === "directory") {
+    await loadAgentFiles(path);
+    return;
+  }
+  await readAgentFile(path);
+}
+
+function renderFileList(listing = {}) {
+  if (listing.truncated) {
+    fileMessage(`Showing first ${FILE_LIST_ENTRY_LIMIT} entries.`);
+  }
+  const table = $("file-list");
+  table.textContent = "";
+  const header = document.createElement("tr");
+  for (const label of ["name", "type", "size"]) {
+    const cell = document.createElement("th");
+    cell.textContent = label;
+    header.appendChild(cell);
+  }
+  table.appendChild(header);
+  if (currentFilePath !== "/") {
+    table.appendChild(fileRow("..", parentPath(currentFilePath), "directory", null));
+  }
+  if (!fileEntries.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 3;
+    cell.className = "muted";
+    cell.textContent = "Empty directory.";
+    row.appendChild(cell);
+    table.appendChild(row);
+    return;
+  }
+  for (const entry of fileEntries) {
+    table.appendChild(fileRow(entry.name, entry.path, entry.type, entry.size_bytes));
+  }
+}
+
+function fileRow(name, path, type, sizeBytes) {
+  const row = document.createElement("tr");
+  const nameCell = document.createElement("td");
+  const button = document.createElement("button");
+  button.className = "file-entry";
+  button.dataset.action = "open-file-path";
+  button.dataset.path = path == null ? "" : String(path);
+  button.dataset.fileType = type == null ? "" : String(type);
+  button.textContent = name == null ? "" : String(name);
+  nameCell.appendChild(button);
+  row.appendChild(nameCell);
+
+  const typeCell = document.createElement("td");
+  typeCell.textContent = type == null ? "" : String(type);
+  row.appendChild(typeCell);
+
+  const sizeCell = document.createElement("td");
+  sizeCell.className = "muted";
+  sizeCell.textContent = sizeBytes == null ? "" : String(sizeBytes);
+  row.appendChild(sizeCell);
+  return row;
+}
+
+function renderFileContent(file) {
+  const truncated = file.truncated ? " (truncated)" : "";
+  $("file-viewer-title").textContent = `${file.path || ""}${truncated}`;
+  $("file-content").textContent = file.content || "";
+}
+
+function goToFilePath() {
+  loadAgentFiles($("file-path").value.trim() || "/");
+}
+
 async function loadPolicy() {
   const response = await api("GET", "/v1/network/policy");
   activeNetworkPolicy = normalizePolicy(response.network_controls);
@@ -686,10 +927,12 @@ async function savePolicy() {
 async function tick() {
   try {
     await refreshHealth();
+    await refreshProviderAccounts();
     await refreshTasks();
     await loadThreads();
     await refreshEvents();
     await refreshNetEvents();
+    if (activeTab === "files") await loadAgentFiles(currentFilePath);
   } catch (error) { /* shown via login panel or notice */ }
 }
 
@@ -712,6 +955,8 @@ document.addEventListener("click", event => {
   const threadId = button.dataset.threadId;
   const runtime = button.dataset.runtime;
   const preset = button.dataset.preset || button.dataset.info;
+  const path = button.dataset.path;
+  const fileType = button.dataset.fileType;
   const actions = {
     "login": () => login(),
     "logout": () => logout(),
@@ -727,6 +972,10 @@ document.addEventListener("click", event => {
     "show-thread": () => showThread(threadId, runtime),
     "show-task-events": () => showTaskEvents(taskId),
     "load-more-task-events": () => loadMoreTaskEvents(taskId),
+    "file-up": () => loadAgentFiles(parentPath(currentFilePath)),
+    "file-go": () => goToFilePath(),
+    "file-refresh": () => loadAgentFiles(currentFilePath),
+    "open-file-path": () => openAgentPath(path, fileType),
     "load-policy": () => loadPolicy(),
     "reset-proposed-policy": () => resetProposedPolicy(),
     "apply-policy-preset": () => applyPolicyPreset(preset),
@@ -740,4 +989,5 @@ document.addEventListener("click", event => {
 
 $("policy").addEventListener("input", loadPolicyFromJsonEditor);
 $("password").addEventListener("keydown", event => { if (event.key === "Enter") login(); });
+$("file-path").addEventListener("keydown", event => { if (event.key === "Enter") goToFilePath(); });
 start();
