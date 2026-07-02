@@ -15,7 +15,7 @@
 
 <section id="login" hidden>
   <h2>Login</h2>
-  <p class="muted">Enter the admin password from the deploy result file.</p>
+  <p class="muted">Enter the admin password from the latest deploy or reconfigure result file.</p>
   <input id="password" type="password" placeholder="admin password" autocomplete="current-password">
   <div class="actions"><button data-action="login">Login</button></div>
 </section>
@@ -25,6 +25,7 @@
     <nav class="sidebar" aria-label="Admin sections">
       <button id="tab-home" class="tab-button active-tab" data-action="show-tab" data-tab="home">Home</button>
       <button id="tab-agent" class="tab-button" data-action="show-tab" data-tab="agent">Agent</button>
+      <button id="tab-files" class="tab-button" data-action="show-tab" data-tab="files">Files</button>
       <button id="tab-network" class="tab-button" data-action="show-tab" data-tab="network">Network</button>
       <div class="actions">
         <button data-action="logout">Logout</button>
@@ -40,18 +41,33 @@
             <button class="danger" data-action="reboot-host">Reboot host</button>
           </div>
         </section>
-      </div>
 
-      <div id="panel-agent" class="tab-panel" hidden>
         <section>
           <h2>Agent runtime</h2>
           <table id="runtime"></table>
           <div id="runtime-guidance"></div>
           <div id="oauth" class="muted"></div>
           <div class="actions">
-            <button id="start-codex-login" data-action="start-login" data-runtime="codex" disabled>Start Codex login</button>
-            <button id="start-claude-login" data-action="start-login" data-runtime="claude_code" disabled>Start Claude login</button>
+            <button id="start-codex-login" data-action="start-login" data-runtime="codex" disabled hidden>Start Codex login</button>
+            <button id="start-claude-login" data-action="start-login" data-runtime="claude_code" disabled hidden>Start Claude login</button>
           </div>
+        </section>
+
+        <section>
+          <h2>Provider usage</h2>
+          <table id="provider-accounts"></table>
+        </section>
+      </div>
+
+      <div id="panel-agent" class="tab-panel" hidden>
+        <section>
+          <h2>Threads</h2>
+          <table id="threads"></table>
+          <div class="actions">
+            <button data-action="load-threads">Refresh</button>
+          </div>
+          <div id="thread-detail"></div>
+          <div id="task-events-detail"></div>
         </section>
 
         <section>
@@ -69,18 +85,30 @@
         </section>
 
         <section>
-          <h2>Threads</h2>
-          <table id="threads"></table>
-          <div class="actions">
-            <button data-action="load-threads">Refresh</button>
-          </div>
-          <div id="thread-detail"></div>
-          <div id="task-events-detail"></div>
-        </section>
-
-        <section>
           <h2>Agent events</h2>
           <table id="events"></table>
+        </section>
+      </div>
+
+      <div id="panel-files" class="tab-panel" hidden>
+        <section>
+          <h2>Agent files</h2>
+          <div class="actions file-toolbar">
+            <button data-action="file-up">Up</button>
+            <input id="file-path" value="/" spellcheck="false">
+            <button data-action="file-go">Go</button>
+            <button data-action="file-refresh">Refresh</button>
+          </div>
+          <p id="file-message" class="inline-message"></p>
+          <div class="file-explorer">
+            <div class="file-list-pane">
+              <table id="file-list"></table>
+            </div>
+            <div class="file-viewer-pane">
+              <div id="file-viewer-title" class="muted"></div>
+              <pre id="file-content" class="file-content"></pre>
+            </div>
+          </div>
         </section>
       </div>
 

@@ -9,7 +9,7 @@ TrustyClaw proxy CA, then opening a separate TLS connection upstream.
 
 Policy checks happen before any upstream DNS resolution or connection, so a
 denied host name is never resolved (host names are otherwise a data
-exfiltration channel). Every decision is appended to network_events.jsonl.
+exfiltration channel). Every decision is recorded in the network_events table.
 Requests are denied whenever the persisted policy cannot be parsed.
 
 On domains whose rule requires message inspection (the live web search
@@ -31,7 +31,7 @@ import threading
 from typing import Any
 import urllib.parse
 
-from host.config import ConfigError, expand_network_controls, parse_network_controls
+from host.config import expand_network_controls, parse_network_controls
 from host.constants import LOOPBACK, PROXY_PORT
 from host.runtime.network_policy import (
     decide_http_request,
@@ -58,11 +58,17 @@ IDLE_TIMEOUT = 310.0
 
 
 def _load_enforcement_policy() -> dict[str, Any]:
-    """Return the in-memory policy used by the proxy.
+    """Load, validate, and expand the stored policy for this request.
 
-    network_controls.json stores the operator-facing policy as configured.
-    Managed provider domains are expanded only inside the proxy process so the
-    stored config never contains generated OpenAI rules.
+    The stored policy is the operator-facing config; managed provider domains
+    are expanded only inside the proxy process so the stored config never
+    contains generated OpenAI rules. There is deliberately no fallback cache:
+    any failure — an unavailable database exactly like an invalid policy —
+    propagates and the request is denied. The other enforcement inputs
+    (account pins) and the decision log live in the same database, so a
+    cached policy could not keep requests flowing through an outage anyway;
+    denying everything until the database returns is the simple, fail-safe
+    behavior.
     """
     return expand_network_controls(parse_network_controls(load_policy()))
 
@@ -70,8 +76,8 @@ def _load_enforcement_policy() -> dict[str, Any]:
 def _policy_load_denial() -> tuple[dict[str, Any], str | None]:
     try:
         return _load_enforcement_policy(), None
-    except (ConfigError, OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
-        return {}, f"network policy invalid: {exc}"
+    except Exception as exc:
+        return {}, f"network policy unavailable: {exc}"
 
 
 CERT_LOCK = threading.Lock()
@@ -168,13 +174,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         try:
             cert_path, key_path = ensure_host_cert(host)
-            self.send_response(200, "Connection Established")
-            self.end_headers()
-            client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            client_context.load_cert_chain(cert_path, key_path)
-            client_tls = client_context.wrap_socket(self.connection, server_side=True)
         except (OSError, subprocess.CalledProcessError) as exc:
             self.send_error(502, str(exc))
+            return
+        self.send_response(200, "Connection Established")
+        self.end_headers()
+        client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        client_context.load_cert_chain(cert_path, key_path)
+        try:
+            client_tls = client_context.wrap_socket(self.connection, server_side=True)
+        except OSError:
+            # CONNECT already succeeded. If the client closes during the MITM
+            # handshake there is no valid HTTP response channel left.
             return
         self._serve_tls_request(host, port, client_tls)
 

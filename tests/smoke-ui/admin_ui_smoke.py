@@ -81,7 +81,7 @@ def run_browser_smoke(url: str, *, headed: bool) -> None:
     except ModuleNotFoundError as exc:
         raise SystemExit(
             "Playwright is not installed. Run:\n"
-            "  python3 -m pip install -r tests/smoke-ui/requirements.txt\n"
+            "  python3 -m pip install -r tests/requirements.txt\n"
             "  python3 -m playwright install chromium"
         ) from exc
 
@@ -109,12 +109,10 @@ def run_browser_smoke(url: str, *, headed: bool) -> None:
             expect(page.locator("body")).to_contain_text("trustyclaw-mock")
             expect(page.locator("#panel-home")).to_be_visible()
             expect(page.locator("#health")).to_contain_text("ok")
+            expect(page.locator("#health")).to_contain_text("runtime 0.2.0")
+            expect(page.locator("#health")).to_contain_text("state 0.2.0")
             expect(page.locator("#panel-home").get_by_role("button", name="Reboot host")).to_be_visible()
-
-            page.get_by_role("button", name="Agent").click()
-            expect(page.locator("#panel-agent")).to_be_visible()
             expect(page.locator("#runtime")).to_contain_text("codex")
-            expect(page.locator("#panel-agent").get_by_role("button", name="Reboot host")).to_have_count(0)
             expect(page.locator("#runtime-guidance")).to_contain_text(
                 "OpenAI provider access is disabled in the active network policy"
             )
@@ -122,8 +120,17 @@ def run_browser_smoke(url: str, *, headed: bool) -> None:
             expect(page.locator("#runtime-guidance")).to_contain_text(
                 "Claude provider access is disabled in the active network policy"
             )
-            expect(page.get_by_role("button", name="Start Codex login")).to_be_disabled()
-            expect(page.get_by_role("button", name="Start Claude login")).to_be_disabled()
+            expect(page.locator("#runtime")).not_to_contain_text("active tasks")
+            expect(page.get_by_role("button", name="Start Codex login")).to_have_count(0)
+            expect(page.get_by_role("button", name="Start Claude login")).to_have_count(0)
+
+            page.get_by_role("button", name="Agent").click()
+            expect(page.locator("#panel-agent")).to_be_visible()
+            expect(page.locator("#panel-agent").get_by_role("button", name="Reboot host")).to_have_count(0)
+            expect(page.locator("#panel-agent #runtime")).to_have_count(0)
+            expect(page.locator("#panel-agent #provider-accounts")).to_have_count(0)
+            expect(page.locator("#panel-agent > section").nth(0)).to_contain_text("Threads")
+            expect(page.locator("#panel-agent > section").nth(1)).to_contain_text("Tasks")
 
             page.locator("#new-task").fill("browser smoke task")
             page.locator("#new-task-thread").fill("smoke-ui")
@@ -136,6 +143,36 @@ def run_browser_smoke(url: str, *, headed: bool) -> None:
             expect(page.locator("#thread-detail")).to_contain_text("browser smoke task")
             page.locator("#thread-detail").get_by_role("button", name="Events").first.click()
             expect(page.locator("#task-events-detail")).to_contain_text("task.created")
+
+            page.get_by_role("button", name="Files", exact=True).click()
+            expect(page.locator("#panel-files")).to_be_visible()
+            expect(page.locator("#file-list th").nth(0)).to_have_text("name")
+            expect(page.locator("#file-list th").nth(1)).to_have_text("type")
+            expect(page.locator("#file-list")).to_contain_text(".codex")
+            page.locator("#file-list").get_by_role("button", name="workspace").click()
+            expect(page.locator("#file-path")).to_have_value("/workspace")
+            page.locator("#file-list").get_by_role("button", name='bad" onclick="window.__xss=1" x=".txt').click()
+            expect(page.locator("#file-content")).to_contain_text("quote-bearing mock file")
+            if page.evaluate("() => window.__xss") is not None:
+                raise AssertionError("quote-bearing filename executed as inline script")
+            hostile_name = '<img src=x onerror="window.__fileNameXss=1">.txt'
+            page.locator("#file-list").get_by_role("button", name=hostile_name).click()
+            expect(page.locator("#file-viewer-title")).to_contain_text(hostile_name)
+            expect(page.locator("#file-content")).to_contain_text("<script>window.__fileContentXss=1</script>")
+            expect(page.locator("#file-content")).to_contain_text("Mock unsafe-looking file contents")
+            if page.locator("#file-list img").count() != 0:
+                raise AssertionError("hostile filename/type rendered as HTML in file list")
+            if page.locator("#file-content img").count() != 0:
+                raise AssertionError("hostile file content rendered as HTML")
+            executed = page.evaluate(
+                "() => [window.__fileNameXss, window.__fileTypeXss, "
+                "window.__fileContentXss, window.__fileContentImageXss]"
+            )
+            if any(value is not None for value in executed):
+                raise AssertionError(f"hostile file explorer value executed script: {executed}")
+            page.locator("#file-list").get_by_role("button", name="notes.txt").click()
+            expect(page.locator("#file-viewer-title")).to_contain_text("/workspace/notes.txt")
+            expect(page.locator("#file-content")).to_contain_text("Mock workspace file contents")
 
             page.get_by_role("button", name="Network", exact=True).click()
             expect(page.locator("#panel-network")).to_be_visible()
@@ -157,18 +194,50 @@ def run_browser_smoke(url: str, *, headed: bool) -> None:
 
             page.get_by_role("button", name="Add OpenAI").click()
             expect(page.get_by_role("button", name="Remove OpenAI")).to_be_enabled()
+            page.get_by_role("button", name="Add Claude").click()
+            expect(page.get_by_role("button", name="Remove Claude")).to_be_enabled()
             page.get_by_role("button", name="Add GitHub").click()
             expect(page.locator("#policy-status")).to_contain_text("unapplied changes")
             page.once("dialog", lambda dialog: dialog.accept())
             page.get_by_role("button", name="Replace active policy with proposal").click()
             expect(page.locator("#policy-message")).to_contain_text("Active network policy replaced")
             expect(page.locator("#active-policy")).to_have_value(re.compile(r'"openai": true'))
+            expect(page.locator("#active-policy")).to_have_value(re.compile(r'"claude": true'))
             expect(page.locator("#active-policy")).to_have_value(re.compile(r'"github.com"'))
 
-            page.get_by_role("button", name="Agent").click()
+            page.get_by_role("button", name="Home").click()
+            expect(page.locator("#panel-home")).to_be_visible()
+            expect(page.get_by_role("button", name="Start Codex login")).to_be_visible()
             expect(page.get_by_role("button", name="Start Codex login")).to_be_enabled()
+            expect(page.get_by_role("button", name="Start Claude login")).to_be_visible()
+            expect(page.get_by_role("button", name="Start Claude login")).to_be_enabled()
             page.get_by_role("button", name="Start Codex login").click()
             expect(page.locator("#oauth")).to_contain_text("MOCK-CODEX")
+            page.evaluate("() => tick()")
+            expect(page.get_by_role("button", name="Start Codex login")).to_have_count(0)
+            expect(page.locator("#provider-accounts")).to_contain_text("acct_mock_openai")
+            expect(page.locator("#provider-accounts")).to_contain_text("akshay@infiloop.io")
+            expect(page.locator("#provider-accounts")).to_contain_text("pro")
+            expect(page.locator("#provider-accounts")).to_contain_text("5 hour: 60%")
+            expect(page.locator("#provider-accounts")).to_contain_text("weekly: 20%")
+            expect(page.locator("#provider-accounts")).to_contain_text("credits: none")
+            expect(page.locator("#provider-accounts")).to_contain_text("checked")
+
+            expect(page.get_by_role("button", name="Start Claude login")).to_be_visible()
+            expect(page.get_by_role("button", name="Start Claude login")).to_be_enabled()
+            page.get_by_role("button", name="Start Claude login").click()
+            expect(page.locator("#oauth")).to_contain_text("Claude Code login")
+            page.once("dialog", lambda dialog: dialog.accept("mock-code"))
+            page.get_by_role("button", name="Submit code").click()
+            page.evaluate("() => tick()")
+            expect(page.get_by_role("button", name="Start Claude login")).to_have_count(0)
+            expect(page.locator("#provider-accounts")).to_contain_text("acct_mock_claude")
+            expect(page.locator("#provider-accounts")).to_contain_text("claude@example.invalid")
+            expect(page.locator("#provider-accounts")).to_contain_text("pro")
+            expect(page.locator("#provider-accounts")).to_contain_text("current session: 0%")
+            expect(page.locator("#provider-accounts")).to_contain_text("weekly: 0%")
+            expect(page.locator("#provider-accounts")).to_contain_text("resets Jul 3, 3:59pm (UTC)")
+            expect(page.locator("#provider-accounts")).to_contain_text("checked")
         finally:
             browser.close()
 

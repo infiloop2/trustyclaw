@@ -24,8 +24,11 @@ DEFAULT_ACCOUNT_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-hos
 AGENT_CWD = "/mnt/trustyclaw-agent/agent-home"
 ACCOUNT_HELPER_TIMEOUT_SECONDS = 15
 STATUS_TIMEOUT_SECONDS = 45
+USAGE_TIMEOUT_SECONDS = 30
 LOGIN_START_TIMEOUT_SECONDS = 30
 LOGIN_URL_RE = re.compile(r"If the browser didn't open, visit: (https://\S+)")
+USAGE_SESSION_RE = re.compile(r"(?m)^Current session:\s*(\d+(?:\.\d+)?)%\s+used\s*$")
+USAGE_WEEK_RE = re.compile(r"(?m)^Current week \(all models\):\s*(\d+(?:\.\d+)?)%\s+used\s+·\s+resets\s+(.+?)\s*$")
 
 _login_process: "ClaudeLoginProcess | None" = None
 _login_lock = threading.Lock()
@@ -301,7 +304,57 @@ def account_status() -> tuple[str, str | None, dict[str, Any] | None]:
     if not account:
         return "error", "Claude auth is logged in but OAuth token metadata is unavailable", None
     _fill_claude_account_metadata(account, status)
+    usage = read_claude_usage()
+    if usage:
+        account["claude_usage"] = usage
     return "active", None, account
+
+
+def read_claude_usage(command: list[str] | None = None) -> dict[str, Any]:
+    usage_command = command or DEFAULT_COMMAND
+    try:
+        proc = subprocess.run(
+            [*usage_command, "-p", "/usage", "--output-format", "json"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=USAGE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    try:
+        value = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    result = value.get("result")
+    if not isinstance(result, str):
+        return {}
+    return _parse_claude_usage_result(result)
+
+
+def _parse_claude_usage_result(result: str) -> dict[str, Any]:
+    session_match = USAGE_SESSION_RE.search(result)
+    week_match = USAGE_WEEK_RE.search(result)
+    if not session_match or not week_match:
+        return {}
+    resets_at_text = week_match.group(2).strip()
+    if not resets_at_text or "\n" in resets_at_text or len(resets_at_text) > 100:
+        return {}
+    return {
+        "current_session_used_percent": _percent_value(session_match.group(1)),
+        "weekly_used_percent": _percent_value(week_match.group(1)),
+        "weekly_resets_at_text": resets_at_text,
+    }
+
+
+def _percent_value(value: str) -> int | float:
+    parsed = float(value)
+    return int(parsed) if parsed.is_integer() else parsed
 
 
 def read_claude_account(command: list[str] | None = None) -> dict[str, Any] | None:
@@ -393,6 +446,16 @@ def _fill_claude_account_metadata(account: dict[str, Any], status: dict[str, Any
         # UUID. This field is user-facing metadata only; the proxy guard pins
         # on access_token_sha256.
         account["account_id"] = account["email"]
+    plan_type = _extract_claude_plan_type(status)
+    if plan_type:
+        account["plan_type"] = plan_type
+
+
+def _extract_claude_plan_type(status: dict[str, Any]) -> str | None:
+    value = status.get("subscriptionType")
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
 
 
 def _assistant_text(message: dict[str, Any]) -> str:

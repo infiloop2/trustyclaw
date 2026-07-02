@@ -1,14 +1,9 @@
-"""Network policy files and request decisions.
+"""Network policy access and request decisions.
 
-The active policy lives in two proxy-owned files that only the
-``update-network-policy`` sudo helper writes after demoting to
-``trustyclaw-proxy``:
-
-- ``network_controls.json``: ``{"network_controls": {...}, "updated_at": ...}``
-
-The proxy reads them to decide requests. The admin API answers health, policy,
-and event-log routes through the ``read-network-state`` helper instead of
-direct file access.
+The active policy lives in the ``network_policy`` database row. The admin
+service (schema owner) replaces it after validation; the proxy role can only
+read it. A missing row is the fail-closed empty default, and a database
+outage denies every request (no fallback cache; see ``network_proxy``).
 """
 
 from __future__ import annotations
@@ -26,10 +21,10 @@ from typing import Any
 from urllib.parse import unquote
 
 from host.runtime.state import (
-    network_policy_files,
+    network_policy_record,
     read_proxy_claude_account,
     read_proxy_openai_account_id,
-    write_json,
+    save_network_policy,
 )
 
 WEB_SEARCH_TOOL_TYPES = {"web_search", "web_search_preview"}
@@ -51,24 +46,21 @@ DECOMPRESS_TIMEOUT_SECONDS = 30
 MAX_DECODED_BODY_BYTES = 128 * 1024 * 1024
 
 
-def policy_path():
-    return network_policy_files().controls
-
-
 def load_policy() -> dict[str, Any]:
-    if not policy_path().exists():
+    record = network_policy_record()
+    if record is None:
         return {"managed_ai_provider_network_access": {}, "allowed_network_access": {}}
-    return json.loads(policy_path().read_text())["network_controls"]
+    controls = record["controls"]
+    return controls if isinstance(controls, dict) else {}
 
 
 def load_policy_updated_at() -> str | None:
-    if not policy_path().exists():
-        return None
-    return json.loads(policy_path().read_text()).get("updated_at")
+    record = network_policy_record()
+    return record["updated_at"] if record else None
 
 
 def save_policy(policy: dict[str, Any], updated_at: str) -> None:
-    write_json(policy_path(), {"network_controls": policy, "updated_at": updated_at})
+    save_network_policy(policy, updated_at)
 
 
 def domain_matches(pattern: str, host: str) -> bool:

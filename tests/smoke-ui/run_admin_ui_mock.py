@@ -166,7 +166,7 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> dic
     if path == "/v1/agent-runtime/codex-oauth-login":
         return oauth("codex", method)
     if path == "/v1/agent-runtime/claude-oauth-login":
-        return oauth("claude", method)
+        return oauth("claude_code", method)
     if path == "/v1/agent-runtime/claude-oauth-login/complete" and method == "POST":
         return complete_claude_oauth(body)
     if path == "/v1/tasks":
@@ -191,6 +191,10 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> dic
             return replace_policy(body)
     if method == "GET" and path == "/v1/network/events":
         return {"events": network_events(since(query))}
+    if method == "GET" and path == "/v1/agent-files":
+        return list_agent_files(one(query, "path") or "/")
+    if method == "GET" and path == "/v1/agent-files/read":
+        return read_agent_file(one(query, "path") or "/")
     if method == "POST" and path == "/v1/host-runtime/reboot":
         STATE.reboot_requested = True
         return {"status": "accepted"}
@@ -204,6 +208,7 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "agent_name": "trustyclaw-mock",
+        "version": {"status": "ok", "runtime": "0.2.0", "state": "0.2.0"},
         "agent_runtime": runtime,
         "network_controls": {"status": "active"},
         "host_runtime": {
@@ -236,21 +241,50 @@ def agent_runtime_status_locked() -> dict[str, Any]:
 
 def agent_accounts() -> dict[str, Any]:
     with STATE.lock:
+        checked_at = STATE.now()
         accounts: list[dict[str, Any]] = []
         for runtime in RUNTIMES:
             status = STATE.runtime_status(runtime)
             if runtime == "codex":
                 account = {"agent_runtime": runtime, "provider": "openai", "status": status}
                 if status == "active":
-                    account["account_id"] = "mock-openai-account"
+                    account.update(
+                        {
+                            "account_id": "acct_mock_openai",
+                            "email": "akshay@infiloop.io",
+                            "plan_type": "pro",
+                            "codex_usage": {
+                                "last_checked_at": checked_at,
+                                "rate_limits": {
+                                    "primary": {
+                                        "used_percent": 60,
+                                        "window_duration_mins": 300,
+                                        "resets_at": 1782788896,
+                                    },
+                                    "secondary": {
+                                        "used_percent": 20,
+                                        "window_duration_mins": 10080,
+                                        "resets_at": 1783296254,
+                                    },
+                                    "credits": {"has_credits": False, "unlimited": False, "balance": "0"},
+                                },
+                            },
+                        }
+                    )
             else:
                 account = {"agent_runtime": runtime, "provider": "claude", "status": status}
                 if status == "active":
                     account.update(
                         {
-                            "account_id": "mock-claude-account",
-                            "organization_id": "mock-claude-org",
+                            "account_id": "acct_mock_claude",
                             "email": "claude@example.invalid",
+                            "plan_type": "pro",
+                            "claude_usage": {
+                                "current_session_used_percent": 0,
+                                "weekly_used_percent": 0,
+                                "weekly_resets_at_text": "Jul 3, 3:59pm (UTC)",
+                                "last_checked_at": checked_at,
+                            },
                         }
                     )
             accounts.append(account)
@@ -279,6 +313,14 @@ def oauth(runtime: str, method: str) -> dict[str, str]:
                     "login_url": "https://example.invalid/codex-login",
                     "expires_at": now,
                 }
+            if method == "POST":
+                # The real Codex device flow completes out of band after the
+                # operator enters the code. The mock flips active here so local
+                # UI smoke can inspect the active account surface. A background
+                # GET may already have created the pending device-code record.
+                STATE.logged_in["codex"] = True
+                STATE.add_agent_event("agent_runtime.login_completed", None, {"agent_runtime": "codex"})
+                STATE.add_agent_event("agent_runtime.active", None, {"agent_runtime": "codex"})
             return dict(STATE.codex_oauth)
     if method not in {"GET", "POST"}:
         raise ApiError(HTTPStatus.NOT_FOUND, "route not found")
@@ -441,6 +483,63 @@ def network_events(min_seq: int) -> list[dict[str, Any]]:
         return [event for event in STATE.network_events if event["seq"] > min_seq]
 
 
+def list_agent_files(path: str) -> dict[str, Any]:
+    files = {
+        "/": [
+            {"name": ".codex", "path": "/.codex", "type": "directory", "modified_at": STATE.now()},
+            {"name": "README.md", "path": "/README.md", "type": "file", "size_bytes": 25, "modified_at": STATE.now()},
+            {"name": "workspace", "path": "/workspace", "type": "directory", "modified_at": STATE.now()},
+        ],
+        "/.codex": [
+            {"name": "auth.json", "path": "/.codex/auth.json", "type": "file", "size_bytes": 18, "modified_at": STATE.now()},
+        ],
+        "/workspace": [
+            {
+                "name": 'bad" onclick="window.__xss=1" x=".txt',
+                "path": '/workspace/bad" onclick="window.__xss=1" x=".txt',
+                "type": "file",
+                "size_bytes": 24,
+                "modified_at": STATE.now(),
+            },
+            {
+                "name": '<img src=x onerror="window.__fileNameXss=1">.txt',
+                "path": '/workspace/<img src=x onerror="window.__fileNameXss=1">.txt',
+                "type": 'file"><img src=x onerror="window.__fileTypeXss=1">',
+                "size_bytes": 72,
+                "modified_at": STATE.now(),
+            },
+            {"name": "notes.txt", "path": "/workspace/notes.txt", "type": "file", "size_bytes": 28, "modified_at": STATE.now()},
+        ],
+    }
+    if path not in files:
+        raise ApiError(HTTPStatus.NOT_FOUND, "path not found")
+    return {"path": path, "entries": files[path], "truncated": False}
+
+
+def read_agent_file(path: str) -> dict[str, Any]:
+    contents = {
+        "/README.md": "# Mock agent home\n",
+        "/.codex/auth.json": '{"mock": "redacted"}\n',
+        '/workspace/bad" onclick="window.__xss=1" x=".txt': "quote-bearing mock file\n",
+        '/workspace/<img src=x onerror="window.__fileNameXss=1">.txt': (
+            '<script>window.__fileContentXss=1</script>'
+            '<img src=x onerror="window.__fileContentImageXss=1">'
+            "Mock unsafe-looking file contents\n"
+        ),
+        "/workspace/notes.txt": "Mock workspace file contents\n",
+    }
+    if path not in contents:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "path is not a regular file")
+    content = contents[path]
+    return {
+        "path": path,
+        "size_bytes": len(content.encode()),
+        "truncated": False,
+        "encoding": "utf-8-replacement",
+        "content": content,
+    }
+
+
 def replace_policy(body: Any) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise ApiError(HTTPStatus.BAD_REQUEST, "network policy must be an object")
@@ -502,6 +601,13 @@ def since(query: dict[str, list[str]]) -> int:
         return int(values[0])
     except ValueError:
         return 0
+
+
+def one(query: dict[str, list[str]], key: str) -> str | None:
+    values = query.get(key)
+    if not values:
+        return None
+    return values[0]
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:

@@ -26,7 +26,7 @@ login-dependent runtime checks live in ``tests/stage/stage_aws.py``.
     dropped by nftables, and non-proxy loopback access to the admin API is
     blocked
   - deploy-time config schema on the real host: agent_runtime, agent_type,
-    ssh_port_opened, and network_controls are absent from persisted runtime
+    operator connection details and network_controls are absent from persisted runtime
     config; first boot creates an empty runtime network policy, with no
     network_status.json, and both runtimes stay deactivated until the runtime
     policy enables their managed providers
@@ -35,11 +35,11 @@ login-dependent runtime checks live in ``tests/stage/stage_aws.py``.
     domain rules, malformed request lengths, and plain-HTTP proxying
   - provider guard pre-login behavior: managed OpenAI/Claude access wakes
     runtimes but does not require completing OAuth
-  - the cross-process event log locking: the network event log is pushed past
-    its prune threshold so the proxy rewrites it by rename mid-storm
-    while the admin API concurrently reads it through its narrow proxy-state
-    helper — reads stay consistent, seqs stay unique and ordered, and the
-    pruned file remains proxy-private
+  - the cross-process event log: the network event table is pushed past its
+    amortized prune threshold by the proxy process (writing under its narrow
+    database role) while the admin API concurrently pages it — reads stay
+    consistent, seqs stay unique and ordered, and the proxy role can write
+    exactly that one table
 
 Only run this from the dedicated smoke GitHub Action or manually with the
 scoped smoke AWS credentials. It creates real billable AWS resources and needs
@@ -60,7 +60,7 @@ Environment assumptions (each is checked, with a clear failure if missing):
   1. The ``aws`` CLI and ``ssh`` are installed and on PATH.
   2. AWS credentials with the permissions in ``tests/smoke/iam_policy_smoke.json``
      are exported as ``AWS_ACCESS_KEY_ID`` / ``AWS_SECRET_ACCESS_KEY``. See
-     docs/Development.md for how to create a scoped IAM user.
+     docs/development/fresh-aws-smoke.md for how to create a scoped IAM user.
 
 Cost: one t3.small plus a 16 GiB root gp3 volume and two 8 GiB encrypted data
 gp3 volumes for the few minutes the test runs (about one US cent). Teardown
@@ -94,7 +94,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from host.config import load_input_config
 from host.constants import ADMIN_API_PORT as ADMIN_PORT, PROXY_PORT
-from host.runtime.state import MAX_EVENTS, PRUNE_EVERY
+from host.runtime.state import PRUNE_EVERY
 
 # Region the smoke deploys into. Keep in sync with the region scoped in
 # tests/smoke/iam_policy_smoke.json — change both together.
@@ -217,8 +217,12 @@ class AwsSmoke:
             "aws_region": SMOKE_REGION,
             "aws_access_key_id_env": ACCESS_KEY_ENV,
             "aws_secret_access_key_env": SECRET_KEY_ENV,
-            "ssh_public_key": public_key,
-            "ssh_port_opened": True,
+            "operator_connections": [
+                {
+                    "mode": "ssh",
+                    "ssh_public_key": public_key,
+                }
+            ],
         }
         self.effective_config.write_text(json.dumps(raw))
         self.config = load_input_config(self.effective_config)
@@ -226,17 +230,18 @@ class AwsSmoke:
 
     def deploy(self) -> None:
         self._step("deploy host")
+        self._destroy_tagged_smoke_resources()
         env = os.environ.copy()
         env["PYTHONPATH"] = str(REPO_ROOT)
         subprocess.run(
             [
                 sys.executable,
                 "-m",
-                "host.deploy",
+                "host.cli.deploy",
                 "--config",
                 str(self.effective_config),
-                "--allow-upgrade-or-recover",
-                "--reset-storage-dangerous-delete",
+                "--result-file",
+                f"{self.config.agent_name}.json",
             ],
             cwd=self.workdir,
             env=env,
@@ -427,65 +432,57 @@ class AwsSmoke:
 
     def check_host_config_schema(self) -> None:
         self._step("deployed host config schema")
-        config = json.loads(self._ssh_code("sudo cat /mnt/trustyclaw-admin/admin-state/config.json"))
+        config = json.loads(self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c \""
+            "SELECT json_build_object("
+            "'agent_name', c.agent_name,"
+            " 'admin_password_sha256', c.admin_password_sha256,"
+            " 'operator_connections', COALESCE((SELECT json_agg(json_strip_nulls(json_build_object("
+            "'mode', o.mode, 'ssh_public_key', o.ssh_public_key,"
+            " 'hostname', o.hostname, 'tunnel_token', o.tunnel_token)) ORDER BY o.mode)"
+            " FROM operator_connections o), '[]'::json))::text FROM config c\""
+        ))
         if config.get("agent_name") != SMOKE_AGENT_NAME:
             raise AssertionError(f"host config has wrong agent_name: {config}")
-        if "agent_runtime" in config:
-            raise AssertionError(f"host config still persists agent_runtime: {config}")
-        if "agent_type" in config:
-            raise AssertionError(f"host config still persists agent_type: {config}")
-        if "ssh_port_opened" in config:
-            raise AssertionError(f"host config still persists deployment-only ssh_port_opened: {config}")
-        if "network_controls" in config:
-            raise AssertionError(f"host config still persists deployment-time network_controls: {config}")
-        if "admin_password_sha256" not in config:
+        if not config.get("admin_password_sha256"):
             raise AssertionError(f"host config missing password hash: {config}")
-        expected_config_keys = {"agent_name", "admin_password_sha256"}
-        if set(config) != expected_config_keys:
-            raise AssertionError(f"host runtime config has unexpected keys: {config}")
-        account_files = json.loads(self._ssh_code(
-            "sudo python3 - <<'PY'\n"
-            "import grp, json, os, pwd\n"
-            "result = {}\n"
-            "for base, label in (('/mnt/trustyclaw-admin/admin-state/', 'admin'), ('/mnt/trustyclaw-admin/proxy-state/', 'proxy')):\n"
-            "  for name in ('openai_account.json', 'claude_account.json'):\n"
-            "    path = base + name\n"
-            "    st = os.stat(path)\n"
-            "    body = json.load(open(path))\n"
-            "    result[label + '/' + name] = {'owner': pwd.getpwuid(st.st_uid).pw_name,\n"
-            "                    'group': grp.getgrgid(st.st_gid).gr_name,\n"
-            "                    'mode': oct(st.st_mode & 0o777), 'body': body}\n"
-            "print(json.dumps(result))\n"
-            "PY"
-        ))
-        expected = {
-            "admin/openai_account.json": ("trustyclaw-admin", "trustyclaw-admin", "0o600", {"account_id": None}),
-            "admin/claude_account.json": ("trustyclaw-admin", "trustyclaw-admin", "0o600", {}),
-            "proxy/openai_account.json": ("trustyclaw-proxy", "trustyclaw-proxy", "0o600", {"account_id": None}),
-            "proxy/claude_account.json": ("trustyclaw-proxy", "trustyclaw-proxy", "0o600", {}),
-        }
-        for name, expected_values in expected.items():
-            account_file = account_files.get(name, {})
-            actual = (
-                account_file.get("owner"),
-                account_file.get("group"),
-                account_file.get("mode"),
-                account_file.get("body"),
-            )
-            if actual != expected_values:
-                raise AssertionError(f"{name} ownership/mode/body mismatch: {account_file}")
+        if self.ssh_key is None:
+            raise AssertionError("smoke SSH key was not prepared")
+        expected_connections = [{"mode": "ssh", "ssh_public_key": Path(f"{self.ssh_key}.pub").read_text().strip()}]
+        if config.get("operator_connections") != expected_connections:
+            raise AssertionError(f"host config has wrong operator connections: {config}")
+        # The config schema is typed columns now; deployment-only inputs
+        # cannot exist as stray keys, pinned by the exact column set.
+        config_columns = set(self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c "
+            "\"SELECT column_name FROM information_schema.columns WHERE table_name = 'config'\""
+        ).split())
+        if config_columns != {"singleton", "agent_name", "admin_password_sha256"}:
+            raise AssertionError(f"config table has unexpected columns: {sorted(config_columns)}")
+        # Proxy account pins live in the proxy_provider_pins table now
+        # (missing rows are the no-pin default until a login lands).
+        pin_rows = self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin "
+            "-c \"SELECT provider FROM proxy_provider_pins WHERE provider NOT IN ('openai', 'claude')\""
+        ).strip()
+        if pin_rows:
+            raise AssertionError(f"unexpected proxy_provider_pins rows: {pin_rows}")
+        # Admin-side provider account records live in the database, in the
+        # provider_accounts table (empty or explicit-null records until login).
+        admin_accounts = self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin "
+            "-c \"SELECT provider FROM provider_accounts WHERE provider NOT IN ('openai', 'claude')\""
+        ).strip()
+        if admin_accounts:
+            raise AssertionError(f"unexpected provider_accounts rows: {admin_accounts}")
         storage_layout = json.loads(self._ssh_code(
             "sudo python3 - <<'PY'\n"
             "import grp, json, os, pwd\n"
             "paths = [\n"
             "    '/mnt/trustyclaw-admin',\n"
-            "    '/mnt/trustyclaw-admin/admin-state',\n"
+            "    '/mnt/trustyclaw-admin/postgres',\n"
+            "    '/mnt/trustyclaw-admin/postgres/14/main',\n"
             "    '/mnt/trustyclaw-admin/proxy-state',\n"
-            "    '/mnt/trustyclaw-admin/proxy-state/network_controls.json',\n"
-            "    '/mnt/trustyclaw-admin/proxy-state/openai_account.json',\n"
-            "    '/mnt/trustyclaw-admin/proxy-state/claude_account.json',\n"
-            "    '/mnt/trustyclaw-admin/proxy-state/.network_policy.lock',\n"
-            "    '/mnt/trustyclaw-admin/proxy-state/network_events.jsonl',\n"
             "    '/mnt/trustyclaw-admin/proxy-state/network_proxy_ca.key',\n"
             "    '/mnt/trustyclaw-admin/proxy-state/network_proxy_ca.crt',\n"
             "]\n"
@@ -502,7 +499,7 @@ class AwsSmoke:
         service_ids = json.loads(self._ssh_code(
             "sudo python3 - <<'PY'\n"
             "import grp, json, pwd\n"
-            "names = ['trustyclaw-admin', 'trustyclaw-proxy', 'trustyclaw-agent']\n"
+            "names = ['trustyclaw-admin', 'trustyclaw-proxy', 'trustyclaw-agent', 'cloudflared', 'postgres']\n"
             "print(json.dumps({name: {'uid': pwd.getpwnam(name).pw_uid, 'gid': grp.getgrnam(name).gr_gid} for name in names}))\n"
             "PY"
         ))
@@ -510,6 +507,8 @@ class AwsSmoke:
             "trustyclaw-admin": {"uid": 47741, "gid": 47741},
             "trustyclaw-proxy": {"uid": 47742, "gid": 47742},
             "trustyclaw-agent": {"uid": 47743, "gid": 47743},
+            "cloudflared": {"uid": 47744, "gid": 47744},
+            "postgres": {"uid": 47745, "gid": 47745},
         }
         if service_ids != expected_service_ids:
             raise AssertionError(f"service IDs are not stable: {service_ids}")
@@ -521,21 +520,31 @@ class AwsSmoke:
         if agent_ca_access != "ok":
             raise AssertionError("agent must read only the installed proxy CA copy, not proxy-state directly")
         partition_access = self._ssh_code(
-            "sudo -u trustyclaw-admin bash -c '! test -r /mnt/trustyclaw-admin/proxy-state/network_controls.json' && "
-            "sudo -u trustyclaw-proxy bash -c '! test -r /mnt/trustyclaw-admin/admin-state/config.json' && "
+            "sudo -u trustyclaw-admin bash -c '! test -r /mnt/trustyclaw-admin/proxy-state/network_proxy_ca.key' && "
+            "sudo -u trustyclaw-proxy bash -c '! test -r /mnt/trustyclaw-admin/postgres/14/main/pg_hba.conf' && "
             "echo ok"
         ).strip()
         if partition_access != "ok":
-            raise AssertionError("admin-state and proxy-state must be directly unreadable across service users")
+            raise AssertionError("proxy-state and the Postgres data directory must be unreadable across service users")
+        # The admin role has full access; the proxy role may connect (its
+        # narrow per-table grants are pinned by the network event storm check)
+        # but must not be able to create objects; the agent has no role at all.
+        database_access = self._ssh_code(
+            "sudo -u trustyclaw-admin psql -tA -d trustyclaw_admin -c 'SELECT 1' && "
+            "sudo -u trustyclaw-proxy psql -tA -d trustyclaw_admin -c 'SELECT 2' && "
+            "sudo -u trustyclaw-proxy bash -c '! psql -tA -d trustyclaw_admin -c \"CREATE TABLE smoke_illegal (n INT)\" 2>/dev/null' && "
+            "sudo -u trustyclaw-agent bash -c '! psql -tA -d trustyclaw_admin -c \"SELECT 1\" 2>/dev/null' && "
+            "echo ok"
+        ).strip().splitlines()
+        if database_access != ["1", "2", "ok"]:
+            raise AssertionError(
+                f"database access must be admin-full, proxy-narrow, agent-none: {database_access}"
+            )
         expected_layout = {
             "/mnt/trustyclaw-admin": ("root", "root", "0o711", False),
-            "/mnt/trustyclaw-admin/admin-state": ("trustyclaw-admin", "trustyclaw-admin", "0o700", False),
+            "/mnt/trustyclaw-admin/postgres": ("root", "root", "0o711", False),
+            "/mnt/trustyclaw-admin/postgres/14/main": ("postgres", "postgres", "0o700", False),
             "/mnt/trustyclaw-admin/proxy-state": ("trustyclaw-proxy", "trustyclaw-proxy", "0o700", False),
-            "/mnt/trustyclaw-admin/proxy-state/network_controls.json": ("trustyclaw-proxy", "trustyclaw-proxy", "0o600", False),
-            "/mnt/trustyclaw-admin/proxy-state/openai_account.json": ("trustyclaw-proxy", "trustyclaw-proxy", "0o600", False),
-            "/mnt/trustyclaw-admin/proxy-state/claude_account.json": ("trustyclaw-proxy", "trustyclaw-proxy", "0o600", False),
-            "/mnt/trustyclaw-admin/proxy-state/.network_policy.lock": ("trustyclaw-proxy", "trustyclaw-proxy", "0o600", False),
-            "/mnt/trustyclaw-admin/proxy-state/network_events.jsonl": ("trustyclaw-proxy", "trustyclaw-proxy", "0o600", False),
             "/mnt/trustyclaw-admin/proxy-state/network_proxy_ca.key": ("trustyclaw-proxy", "trustyclaw-proxy", "0o600", False),
             "/mnt/trustyclaw-admin/proxy-state/network_proxy_ca.crt": ("trustyclaw-proxy", "trustyclaw-proxy", "0o644", False),
         }
@@ -545,7 +554,7 @@ class AwsSmoke:
             if actual != expected_values:
                 raise AssertionError(f"{path} ownership/mode mismatch: {entry}")
         self._ok(
-            "host config persists runtime/name/password; admin/proxy state are private and helper-readable"
+            "host config persists name/password in the database; database and proxy state are private per service user"
         )
 
     def check_network_policy(self) -> None:
@@ -562,31 +571,38 @@ class AwsSmoke:
         for host in self.managed_domains:
             if host in rules:
                 raise AssertionError(f"managed provider rule {host} leaked into API policy response: {rules}")
-        internal = json.loads(self._ssh_code("sudo cat /mnt/trustyclaw-admin/proxy-state/network_controls.json"))["network_controls"]
-        internal_rules = internal["allowed_network_access"]
-        if internal.get("managed_ai_provider_network_access") != expected_provider:
-            raise AssertionError(f"stored policy did not preserve explicit managed provider: {internal}")
+        # The stored policy is typed rows now; check them directly.
+        stored_providers = set(self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c 'SELECT provider FROM managed_provider_access'"
+        ).split())
+        expected_enabled = {name for name, enabled in expected_provider.items() if enabled}
+        if stored_providers != expected_enabled:
+            raise AssertionError(
+                f"stored policy did not preserve explicit managed providers: {sorted(stored_providers)}"
+            )
+        stored_domains = set(self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c 'SELECT domain FROM allowed_domains'"
+        ).split())
+        if "api.github.com" not in stored_domains:
+            raise AssertionError(f"replaced policy not reflected in stored rows: {sorted(stored_domains)}")
         for host in self.managed_domains:
-            if host in internal_rules:
-                raise AssertionError(f"managed provider rule {host} leaked into stored policy: {internal}")
+            if host in stored_domains:
+                raise AssertionError(f"managed provider rule {host} leaked into stored policy: {sorted(stored_domains)}")
         self._ok("policy read back and stored user-facing; proxy expands managed AI provider rules in memory")
 
     def check_initial_disabled_provider_deploy(self) -> None:
         self._step("initial deploy with managed providers disabled")
-        stored = json.loads(self._ssh_code("sudo cat /mnt/trustyclaw-admin/proxy-state/network_controls.json"))
         expected_empty_policy = {
             "managed_ai_provider_network_access": {},
             "allowed_network_access": {},
         }
-        if stored.get("network_controls") != expected_empty_policy:
-            raise AssertionError(f"initial stored policy should be empty: {stored}")
-        if not isinstance(stored.get("updated_at"), str) or not stored["updated_at"]:
-            raise AssertionError(f"initial stored policy missing updated_at: {stored}")
-        status_path = self._ssh_code(
-            "sudo bash -c '! test -e /mnt/trustyclaw-admin/proxy-state/network_status.json && echo absent'"
+        stored_rows = self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c 'SELECT count(*) FROM network_policy'"
         ).strip()
-        if status_path != "absent":
-            raise AssertionError("network_status.json should not exist; network status is derived")
+        if stored_rows != "0":
+            raise AssertionError(
+                f"a fresh deploy must not seed a policy row (missing row = fail-closed empty default): {stored_rows}"
+            )
         policy = self._api("GET", "/v1/network/policy")["network_controls"]
         if policy != expected_empty_policy:
             raise AssertionError(f"initial API policy should be empty: {policy}")
@@ -664,8 +680,8 @@ class AwsSmoke:
             'id="policy-status"',
             'id="start-codex-login"',
             'id="start-claude-login"',
-            "disabled>Start Codex login</button>",
-            "disabled>Start Claude login</button>",
+            'data-runtime="codex" disabled hidden>Start Codex login</button>',
+            'data-runtime="claude_code" disabled hidden>Start Claude login</button>',
             "updateLoginButtons",
             'id="policy-preset-openai"',
             'id="policy-preset-claude"',
@@ -738,7 +754,7 @@ class AwsSmoke:
             "saveWebsiteRule",
         ):
             if expected not in page:
-                raise AssertionError(f"UI page is missing thread history path {expected!r}")
+                raise AssertionError(f"UI page is missing expected admin UI fragment {expected!r}")
         for removed in (
             "onclick=",
             "oninput=",
@@ -1177,7 +1193,7 @@ class AwsSmoke:
         self._ok(f"{creates} parallel creates unique, storm created exactly one task, list consistent")
 
     def check_state_transactions(self) -> None:
-        """Edge cases of the state.json read-modify-write transaction under
+        """Edge cases of the admin-state read-modify-write transaction under
         real concurrency: check-then-act atomicity for terminal transitions
         (exactly one racing cancel wins), racing field updates that must be
         last-writer-wins (never merged or torn), reads that stay fast and
@@ -1400,6 +1416,23 @@ class AwsSmoke:
 
     def check_proxy_concurrency(self) -> None:
         self._step("parallel proxy traffic with consistent event sequencing")
+        self._api(
+            "PUT",
+            "/v1/network/policy",
+            {
+                "managed_ai_provider_network_access": {},
+                "allowed_network_access": {
+                    "api.github.com": {
+                        "allow_http_methods": ["GET"],
+                        "path_guards": ["^/$"],
+                    },
+                },
+            },
+        )
+        for runtime in SMOKE_RUNTIMES:
+            status = self._wait_for_runtime_status({"deactivated"}, runtime=runtime, timeout=60)
+            if status != "deactivated":
+                raise AssertionError(f"{runtime} should be deactivated before proxy concurrency check, got {status}")
         baseline = max((event["seq"] for event in self._network_events()), default=0)
         proxy = f"http://127.0.0.1:{PROXY_PORT}"
         curl = "curl -s -o /dev/null -w '%{http_code}\\n' --max-time 25"
@@ -1562,6 +1595,7 @@ class AwsSmoke:
             or "email" not in account
         ):
             raise AssertionError(f"GET account while Claude is active returned unexpected shape: {account}")
+        self._assert_provider_metadata("claude_code", account)
 
         print(f"  POST {url} without bearer after Claude account token hash is known", flush=True)
         missing = self._ssh_code(
@@ -1665,6 +1699,7 @@ class AwsSmoke:
         account_id = account.get("account_id")
         if not account_id:
             raise AssertionError(f"GET account while active did not include account_id: {account}")
+        self._assert_provider_metadata("codex", account)
 
         proxy = f"http://127.0.0.1:{PROXY_PORT}"
         url = "https://chatgpt.com/backend-api/codex/responses"
@@ -1769,6 +1804,7 @@ class AwsSmoke:
         for runtime, account in accounts.items():
             if account.get("status") != "active" or not account.get("account_id"):
                 raise AssertionError(f"{runtime} account should be active before mixed tasks: {account}")
+            self._assert_provider_metadata(runtime, account)
         self._ok("Codex and Claude Code are active at the same time with account pins available")
 
     def check_runtime_deactivation_stops_running_tasks(self) -> None:
@@ -2119,22 +2155,20 @@ class AwsSmoke:
     # --- helpers -----------------------------------------------------------
 
     def check_network_event_prune_race(self) -> None:
-        """Push the network event log past MAX_EVENTS so the proxy's
-        prune actually fires (every PRUNE_EVERY-th append rewrites the file by
-        rename) while the admin API concurrently reads it. This is the one
-        locking path only a live host can exercise — two real processes, two
-        uids: the cross-process flock plus the inode re-check in locked_jsonl
-        must keep reads consistent across the rename, and the pruned file must
-        stay proxy-private while the admin API still reads it through the
-        read-network-state helper. Runs last because it leaves >10k events
-        behind, which would slow any later check that drains the log from seq
-        0."""
-        self._step("network event prune under concurrent helper reads (cross-process flock)")
-        tail = self._ssh_code("sudo tail -n 1 /mnt/trustyclaw-admin/proxy-state/network_events.jsonl")
-        baseline = int(json.loads(tail)["seq"]) if tail.strip() else 0
-        # Enough denied CONNECTs to exceed MAX_EVENTS lines plus two prune
-        # boundaries, so at least one real prune happens during the storm.
-        needed = max(MAX_EVENTS + 2 * PRUNE_EVERY + 50 - baseline, 2 * PRUNE_EVERY + 50)
+        """Storm denied CONNECTs through the proxy while the admin API
+        concurrently pages the network event table. Two real processes, two
+        database roles: the proxy inserts rows under its narrow grant (its
+        amortized prune fires every PRUNE_EVERY-th insert, a no-op below the
+        cap), the admin reads them, and paging must stay unique and ordered
+        throughout. Also pins the role isolation only a live host can show:
+        the proxy role can write exactly the network_events table and nothing
+        else."""
+        self._step("network event storm under concurrent reads (two database roles)")
+        baseline_row = self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c 'SELECT COALESCE(max(seq), 0) FROM network_events'"
+        ).strip()
+        baseline = int(baseline_row or 0)
+        needed = 2 * PRUNE_EVERY + 50  # cross at least two amortized-prune boundaries
         print(f"  pushing {needed} denied requests through the proxy (seq baseline {baseline})", flush=True)
 
         reader_failures: list[str] = []
@@ -2188,38 +2222,35 @@ class AwsSmoke:
         if "generated" not in output:
             raise AssertionError(f"event generator did not finish cleanly: {output!r}")
         if reader_failures:
-            raise AssertionError(f"concurrent reader failed during the prune storm: {reader_failures[0]}")
+            raise AssertionError(f"concurrent reader failed during the storm: {reader_failures[0]}")
         if reader_reads["count"] < 10:
             raise AssertionError(f"reader only completed {reader_reads['count']} reads; the storm outpaced it entirely")
 
-        # On-host verification of the pruned file: bounded, unique, ordered,
-        # and still proxy-private after the proxy-user prune-by-rename.
         verdict = json.loads(self._ssh_code(
-            "sudo python3 - <<'PY'\n"
-            "import grp, json, os, pwd\n"
-            "path = '/mnt/trustyclaw-admin/proxy-state/network_events.jsonl'\n"
-            "seqs = [json.loads(l)['seq'] for l in open(path) if l.strip()]\n"
-            "st = os.stat(path)\n"
-            "print(json.dumps({'lines': len(seqs), 'unique': len(set(seqs)) == len(seqs),\n"
-            "                  'ordered': seqs == sorted(seqs), 'min_seq': min(seqs), 'max_seq': max(seqs),\n"
-            "                  'owner': pwd.getpwuid(st.st_uid).pw_name, 'group': grp.getgrgid(st.st_gid).gr_name,\n"
-            "                  'mode': oct(st.st_mode & 0o777)}))\n"
-            "PY"
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c "
+            "\"SELECT json_build_object('rows', count(*), 'max_seq', COALESCE(max(seq), 0),"
+            " 'unique', count(*) = count(DISTINCT seq))::text FROM network_events WHERE seq > "
+            f"{baseline}\""
         ))
-        if verdict["lines"] > MAX_EVENTS + PRUNE_EVERY:
-            raise AssertionError(f"event log was not pruned: {verdict['lines']} lines")
-        if verdict["min_seq"] <= baseline:
-            raise AssertionError(f"no prune dropped old events (min seq {verdict['min_seq']} <= baseline {baseline})")
-        if not verdict["unique"] or not verdict["ordered"]:
-            raise AssertionError(f"event log corrupt after prune storm: {verdict}")
-        if (verdict["owner"], verdict["group"], verdict["mode"]) != ("trustyclaw-proxy", "trustyclaw-proxy", "0o600"):
-            raise AssertionError(f"pruned file lost its ownership/mode: {verdict}")
+        if verdict["rows"] < needed:
+            raise AssertionError(f"storm generated {needed} denials but only {verdict['rows']} events landed")
+        if not verdict["unique"]:
+            raise AssertionError(f"duplicate event seqs after the storm: {verdict}")
+        # Role isolation: the proxy role can touch exactly network_events.
+        isolation = self._ssh_code(
+            "sudo -u trustyclaw-proxy psql -tA -d trustyclaw_admin -c 'SELECT count(*) >= 0 FROM network_events' && "
+            "sudo -u trustyclaw-proxy bash -c '! psql -tA -d trustyclaw_admin -c \"SELECT count(*) FROM tasks\" 2>/dev/null' && "
+            "sudo -u trustyclaw-proxy bash -c '! psql -tA -d trustyclaw_admin -c \"SELECT agent_name FROM config\" 2>/dev/null' && "
+            "echo ok"
+        ).strip().splitlines()
+        if isolation != ["t", "ok"]:
+            raise AssertionError(f"proxy database role is not confined to network_events: {isolation}")
         final = self._api("GET", f"/v1/network/events?since={verdict['max_seq'] - 5}")
         if not final["events"]:
-            raise AssertionError("admin API cannot read the event log after the prune")
+            raise AssertionError("admin API cannot read the network events after the storm")
         self._ok(
             f"{needed} events stormed; {reader_reads['count']} concurrent reads stayed consistent; "
-            f"file pruned to {verdict['lines']} lines, proxy-private mode intact"
+            "proxy role confined to network_events"
         )
 
     def _raw_local_http(self, port: int, request: bytes) -> bytes:
@@ -2362,6 +2393,30 @@ class AwsSmoke:
                 return account
         raise AssertionError(f"account summary did not include {runtime_type}: {accounts}")
 
+    def _assert_provider_metadata(self, runtime_type: str, account: dict) -> None:
+        forbidden_fragments = ("token", "secret", "key", "authorization", "bearer", "sha256")
+        allowed_keys = {"agent_runtime", "provider", "status", "account_id", "email", "plan_type"}
+        if runtime_type == "codex":
+            allowed_keys.add("codex_usage")
+        elif runtime_type == "claude_code":
+            allowed_keys.add("claude_usage")
+        unexpected_keys = sorted(set(account) - allowed_keys)
+        if unexpected_keys:
+            raise AssertionError(f"{runtime_type} account metadata exposed unexpected key(s) {unexpected_keys}: {account}")
+
+        def check_no_secretish_keys(value: object) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    lowered = str(key).lower()
+                    if any(fragment in lowered for fragment in forbidden_fragments):
+                        raise AssertionError(f"{runtime_type} account metadata leaked secret-like key {key!r}: {account}")
+                    check_no_secretish_keys(item)
+            elif isinstance(value, list):
+                for item in value:
+                    check_no_secretish_keys(item)
+
+        check_no_secretish_keys(account)
+
     def print_network_events(self, label: str, *, since: int = 0) -> None:
         try:
             events = self._network_events(since=since)
@@ -2440,19 +2495,33 @@ class AwsSmoke:
     def _wait_for_runtime_status(self, wanted: set[str], *, timeout: float, runtime: str | None = None) -> str:
         runtime = runtime or self.agent_runtime
         deadline = time.time() + timeout
-        status = self.runtime_status_record(self._api("GET", "/v1/agent-runtime/status"), runtime)["status"]
+        record = self.runtime_status_record(self._api("GET", "/v1/agent-runtime/status"), runtime)
+        status = record["status"]
         print(
-            f"  {runtime} runtime status: {status} (waiting for {'/'.join(sorted(wanted))})",
+            self._runtime_status_line(runtime, record, wanted),
             flush=True,
         )
+        previous_detail = record.get("error_message")
         while time.time() < deadline and status not in wanted:
             time.sleep(5)
-            previous, status = status, self.runtime_status_record(
+            previous = status
+            record = self.runtime_status_record(
                 self._api("GET", "/v1/agent-runtime/status"), runtime
-            )["status"]
-            if status != previous:
-                print(f"  {runtime} runtime status: {status}", flush=True)
+            )
+            status = record["status"]
+            detail = record.get("error_message")
+            if status != previous or detail != previous_detail:
+                print(self._runtime_status_line(runtime, record), flush=True)
+            previous_detail = detail
         return status
+
+    def _runtime_status_line(self, runtime: str, record: dict, wanted: set[str] | None = None) -> str:
+        status = record["status"]
+        suffix = f" (waiting for {'/'.join(sorted(wanted))})" if wanted else ""
+        detail = record.get("error_message")
+        if isinstance(detail, str) and detail:
+            return f"  {runtime} runtime status: {status}{suffix}; error_message={detail!r}"
+        return f"  {runtime} runtime status: {status}{suffix}"
 
     def _ssh_code(self, remote_command: str) -> str:
         result = subprocess.run(

@@ -41,6 +41,12 @@ jobs:
     if: ${{ needs.authorize.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout trusted workflow actions
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
       - name: Stop stage EC2 instance
         shell: bash
         env:
@@ -49,93 +55,38 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
         run: |
           set -euo pipefail
-          write_summary() {
-            if [[ -z "${GITHUB_STEP_SUMMARY:-}" ]]; then
-              return
-            fi
+          cat > stage_config.json <<JSON
+          {
+            "agent_name": "trustyclaw-stage",
+            "aws_region": "us-east-1",
+            "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
+            "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY"
+          }
+          JSON
+          if python3 -m host.cli.stop --config stage_config.json --result-file trustyclaw-stage-stop.json; then
+            result="stopped"
+          else
+            result="failed"
             {
               echo "## TrustyClaw stage stop"
               echo
               echo "| Field | Value |"
               echo "| --- | --- |"
-              echo "| Result | ${summary_result:-unknown} |"
-              echo "| Instance | ${instance_id:-n/a} |"
-              echo "| Initial state | ${initial_state:-n/a} |"
-              echo "| Final state | ${final_state:-n/a} |"
-              if [[ -n "${summary_note:-}" ]]; then
-                echo "| Note | ${summary_note} |"
-              fi
+              echo "| Result | ${result} |"
             } >> "${GITHUB_STEP_SUMMARY}"
-          }
-
-          instances_json="$(aws ec2 describe-instances \
-            --filters \
-              'Name=tag:trustyclaw-host-agent-name,Values=trustyclaw-stage' \
-              'Name=tag:trustyclaw-host,Values=true' \
-              'Name=instance-state-name,Values=pending,running,stopping,stopped' \
-            --query 'Reservations[].Instances[].{id:InstanceId,state:State.Name,dns:PublicDnsName,ip:PublicIpAddress}' \
-            --output json)"
-          instance_count="$(jq 'length' <<<"${instances_json}")"
-          if (( instance_count == 0 )); then
-            summary_result="no-op"
-            summary_note="No existing trustyclaw-stage instance found."
-            write_summary
-            echo "No existing trustyclaw-stage instance found; nothing to stop."
-            exit 0
-          fi
-          if (( instance_count > 1 )); then
-            summary_result="failed"
-            summary_note="Expected one trustyclaw-stage instance, found ${instance_count}."
-            write_summary
-            echo "Expected one trustyclaw-stage instance, found ${instance_count}." >&2
-            jq . <<<"${instances_json}"
             exit 1
           fi
-
-          instance_id="$(jq -r '.[0].id' <<<"${instances_json}")"
-          state="$(jq -r '.[0].state' <<<"${instances_json}")"
-          initial_state="${state}"
-          case "${state}" in
-            stopped)
-              echo "Stage instance ${instance_id} is already stopped."
-              ;;
-            stopping)
-              echo "Stage instance ${instance_id} is already stopping; waiting for stopped."
-              aws ec2 wait instance-stopped --instance-ids "${instance_id}"
-              ;;
-            pending)
-              echo "Stage instance ${instance_id} is pending; waiting for running, then stopping."
-              aws ec2 wait instance-running --instance-ids "${instance_id}"
-              aws ec2 stop-instances --instance-ids "${instance_id}" >/dev/null
-              aws ec2 wait instance-stopped --instance-ids "${instance_id}"
-              ;;
-            running)
-              echo "Stopping stage instance ${instance_id}."
-              aws ec2 stop-instances --instance-ids "${instance_id}" >/dev/null
-              aws ec2 wait instance-stopped --instance-ids "${instance_id}"
-              ;;
-            *)
-              summary_result="failed"
-              summary_note="Unsupported stage instance state ${state}."
-              write_summary
-              echo "Unsupported stage instance state ${state} for ${instance_id}." >&2
-              exit 1
-              ;;
-          esac
-
-          current="$(aws ec2 describe-instances \
-            --instance-ids "${instance_id}" \
-            --query 'Reservations[0].Instances[0].State.Name' \
-            --output text)"
-          final_state="${current}"
-          if [[ "${final_state}" != "stopped" ]]; then
-            summary_result="failed"
-            summary_note="Expected final state stopped, got ${final_state:-unknown}."
-            write_summary
-            echo "Expected stage instance ${instance_id} to be stopped, got ${final_state:-unknown}." >&2
-            exit 1
-          fi
-          summary_result="stopped"
-          summary_note="Stage instance is stopped; preserved EBS volumes were not deleted."
-          write_summary
-          echo "Stage instance ${instance_id} is stopped."
+          instance_id="$(jq -r '.instance_id // "n/a"' trustyclaw-stage-stop.json)"
+          initial_state="$(jq -r '.initial_state // "n/a"' trustyclaw-stage-stop.json)"
+          final_state="$(jq -r '.state // "n/a"' trustyclaw-stage-stop.json)"
+          {
+            echo "## TrustyClaw stage stop"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Result | ${result} |"
+            echo "| Instance | ${instance_id} |"
+            echo "| Initial state | ${initial_state} |"
+            echo "| Final state | ${final_state} |"
+            echo "| Note | Stage instance is stopped; preserved EBS volumes were not deleted. |"
+          } >> "${GITHUB_STEP_SUMMARY}"

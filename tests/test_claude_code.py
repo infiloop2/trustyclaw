@@ -71,9 +71,13 @@ class ClaudeCodeTests(unittest.TestCase):
             sys.executable,
             "-c",
             (
-                "import json; print(json.dumps({"
+                "import json, sys; "
+                "print(json.dumps({'result': 'Current session: 1% used\\n"
+                "Current week (all models): 2% used · resets Jul 3, 3:59pm (UTC)'}) "
+                "if '/usage' in sys.argv else json.dumps({"
                 "'loggedIn': True, 'authMethod': 'claude.ai', "
-                "'email': 'user@example.com', 'orgId': 'org_123'}))"
+                "'email': 'user@example.com', 'orgId': 'org_123', "
+                "'subscriptionType': 'max'}))"
             ),
             "--",
         ]
@@ -93,6 +97,70 @@ class ClaudeCodeTests(unittest.TestCase):
                         "account_id": "user@example.com",
                         "email": "user@example.com",
                         "organization_id": "org_123",
+                        "plan_type": "max",
+                        "claude_usage": {
+                            "current_session_used_percent": 1,
+                            "weekly_used_percent": 2,
+                            "weekly_resets_at_text": "Jul 3, 3:59pm (UTC)",
+                        },
+                    },
+                ),
+            )
+        finally:
+            claude_code.DEFAULT_COMMAND = original_command
+            claude_code.DEFAULT_ACCOUNT_COMMAND = original_account
+
+    def test_read_claude_usage_parses_usage_result_text(self) -> None:
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import json; print(json.dumps({"
+                "'type': 'result', "
+                "'result': 'You are currently using your subscription to power your Claude Code usage\\n\\n"
+                "Current session: 0% used\\n"
+                "Current week (all models): 12.5% used · resets Jul 3, 3:59pm (UTC)'"
+                "}))"
+            ),
+        ]
+
+        self.assertEqual(
+            claude_code.read_claude_usage(command),
+            {
+                "current_session_used_percent": 0,
+                "weekly_used_percent": 12.5,
+                "weekly_resets_at_text": "Jul 3, 3:59pm (UTC)",
+            },
+        )
+
+    def test_read_claude_usage_ignores_unknown_result_text(self) -> None:
+        command = [sys.executable, "-c", "import json; print(json.dumps({'result': 'not usage'}))"]
+
+        self.assertEqual(claude_code.read_claude_usage(command), {})
+
+    def test_account_status_reads_helper_identity_metadata(self) -> None:
+        original_command = claude_code.DEFAULT_COMMAND
+        original_account = claude_code.DEFAULT_ACCOUNT_COMMAND
+        claude_code.DEFAULT_COMMAND = [
+            sys.executable,
+            "-c",
+            "import json; print(json.dumps({'loggedIn': True, 'authMethod': 'claude.ai'}))",
+            "--",
+        ]
+        claude_code.DEFAULT_ACCOUNT_COMMAND = [
+            sys.executable,
+            "-c",
+            "import json; print(json.dumps({'access_token_sha256':'hash','account_id':'acct'}))",
+        ]
+        try:
+            self.assertEqual(
+                claude_code.account_status(),
+                (
+                    "active",
+                    None,
+                    {
+                        "access_token_sha256": "hash",
+                        "account_id": "acct",
                     },
                 ),
             )

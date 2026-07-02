@@ -236,6 +236,63 @@ input[type="checkbox"] {
   max-width: 12rem;
 }
 
+.file-toolbar {
+  align-items: center;
+}
+
+.file-toolbar input {
+  flex: 1 1 20rem;
+}
+
+.file-explorer {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(18rem, 24rem) minmax(0, 1fr);
+  margin-top: 0.8rem;
+}
+
+.file-list-pane,
+.file-viewer-pane {
+  border: 1px solid #2a3340;
+  border-radius: 5px;
+  min-width: 0;
+  overflow: auto;
+}
+
+.file-list-pane {
+  max-height: 34rem;
+}
+
+.file-viewer-pane {
+  display: grid;
+  grid-template-rows: auto minmax(20rem, 1fr);
+}
+
+.file-viewer-pane > .muted {
+  border-bottom: 1px solid #2a3340;
+  padding: 0.45rem 0.6rem;
+}
+
+button.file-entry {
+  background: transparent;
+  border: 0;
+  color: #d8dee6;
+  padding: 0;
+  text-align: left;
+}
+
+button.file-entry:hover {
+  color: #7fb4d6;
+}
+
+.file-content {
+  margin: 0;
+  min-height: 20rem;
+  overflow: auto;
+  padding: 0.75rem;
+  white-space: pre-wrap;
+}
+
 textarea {
   min-height: 9rem;
   white-space: pre;
@@ -301,6 +358,12 @@ pre {
   word-break: break-word;
 }
 
+pre.metadata {
+  font-size: 0.8rem;
+  margin: 0;
+  max-width: 32rem;
+}
+
 #login {
   max-width: 28rem;
 }
@@ -328,5 +391,9 @@ pre {
 
   .sidebar {
     position: static;
+  }
+
+  .file-explorer {
+    grid-template-columns: 1fr;
   }
 }

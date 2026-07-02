@@ -1,11 +1,72 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+import re
+import tempfile
 import unittest
+from unittest.mock import patch
 
+from host.config import parse_input_config
 from tests.smoke.smoke_aws import AwsSmoke
+from tests.stage.stage_aws import StageAwsSmoke, _required_env_path
 
 
 class AwsSmokeTeardownTests(unittest.TestCase):
+    def test_fresh_smoke_uses_strict_deploy_command_and_result_file(self) -> None:
+        smoke = AwsSmoke()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            smoke.workdir = tmp_path
+            smoke.effective_config = tmp_path / "effective_config.json"
+            smoke.effective_config.write_text(
+                json.dumps(
+                    {
+                        "agent_name": "trustyclaw-smoke",
+                        "aws_region": "us-east-1",
+                        "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
+                        "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
+                        "operator_connections": [
+                            {
+                                "mode": "ssh",
+                                "ssh_public_key": "ssh-ed25519 AAAATEST operator@example",
+                            }
+                        ],
+                    }
+                )
+            )
+            smoke.config = parse_input_config(json.loads(smoke.effective_config.read_text()))
+            calls: list[list[str]] = []
+
+            def fake_run(args: list[str], **kwargs: object) -> object:
+                calls.append(args)
+                if kwargs.get("cwd") != tmp_path:
+                    raise AssertionError(f"fresh smoke deploy used unexpected cwd: {kwargs.get('cwd')!r}")
+                (tmp_path / "trustyclaw-smoke.json").write_text(
+                    json.dumps(
+                        {
+                            "agent_name": "trustyclaw-smoke",
+                            "instance_id": "i-smoke",
+                            "region": "us-east-1",
+                            "public_dns": "smoke.example.com",
+                        }
+                    )
+                )
+                return object()
+
+            with (
+                patch.object(smoke, "_destroy_tagged_smoke_resources"),
+                patch("tests.smoke.smoke_aws.subprocess.run", side_effect=fake_run),
+            ):
+                smoke.deploy()
+
+        self.assertEqual(calls[0][1:3], ["-m", "host.cli.deploy"])
+        self.assertIn("--config", calls[0])
+        self.assertEqual(calls[0][calls[0].index("--config") + 1], str(smoke.effective_config))
+        self.assertIn("--result-file", calls[0])
+        self.assertEqual(calls[0][calls[0].index("--result-file") + 1], "trustyclaw-smoke.json")
+        self.assertEqual(smoke.result["instance_id"], "i-smoke")
+
     def test_teardown_destroys_tagged_resources_without_deploy_result(self) -> None:
         smoke = AwsSmoke()
         calls: list[tuple[str, ...]] = []
@@ -55,6 +116,139 @@ class AwsSmokeTeardownTests(unittest.TestCase):
         self.assertIn(("ec2", "terminate-instances", "--instance-ids", "i-smoke"), calls)
         self.assertEqual(volumes_deleted, {"vol-root", "vol-admin", "vol-agent"})
         self.assertTrue(security_group_deleted)
+
+
+class StageAwsSmokeTests(unittest.TestCase):
+    def test_stage_rejects_non_stage_result_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result_path = tmp_path / "wrong.json"
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "agent_name": "trustyclaw-smoke",
+                        "region": "us-east-1",
+                        "public_dns": "smoke.example.com",
+                        "admin_password": "stable-admin",
+                    }
+                )
+            )
+            ssh_key = tmp_path / "stage_operator"
+            ssh_key.write_text("private key")
+
+            with self.assertRaisesRegex(AssertionError, "expected 'trustyclaw-stage'"):
+                StageAwsSmoke(result_path, ssh_key)
+
+    def test_stage_upgrade_result_requires_admin_password_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result_path = tmp_path / "trustyclaw-stage.json"
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "agent_name": "trustyclaw-stage",
+                        "region": "us-east-1",
+                        "public_dns": "stage.example.com",
+                    }
+                )
+            )
+            ssh_key = tmp_path / "stage_operator"
+            ssh_key.write_text("private key")
+
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                self.assertRaisesRegex(AssertionError, "STAGE_ADMIN_PASSWORD is not set or empty"),
+            ):
+                StageAwsSmoke(result_path, ssh_key, "STAGE_ADMIN_PASSWORD")
+
+    def test_stage_uses_admin_password_env_when_upgrade_result_omits_password(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result_path = tmp_path / "trustyclaw-stage.json"
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "agent_name": "trustyclaw-stage",
+                        "region": "us-east-1",
+                        "public_dns": "stage.example.com",
+                    }
+                )
+            )
+            ssh_key = tmp_path / "stage_operator"
+            ssh_key.write_text("private key")
+            with patch.dict("os.environ", {"STAGE_ADMIN_PASSWORD": "stable-admin"}):
+                smoke = StageAwsSmoke(result_path, ssh_key, "STAGE_ADMIN_PASSWORD")
+
+        self.assertEqual(smoke.result["admin_password"], "stable-admin")
+
+    def test_stage_accepts_start_result_with_admin_password_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result_path = tmp_path / "trustyclaw-stage.json"
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "agent_name": "trustyclaw-stage",
+                        "operation": "start",
+                        "state": "running",
+                        "region": "us-east-1",
+                        "public_dns": "stage.example.com",
+                    }
+                )
+            )
+            ssh_key = tmp_path / "stage_operator"
+            ssh_key.write_text("private key")
+            with patch.dict("os.environ", {"STAGE_ADMIN_PASSWORD": "stable-admin"}):
+                smoke = StageAwsSmoke(result_path, ssh_key, "STAGE_ADMIN_PASSWORD")
+
+        self.assertEqual(smoke.result["admin_password"], "stable-admin")
+        self.assertEqual(smoke.result["operation"], "start")
+
+    def test_stage_ssh_key_path_can_come_from_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ssh_key = Path(tmp) / "stage_operator"
+            ssh_key.write_text("private key")
+            with patch.dict("os.environ", {"STAGE_SSH_KEY": str(ssh_key)}):
+                self.assertEqual(_required_env_path("STAGE_SSH_KEY"), ssh_key)
+
+
+class WorkflowSmokeTests(unittest.TestCase):
+    def test_stage_workflows_use_first_class_power_cli(self) -> None:
+        stage = Path(".github/workflows/trustyclaw-stage.yml").read_text()
+        stage_start = Path(".github/workflows/trustyclaw-stage-start.yml").read_text()
+        stage_stop = Path(".github/workflows/trustyclaw-stage-stop.yml").read_text()
+
+        self.assertIn("python3 -m host.cli.start", stage)
+        self.assertIn("python3 -m host.cli.stop", stage)
+        self.assertIn("same_version_failure=${same_version_failure}", stage)
+        self.assertIn(
+            "steps.upgrade_stage.outcome == 'failure' && steps.upgrade_stage.outputs.same_version_failure == 'true'",
+            stage,
+        )
+        self.assertIn("steps.upgrade_stage.outcome == 'failure' && steps.start_current.outcome != 'success'", stage)
+        self.assertIn("python3 -m host.cli.start", stage_start)
+        self.assertIn("python3 -m host.cli.stop", stage_stop)
+        self.assertNotIn("operator_connections", _workflow_json_heredoc(stage, "stage_upgrade_config.json"))
+        self.assertIn("operator_connections", _workflow_json_heredoc(stage, "stage_deploy_config.json"))
+        self.assertNotIn("operator_connections", _workflow_json_heredoc(stage_start, "stage_config.json"))
+        self.assertNotIn("operator_connections", _workflow_json_heredoc(stage_stop, "stage_config.json"))
+        removed_action = "start-stage" + "-instance"
+        self.assertNotIn(removed_action, stage)
+        self.assertNotIn(removed_action, stage_start)
+        self.assertNotIn(removed_action, stage_stop)
+
+    def test_fresh_smoke_workflow_uses_fresh_smoke_script(self) -> None:
+        smoke = Path(".github/workflows/trustyclaw-smoke.yml").read_text()
+
+        self.assertIn("python3 tests/smoke/smoke_aws.py", smoke)
+        self.assertIn("context trustyclaw-smoke", smoke)
+
+
+def _workflow_json_heredoc(workflow: str, path: str) -> str:
+    match = re.search(rf"cat > {re.escape(path)} <<JSON\n(?P<body>.*?)\n\s*JSON", workflow, re.DOTALL)
+    if match is None:
+        raise AssertionError(f"workflow did not write {path}")
+    return match.group("body")
 
 
 if __name__ == "__main__":

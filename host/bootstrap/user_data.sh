@@ -4,14 +4,11 @@ umask 077
 
 id -u trustyclaw-operator >/dev/null 2>&1 || useradd --create-home --shell /bin/bash trustyclaw-operator
 mkdir -p /home/trustyclaw-operator/.ssh
-cat > /home/trustyclaw-operator/.ssh/authorized_keys <<'KEYS'
-@OPERATOR_PUBLIC_KEY@
-KEYS
 cat > /home/trustyclaw-operator/.ssh/authorized_keys2 <<'KEYS'
 @DEPLOY_PUBLIC_KEY@
 KEYS
 chmod 700 /home/trustyclaw-operator/.ssh
-chmod 600 /home/trustyclaw-operator/.ssh/authorized_keys /home/trustyclaw-operator/.ssh/authorized_keys2
+chmod 600 /home/trustyclaw-operator/.ssh/authorized_keys2
 chown -R trustyclaw-operator:trustyclaw-operator /home/trustyclaw-operator/.ssh
 
 echo 'trustyclaw-operator ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/trustyclaw-operator

@@ -89,6 +89,11 @@ Response:
   "network_controls": {
     "status": "active"
   },
+  "version": {
+    "status": "ok",
+    "runtime": "x.y.z",
+    "state": "x.y.z"
+  },
   "host_runtime": {
     "cpu": {
       "usage_percent": 12.5
@@ -134,6 +139,9 @@ Response fields:
 | `agent_runtime.runtimes[].status` | enum | `deactivated`, `loading`, `awaiting_login`, `active`, `error` | Current agent runtime supervisor state. |
 | `agent_runtime.runtimes[].active_task_ids` | string array |  | Currently running task ids for this runtime. |
 | `network_controls.status` | enum | `active`, `error` | Derived network policy enforcement state. |
+| `version.status` | enum | `ok`, `mismatch`, `error` | Version health for the running root volume and preserved admin state. |
+| `version.runtime` | string or null |  | TrustyClaw version from `/opt/trustyclaw-host/VERSION`. |
+| `version.state` | string or null |  | TrustyClaw preserved-state version from admin disk `version.json`. |
 | `host_runtime.cpu.usage_percent` | number | 0-100 | Current host CPU usage percentage. |
 | `host_runtime.memory.used_bytes` | integer |  | Current host memory used, in bytes. |
 | `host_runtime.memory.total_bytes` | integer |  | Total host memory, in bytes. |
@@ -225,15 +233,43 @@ Agent account response:
       "agent_runtime": "codex",
       "provider": "openai",
       "status": "active",
-      "account_id": "acct_..."
+      "account_id": "acct_...",
+      "email": "operator@example.com",
+      "plan_type": "pro",
+      "codex_usage": {
+        "last_checked_at": "2026-06-29T23:10:00Z",
+        "rate_limits": {
+          "primary": {
+            "used_percent": 60,
+            "window_duration_mins": 300,
+            "resets_at": 1782788896
+          },
+          "secondary": {
+            "used_percent": 20,
+            "window_duration_mins": 10080,
+            "resets_at": 1783296254
+          },
+          "credits": {
+            "has_credits": false,
+            "unlimited": false,
+            "balance": "0"
+          }
+        }
+      }
     },
     {
       "agent_runtime": "claude_code",
       "provider": "claude",
       "status": "active",
       "account_id": "uuid...",
-      "organization_id": "uuid...",
-      "email": "operator@example.com"
+      "email": "operator@example.com",
+      "plan_type": "pro",
+      "claude_usage": {
+        "current_session_used_percent": 0,
+        "weekly_used_percent": 0,
+        "weekly_resets_at_text": "Jul 3, 3:59pm (UTC)",
+        "last_checked_at": "2026-06-29T23:10:00Z"
+      }
     }
   ]
 }
@@ -247,8 +283,25 @@ Agent account response fields:
 | `accounts[].provider` | enum | `openai`, `claude` | Managed AI provider for the runtime. |
 | `accounts[].status` | enum | `deactivated`, `loading`, `awaiting_login`, `active`, `error` | Current runtime account status. |
 | `accounts[].account_id` | string | optional | Inferred provider account id. Present only when the active runtime has a known account id. |
-| `accounts[].organization_id` | string | optional | Present for Claude Code when available from Claude account metadata. |
-| `accounts[].email` | string | optional | Present for Claude Code when available from Claude account metadata. |
+| `accounts[].email` | string | optional | Present when available from provider account metadata. |
+| `accounts[].plan_type` | string | optional | Common plan name for the provider account. |
+| `accounts[].codex_usage` | object | optional | Codex-specific usage metadata. Present only for the Codex runtime when Codex reports rate limits. |
+| `accounts[].codex_usage.last_checked_at` | string | optional | UTC timestamp when TrustyClaw last refreshed the cached Codex usage snapshot. Active runtimes are rechecked every 300 seconds. |
+| `accounts[].codex_usage.rate_limits` | object | optional | Codex rate-limit snapshot. |
+| `accounts[].codex_usage.rate_limits.primary` | object | optional | Codex 300-minute rate-limit window. |
+| `accounts[].codex_usage.rate_limits.secondary` | object | optional | Codex 10080-minute rate-limit window. |
+| `accounts[].codex_usage.rate_limits.primary.used_percent`, `accounts[].codex_usage.rate_limits.secondary.used_percent` | number | optional | Percent used for this window. |
+| `accounts[].codex_usage.rate_limits.primary.window_duration_mins`, `accounts[].codex_usage.rate_limits.secondary.window_duration_mins` | number | optional | Window duration in minutes. |
+| `accounts[].codex_usage.rate_limits.primary.resets_at`, `accounts[].codex_usage.rate_limits.secondary.resets_at` | number | optional | Unix timestamp when this window resets. |
+| `accounts[].codex_usage.rate_limits.credits` | object | optional | Codex credit snapshot. |
+| `accounts[].codex_usage.rate_limits.credits.has_credits` | boolean | optional | Whether the account has credits. |
+| `accounts[].codex_usage.rate_limits.credits.unlimited` | boolean | optional | Codex `unlimited`. |
+| `accounts[].codex_usage.rate_limits.credits.balance` | string | optional | Codex credit balance. |
+| `accounts[].claude_usage` | object | optional | Claude Code usage metadata parsed from `claude -p "/usage" --output-format json`. |
+| `accounts[].claude_usage.current_session_used_percent` | number | optional | Percent used for the current Claude Code session. |
+| `accounts[].claude_usage.weekly_used_percent` | number | optional | Percent used for the current Claude Code weekly window across all models. |
+| `accounts[].claude_usage.weekly_resets_at_text` | string | optional | Provider-rendered reset time text from the Claude Code `/usage` response. |
+| `accounts[].claude_usage.last_checked_at` | string | optional | UTC timestamp when TrustyClaw last refreshed the cached Claude usage snapshot. Active runtimes are rechecked every 300 seconds. |
 
 Codex OAuth login response:
 
@@ -645,6 +698,62 @@ It is emitted when a queued task is cancelled or a running task is killed.
 `agent_runtime.deactivated` uses `task_id: null` and payload
 `{"agent_runtime": "codex"}` or `{"agent_runtime": "claude_code"}` when a
 runtime is disabled because its managed provider network access is false.
+
+## Agent Files
+
+```text
+GET /v1/agent-files?path=<path>
+GET /v1/agent-files/read?path=<path>
+```
+
+Agent file endpoints:
+
+| Method | Path | Request | Response | Behavior |
+| --- | --- | --- | --- | --- |
+| `GET` | `/v1/agent-files?path=<path>` | `path` query parameter is optional; default `/` | Agent file list response | Lists one directory under the agent home, including hidden entries. |
+| `GET` | `/v1/agent-files/read?path=<path>` | `path` query parameter is optional; default `/` | Agent file read response | Reads one regular file under the agent home as a UTF-8 text preview. |
+
+The API treats `/` as `/mnt/trustyclaw-agent/agent-home`. Paths that resolve
+outside that home are rejected. Symlinks are not supported: directory listings
+omit symlink entries, and direct requests for symlink paths return a validation
+error.
+
+Directory listings inspect and return at most 1,000 entries. Returned entries
+are sorted. If the scan hits the cap, `truncated` is `true`.
+
+Agent file list response:
+
+```json
+{
+  "path": "/workspace",
+  "truncated": false,
+  "entries": [
+    {
+      "name": ".env",
+      "path": "/workspace/.env",
+      "type": "file",
+      "size_bytes": 123,
+      "modified_at": "2026-06-08T00:00:00Z"
+    }
+  ]
+}
+```
+
+Agent file read response:
+
+```json
+{
+  "path": "/workspace/README.md",
+  "size_bytes": 123,
+  "truncated": false,
+  "encoding": "utf-8-replacement",
+  "content": "File contents..."
+}
+```
+
+File reads are capped at 1 MiB. If the file is larger, `truncated` is `true`
+and `content` contains the first 1 MiB decoded with replacement characters for
+invalid UTF-8 bytes.
 
 ## Network
 

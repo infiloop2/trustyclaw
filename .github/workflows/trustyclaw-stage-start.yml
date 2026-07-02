@@ -41,6 +41,12 @@ jobs:
     if: ${{ needs.authorize.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout trusted workflow actions
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
       - name: Start stage EC2 instance
         shell: bash
         env:
@@ -49,112 +55,49 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
         run: |
           set -euo pipefail
-          write_summary() {
-            if [[ -z "${GITHUB_STEP_SUMMARY:-}" ]]; then
-              return
-            fi
+          cat > stage_config.json <<JSON
+          {
+            "agent_name": "trustyclaw-stage",
+            "aws_region": "us-east-1",
+            "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
+            "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY"
+          }
+          JSON
+          if python3 -m host.cli.start --config stage_config.json --result-file trustyclaw-stage.json; then
+            result="running"
+          else
+            result="failed"
             {
               echo "## TrustyClaw stage start"
               echo
               echo "| Field | Value |"
               echo "| --- | --- |"
-              echo "| Result | ${summary_result:-unknown} |"
-              echo "| Instance | ${instance_id:-n/a} |"
-              echo "| Initial state | ${initial_state:-n/a} |"
-              echo "| Final state | ${final_state:-n/a} |"
-              echo "| Public DNS | ${public_dns:-n/a} |"
-              echo "| Public IP | ${public_ip:-n/a} |"
-              if [[ -n "${summary_note:-}" ]]; then
-                echo "| Note | ${summary_note} |"
-              fi
-              if [[ -n "${public_dns:-}" ]]; then
-                echo
-                echo "### SSH tunnel"
-                echo
-                echo '```bash'
-                echo "ssh -i ~/.ssh/trustyclaw/stage_operator -o ExitOnForwardFailure=yes -N -L 7443:127.0.0.1:7443 -L 7445:127.0.0.1:7445 trustyclaw-operator@${public_dns}"
-                echo '```'
-                echo
-                echo "Admin UI: http://127.0.0.1:7443"
-              fi
+              echo "| Result | ${result} |"
             } >> "${GITHUB_STEP_SUMMARY}"
-          }
-
-          instances_json="$(aws ec2 describe-instances \
-            --filters \
-              'Name=tag:trustyclaw-host-agent-name,Values=trustyclaw-stage' \
-              'Name=tag:trustyclaw-host,Values=true' \
-              'Name=instance-state-name,Values=pending,running,stopping,stopped' \
-            --query 'Reservations[].Instances[].{id:InstanceId,state:State.Name,dns:PublicDnsName,ip:PublicIpAddress}' \
-            --output json)"
-          instance_count="$(jq 'length' <<<"${instances_json}")"
-          if (( instance_count == 0 )); then
-            summary_result="failed"
-            summary_note="No existing trustyclaw-stage instance found. Run the stage workflow once to deploy it."
-            write_summary
-            echo "No existing trustyclaw-stage instance found. Run the stage workflow once to deploy it." >&2
             exit 1
           fi
-          if (( instance_count > 1 )); then
-            summary_result="failed"
-            summary_note="Expected one trustyclaw-stage instance, found ${instance_count}."
-            write_summary
-            echo "Expected one trustyclaw-stage instance, found ${instance_count}." >&2
-            jq . <<<"${instances_json}"
-            exit 1
-          fi
-
-          instance_id="$(jq -r '.[0].id' <<<"${instances_json}")"
-          state="$(jq -r '.[0].state' <<<"${instances_json}")"
-          initial_state="${state}"
-          case "${state}" in
-            running)
-              echo "Stage instance ${instance_id} is already running."
-              ;;
-            pending)
-              echo "Stage instance ${instance_id} is pending; waiting for running."
-              aws ec2 wait instance-running --instance-ids "${instance_id}"
-              ;;
-            stopping)
-              echo "Stage instance ${instance_id} is stopping; waiting for stopped, then starting."
-              aws ec2 wait instance-stopped --instance-ids "${instance_id}"
-              aws ec2 start-instances --instance-ids "${instance_id}" >/dev/null
-              aws ec2 wait instance-running --instance-ids "${instance_id}"
-              ;;
-            stopped)
-              echo "Starting stage instance ${instance_id}."
-              aws ec2 start-instances --instance-ids "${instance_id}" >/dev/null
-              aws ec2 wait instance-running --instance-ids "${instance_id}"
-              ;;
-            *)
-              summary_result="failed"
-              summary_note="Unsupported stage instance state ${state}."
-              write_summary
-              echo "Unsupported stage instance state ${state} for ${instance_id}." >&2
-              exit 1
-              ;;
-          esac
-
-          aws ec2 wait instance-running --instance-ids "${instance_id}"
-          current="$(aws ec2 describe-instances \
-            --instance-ids "${instance_id}" \
-            --query 'Reservations[0].Instances[0].{state:State.Name,dns:PublicDnsName,ip:PublicIpAddress}' \
-            --output json)"
-          final_state="$(jq -r '.state // empty' <<<"${current}")"
-          public_dns="$(jq -r '.dns // empty' <<<"${current}")"
-          public_ip="$(jq -r '.ip // empty' <<<"${current}")"
-          if [[ "${final_state}" != "running" ]]; then
-            summary_result="failed"
-            summary_note="Expected final state running, got ${final_state:-unknown}."
-            write_summary
-            echo "Expected stage instance ${instance_id} to be running, got ${final_state:-unknown}." >&2
-            exit 1
-          fi
-          summary_result="running"
-          summary_note="Stage is ready for SSH tunnel inspection."
-          write_summary
-          echo "Stage instance ${instance_id} is running."
-          echo "Public DNS: ${public_dns}"
-          echo "Public IP: ${public_ip}"
-          echo "SSH tunnel:"
-          echo "ssh -i ~/.ssh/trustyclaw/stage_operator -o ExitOnForwardFailure=yes -N -L 7443:127.0.0.1:7443 -L 7445:127.0.0.1:7445 trustyclaw-operator@${public_dns}"
+          instance_id="$(jq -r '.instance_id // "n/a"' trustyclaw-stage.json)"
+          initial_state="$(jq -r '.initial_state // "n/a"' trustyclaw-stage.json)"
+          final_state="$(jq -r '.state // "n/a"' trustyclaw-stage.json)"
+          public_dns="$(jq -r '.public_dns // "n/a"' trustyclaw-stage.json)"
+          public_ip="$(jq -r '.public_ip // "n/a"' trustyclaw-stage.json)"
+          {
+            echo "## TrustyClaw stage start"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Result | ${result} |"
+            echo "| Instance | ${instance_id} |"
+            echo "| Initial state | ${initial_state} |"
+            echo "| Final state | ${final_state} |"
+            echo "| Public DNS | ${public_dns} |"
+            echo "| Public IP | ${public_ip} |"
+            echo
+            echo "### SSH tunnel"
+            echo
+            echo '```bash'
+            echo "ssh -i ~/.ssh/trustyclaw/stage_operator -o ExitOnForwardFailure=yes -N -L 7443:127.0.0.1:7443 -L 7445:127.0.0.1:7445 trustyclaw-operator@${public_dns}"
+            echo '```'
+            echo
+            echo "Admin UI: http://127.0.0.1:7443"
+          } >> "${GITHUB_STEP_SUMMARY}"

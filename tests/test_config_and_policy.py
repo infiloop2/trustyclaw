@@ -12,8 +12,9 @@ from host.config import (
     expand_network_controls,
     parse_input_config,
     parse_network_controls,
+    runtime_operator_connections_from_input,
 )
-from host.deploy import _subnet_has_public_ipv4_route
+from host.cli.lifecycle import _subnet_has_public_ipv4_route
 from host.runtime.network_policy import (
     anthropic_request_denied,
     decide_http_request,
@@ -33,13 +34,57 @@ class ConfigTests(unittest.TestCase):
                 "aws_region": "us-east-1",
                 "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
                 "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
-                "ssh_public_key": "ssh-ed25519 AAAATEST",
-                "ssh_port_opened": True,
+                "operator_connections": [
+                    {
+                        "mode": "ssh",
+                        "ssh_public_key": "ssh-ed25519 AAAATEST",
+                    },
+                    {
+                        "mode": "cloudflare_access",
+                        "hostname": "trustyclaw.example.com",
+                        "tunnel_token_env": "TRUSTYCLAW_TUNNEL_TOKEN",
+                    },
+                ],
             }
         )
 
         self.assertEqual(config.agent_name, "trustyclaw-dev_1")
-        self.assertTrue(config.ssh_port_opened)
+        self.assertIsNotNone(config.operator_connections)
+        self.assertEqual(config.operator_connections[0].mode, "ssh")
+        self.assertEqual(config.operator_connections[0].ssh_public_key, "ssh-ed25519 AAAATEST")
+        self.assertEqual(config.operator_connections[1].mode, "cloudflare_access")
+        self.assertEqual(config.operator_connections[1].hostname, "trustyclaw.example.com")
+
+    def test_upgrade_config_does_not_require_ssh_access_fields(self) -> None:
+        config = parse_input_config(
+            {
+                "agent_name": "trustyclaw-dev_1",
+                "aws_region": "us-east-1",
+                "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
+                "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
+            },
+            require_operator_connections=False,
+        )
+
+        self.assertIsNone(config.operator_connections)
+
+    def test_operator_connections_are_rejected_when_not_required(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "unsupported fields: operator_connections"):
+            parse_input_config(
+                {
+                    "agent_name": "trustyclaw-dev_1",
+                    "aws_region": "us-east-1",
+                    "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
+                    "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
+                    "operator_connections": [
+                        {
+                            "mode": "ssh",
+                            "ssh_public_key": "ssh-ed25519 AAAATEST",
+                        }
+                    ],
+                },
+                require_operator_connections=False,
+            )
 
     def test_input_config_requires_ssh_access_and_rejects_network_controls(self) -> None:
         base = {
@@ -47,18 +92,142 @@ class ConfigTests(unittest.TestCase):
             "aws_region": "us-east-1",
             "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
             "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
-            "ssh_public_key": "ssh-ed25519 AAAATEST",
         }
-        with self.assertRaisesRegex(ConfigError, "ssh_port_opened must be true or false"):
+        with self.assertRaisesRegex(ConfigError, "operator_connections must be an array"):
             parse_input_config(base)
 
-        with self.assertRaisesRegex(ConfigError, "ssh_port_opened must be true"):
-            parse_input_config({**base, "ssh_port_opened": False})
+        with self.assertRaisesRegex(ConfigError, "operator_connections\\[\\].mode must be 'ssh' or 'cloudflare_access'"):
+            parse_input_config(
+                {
+                    **base,
+                    "operator_connections": [
+                        {
+                            "mode": "future",
+                            "ssh_public_key": "ssh-ed25519 AAAATEST",
+                        }
+                    ],
+                }
+            )
+
+    def test_runtime_operator_connections_resolve_cloudflare_token_env(self) -> None:
+        config = parse_input_config(
+            {
+                "agent_name": "trustyclaw-dev_1",
+                "aws_region": "us-east-1",
+                "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
+                "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
+                "operator_connections": [
+                    {
+                        "mode": "cloudflare_access",
+                        "hostname": "trustyclaw.example.com",
+                        "tunnel_token_env": "TRUSTYCLAW_TUNNEL_TOKEN",
+                    }
+                ],
+            }
+        )
+        connections = runtime_operator_connections_from_input(
+            config.operator_connections or (),
+            {"TRUSTYCLAW_TUNNEL_TOKEN": "token.value"},
+        )
+
+        self.assertEqual(connections[0].mode, "cloudflare_access")
+        self.assertEqual(connections[0].hostname, "trustyclaw.example.com")
+        self.assertEqual(connections[0].tunnel_token, "token.value")
+
+        with self.assertRaisesRegex(ConfigError, "TRUSTYCLAW_TUNNEL_TOKEN is not set"):
+            runtime_operator_connections_from_input(config.operator_connections or (), {})
+
+        with self.assertRaisesRegex(ConfigError, "single Cloudflare tunnel token"):
+            runtime_operator_connections_from_input(
+                config.operator_connections or (),
+                {"TRUSTYCLAW_TUNNEL_TOKEN": "token with spaces"},
+            )
+
+        base = {
+            "agent_name": "trustyclaw-dev_1",
+            "aws_region": "us-east-1",
+            "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
+            "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
+        }
+        with self.assertRaisesRegex(ConfigError, "operator_connections\\[\\].ssh_public_key must be an OpenSSH public key"):
+            parse_input_config(
+                {
+                    **base,
+                    "operator_connections": [
+                        {
+                            "mode": "ssh",
+                            "ssh_public_key": "not-a-key",
+                        }
+                    ],
+                }
+            )
+
+        with self.assertRaisesRegex(ConfigError, "operator_connections must contain at least one connection"):
+            parse_input_config({**base, "operator_connections": []})
+
+        with self.assertRaisesRegex(ConfigError, "operator_connections must not contain duplicate modes: ssh"):
+            parse_input_config(
+                {
+                    **base,
+                    "operator_connections": [
+                        {"mode": "ssh", "ssh_public_key": "ssh-ed25519 AAAATEST"},
+                        {"mode": "ssh", "ssh_public_key": "ssh-ed25519 AAAATEST2"},
+                    ],
+                }
+            )
+
+        with self.assertRaisesRegex(ConfigError, "hostname must be an exact domain"):
+            parse_input_config(
+                {
+                    **base,
+                    "operator_connections": [
+                        {
+                            "mode": "cloudflare_access",
+                            "hostname": "*.example.com",
+                            "tunnel_token_env": "TRUSTYCLAW_TUNNEL_TOKEN",
+                        }
+                    ],
+                }
+            )
+
+        with self.assertRaisesRegex(ConfigError, "tunnel_token_env must be a valid environment variable name"):
+            parse_input_config(
+                {
+                    **base,
+                    "operator_connections": [
+                        {
+                            "mode": "cloudflare_access",
+                            "hostname": "trustyclaw.example.com",
+                            "tunnel_token_env": "not valid",
+                        }
+                    ],
+                }
+            )
+
+        with self.assertRaisesRegex(ConfigError, "config has unsupported fields: ssh_public_key"):
+            parse_input_config({**base, "ssh_public_key": "ssh-ed25519 AAAATEST"})
+
+        with self.assertRaisesRegex(ConfigError, "config has unsupported fields: operator_connection"):
+            parse_input_config(
+                {
+                    **base,
+                    "operator_connection": {
+                        "mode": "ssh",
+                        "ssh_public_key": "ssh-ed25519 AAAATEST",
+                    },
+                }
+            )
 
         with self.assertRaisesRegex(ConfigError, "config has unsupported fields: network_controls"):
             parse_input_config(
                 {
                     **base,
+                    "operator_connections": [
+                        {
+                            "mode": "ssh",
+                            "ssh_public_key": "ssh-ed25519 AAAATEST",
+                        }
+                    ],
                     "network_controls": {
                         "managed_ai_provider_network_access": {"openai": True},
                         "allowed_network_access": {},
@@ -522,7 +691,7 @@ class DeployNetworkTests(unittest.TestCase):
             }
         ]
 
-        with patch("host.deploy._aws", side_effect=responses):
+        with patch("host.cli.lifecycle_aws._aws", side_effect=responses):
             self.assertTrue(_subnet_has_public_ipv4_route({}, "vpc-1", "subnet-1"))
 
     def test_subnet_rejects_nat_default_route(self) -> None:
@@ -542,7 +711,7 @@ class DeployNetworkTests(unittest.TestCase):
             }
         ]
 
-        with patch("host.deploy._aws", side_effect=responses):
+        with patch("host.cli.lifecycle_aws._aws", side_effect=responses):
             self.assertFalse(_subnet_has_public_ipv4_route({}, "vpc-1", "subnet-1"))
 
 

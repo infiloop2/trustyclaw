@@ -1,15 +1,16 @@
 """Localhost admin API (127.0.0.1:7443), reached through SSH port forwarding.
 
-Route handlers validate the documented protocol and update the JSON state
-files; running tasks through the selected agent runtime is delegated to
+Route handlers validate the documented protocol and update admin state in the
+local Postgres database (through the storage accessors in ``state``);
+running tasks through the selected agent runtime is delegated to
 ``orchestrator``, which owns the worker pool and runtime process cache.
 Privileged operations
 (reboot, network policy replacement) go through narrow root-owned sudo
 helpers.
 
 Authentication compares a SHA-256 hash of the presented bearer password
-against ``admin_password_sha256`` from config.json, so the cleartext password
-never exists on the host.
+against ``admin_password_sha256`` from the config table, so the cleartext
+password never exists on the host.
 """
 
 from __future__ import annotations
@@ -31,19 +32,15 @@ from urllib.parse import parse_qs, urlparse
 
 from host.config import AGENT_RUNTIMES, ConfigError, parse_network_controls
 from host.constants import ADMIN_API_PORT, LOOPBACK, PROXY_PORT
-from host.runtime import claude_code, codex_app_server, orchestrator, proxy_state_client, task_status
+from host.runtime import claude_code, codex_app_server, orchestrator, proxy_state_client, state, task_status
 from host.runtime.orchestrator import agent_runtime_status
 from host.runtime.state import (
     TASK_LIMIT,
-    append_agent_event,
     load_config,
     page_agent_events,
     page_task_events,
-    prune_agent_events,
-    read_openai_account_id,
     read_claude_account,
-    read_state,
-    state_update,
+    read_openai_account,
     utc_now,
 )
 from host.runtime.task_status import (
@@ -53,6 +50,7 @@ from host.runtime.task_status import (
     QUEUED,
     RUNNING,
 )
+from host.version import version_status
 
 
 HOST = LOOPBACK
@@ -69,36 +67,43 @@ MAX_REQUEST_BODY_BYTES = 1024 * 1024
 IDEMPOTENCY_RETENTION_SECONDS = 24 * 3600
 IDEMPOTENCY_ENTRY_LIMIT = 10_000
 MAINTENANCE_INTERVAL_SECONDS = 3600  # scheduled state cleanup cadence (not per-request)
-FINISHED_TASK_LIMIT = 1000  # finished tasks kept as history before the oldest are pruned
+FINISHED_TASK_LIMIT = 100_000  # finished tasks kept as history before the oldest are pruned
 THREAD_TASK_LIMIT = 1000
-THREAD_MAP_LIMIT = 1000  # user thread -> runtime session mappings kept before LRU pruning
+THREAD_MAP_LIMIT = 100_000  # user thread -> runtime session mappings kept before LRU pruning
 # Queued tasks and undelivered steers are the two operator-driven inputs that
-# would otherwise grow state.json without bound (active tasks are never
+# would otherwise grow admin state without bound (active tasks are never
 # pruned; steers queue until the worker delivers them). Both caps return 409.
 QUEUED_TASK_LIMIT = 1000
 PENDING_STEER_LIMIT = 20
 NETWORK_POLICY_LOCK_TIMEOUT_SECONDS = 5
-NETWORK_POLICY_HELPER_TIMEOUT_SECONDS = 30
 OAUTH_LOGIN_LOCK_TIMEOUT_SECONDS = 5
 REBOOT_HELPER_TIMEOUT_SECONDS = 10
+AGENT_FILE_HELPER_TIMEOUT_SECONDS = 10
+AGENT_FILE_HELPER_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/read-agent-file"]
 # Lock inventory for this module (each request runs on its own handler
 # thread, so every handler is concurrent with every other and with the
 # orchestrator's workers):
-# - The state lock (private to state.py, entered through state_update() and
-#   read_state()): every state.json access. Held briefly; slow work (runtime
-#   spawns, helper subprocesses, process closes) always runs outside the
-#   transaction so reads and /v1/health never stall behind a mutation.
+# - The mutation lock (private to state.py, entered through state.mutation()):
+#   every admin-state write cycle. Held briefly; slow work (runtime spawns,
+#   helper subprocesses, process closes) always runs outside the mutation so
+#   reads and /v1/health never stall behind it. Reads are lock-free queries.
 # - NETWORK_POLICY_LOCK: serializes policy replacements end-to-end (validate +
 #   root helper run). Acquired with a timeout so a stuck helper returns 409 to
 #   later callers instead of piling up threads.
 # - OAUTH_LOGIN_LOCK: serializes device-login starts so two clicks cannot mint
 #   two device codes. Also timeout-guarded.
-# - Idempotency keys act as a per-key mutex across retries: the in-flight
-#   reservation in _mutate_idempotently is claimed in one state transaction,
-#   the request body executes outside it, and the reservation is released on
-#   failure (or by initialize_state after a crash).
+# - IDEMPOTENCY_LOCK guards the in-memory idempotency store below. Keys act as
+#   a per-key mutex across retries: the in-flight reservation in
+#   _mutate_idempotently is claimed under the lock, the request body executes
+#   outside it, and the reservation is released on failure.
 NETWORK_POLICY_LOCK = threading.Lock()
 OAUTH_LOGIN_LOCK = threading.Lock()
+# Idempotency replay records live in process memory, not the database: they
+# are a retry convenience with a 24-hour horizon, and a service restart —
+# which already fails in-flight tasks — simply resets them, so a retried key
+# re-executes at most once per process lifetime.
+IDEMPOTENCY_ENTRIES: dict[str, dict[str, Any]] = {}
+IDEMPOTENCY_LOCK = threading.Lock()
 
 
 class ApiError(Exception):
@@ -150,16 +155,15 @@ class Handler(BaseHTTPRequestHandler):
         if not IDEMPOTENCY_RE.fullmatch(key):
             raise ApiError(HTTPStatus.BAD_REQUEST, "missing or invalid Idempotency-Key")
         body = self._read_body()
-        # Atomically claim the key: in one transaction, either return a
-        # completed response, reject an in-flight duplicate, or reserve the
-        # key. Without the reservation, two concurrent retries with the same
-        # key both pass a check-then-act gap and execute twice — exactly what
-        # idempotency must prevent.
-        with state_update() as state:
-            entries = state.setdefault("idempotency", {})
+        # Atomically claim the key: under the lock, either return a completed
+        # response, reject an in-flight duplicate, or reserve the key. Without
+        # the reservation, two concurrent retries with the same key both pass
+        # a check-then-act gap and execute twice — exactly what idempotency
+        # must prevent.
+        with IDEMPOTENCY_LOCK:
             now = time.time()
-            prune_idempotency(entries, now=now)
-            stored = entries.get(key)
+            prune_idempotency(IDEMPOTENCY_ENTRIES, now=now)
+            stored = IDEMPOTENCY_ENTRIES.get(key)
             if stored is not None:
                 if stored["method"] != method or stored["path"] != path.path:
                     raise ApiError(HTTPStatus.BAD_REQUEST, "Idempotency-Key was already used for a different request")
@@ -169,27 +173,25 @@ class Handler(BaseHTTPRequestHandler):
                 # new key is stored.
                 if now - stored["stored_at"] <= IDEMPOTENCY_RETENTION_SECONDS:
                     return stored["response"]
-            entries[key] = {"method": method, "path": path.path, "in_flight": True, "stored_at": now}
-            prune_idempotency(entries, now=now, preserve_key=key)
-        # Execute outside the state transaction so a slow mutation (runtime
-        # spawn, policy subprocess, process shutdown) never blocks reads or
-        # /v1/health.
+            IDEMPOTENCY_ENTRIES[key] = {"method": method, "path": path.path, "in_flight": True, "stored_at": now}
+            prune_idempotency(IDEMPOTENCY_ENTRIES, now=now, preserve_key=key)
+        # Execute outside the lock so a slow mutation (runtime spawn, policy
+        # subprocess, process shutdown) never blocks other requests.
         try:
             response = route(method, path.path, parse_qs(path.query), body)
         except BaseException:
             # Release the reservation so a retry can proceed after a failure.
-            with state_update() as state:
-                entry = state.get("idempotency", {}).get(key)
+            with IDEMPOTENCY_LOCK:
+                entry = IDEMPOTENCY_ENTRIES.get(key)
                 if entry is not None and entry.get("in_flight"):
-                    del state["idempotency"][key]
+                    del IDEMPOTENCY_ENTRIES[key]
             raise
-        with state_update() as state:
-            entries = state.setdefault("idempotency", {})
+        with IDEMPOTENCY_LOCK:
             now = time.time()
-            entries[key] = {
+            IDEMPOTENCY_ENTRIES[key] = {
                 "method": method, "path": path.path, "response": response, "stored_at": now,
             }
-            prune_idempotency(entries, now=now, preserve_key=key)
+            prune_idempotency(IDEMPOTENCY_ENTRIES, now=now, preserve_key=key)
         return response
 
     def _send_ui_asset(self, path: str) -> None:
@@ -274,6 +276,10 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> Any
             return replace_network_policy(body)
     if path == "/v1/network/events" and method == "GET":
         return {"events": proxy_state_client.network_events(_since(query))}
+    if path == "/v1/agent-files" and method == "GET":
+        return agent_file_list(_agent_file_path(query))
+    if path == "/v1/agent-files/read" and method == "GET":
+        return agent_file_read(_agent_file_path(query))
     if path == "/v1/host-runtime/reboot" and method == "POST":
         return reboot_host()
     raise ApiError(HTTPStatus.NOT_FOUND, "route not found")
@@ -303,6 +309,65 @@ def reboot_host() -> dict[str, str]:
     if proc.returncode != 0:
         raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, proc.stderr.strip() or "reboot helper failed")
     return {"status": "accepted"}
+
+
+def agent_file_list(path: str) -> dict[str, Any]:
+    return _run_agent_file_helper("list", path)
+
+
+def agent_file_read(path: str) -> dict[str, Any]:
+    return _run_agent_file_helper("read", path)
+
+
+def _run_agent_file_helper(action: str, path: str) -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            [*AGENT_FILE_HELPER_COMMAND, action, path],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=AGENT_FILE_HELPER_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ApiError(HTTPStatus.GATEWAY_TIMEOUT, "agent file helper timed out") from exc
+    except PermissionError as exc:
+        # The timeout path kills the child, but the helper starts as root via
+        # sudo before demoting to the agent user, so the unprivileged service
+        # user's kill can raise PermissionError in place of TimeoutExpired.
+        raise ApiError(
+            HTTPStatus.GATEWAY_TIMEOUT,
+            "agent file helper timed out (the root helper could not be terminated)",
+        ) from exc
+    if proc.returncode != 0:
+        message = _helper_error_message(proc.stdout, proc.stderr)
+        status = {
+            2: HTTPStatus.NOT_FOUND,
+            3: HTTPStatus.BAD_REQUEST,
+            4: HTTPStatus.BAD_REQUEST,
+        }.get(proc.returncode, HTTPStatus.INTERNAL_SERVER_ERROR)
+        raise ApiError(status, message or "agent file helper failed")
+    try:
+        value = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "agent file helper returned invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "agent file helper returned invalid JSON")
+    return value
+
+
+def _helper_error_message(stdout: str, stderr: str) -> str:
+    try:
+        value = json.loads(stdout)
+    except json.JSONDecodeError:
+        return stderr.strip()
+    if isinstance(value, dict):
+        error = value.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str):
+                return message
+    return stderr.strip()
 
 
 def task_route(method: str, path: str, query: dict[str, list[str]], body: Any) -> Any:
@@ -339,12 +404,18 @@ def thread_route(method: str, path: str, query: dict[str, list[str]]) -> Any:
 def health() -> dict[str, Any]:
     runtime = agent_runtime_status()
     network_status = proxy_state_client.network_status()
+    version = version_status()
     if network_status == "active" and not proxy_alive():
         network_status = "error"  # policy says active but nothing is enforcing it
-    degraded = any(item["status"] == "error" for item in runtime["runtimes"]) or network_status == "error"
+    degraded = (
+        any(item["status"] == "error" for item in runtime["runtimes"])
+        or network_status == "error"
+        or version["status"] != "ok"
+    )
     return {
         "status": "degraded" if degraded else "ok",
         "agent_name": load_config().get("agent_name"),
+        "version": version,
         "agent_runtime": runtime,
         "network_controls": {"status": network_status},
         "host_runtime": host_metrics(),
@@ -360,17 +431,6 @@ def proxy_alive() -> bool:
             return True
     except OSError:
         return False
-
-
-def _task_number(task: dict[str, Any]) -> int:
-    try:
-        return int(str(task["task_id"]).rsplit("_", 1)[-1])
-    except (KeyError, ValueError):
-        return 0
-
-
-def _task_history_key(task: dict[str, Any]) -> tuple[str, int]:
-    return (str(task.get("updated_at", "")), _task_number(task))
 
 
 def prune_idempotency(entries: dict[str, Any], *, now: float, preserve_key: str | None = None) -> None:
@@ -391,48 +451,20 @@ def prune_idempotency(entries: dict[str, Any], *, now: float, preserve_key: str 
 
 
 def prune_state() -> None:
-    """Bound state.json growth: keep all active tasks plus the most recent
-    finished ones, and drop expired/excess idempotency entries. Runs on a
-    schedule (maintenance_loop), never on the request path, so reads stay
-    cheap."""
-    with state_update() as state:
-        tasks = state.get("tasks", [])
-        active = [t for t in tasks if t["status"] in ACTIVE_STATUSES]
-        finished = sorted(
-            (t for t in tasks if t["status"] not in ACTIVE_STATUSES),
-            key=_task_history_key,
-        )
-        kept_finished = finished[-FINISHED_TASK_LIMIT:]
-        pruned_tasks = {_task_number(t) for t in finished[:-FINISHED_TASK_LIMIT]}
-
-        entries = state.get("idempotency", {})
-        now = time.time()
-        before_idempotency = dict(entries)
-        prune_idempotency(entries, now=now)
-
-        # Bound the user-thread -> runtime session maps: drop the least recently
-        # used mappings. A dropped thread is not an error — a later task on it
-        # just starts a fresh runtime conversation.
-        threads = state.get("codex_threads", {})
-        stale_codex_threads = len(threads) > THREAD_MAP_LIMIT
-        claude_sessions = state.get("claude_sessions", {})
-        stale_claude_sessions = len(claude_sessions) > THREAD_MAP_LIMIT
-
-        if not pruned_tasks and entries == before_idempotency and not stale_codex_threads and not stale_claude_sessions:
-            return
-        if stale_codex_threads:
-            kept = sorted(threads.items(), key=lambda item: item[1].get("last_used_at", ""))[-THREAD_MAP_LIMIT:]
-            state["codex_threads"] = dict(kept)
-        if stale_claude_sessions:
-            kept = sorted(claude_sessions.items(), key=lambda item: item[1].get("last_used_at", ""))[-THREAD_MAP_LIMIT:]
-            state["claude_sessions"] = dict(kept)
-        # Preserve original task order, minus the pruned finished ones.
-        kept_numbers = {_task_number(t) for t in active} | {_task_number(t) for t in kept_finished}
-        state["tasks"] = [t for t in tasks if _task_number(t) in kept_numbers]
-        # Bound the agent-event log while still inside the state transaction,
-        # so event sequence allocation and log pruning share one critical
-        # section.
-        prune_agent_events()
+    """Bound admin-state growth: keep all active tasks plus the most recent
+    finished ones, cap the thread->session maps and the event log, and drop
+    expired/excess idempotency entries. Runs on a schedule (maintenance_loop),
+    never on the request path; the deletes are indexed and touch only rows
+    beyond the caps."""
+    with state.mutation() as cur:
+        state.prune_finished_tasks(cur, FINISHED_TASK_LIMIT)
+        # A dropped thread mapping is not an error — a later task on it just
+        # starts a fresh runtime conversation.
+        state.prune_thread_sessions(cur, "codex", THREAD_MAP_LIMIT)
+        state.prune_thread_sessions(cur, "claude_code", THREAD_MAP_LIMIT)
+        state.prune_agent_events(cur)
+    with IDEMPOTENCY_LOCK:
+        prune_idempotency(IDEMPOTENCY_ENTRIES, now=time.time())
 
 
 def maintenance_loop() -> None:
@@ -450,10 +482,9 @@ def start_codex_oauth_login() -> dict[str, str]:
     try:
         if not orchestrator.runtime_network_enabled("codex"):
             raise ApiError(HTTPStatus.CONFLICT, "Codex OAuth login is unavailable while OpenAI provider access is disabled")
-        state = read_state()
-        if _runtime_status(state, "codex") != "awaiting_login":
+        if orchestrator.runtime_status("codex") != "awaiting_login":
             raise ApiError(HTTPStatus.CONFLICT, "Codex OAuth login is only available while awaiting_login")
-        oauth = state.get("codex_oauth")
+        oauth = state.oauth_login("codex")
         if oauth:
             return {key: oauth[key] for key in ("status", "device_code", "login_url", "expires_at")}
         login = codex_app_server.start_device_login()
@@ -463,11 +494,11 @@ def start_codex_oauth_login() -> dict[str, str]:
             "login_url": login.verification_url,
             "expires_at": _minutes_from_now(10),
         }
-        with state_update() as state:
-            if not orchestrator.runtime_network_enabled("codex") or _runtime_status(state, "codex") != "awaiting_login":
+        with state.mutation() as cur:
+            if not orchestrator.runtime_network_enabled("codex") or orchestrator.runtime_status("codex") != "awaiting_login":
                 codex_app_server.close_login_server()
                 raise ApiError(HTTPStatus.CONFLICT, "Codex OAuth login is only available while awaiting_login")
-            state["codex_oauth"] = response | {"login_id": login.login_id}
+            state.set_oauth_login(cur, "codex", response | {"login_id": login.login_id})
         return response
     finally:
         OAUTH_LOGIN_LOCK.release()
@@ -476,10 +507,9 @@ def start_codex_oauth_login() -> dict[str, str]:
 def current_codex_oauth_login() -> dict[str, str]:
     if not orchestrator.runtime_network_enabled("codex"):
         raise ApiError(HTTPStatus.CONFLICT, "Codex OAuth login is unavailable while OpenAI provider access is disabled")
-    state = read_state()
-    if _runtime_status(state, "codex") != "awaiting_login":
+    if orchestrator.runtime_status("codex") != "awaiting_login":
         raise ApiError(HTTPStatus.CONFLICT, "Codex OAuth login is only available while awaiting_login")
-    oauth = state.get("codex_oauth")
+    oauth = state.oauth_login("codex")
     if not oauth:
         raise ApiError(HTTPStatus.NOT_FOUND, "Codex OAuth login has not been started")
     return {key: oauth[key] for key in ("status", "device_code", "login_url", "expires_at")}
@@ -491,11 +521,10 @@ def start_claude_oauth_login() -> dict[str, str]:
     try:
         if not orchestrator.runtime_network_enabled("claude_code"):
             raise ApiError(HTTPStatus.CONFLICT, "Claude OAuth login is unavailable while Claude provider access is disabled")
-        state = read_state()
-        if _runtime_status(state, "claude_code") != "awaiting_login":
+        if orchestrator.runtime_status("claude_code") != "awaiting_login":
             raise ApiError(HTTPStatus.CONFLICT, "Claude OAuth login is only available while awaiting_login")
-        oauth = state.get("claude_oauth")
-        if isinstance(oauth, dict) and oauth.get("provider") == "claude":
+        oauth = state.oauth_login("claude")
+        if oauth is not None:
             return {key: oauth[key] for key in ("status", "login_url", "expires_at")}
         login = claude_code.start_oauth_login()
         response = {
@@ -503,11 +532,11 @@ def start_claude_oauth_login() -> dict[str, str]:
             "login_url": login.login_url,
             "expires_at": _minutes_from_now(10),
         }
-        with state_update() as state:
-            if not orchestrator.runtime_network_enabled("claude_code") or _runtime_status(state, "claude_code") != "awaiting_login":
+        with state.mutation() as cur:
+            if not orchestrator.runtime_network_enabled("claude_code") or orchestrator.runtime_status("claude_code") != "awaiting_login":
                 claude_code.close_login_process()
                 raise ApiError(HTTPStatus.CONFLICT, "Claude OAuth login is only available while awaiting_login")
-            state["claude_oauth"] = response | {"provider": "claude"}
+            state.set_oauth_login(cur, "claude", response)
         return response
     finally:
         OAUTH_LOGIN_LOCK.release()
@@ -516,11 +545,10 @@ def start_claude_oauth_login() -> dict[str, str]:
 def current_claude_oauth_login() -> dict[str, str]:
     if not orchestrator.runtime_network_enabled("claude_code"):
         raise ApiError(HTTPStatus.CONFLICT, "Claude OAuth login is unavailable while Claude provider access is disabled")
-    state = read_state()
-    if _runtime_status(state, "claude_code") != "awaiting_login":
+    if orchestrator.runtime_status("claude_code") != "awaiting_login":
         raise ApiError(HTTPStatus.CONFLICT, "Claude OAuth login is only available while awaiting_login")
-    oauth = state.get("claude_oauth")
-    if not isinstance(oauth, dict) or oauth.get("provider") != "claude":
+    oauth = state.oauth_login("claude")
+    if oauth is None:
         raise ApiError(HTTPStatus.NOT_FOUND, "Claude OAuth login has not been started")
     return {key: oauth[key] for key in ("status", "login_url", "expires_at")}
 
@@ -534,61 +562,159 @@ def complete_claude_oauth_login(body: Any) -> dict[str, str]:
         claude_code.complete_oauth_login(body["code"])
     except claude_code.ClaudeCodeError as exc:
         raise ApiError(HTTPStatus.CONFLICT, str(exc)) from exc
-    with state_update() as state:
-        state["claude_oauth"] = None
+    with state.mutation() as cur:
+        state.set_oauth_login(cur, "claude", None)
     orchestrator.refresh_runtime_status("claude_code")
     return {"status": "accepted"}
 
 
 def current_agent_accounts() -> dict[str, Any]:
-    state = read_state()
-    return {"accounts": [_current_agent_account(state, "codex"), _current_agent_account(state, "claude_code")]}
+    statuses = orchestrator.all_runtime_status_records()
+    return {"accounts": [_current_agent_account(statuses, "codex"), _current_agent_account(statuses, "claude_code")]}
 
 
-def _current_agent_account(state: dict[str, Any], runtime_type: str) -> dict[str, Any]:
-    status = _runtime_status(state, runtime_type)
+def _current_agent_account(statuses: dict[str, dict[str, Any]], runtime_type: str) -> dict[str, Any]:
+    status = str(statuses.get(runtime_type, {}).get("status", "loading"))
     if runtime_type == "claude_code":
         response = {"agent_runtime": "claude_code", "provider": "claude", "status": status}
         if status != "active":
             return response
         account = read_claude_account()
-        account_id = account.get("account_id")
-        organization_id = account.get("organization_id")
-        email = account.get("email")
-        if isinstance(account_id, str) and account_id:
-            response["account_id"] = account_id
-        if isinstance(organization_id, str) and organization_id:
-            response["organization_id"] = organization_id
-        if isinstance(email, str) and email:
-            response["email"] = email
+        response.update(_account_response_metadata(account, runtime_type))
         return response
     response = {"agent_runtime": "codex", "provider": "openai", "status": status}
     if status != "active":
         return response
-    account_id = read_openai_account_id()
-    if account_id:
-        response["account_id"] = account_id
+    account = read_openai_account()
+    response.update(_account_response_metadata(account, runtime_type))
     return response
+
+
+def _account_response_metadata(account: dict[str, Any], runtime_type: str) -> dict[str, Any]:
+    response: dict[str, Any] = {}
+    for key in ("account_id", "email"):
+        value = account.get(key)
+        if isinstance(value, str) and value:
+            response[key] = value
+    plan_type = _normalize_plan_type(account)
+    if plan_type:
+        response["plan_type"] = plan_type
+    if runtime_type == "codex":
+        codex_usage = _normalize_codex_usage(account.get("codex_usage"))
+        if codex_usage:
+            response["codex_usage"] = codex_usage
+    if runtime_type == "claude_code":
+        claude_usage = _normalize_claude_usage(account.get("claude_usage"))
+        if claude_usage:
+            response["claude_usage"] = claude_usage
+    return response
+
+
+def _normalize_plan_type(account: dict[str, Any]) -> str | None:
+    for key in ("plan_type", "planType", "plan"):
+        value = account.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _normalize_codex_usage(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    last_checked_at = _public_metadata_scalar(value.get("last_checked_at"))
+    if isinstance(last_checked_at, str):
+        result["last_checked_at"] = last_checked_at
+    rate_limits = _normalize_rate_limit_snapshot(value.get("rate_limits"))
+    if rate_limits:
+        result["rate_limits"] = rate_limits
+    return result
+
+
+def _normalize_claude_usage(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key in ("current_session_used_percent", "weekly_used_percent"):
+        scalar = _public_metadata_scalar(value.get(key))
+        if type(scalar) in (int, float):
+            result[key] = scalar
+    resets_at_text = value.get("weekly_resets_at_text")
+    if isinstance(resets_at_text, str) and resets_at_text:
+        result["weekly_resets_at_text"] = resets_at_text
+    last_checked_at = _public_metadata_scalar(value.get("last_checked_at"))
+    if isinstance(last_checked_at, str):
+        result["last_checked_at"] = last_checked_at
+    expected_keys = {
+        "current_session_used_percent",
+        "weekly_used_percent",
+        "weekly_resets_at_text",
+        "last_checked_at",
+    }
+    return result if set(result) == expected_keys else {}
+
+
+def _normalize_rate_limit_snapshot(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key in ("primary", "secondary"):
+        window = _normalize_rate_limit_window(value.get(key))
+        if window:
+            result[key] = window
+    credits = _normalize_credits(value.get("credits"))
+    if credits:
+        result["credits"] = credits
+    return result
+
+
+def _normalize_rate_limit_window(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key in ("used_percent", "window_duration_mins", "resets_at"):
+        scalar = _public_metadata_scalar(value.get(key))
+        if scalar is not None:
+            result[key] = scalar
+    return result
+
+
+def _normalize_credits(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key in ("has_credits", "unlimited", "balance"):
+        scalar = _public_metadata_scalar(value.get(key))
+        if scalar is not None:
+            result[key] = scalar
+    return result
+
+
+def _public_metadata_scalar(value: Any) -> Any:
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, bool) or isinstance(value, int) or isinstance(value, float):
+        return value
+    return None
 
 
 def create_task(body: Any) -> dict[str, Any]:
     input_message = _message(body, "input_message")
     thread_id = _thread_id(body)
     agent_runtime = _agent_runtime(body)
-    with state_update() as state:
-        existing_runtime = thread_runtime_in_state(state, thread_id)
+    with state.mutation() as cur:
+        existing_runtime = state.thread_task_runtime(cur, thread_id) or state.thread_session_runtime(cur, thread_id)
         if existing_runtime is not None and existing_runtime != agent_runtime:
             raise ApiError(
                 HTTPStatus.CONFLICT,
                 f"thread_id is already used by {existing_runtime}; use that runtime or choose a new thread_id",
             )
-        if sum(1 for t in state["tasks"] if t["status"] == QUEUED) >= QUEUED_TASK_LIMIT:
+        if state.queued_task_count(cur) >= QUEUED_TASK_LIMIT:
             raise ApiError(
                 HTTPStatus.CONFLICT,
                 f"task queue is full ({QUEUED_TASK_LIMIT} queued tasks); cancel queued tasks or wait",
             )
-        task_id = f"task_{state['next_task_number']}"
-        state["next_task_number"] = int(state["next_task_number"]) + 1
+        task_id = f"task_{state.allocate_task_number(cur)}"
         now = utc_now()
         task = {
             "task_id": task_id,
@@ -596,17 +722,16 @@ def create_task(body: Any) -> dict[str, Any]:
             "agent_runtime": agent_runtime,
             "thread_id": thread_id,
             "input_message": input_message,
-            "steer_messages": [],
             "created_at": now,
             "updated_at": now,
         }
-        state["tasks"].append(task)
+        state.insert_task(cur, task)
     orchestrator.WORKER_WAKE.set()
     return public_task(task)
 
 
 def list_tasks(last_seen_task_id: str | None) -> dict[str, Any]:
-    tasks = [task for task in read_state()["tasks"] if task["status"] in ACTIVE_STATUSES]
+    tasks = state.active_tasks()
     ordered = _queue_order(tasks)
     start = 0
     if last_seen_task_id:
@@ -618,29 +743,9 @@ def list_tasks(last_seen_task_id: str | None) -> dict[str, Any]:
 
 
 def list_threads() -> dict[str, Any]:
-    state = read_state()
-    threads: dict[str, dict[str, Any]] = {}
-    for task in state["tasks"]:
-        thread_id = task["thread_id"]
-        runtime = task["agent_runtime"]
-        entry = threads.setdefault(
-            thread_id,
-            {
-                "thread_id": thread_id,
-                "agent_runtime": runtime,
-                "last_used_at": task["updated_at"],
-                "active_tasks": [],
-                "task_count": 0,
-            },
-        )
-        entry["last_used_at"] = max(str(entry["last_used_at"]), str(task["updated_at"]))
-        entry["task_count"] = int(entry["task_count"]) + 1
-        if task["status"] in ACTIVE_STATUSES:
-            entry["active_tasks"].append({"task_id": task["task_id"], "status": task["status"]})
-    for thread_id, mapping in state.get("codex_threads", {}).items():
-        _merge_thread_mapping(threads, thread_id, "codex", mapping)
-    for thread_id, mapping in state.get("claude_sessions", {}).items():
-        _merge_thread_mapping(threads, thread_id, "claude_code", mapping)
+    threads = {summary["thread_id"]: summary for summary in state.thread_summaries()}
+    for runtime, thread_id, last_used_at in state.session_summaries():
+        _merge_thread_mapping(threads, thread_id, runtime, {"last_used_at": last_used_at})
     ordered = sorted(
         threads.values(),
         key=lambda item: (str(item["last_used_at"]), item["agent_runtime"], item["thread_id"]),
@@ -669,73 +774,63 @@ def _merge_thread_mapping(
 
 
 def list_thread_tasks(thread_id: str) -> dict[str, Any]:
-    tasks = [task for task in read_state()["tasks"] if task["thread_id"] == thread_id]
-    ordered = sorted(tasks, key=_task_history_key, reverse=True)
-    return {"tasks": [public_task(task) for task in ordered[:THREAD_TASK_LIMIT]]}
-
-
-def thread_runtime_in_state(state: dict[str, Any], thread_id: str) -> str | None:
-    for task in state["tasks"]:
-        if task["thread_id"] == thread_id:
-            return str(task["agent_runtime"])
-    if thread_id in state.get("codex_threads", {}):
-        return "codex"
-    if thread_id in state.get("claude_sessions", {}):
-        return "claude_code"
-    return None
+    return {"tasks": [public_task(task) for task in state.tasks_for_thread(thread_id, THREAD_TASK_LIMIT)]}
 
 
 def get_task(task_id: str) -> dict[str, Any]:
-    return public_task(_find_task_in_state(read_state(), task_id))
+    return public_task(_require_task(state.get_task(task_id)))
 
 
 def update_task(task_id: str, body: Any) -> dict[str, Any]:
     input_message = _message(body, "input_message")
-    with state_update() as state:
-        task = _find_task_in_state(state, task_id)
+    with state.mutation() as cur:
+        task = _require_task(state.get_task(task_id, cur))
         if task["status"] != QUEUED:
             raise ApiError(HTTPStatus.CONFLICT, "only queued tasks can be updated")
         task["input_message"] = input_message
         task["updated_at"] = utc_now()
+        state.save_task(cur, task)
         return public_task(task)
 
 
 def steer_task(task_id: str, body: Any) -> dict[str, str]:
     steer_message = _message(body, "steer_message")
-    with state_update() as state:
-        task = _find_task_in_state(state, task_id)
+    with state.mutation() as cur:
+        task = _require_task(state.get_task(task_id, cur))
         if task["status"] != RUNNING:
             raise ApiError(HTTPStatus.CONFLICT, "only running tasks can be steered")
-        pending = task.setdefault("steer_messages", [])
-        if len(pending) >= PENDING_STEER_LIMIT:
+        if state.pending_steer_count(cur, task_id) >= PENDING_STEER_LIMIT:
             raise ApiError(
                 HTTPStatus.CONFLICT,
                 f"task already has {PENDING_STEER_LIMIT} undelivered steer messages; wait for delivery",
             )
-        pending.append(steer_message)
+        state.append_task_steer(cur, task_id, steer_message)
         task["updated_at"] = utc_now()
-        append_agent_event(state, "task.message", task_id, {"message": steer_message, "source": "user"})
+        state.save_task(cur, task)
+        state.append_agent_event(cur, "task.message", task_id, {"message": steer_message, "source": "user"})
     return {"status": "accepted"}
 
 
 def cancel_task(task_id: str) -> dict[str, str]:
-    with state_update() as state:
-        task = _find_task_in_state(state, task_id)
+    with state.mutation() as cur:
+        task = _require_task(state.get_task(task_id, cur))
         if task["status"] != QUEUED:
             raise ApiError(HTTPStatus.CONFLICT, "only queued tasks can be cancelled")
         task_status.set_status(task, CANCELLED, now=utc_now())
-        append_agent_event(state, "task.cancelled", task_id, {})
+        state.save_task(cur, task)
+        state.append_agent_event(cur, "task.cancelled", task_id, {})
     return {"status": "accepted"}
 
 
 def kill_task(task_id: str) -> dict[str, str]:
-    with state_update() as state:
-        task = _find_task_in_state(state, task_id)
+    with state.mutation() as cur:
+        task = _require_task(state.get_task(task_id, cur))
         if task["status"] != RUNNING:
             raise ApiError(HTTPStatus.CONFLICT, "only running tasks can be killed")
         task_status.set_status(task, CANCELLED, now=utc_now())
-        append_agent_event(state, "task.cancelled", task_id, {})
-    # Kill the task's runtime process outside the state transaction (closing can be
+        state.save_task(cur, task)
+        state.append_agent_event(cur, "task.cancelled", task_id, {})
+    # Kill the task's runtime process outside the mutation (closing can be
     # slow). The worker blocked in run_turn sees the dead server as an error
     # and finds the task already cancelled, so the cancellation sticks.
     orchestrator.close_task_server(task_id)
@@ -753,45 +848,17 @@ def replace_network_policy(body: Any) -> dict[str, Any]:
     if not NETWORK_POLICY_LOCK.acquire(timeout=NETWORK_POLICY_LOCK_TIMEOUT_SECONDS):
         raise ApiError(HTTPStatus.CONFLICT, "network policy update already in progress")
     try:
-        result = apply_network_policy_as_root(parsed.to_json())
+        # The validated policy goes straight to the database row the proxy
+        # reads (the proxy role cannot write it back). Only stored after
+        # parse_network_controls above accepted it — same validation the old
+        # root helper performed.
+        policy = parsed.to_json()
+        updated_at = utc_now()
+        state.save_network_policy(policy, updated_at)
         orchestrator.reconcile_runtime_status_after_policy_change()
-        return result
+        return {"network_controls": policy, "updated_at": updated_at}
     finally:
         NETWORK_POLICY_LOCK.release()
-
-
-def apply_network_policy_as_root(policy: dict[str, Any]) -> dict[str, Any]:
-    try:
-        proc = subprocess.run(
-            ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/update-network-policy"],
-            input=json.dumps(policy),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=NETWORK_POLICY_HELPER_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise ApiError(HTTPStatus.GATEWAY_TIMEOUT, "network policy update timed out") from exc
-    except PermissionError as exc:
-        # The timeout path kills the child, but the helper starts as root via
-        # sudo before demoting to the proxy user, so the unprivileged service
-        # user's kill can raise PermissionError in place of TimeoutExpired.
-        # The helper keeps running; its own file lock and atomic policy replace
-        # keep the policy files consistent.
-        raise ApiError(
-            HTTPStatus.GATEWAY_TIMEOUT,
-            "network policy update timed out (the root helper could not be terminated)",
-        ) from exc
-    if proc.returncode != 0:
-        raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, proc.stderr.strip() or "network policy update failed")
-    try:
-        result = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "network policy update returned invalid JSON") from exc
-    if not isinstance(result, dict):
-        raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "network policy update returned invalid JSON")
-    return result
 
 
 def host_metrics() -> dict[str, Any]:
@@ -893,11 +960,10 @@ def _queue_order(tasks: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any]]
     return ordered
 
 
-def _find_task_in_state(state: dict[str, Any], task_id: str) -> dict[str, Any]:
-    for task in state["tasks"]:
-        if task["task_id"] == task_id:
-            return task
-    raise ApiError(HTTPStatus.NOT_FOUND, "task not found")
+def _require_task(task: dict[str, Any] | None) -> dict[str, Any]:
+    if task is None:
+        raise ApiError(HTTPStatus.NOT_FOUND, "task not found")
+    return task
 
 
 def _message(body: Any, key: str) -> str:
@@ -938,14 +1004,6 @@ def _agent_runtime_value(value: str) -> str:
     return value
 
 
-def _runtime_status(state: dict[str, Any], runtime_type: str) -> str:
-    statuses = state.get("agent_runtime_statuses", {})
-    runtime_state = statuses.get(runtime_type, {}) if isinstance(statuses, dict) else {}
-    if isinstance(runtime_state, dict):
-        return str(runtime_state.get("status", "loading"))
-    return "loading"
-
-
 def _one(query: dict[str, list[str]], key: str) -> str | None:
     values = query.get(key)
     if not values:
@@ -953,6 +1011,17 @@ def _one(query: dict[str, list[str]], key: str) -> str | None:
     if len(values) != 1:
         raise ApiError(HTTPStatus.BAD_REQUEST, f"{key} must appear once")
     return values[0]
+
+
+def _agent_file_path(query: dict[str, list[str]]) -> str:
+    value = _one(query, "path")
+    if value is None or value == "":
+        return "/"
+    if "\0" in value:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "path contains a NUL byte")
+    if len(value) > 4096:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "path is too long")
+    return value
 
 
 def _since(query: dict[str, list[str]]) -> int | None:
@@ -974,22 +1043,21 @@ def _minutes_from_now(minutes: int) -> str:
 
 def initialize_state() -> None:
     """Recover after a restart or reboot: a task that was mid-turn has no
-    worker attached anymore, so fail it rather than leave it running forever."""
-    with state_update() as state:
-        now = utc_now()
-        for task in state["tasks"]:
-            if task["status"] == RUNNING:
-                task_status.set_status(task, FAILED, now=now)
-                task["error_message"] = "host runtime restarted while the task was running"
-                append_agent_event(state, "task.failed", task["task_id"], {"error_message": task["error_message"]})
-        # Drop idempotency reservations whose request died with the process;
-        # otherwise a retry of that key would get 409 forever.
-        entries = state.get("idempotency", {})
-        for key in [k for k, v in entries.items() if v.get("in_flight")]:
-            del entries[key]
+    worker attached anymore, so fail it rather than leave it running forever.
+    (Idempotency replay records live in this process's memory, so a restart
+    already cleared them along with any in-flight reservations.)"""
+    error_message = "host runtime restarted while the task was running"
+    with state.mutation() as cur:
+        for task_id in state.fail_running_tasks(cur, error_message):
+            state.append_agent_event(cur, "task.failed", task_id, {"error_message": error_message})
 
 
 def main() -> int:
+    # Schema migrations are deploy-plane work: bootstrap runs `migrate up`
+    # before services start, and the service itself never migrates — a stray
+    # service start can therefore never move the schema under other code, and
+    # a schema/code mismatch (unsupported) fails loudly here instead of being
+    # papered over.
     # Bind the port before touching state: the state lock is in-process only,
     # so the bind is the single-instance gate. A second instance must fail here
     # rather than fail the live instance's running task and drop its in-flight
