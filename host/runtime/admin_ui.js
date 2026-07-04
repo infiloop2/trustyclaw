@@ -4,6 +4,7 @@ let eventsSince = null, netSince = null;
 const events = [], netEvents = [];
 let runtimeType = "codex";
 let threads = [], threadTasks = [];
+let selectedThreadId = null, selectedThreadRuntime = null;
 let activeTab = "home";
 let activeNetworkPolicy = {"managed_ai_provider_network_access": {}, "allowed_network_access": {}};
 let proposedNetworkPolicy = {"managed_ai_provider_network_access": {}, "allowed_network_access": {}};
@@ -153,11 +154,24 @@ function esc(value) {
   return div.innerHTML;
 }
 
-function showLogin() { $("login").hidden = false; $("app").hidden = true; }
+// Skip innerHTML swaps when nothing changed: the UI polls every 5 seconds and
+// unconditional re-renders would break in-flight taps, hover, and selection.
+function setHtml(el, html) {
+  if (el.__lastHtml === html) return;
+  el.__lastHtml = html;
+  el.innerHTML = html;
+}
+
+function showLogin() {
+  $("login").hidden = false;
+  $("app").hidden = true;
+  $("logout-button").hidden = true;
+  $("agent-name").hidden = true;
+}
 
 function showTab(name) {
   activeTab = name;
-  for (const tabName of ["home", "agent", "files", "network"]) {
+  for (const tabName of ["home", "agent", "agent-log", "files", "network", "net-log"]) {
     $(`tab-${tabName}`).classList.toggle("active-tab", tabName === name);
     $(`panel-${tabName}`).hidden = tabName !== name;
   }
@@ -192,33 +206,62 @@ function renderPresetInfo(info) {
     </table>`;
 }
 
+function gib(bytes) { return (bytes / 1073741824).toFixed(1); }
+
+function statTile(label, valueHtml, extraClass = "") {
+  return `<div class="stat-tile${extraClass ? " " + extraClass : ""}"><div class="stat-label">${esc(label)}</div><div class="stat-value">${valueHtml}</div></div>`;
+}
+
+function meterTile(label, valueHtml, percent) {
+  const clamped = Math.max(0, Math.min(100, percent));
+  return `
+    <div class="stat-tile">
+      <div class="stat-label">${esc(label)}</div>
+      <div class="stat-value">${valueHtml}</div>
+      <div class="meter${clamped >= 80 ? " hot" : ""}"><i style="width:${clamped.toFixed(1)}%"></i></div>
+    </div>`;
+}
+
+function usageTile(label, used, total, totalLabel) {
+  const value = `${esc(gib(used))} <span class="unit">/ ${esc(gib(total))} ${esc(totalLabel || "GiB")}</span>`;
+  return meterTile(label, value, total > 0 ? (used / total) * 100 : 0);
+}
+
 async function refreshHealth() {
   const health = await api("GET", "/v1/health");
   $("agent-name").textContent = health.agent_name;
+  $("agent-name").hidden = false;
   const runtimes = Array.isArray(health.agent_runtime.runtimes) ? health.agent_runtime.runtimes : [];
   latestRuntimes = runtimes;
   runtimeType = runtimes.find(r => r.status === "active")?.type || runtimes[0]?.type || "codex";
   const host = health.host_runtime;
-  const gib = bytes => (bytes / 1073741824).toFixed(1) + " GiB";
-  $("health").innerHTML = `
-    <tr><th>overall</th><td>${badge(health.status)}</td></tr>
-    <tr><th>network controls</th><td>${badge(health.network_controls.status)}</td></tr>
-    <tr><th>version</th><td>${renderVersion(health.version)}</td></tr>
-    <tr><th>cpu</th><td>${esc(host.cpu.usage_percent)}%</td></tr>
-    <tr><th>memory</th><td>${gib(host.memory.used_bytes)} / ${gib(host.memory.total_bytes)}</td></tr>
-    <tr><th>filesystem</th><td>${gib(host.filesystem.used_bytes)} / ${gib(host.filesystem.total_bytes)}</td></tr>
-    <tr><th>swap</th><td>${gib(host.swap.used_bytes)} / ${gib(host.swap.allocated_bytes)}</td></tr>`;
-  $("runtime").innerHTML = `<tr><th>type</th><th>status</th></tr>` +
+  setHtml($("health"), `
+    <div class="stat-grid stat-statuses">
+      ${statTile("Overall", badge(health.status))}
+      ${statTile("Network controls", badge(health.network_controls.status))}
+      ${statTile("Version", renderVersion(health.version), "stat-wide")}
+    </div>
+    <div class="stat-grid stat-meters">
+      ${meterTile("CPU", `${esc(host.cpu.usage_percent)}<span class="unit">%</span>`, Number(host.cpu.usage_percent) || 0)}
+      ${usageTile("Memory", host.memory.used_bytes, host.memory.total_bytes)}
+      ${usageTile("Filesystem", host.filesystem.used_bytes, host.filesystem.total_bytes)}
+      ${usageTile("Swap", host.swap.used_bytes, host.swap.allocated_bytes)}
+    </div>`);
+  setHtml($("runtime"), `<div class="runtime-grid">` +
     runtimes.map(runtime => `
-      <tr>
-        <td>${esc(runtime.type)}</td>
-        <td>${badge(runtime.status)}</td>
-      </tr>`).join("");
+      <div class="runtime-card">
+        <div>
+          <div class="name">${esc(RUNTIME_PROVIDERS[runtime.type]?.label || runtime.type)}</div>
+          <div class="sub">${esc(runtime.type)}${(runtime.active_task_ids || []).length
+            ? ` &middot; ${(runtime.active_task_ids || []).length} running` : ""}</div>
+        </div>
+        ${badge(runtime.status)}
+      </div>`).join("") + `</div>`);
   updateLoginButtons(runtimes);
   renderRuntimeGuidance(runtimes);
   const pending = runtimes.find(runtime => runtime.status === "awaiting_login");
   if (pending) await showOauth(false, pending.type);
-  else $("oauth").textContent = "";
+  else setHtml($("oauth"), "");
 }
 
 function renderVersion(version) {
@@ -233,12 +276,12 @@ async function refreshProviderAccounts() {
   const response = await api("GET", "/v1/agent-runtime/account");
   const accounts = Array.isArray(response.accounts) ? response.accounts : [];
   if (!accounts.length) {
-    $("provider-accounts").innerHTML = `<tr><td class="muted">No provider accounts.</td></tr>`;
+    setHtml($("provider-accounts"), `<tr><td class="empty-state">No provider accounts.</td></tr>`);
     return;
   }
-  $("provider-accounts").innerHTML = `
+  setHtml($("provider-accounts"), `
     <tr><th>runtime</th><th>account</th><th>plan</th><th>usage</th></tr>
-    ${accounts.map(renderProviderAccountRow).join("")}`;
+    ${accounts.map(renderProviderAccountRow).join("")}`);
 }
 
 function renderProviderAccountRow(account) {
@@ -375,7 +418,7 @@ function renderRuntimeGuidance(runtimes = latestRuntimes) {
         <div class="runtime-guidance">
           <p>${esc(meta.label)} is deactivated because ${esc(meta.providerLabel)} provider access is disabled in the active network policy. The proposal enables it; replace the active policy to activate this runtime.</p>
           <div class="actions">
-            <button data-action="show-tab" data-tab="network">Open Network settings</button>
+            <button class="ghost sm" data-action="show-tab" data-tab="network">Open Network settings</button>
           </div>
         </div>`);
     } else if (!activeEnabled) {
@@ -383,12 +426,12 @@ function renderRuntimeGuidance(runtimes = latestRuntimes) {
         <div class="runtime-guidance">
           <p>${esc(meta.label)} is deactivated because ${esc(meta.providerLabel)} provider access is disabled in the active network policy. Add ${esc(meta.providerLabel)} to the proposed policy before starting login.</p>
           <div class="actions">
-            <button data-action="show-tab" data-tab="network">Open Network settings</button>
+            <button class="ghost sm" data-action="show-tab" data-tab="network">Open Network settings</button>
           </div>
         </div>`);
     }
   }
-  $("runtime-guidance").innerHTML = messages.length ? `<div class="runtime-guidance-list">${messages.join("")}</div>` : "";
+  setHtml($("runtime-guidance"), messages.length ? `<div class="runtime-guidance-list">${messages.join("")}</div>` : "");
 }
 
 async function showOauth(start, runtime) {
@@ -396,17 +439,18 @@ async function showOauth(start, runtime) {
   try {
     if (runtime === "claude_code") {
       const login = await api(start ? "POST" : "GET", "/v1/agent-runtime/claude-oauth-login");
-      $("oauth").innerHTML =
-        `Claude Code login: open ` +
-        `<a href="${esc(login.login_url)}" target="_blank">${esc(login.login_url)}</a> ` +
-        `(expires ${esc(login.expires_at)}) ` +
-        `<button data-action="complete-claude-login">Submit code</button>`;
+      setHtml($("oauth"), `<div class="oauth-card">
+        <span>Claude Code login: open
+        <a href="${esc(login.login_url)}" target="_blank">${esc(login.login_url)}</a>
+        <span class="muted">(expires ${esc(login.expires_at)})</span></span>
+        <button class="primary sm" data-action="complete-claude-login">Submit code</button></div>`);
       return;
     }
     const login = await api(start ? "POST" : "GET", "/v1/agent-runtime/codex-oauth-login");
-    $("oauth").innerHTML =
-      `Codex login: enter code <b>${esc(login.device_code)}</b> at ` +
-      `<a href="${esc(login.login_url)}" target="_blank">${esc(login.login_url)}</a> (expires ${esc(login.expires_at)})`;
+    setHtml($("oauth"), `<div class="oauth-card">
+      <span>Codex login: enter code <b>${esc(login.device_code)}</b> at
+      <a href="${esc(login.login_url)}" target="_blank">${esc(login.login_url)}</a>
+      <span class="muted">(expires ${esc(login.expires_at)})</span></span></div>`);
   } catch (error) { if (start) notice(error.message); }
 }
 
@@ -436,7 +480,10 @@ async function createTask() {
   try {
     await api("POST", "/v1/tasks", { input_message: message, thread_id: threadId, agent_runtime: agentRuntime });
     $("new-task").value = "";
-    await refreshTasks();
+    selectedThreadId = threadId;
+    selectedThreadRuntime = agentRuntime;
+    updateComposer();
+    await refreshSelectedThread();
     await loadThreads();
   }
   catch (error) { notice(error.message); }
@@ -450,33 +497,14 @@ async function steerTask(taskId) {
 }
 
 async function cancelTask(taskId) {
-  try { await api("POST", `/v1/tasks/${taskId}/cancel`); await refreshTasks(); }
+  try { await api("POST", `/v1/tasks/${taskId}/cancel`); await refreshSelectedThread(); }
   catch (error) { notice(error.message); }
 }
 
 async function killTask(taskId) {
   if (!confirm("Kill running task " + taskId + "? Its runtime process is terminated and the task is cancelled.")) return;
-  try { await api("POST", `/v1/tasks/${taskId}/kill`); await refreshTasks(); }
+  try { await api("POST", `/v1/tasks/${taskId}/kill`); await refreshSelectedThread(); }
   catch (error) { notice(error.message); }
-}
-
-async function refreshTasks() {
-  const listed = await api("GET", "/v1/tasks");
-  if (!listed.tasks.length) { $("tasks").innerHTML = `<tr><td class="muted">No running or queued tasks.</td></tr>`; return; }
-  $("tasks").innerHTML = `<tr><th>#</th><th>task</th><th>runtime</th><th>thread</th><th>status</th><th>message</th><th></th></tr>` +
-    listed.tasks.map(task => `
-      <tr>
-        <td>${task.queue_position}</td>
-        <td>${esc(task.task_id)}</td>
-        <td>${esc(task.agent_runtime)}</td>
-        <td>${esc(task.thread_id)}</td>
-        <td>${badge(task.status)}</td>
-        <td><pre>${esc(task.input_message)}</pre></td>
-        <td>${task.status === "running"
-              ? `<button data-action="steer-task" data-task-id="${esc(task.task_id)}">Steer</button>
-                 <button class="danger" data-action="kill-task" data-task-id="${esc(task.task_id)}">Kill</button>`
-              : `<button data-action="cancel-task" data-task-id="${esc(task.task_id)}">Cancel</button>`}</td>
-      </tr>`).join("");
 }
 
 async function loadThreads() {
@@ -485,45 +513,119 @@ async function loadThreads() {
   renderThreads();
 }
 
+function runtimeLabel(runtime) {
+  return RUNTIME_PROVIDERS[runtime]?.label || runtime;
+}
+
 function renderThreads() {
   if (!threads.length) {
-    $("threads").innerHTML = `<tr><td class="muted">No recent threads.</td></tr>`;
+    setHtml($("threads"), `<div class="empty-state">No threads yet. Start one on the right.</div>`);
     return;
   }
-  $("threads").innerHTML = `<tr><th>thread</th><th>runtime</th><th>last used</th><th>tasks</th><th>active</th><th></th></tr>` +
-    threads.map(thread => `
-      <tr>
-        <td>${esc(thread.thread_id)}</td>
-        <td>${esc(thread.agent_runtime)}</td>
-        <td class="muted">${esc(thread.last_used_at)}</td>
-        <td>${esc(thread.task_count)}</td>
-        <td>${(thread.active_tasks || []).map(task => badge(task.status)).join(" ")}</td>
-        <td><button data-action="show-thread" data-thread-id="${esc(thread.thread_id)}" data-runtime="${esc(thread.agent_runtime)}">Open</button></td>
-      </tr>`).join("");
+  setHtml($("threads"), threads.map(thread => `
+    <button class="thread-item${thread.thread_id === selectedThreadId ? " selected" : ""}"
+            data-action="show-thread" data-thread-id="${esc(thread.thread_id)}" data-runtime="${esc(thread.agent_runtime)}">
+      <span class="thread-name">${esc(thread.thread_id)}</span>
+      <span class="thread-meta">${esc(runtimeLabel(thread.agent_runtime))} &middot; ${esc(thread.task_count)} task${thread.task_count === 1 ? "" : "s"}
+        ${(thread.active_tasks || []).map(task => badge(task.status)).join(" ")}</span>
+      <span class="thread-meta">${esc(formatDateTime(thread.last_used_at))}</span>
+    </button>`).join(""));
+}
+
+function newThread() {
+  selectedThreadId = null;
+  selectedThreadRuntime = null;
+  threadTasks = [];
+  $("task-events-detail").innerHTML = "";
+  $("new-task-thread").value = "";
+  updateComposer();
+  renderThreadHistory();
+  renderThreads();
+  $("new-task-thread").focus();
+}
+
+function updateComposer() {
+  const hasThread = selectedThreadId !== null;
+  $("thread-field").hidden = hasThread;
+  $("runtime-field").hidden = hasThread;
+  $("composer-target").textContent = hasThread
+    ? `New task on ${selectedThreadId} (${runtimeLabel(selectedThreadRuntime)})`
+    : "New thread";
+  $("new-task").placeholder = hasThread
+    ? "Describe what the agent should do next…"
+    : "Describe the first task in this thread…";
+  if (hasThread) {
+    $("new-task-thread").value = selectedThreadId;
+    $("new-task-runtime").value = selectedThreadRuntime;
+  }
 }
 
 async function showThread(threadId, agentRuntime) {
-  $("new-task-thread").value = threadId;
-  $("new-task-runtime").value = agentRuntime;
-  $("task-events-detail").innerHTML = "";
+  if (threadId !== selectedThreadId) $("task-events-detail").innerHTML = "";
+  selectedThreadId = threadId;
+  selectedThreadRuntime = agentRuntime;
+  updateComposer();
+  renderThreads();
+  await refreshSelectedThread();
+}
+
+async function refreshSelectedThread() {
+  if (selectedThreadId === null) { renderThreadHistory(); return; }
   const response = await api(
     "GET",
-    `/v1/threads/${encodeURIComponent(threadId)}/tasks`
+    `/v1/threads/${encodeURIComponent(selectedThreadId)}/tasks`
   );
   threadTasks = response.tasks || [];
-  $("thread-detail").innerHTML = `
-    <h2>${esc(threadId)} tasks</h2>
-    <table>
-      <tr><th>task</th><th>status</th><th>updated</th><th>message</th><th></th></tr>
-      ${threadTasks.length ? threadTasks.map(task => `
-        <tr>
-          <td>${esc(task.task_id)}</td>
-          <td>${badge(task.status)}</td>
-          <td class="muted">${esc(task.updated_at)}</td>
-          <td><pre>${esc(task.input_message)}</pre></td>
-          <td><button data-action="show-task-events" data-task-id="${esc(task.task_id)}">Events</button></td>
-        </tr>`).join("") : `<tr><td colspan="5" class="muted">No retained tasks for this thread.</td></tr>`}
-    </table>`;
+  renderThreadHistory();
+}
+
+function taskNumber(taskId) {
+  const tail = String(taskId).split("_").pop();
+  return /^\d+$/.test(tail) ? Number(tail) : 0;
+}
+
+function renderThreadHistory() {
+  if (selectedThreadId === null) {
+    setHtml($("thread-detail"), `<div class="empty-state thread-empty">Select a thread on the left to see its tasks, or start a new one below.</div>`);
+    return;
+  }
+  const ordered = threadTasks.slice().sort((a, b) =>
+    a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : taskNumber(a.task_id) - taskNumber(b.task_id));
+  setHtml($("thread-detail"), `
+    <div class="thread-head">
+      <span class="thread-title">${esc(selectedThreadId)}</span>
+      <span class="muted">${esc(runtimeLabel(selectedThreadRuntime))}</span>
+    </div>
+    ${ordered.length ? ordered.map(renderTaskCard).join("")
+      : `<div class="empty-state thread-empty">No retained tasks for this thread yet.</div>`}`);
+}
+
+function renderTaskCard(task) {
+  const actions = [
+    task.status === "running"
+      ? `<button class="sm" data-action="steer-task" data-task-id="${esc(task.task_id)}">Steer</button>
+         <button class="danger sm" data-action="kill-task" data-task-id="${esc(task.task_id)}">Kill</button>`
+      : "",
+    task.status === "queued"
+      ? `<button class="ghost sm" data-action="cancel-task" data-task-id="${esc(task.task_id)}">Cancel</button>`
+      : "",
+    `<button class="ghost sm" data-action="show-task-events" data-task-id="${esc(task.task_id)}">Events</button>`,
+  ].join("");
+  const pendingNote = task.status === "running" ? "Working&hellip;"
+    : task.status === "queued" ? "Queued; waiting for the runtime." : "";
+  return `
+    <div class="task-card">
+      <div class="task-head">
+        <span class="mono muted">${esc(task.task_id)}</span>
+        ${badge(task.status)}
+        <span class="muted time">${esc(formatDateTime(task.created_at))}</span>
+        <span class="task-actions">${actions}</span>
+      </div>
+      <div class="msg user"><pre>${esc(task.input_message)}</pre></div>
+      ${task.output_message ? `<div class="msg agent"><pre>${esc(task.output_message)}</pre></div>` : ""}
+      ${task.error_message ? `<div class="msg error"><pre>${esc(task.error_message)}</pre></div>` : ""}
+      ${pendingNote ? `<div class="msg pending muted">${pendingNote}</div>` : ""}
+    </div>`;
 }
 
 async function loadTaskEventBatch(taskId) {
@@ -564,28 +666,28 @@ function renderTaskEventsDetail() {
   const taskEvents = selectedTaskEvents;
   $("task-events-detail").innerHTML = `
     <h2>${esc(task.task_id)} events</h2>
-    <table>
+    <div class="table-scroll"><table>
       <tr><th>status</th><td>${badge(task.status)}</td></tr>
       <tr><th>runtime</th><td>${esc(task.agent_runtime)}</td></tr>
-      <tr><th>thread</th><td>${esc(task.thread_id)}</td></tr>
-      <tr><th>created</th><td class="muted">${esc(task.created_at)}</td></tr>
-      <tr><th>updated</th><td class="muted">${esc(task.updated_at)}</td></tr>
+      <tr><th>thread</th><td class="mono">${esc(task.thread_id)}</td></tr>
+      <tr><th>created</th><td class="muted time">${esc(formatDateTime(task.created_at))}</td></tr>
+      <tr><th>updated</th><td class="muted time">${esc(formatDateTime(task.updated_at))}</td></tr>
       <tr><th>input</th><td><pre>${esc(task.input_message)}</pre></td></tr>
       ${task.output_message ? `<tr><th>output</th><td><pre>${esc(task.output_message)}</pre></td></tr>` : ""}
       ${task.error_message ? `<tr><th>error</th><td><pre>${esc(task.error_message)}</pre></td></tr>` : ""}
-    </table>
+    </table></div>
     <h2>Events</h2>
-    <table>
+    <div class="table-scroll"><table>
       <tr><th>seq</th><th>time</th><th>type</th><th>source</th><th>payload</th></tr>
       ${taskEvents.length ? taskEvents.map(event => `
         <tr>
           <td>${esc(event.seq)}</td>
-          <td class="muted">${esc(event.timestamp)}</td>
+          <td class="muted time">${esc(formatDateTime(event.timestamp))}</td>
           <td>${esc(event.event_type)}</td>
           <td>${esc(event.payload.source || "")}</td>
           <td><pre>${esc(event.payload.message || event.payload.error_message || JSON.stringify(event.payload))}</pre></td>
         </tr>`).join("") : `<tr><td colspan="5" class="muted">No retained events for this task.</td></tr>`}
-    </table>
+    </table></div>
     ${selectedTaskEventsHasMore ? `<div class="actions"><button data-action="load-more-task-events" data-task-id="${esc(task.task_id)}">Load more events</button></div>` : ""}`;
 }
 
@@ -593,27 +695,27 @@ async function refreshEvents() {
   const response = await api("GET", "/v1/events" + (eventsSince === null ? "" : "?since=" + eventsSince));
   for (const event of response.events) { events.push(event); eventsSince = event.seq; }
   while (events.length > 50) events.shift();
-  $("events").innerHTML = `<tr><th>time</th><th>type</th><th>task</th><th>payload</th></tr>` +
+  setHtml($("events"), `<tr><th>time</th><th>type</th><th>task</th><th>payload</th></tr>` +
     events.slice().reverse().map(event => `
       <tr>
-        <td class="muted">${esc(event.timestamp)}</td>
-        <td>${esc(event.event_type)}</td>
-        <td>${esc(event.task_id || "")}</td>
+        <td class="muted time">${esc(formatDateTime(event.timestamp))}</td>
+        <td class="mono">${esc(event.event_type)}</td>
+        <td class="mono">${esc(event.task_id || "")}</td>
         <td><pre>${esc(event.payload.message || event.payload.error_message || "")}</pre></td>
-      </tr>`).join("");
+      </tr>`).join(""));
 }
 
 async function refreshNetEvents() {
   const response = await api("GET", "/v1/network/events" + (netSince === null ? "" : "?since=" + netSince));
   for (const event of response.events) { netEvents.push(event); netSince = event.seq; }
   while (netEvents.length > 50) netEvents.shift();
-  $("net-events").innerHTML = `<tr><th>time</th><th>request</th><th>decision</th></tr>` +
+  setHtml($("net-events"), `<tr><th>time</th><th>request</th><th>decision</th></tr>` +
     netEvents.slice().reverse().map(event => `
       <tr>
-        <td class="muted">${esc(event.timestamp)}</td>
-        <td>${esc(event.method)} ${esc(event.protocol)}://${esc(event.host)}${esc(event.path)}</td>
+        <td class="muted time">${esc(formatDateTime(event.timestamp))}</td>
+        <td class="mono">${esc(event.method)} ${esc(event.protocol)}://${esc(event.host)}${esc(event.path)}</td>
         <td>${badge(event.decision)}</td>
-      </tr>`).join("");
+      </tr>`).join(""));
 }
 
 function fileMessage(message) {
@@ -678,7 +780,7 @@ function renderFileList(listing = {}) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
     cell.colSpan = 3;
-    cell.className = "muted";
+    cell.className = "empty-state";
     cell.textContent = "Empty directory.";
     row.appendChild(cell);
     table.appendChild(row);
@@ -921,6 +1023,9 @@ async function savePolicy() {
     proposedNetworkPolicy = clonePolicy(activeNetworkPolicy);
     renderPolicyControls();
     policyMessage("Active network policy replaced.");
+    // Runtime states change with the policy; reflect that now, not at the next poll.
+    refreshHealth().catch(() => {});
+    refreshProviderAccounts().catch(() => {});
   } catch (error) { policyMessage(error.message); }
 }
 
@@ -928,8 +1033,8 @@ async function tick() {
   try {
     await refreshHealth();
     await refreshProviderAccounts();
-    await refreshTasks();
     await loadThreads();
+    await refreshSelectedThread();
     await refreshEvents();
     await refreshNetEvents();
     if (activeTab === "files") await loadAgentFiles(currentFilePath);
@@ -940,6 +1045,9 @@ function start() {
   if (!getPassword()) { showLogin(); return; }
   $("login").hidden = true;
   $("app").hidden = false;
+  $("logout-button").hidden = false;
+  updateComposer();
+  renderThreadHistory();
   loadPolicy().catch(() => {});
   tick();
   setInterval(tick, 5000);
@@ -968,7 +1076,7 @@ document.addEventListener("click", event => {
     "steer-task": () => steerTask(taskId),
     "kill-task": () => killTask(taskId),
     "cancel-task": () => cancelTask(taskId),
-    "load-threads": () => loadThreads(),
+    "new-thread": () => newThread(),
     "show-thread": () => showThread(threadId, runtime),
     "show-task-events": () => showTaskEvents(taskId),
     "load-more-task-events": () => loadMoreTaskEvents(taskId),

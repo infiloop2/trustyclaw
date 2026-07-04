@@ -111,21 +111,93 @@ the final host closes EC2 SSH ingress after bootstrap.
 ### Cloudflare Access Operator Access
 
 Cloudflare mode assumes you create the Cloudflare resources yourself and give
-TrustyClaw only a tunnel token plus the final hostname.
+TrustyClaw only a tunnel token plus the final hostname. TrustyClaw installs and
+runs the tunnel connector on the host; you never install anything locally.
 
-For a new Cloudflare setup:
+You will create five things in Cloudflare: an account, an active domain, a
+tunnel, a published hostname on that tunnel, and an Access application that
+guards the hostname. The walkthrough below starts from nothing. Cloudflare
+moves dashboard menus around occasionally; if a label differs, look for the
+same concept.
 
-1. Add a domain to Cloudflare and make it active.
-2. In Cloudflare Zero Trust, create a Cloudflare Tunnel.
-3. Add a public hostname for the tunnel, for example
-   `trustyclaw.example.com`, with service `http://localhost:7443`.
-4. Create a Cloudflare Access self-hosted application for that hostname.
-5. Add an Access policy that allows only your user, group, or email domain.
-6. Copy the tunnel token from Cloudflare and export it locally:
+**1. Create a Cloudflare account and add a domain.**
+
+- Sign up at [dash.cloudflare.com](https://dash.cloudflare.com) (free plan).
+- You need a domain whose DNS is hosted by Cloudflare. Either buy one through
+  Cloudflare (**Domain Registration > Register Domains** — it activates
+  immediately), or add a domain you already own (**Account Home > Add a
+  domain**) and change the nameservers at your current registrar to the two
+  Cloudflare assigns you. An added domain shows **Pending** until the
+  nameserver change propagates (minutes to a day or two). Wait for the domain
+  to show **Active** before continuing.
+
+**2. Complete Zero Trust onboarding.**
+
+- In the Cloudflare dashboard sidebar, open **Zero Trust**. The first visit
+  walks you through onboarding: pick a team name (any unique name; it becomes
+  `<team-name>.cloudflareaccess.com`, the URL your Access login page lives
+  under) and select the **Free** plan.
+- The Free plan costs `$0` but Cloudflare still requires a payment method
+  (card or PayPal) on file to finish onboarding. This is expected; you are not
+  charged.
+
+**3. Create a tunnel and copy its token.**
+
+- Go to **Zero Trust > Networks > Tunnels > Create a tunnel**, choose the
+  **Cloudflared** connector type, and name the tunnel, for example
+  `trustyclaw`.
+- The next screen shows connector install commands for various operating
+  systems. Do not run any of them — TrustyClaw installs the connector on the
+  host during deploy. You only need the tunnel token: the long string starting
+  with `eyJ` at the end of any install command. Use the copy button, extract
+  the token, and keep it somewhere private for step 6.
+- The tunnel stays **Inactive**/**Down** until your first TrustyClaw deploy
+  connects it. That is expected; continue anyway.
+
+**4. Publish a hostname that routes to the admin UI.**
+
+- Open the tunnel you created and add a published application route (on
+  current dashboards a **Routes**/**Published application routes** tab with an
+  **Add a public hostname** or **Add route > Published application** button).
+- Set subdomain `trustyclaw` (or any name you like) on your domain, so the
+  full hostname is for example `trustyclaw.example.com`.
+- Set the service **Type** to `HTTP` and the **URL** to `localhost:7443`. The
+  hop from the connector to the admin process stays on the host's loopback,
+  so plain HTTP here is correct; browsers still reach the hostname over
+  HTTPS.
+- Saving the route creates the DNS record for the hostname automatically. Do
+  not create one yourself.
+
+**5. Guard the hostname with an Access application.**
+
+Without this step the admin UI login would be reachable by the whole
+internet, protected only by the admin password. Do not skip it.
+
+- Go to **Zero Trust > Access controls > Applications > Create new
+  application** (older dashboards: **Access > Applications > Add an
+  application**) and choose **Self-hosted**.
+- Name it, and add the public hostname from step 4 exactly (subdomain
+  `trustyclaw`, your domain, no path).
+- Create the Access policy: action **Allow**, with an include rule matching
+  only you — the simplest is **Emails** with your own email address. On
+  current dashboards policies are created under **Access controls >
+  Policies** and attached to the application; older dashboards create the
+  policy inline.
+- Leave the login methods at their defaults. New Zero Trust accounts get a
+  working email login out of the box (one-time PIN or Cloudflare account
+  login), so you do not need to configure an identity provider.
+- Accept the defaults for everything else and save.
+
+**6. Export the tunnel token for deploy.**
+
+Deploy reads the token from the environment variable your config names:
 
 ```bash
-export TRUSTYCLAW_CLOUDFLARE_TUNNEL_TOKEN=...
+export TRUSTYCLAW_CLOUDFLARE_TUNNEL_TOKEN=...   # the eyJ... string from step 3
 ```
+
+If you lost the token, open the tunnel's **Overview** tab and copy it from
+the install command again (or select **Refresh token**).
 
 Then add this endpoint to `operator_connections`:
 
@@ -139,8 +211,10 @@ Then add this endpoint to `operator_connections`:
 
 TrustyClaw installs `cloudflared` as a systemd service, enables it across
 reboots, and verifies during bootstrap that the configured hostname returns a
-Cloudflare Access login or deny response. The admin password is still required
-after Cloudflare Access succeeds.
+Cloudflare Access login or deny response. After a successful deploy the tunnel
+shows **Healthy** in the Cloudflare dashboard, and opening the hostname shows
+the Cloudflare Access login. The admin password is still required after
+Cloudflare Access succeeds.
 
 See [`docs/api/InputConfig.md`](docs/api/InputConfig.md) for the full input
 schema for customization.
