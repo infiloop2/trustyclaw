@@ -84,7 +84,20 @@ client must be able to keep it for the task event stream.
 
 Codex device-code login must continue polling while the app-server process that
 started login stays alive. TrustyClaw therefore keeps that app-server alive
-until a later account check reports active login or a new login starts.
+until its completed login is captured as the trusted account, a new login
+starts, or an operator resets the linked account.
+Linked-account reset also clears local Codex auth files and closes live Codex
+runtime processes, so a new login flow starts from an unlinked local auth
+state.
+First-account capture also requires that same parked app-server to emit a
+successful `account/login/completed` notification with the matching `loginId`
+and a supported ChatGPT account id in that notification payload (for example
+`account.accountId` or `account_id`). An active `account/read` result by itself
+is not operator approval for the stored device-code flow, and first capture
+does not fall back to `~/.codex/auth.json` because that file is agent-writable.
+The resulting OpenAI provider account row is tagged with
+`operator_approval: "codex_device_login"`; rows without that marker are
+legacy/unapproved state and cannot seed the proxy pin.
 
 `account/read` is not assumed to expose the ChatGPT account id. TrustyClaw reads
 the account id through `read-codex-account-id`, which parses a small part of
@@ -104,10 +117,11 @@ Supported account-id sources, in order:
    decoded payload must contain object `https://api.openai.com/auth` with string
    field `chatgpt_account_id`.
 
-An active Codex account without one of those account-id sources is treated as a
-runtime error, because the proxy cannot pin OpenAI data-plane traffic to the
-logged-in account. TrustyClaw stores only the derived account id in admin and
-proxy state, not the tokens needed to recreate Codex auth files.
+For steady-state status refresh, an active Codex account without one of those
+account-id sources is treated as a runtime error, because the proxy cannot pin
+OpenAI data-plane traffic to the logged-in account. TrustyClaw stores only the
+operator-approved account id in admin and proxy state, not the tokens needed to
+recreate Codex auth files.
 
 TrustyClaw keeps the observed `account/read` identity fields (`email` and
 `planType`) in admin state. The Admin API exposes the Codex plan as the
@@ -139,8 +153,13 @@ request shapes:
   external access enabled or omitted, so the proxy can deny it.
 
 Bootstrap also installs `/etc/codex/requirements.toml` to pin Codex web search
-behavior to cached search. The proxy guard is still required as the enforcement
-layer.
+behavior to cached search and disable Codex app/plugin connector surfaces, plus
+`/mnt/trustyclaw-agent/agent-home/.codex/config.toml` from
+`host/bootstrap/agent-home/.codex/config.toml`. That file must set
+`approval_policy = "never"`, `sandbox_mode = "danger-full-access"`, and trust
+`/mnt/trustyclaw-agent/agent-home`. Bootstrap installs it root-owned, readable,
+and immutable so the agent cannot edit or delete the active policy file. The
+proxy guard is still required as the web-search enforcement layer.
 
 ## Claude Code harness expectations
 
@@ -150,8 +169,24 @@ TrustyClaw starts one Claude Code process per task turn through:
 
 ```text
 claude -p --input-format stream-json --output-format stream-json --verbose \
-  --permission-mode bypassPermissions --safe-mode --strict-mcp-config
+  --setting-sources user --strict-mcp-config
 ```
+
+Bootstrap also installs `/mnt/trustyclaw-agent/agent-home/.claude/settings.json`
+from `host/bootstrap/agent-home/.claude/settings.json`. That file must set
+`permissions.defaultMode = "bypassPermissions"` and
+`skipDangerousModePermissionPrompt = true`. Bootstrap installs it root-owned,
+readable, and immutable; `--setting-sources user` keeps stale local or project
+settings out of the task harness while still allowing `CLAUDE.md` instructions
+to load.
+
+Bootstrap installs the same `host/bootstrap/agent-home/agents_claude.md`
+contents to `/mnt/trustyclaw-agent/agent-home/AGENTS.md` and
+`/mnt/trustyclaw-agent/agent-home/CLAUDE.md`. That source file must tell agents
+they are running on a TrustyClaw host with full local shell/file permissions,
+must not prompt for local approvals, and must use TrustyClaw network-policy
+failures as operator allowlist requests. The installed host files are also
+root-owned, readable, and immutable.
 
 When resuming a thread, TrustyClaw appends:
 
@@ -193,7 +228,7 @@ Expected status fields:
 | `loggedIn` | `true` means the CLI believes it is logged in. Missing or false means `awaiting_login`. |
 | `authMethod` | Must be `claude.ai`; any other value is an error. |
 | `email`, `orgId` | Used as optional metadata when helper-read auth files do not already expose equivalent values. |
-| `accountId`, `account_id`, `userId`, `userID`, `user_id` | Optional account id sources. If none is present, email is used only as user-facing account metadata. |
+| `accountId`, `account_id`, `userId`, `userID`, `user_id` | Optional provisional account-id sources within a single status probe. The identity that gets anchored and displayed always comes from token attestation (below), never from these agent-writable fields. Legacy stored Claude rows without `identity_attestation: "anthropic_oauth_profile"` are treated as no anchor (like an unapproved OpenAI row), so a plain operator re-login re-captures them through the first-capture attestation gate; no separate reset is required. |
 
 Login starts with:
 
@@ -223,6 +258,55 @@ helper set `CLAUDE_CONFIG_DIR=/mnt/trustyclaw-agent/agent-home/.claude`.
 The credentials file must contain `claudeAiOauth.accessToken`. The helper stores
 only `sha256(accessToken)` plus optional `account_id`, `organization_id`, and
 `email`; it never copies the bearer token into admin or proxy state.
+
+When the operator submits the browser code, TrustyClaw reads that hash once
+right after the login command finishes and records it on the completed OAuth
+row. First account capture only accepts an attestation of that exact token: the
+admin API passes the approved hash to `read-claude-account --attest`, and the
+helper verifies the current credential hash before any profile request. Agent
+credentials swapped after completion do not inherit the operator's approval;
+the remaining swap window is the moment between the CLI writing the file and
+this read, and the linked account is shown in the admin UI once pinned.
+
+### Account identity attestation
+
+The Anthropic proxy pin is the bearer-token hash and follows token rotation, so
+the durable account anchor is attested against the token itself instead of
+being read from agent-writable files. Whenever the observed token hash differs
+from the anchored one — first operator login and every token rotation —
+`read-claude-account --attest` calls:
+
+```text
+GET https://api.anthropic.com/api/oauth/profile
+Authorization: Bearer <claudeAiOauth.accessToken>
+```
+
+Expected response fields:
+
+| Field | Expected behavior |
+| --- | --- |
+| `account.uuid` | Required. The account the token belongs to. Must match the anchored account id; on first capture during an operator OAuth login it becomes the anchor. |
+| `account.email`, `organization.uuid` | Optional identity metadata stored alongside the anchor. |
+
+Properties this depends on:
+
+- This is the same private endpoint Claude Code itself calls during login
+  bootstrap — it is one of the pre-pin allowlisted paths in
+  `host/runtime/network_policy.py` — so the pinned harness version already
+  requires it to exist and accept the OAuth bearer.
+- The attest call runs as root over direct host egress, not through the proxy:
+  the agent uid can only reach the local proxy (whose account guard would
+  reject a just-rotated token mid-attest), and the admin uid has no egress.
+  The bearer token never leaves the helper process; only its hash and the
+  attested identity are returned to admin code.
+- Anchored tokens skip the call entirely, so steady-state status refreshes
+  make no extra network requests.
+
+If Anthropic changes this endpoint's auth or response shape, Claude token
+rotations degrade to a retryable runtime `error` (with the attestation failure
+in the message) until this integration is updated; unchanged tokens keep
+working. Treat the endpoint like the other harness interfaces in this document
+during upgrade reviews.
 
 TrustyClaw also extracts the observed `subscriptionType` value from
 `claude auth status --json` into the common Admin API `plan_type` field.
@@ -282,7 +366,10 @@ Before changing a harness version:
 3. Verify login status and login start flows on a real host for every changed
    harness.
 4. Verify the account helper still reads the account id or bearer-token hash
-   without broadening `trustyclaw-admin` filesystem access.
+   without broadening `trustyclaw-admin` filesystem access, and that
+   `read-claude-account --attest --expected-token-sha256 <hash>` rejects a
+   mismatched local token before egress and still resolves the expected token to
+   the expected `account.uuid` through the profile endpoint.
 5. Verify a task can start, stream messages, accept steering, complete, and be
    killed.
 6. Verify thread/session resume still works after a second task on the same

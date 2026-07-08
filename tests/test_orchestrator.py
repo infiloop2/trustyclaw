@@ -59,6 +59,18 @@ def make_task(number: int, thread_id: str, status: str = "queued", runtime: str 
     }
 
 
+def save_approved_openai_account(account_id: str, **extra: object) -> None:
+    save_openai_account(
+        {"account_id": account_id, "operator_approval": orchestrator.OPENAI_OPERATOR_APPROVAL, **extra}
+    )
+
+
+def save_attested_claude_account(account_id: str, **extra: object) -> None:
+    save_claude_account(
+        {"account_id": account_id, "identity_attestation": orchestrator.CLAUDE_IDENTITY_ATTESTATION, **extra}
+    )
+
+
 class OrchestratorTests(unittest.TestCase):
     def setUp(self) -> None:
         pg_harness.reset_database()
@@ -75,11 +87,13 @@ class OrchestratorTests(unittest.TestCase):
         FakeServer.instances = []
         orchestrator._POOL.clear()
         orchestrator._CLOSING_THREADS.clear()
+        orchestrator._CLAUDE_ATTESTATIONS.clear()
         self.addCleanup(orchestrator._POOL.clear)
         self.addCleanup(orchestrator._CLOSING_THREADS.clear)
+        self.addCleanup(orchestrator._CLAUDE_ATTESTATIONS.clear)
         save_policy(
             {
-                "managed_ai_provider_network_access": {"openai": True, "claude": True},
+                "managed_network_integrations": {"openai": {"enabled": True}, "claude": {"enabled": True}},
                 "allowed_network_access": {},
             },
             "2026-06-08T00:00:00Z",
@@ -114,6 +128,7 @@ class OrchestratorTests(unittest.TestCase):
         return next(t["status"] for t in load_state()["tasks"] if t["task_id"] == task_id)
 
     def test_active_runtime_refresh_stamps_usage_last_checked_at(self) -> None:
+        save_approved_openai_account("acct")
         with (
             patch.object(orchestrator, "utc_now", return_value="2026-06-29T23:10:00Z"),
             patch.object(
@@ -234,7 +249,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_claim_uses_current_provider_policy_not_only_cached_active_status(self) -> None:
         save_policy(
-            {"managed_ai_provider_network_access": {}, "allowed_network_access": {}},
+            {"managed_network_integrations": {}, "allowed_network_access": {}},
             "2026-06-08T00:00:01Z",
         )
         self.seed_tasks(make_task(1, "stale-active-codex"), make_task(2, "stale-active-claude", runtime="claude_code"))
@@ -244,6 +259,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(self.task_status("task_2"), "queued")
 
     def test_codex_and_claude_have_independent_three_task_claim_caps(self) -> None:
+        save_attested_claude_account("acct", access_token_sha256="f" * 64)
         tasks = []
         number = 1
         for index in range(4):
@@ -338,6 +354,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(seen, ["codex-task 1"])
 
     def test_claude_runtime_records_and_resumes_session_id(self) -> None:
+        save_attested_claude_account("acct", access_token_sha256="f" * 64)
         self.seed_tasks(make_task(1, "chat", runtime="claude_code"))
         seen: list[str | None] = []
 
@@ -378,7 +395,10 @@ class OrchestratorTests(unittest.TestCase):
 
         self.assertEqual(seen, [None, "claude-session-1"])
 
-    def test_claude_task_refreshes_account_pin_before_turn(self) -> None:
+    def test_claude_task_repins_rotated_token_before_turn(self) -> None:
+        # The Claude CLI refreshes its OAuth access token on its own schedule.
+        # The bearer-token pin must follow that rotation (only the account
+        # identity is anchored), and the pre-turn refresh is what re-pins it.
         self.seed_tasks(make_task(1, "chat", runtime="claude_code"))
         old_token = "old-token"
         fresh_token = "fresh-token"
@@ -387,12 +407,7 @@ class OrchestratorTests(unittest.TestCase):
                 "api.anthropic.com": {"allow_http_methods": ["GET", "POST"], "anthropic_account_guard": True}
             }
         }
-        save_claude_account(
-            {
-                "account_id": "acct",
-                "access_token_sha256": hashlib.sha256(old_token.encode()).hexdigest(),
-            }
-        )
+        save_attested_claude_account("acct", access_token_sha256=hashlib.sha256(old_token.encode()).hexdigest())
         save_proxy_claude_account(
             {
                 "account_id": "acct",
@@ -405,24 +420,9 @@ class OrchestratorTests(unittest.TestCase):
             )
         )
 
-        def fake_run_turn(server, input_message, session_id, steers, on_message, steer_delivered):
-            self.assertEqual(read_claude_account()["access_token_sha256"], hashlib.sha256(fresh_token.encode()).hexdigest())
-            self.assertEqual(read_proxy_claude_account()["access_token_sha256"], hashlib.sha256(fresh_token.encode()).hexdigest())
-            self.assertIsNotNone(
-                anthropic_request_denied(
-                    policy, "POST", "api.anthropic.com", "/v1/messages", [("Authorization", f"Bearer {old_token}")]
-                )
-            )
-            self.assertIsNone(
-                anthropic_request_denied(
-                    policy, "POST", "api.anthropic.com", "/v1/messages", [("Authorization", f"Bearer {fresh_token}")]
-                )
-            )
-            return "claude-session-1", "done"
-
         with (
             patch.object(orchestrator.claude_code, "ClaudeCodeSession", FakeServer),
-            patch.object(orchestrator.claude_code, "run_turn", fake_run_turn),
+            patch.object(orchestrator.claude_code, "run_turn", self.run_turn_stub()),
             patch.object(
                 orchestrator.claude_code,
                 "account_status",
@@ -432,10 +432,305 @@ class OrchestratorTests(unittest.TestCase):
                     {"account_id": "acct", "access_token_sha256": hashlib.sha256(fresh_token.encode()).hexdigest()},
                 ),
             ),
+            patch.object(
+                orchestrator.claude_code,
+                "read_attested_identity",
+                return_value={
+                    "access_token_sha256": hashlib.sha256(fresh_token.encode()).hexdigest(),
+                    "account_uuid": "acct",
+                },
+            ),
         ):
             orchestrator.run_next_task()
 
         self.assertEqual(self.task_status("task_1"), "completed")
+        self.assertEqual(read_claude_account()["access_token_sha256"], hashlib.sha256(fresh_token.encode()).hexdigest())
+        self.assertEqual(read_proxy_claude_account()["access_token_sha256"], hashlib.sha256(fresh_token.encode()).hexdigest())
+        self.assertIsNotNone(
+            anthropic_request_denied(
+                policy, "POST", "api.anthropic.com", "/v1/messages", [("Authorization", f"Bearer {old_token}")]
+            )
+        )
+        self.assertIsNone(
+            anthropic_request_denied(
+                policy, "POST", "api.anthropic.com", "/v1/messages", [("Authorization", f"Bearer {fresh_token}")]
+            )
+        )
+
+    def test_claude_refresh_rejects_token_attested_to_another_account(self) -> None:
+        # Token rotation is allowed; a different *account* is not. The new
+        # token's owner comes from the provider's profile endpoint, so forged
+        # local metadata cannot help: the attested uuid decides.
+        save_attested_claude_account("acct-trusted", access_token_sha256="0" * 64)
+        save_proxy_claude_account({"account_id": "acct-trusted", "access_token_sha256": "0" * 64})
+
+        with (
+            patch.object(
+                orchestrator.claude_code,
+                "account_status",
+                return_value=("active", None, {"account_id": "acct-trusted", "access_token_sha256": "1" * 64}),
+            ),
+            patch.object(
+                orchestrator.claude_code,
+                "read_attested_identity",
+                return_value={"access_token_sha256": "1" * 64, "account_uuid": "acct-attacker"},
+            ),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "error")
+
+        self.assertEqual(read_claude_account()["account_id"], "acct-trusted")
+        self.assertEqual(read_proxy_claude_account(), {})
+        record = orchestrator.runtime_status_record("claude_code")
+        self.assertIn("account changed", record["error_message"])
+
+    def test_claude_refresh_rejects_attested_anchor_email_collision(self) -> None:
+        save_attested_claude_account("acct-trusted", email="op@example.com", access_token_sha256="0" * 64)
+
+        with (
+            patch.object(
+                orchestrator.claude_code,
+                "account_status",
+                return_value=(
+                    "active",
+                    None,
+                    {"account_id": "acct-trusted", "email": "op@example.com", "access_token_sha256": "1" * 64},
+                ),
+            ),
+            patch.object(
+                orchestrator.claude_code,
+                "read_attested_identity",
+                return_value={"access_token_sha256": "1" * 64, "account_uuid": "acct-attacker", "email": "op@example.com"},
+            ),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "error")
+
+        self.assertEqual(read_claude_account()["account_id"], "acct-trusted")
+        self.assertEqual(read_proxy_claude_account(), {})
+        self.assertIn("account changed", orchestrator.runtime_status_record("claude_code").get("error_message", ""))
+
+    def test_claude_refresh_skips_attestation_for_anchored_token_and_ignores_local_metadata(self) -> None:
+        # An unchanged token was attested when it was anchored: no network
+        # call, and the identity saved comes from the anchor, so agent-forged
+        # local metadata never lands anywhere.
+        save_attested_claude_account("acct-trusted", email="op@example.com", access_token_sha256="f" * 64)
+
+        with (
+            patch.object(
+                orchestrator.claude_code,
+                "account_status",
+                return_value=("active", None, {"account_id": "forged-uuid", "access_token_sha256": "f" * 64}),
+            ),
+            patch.object(
+                orchestrator.claude_code,
+                "read_attested_identity",
+                side_effect=AssertionError("anchored token must not re-attest"),
+            ),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "active")
+
+        self.assertEqual(read_claude_account()["account_id"], "acct-trusted")
+        self.assertEqual(read_claude_account()["email"], "op@example.com")
+        self.assertEqual(read_proxy_claude_account()["account_id"], "acct-trusted")
+        self.assertEqual(read_proxy_claude_account()["access_token_sha256"], "f" * 64)
+
+    def test_claude_legacy_anchor_without_login_stays_awaiting(self) -> None:
+        # Pre-attestation releases could anchor Claude by local agent-writable
+        # metadata such as email. That row is not a trusted anchor, so with no
+        # operator login in flight the agent cannot self-promote it: the runtime
+        # stays awaiting_login, never attests, and the stale row is left intact
+        # until a fresh operator login re-captures it (see the login test below).
+        save_claude_account(
+            {"account_id": "op@example.com", "email": "op@example.com", "access_token_sha256": "f" * 64}
+        )
+
+        with (
+            patch.object(
+                orchestrator.claude_code,
+                "account_status",
+                return_value=("active", None, {"account_id": "op@example.com", "access_token_sha256": "f" * 64}),
+            ),
+            patch.object(
+                orchestrator.claude_code,
+                "read_attested_identity",
+                side_effect=AssertionError("legacy Claude row must not attest without an operator login"),
+            ) as attest,
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "awaiting_login")
+
+        attest.assert_not_called()
+        account = read_claude_account()
+        self.assertEqual(account["account_id"], "op@example.com")
+        self.assertEqual(account["email"], "op@example.com")
+        self.assertNotIn("identity_attestation", account)
+        self.assertEqual(read_proxy_claude_account(), {})
+
+    def test_claude_legacy_anchor_recaptured_by_operator_login_without_reset(self) -> None:
+        # A pre-attestation upgrade row plus a completed operator login re-captures
+        # through first-capture attestation, overwriting the legacy identity in
+        # place. No separate reset is required (parity with an unapproved OpenAI
+        # row, which a plain re-login also re-captures).
+        save_claude_account(
+            {"account_id": "op@example.com", "email": "stale@example.com", "access_token_sha256": "0" * 64}
+        )
+        state = load_state()
+        state["agent_runtime_statuses"]["claude_code"]["status"] = "awaiting_login"
+        state["claude_oauth"] = {
+            "status": "completed",
+            "login_url": "https://claude.com/cai/oauth/authorize",
+            "expires_at": "2099-06-08T00:10:00Z",
+            "access_token_sha256": "f" * 64,
+        }
+        save_state(state)
+
+        with (
+            patch.object(
+                orchestrator.claude_code,
+                "account_status",
+                return_value=("active", None, {"account_id": "forged-uuid", "access_token_sha256": "f" * 64}),
+            ),
+            patch.object(
+                orchestrator.claude_code,
+                "read_attested_identity",
+                return_value={
+                    "access_token_sha256": "f" * 64,
+                    "account_uuid": "acct-real",
+                    "email": "op@example.com",
+                    "organization_uuid": "org-real",
+                },
+            ),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "active")
+
+        account = read_claude_account()
+        self.assertEqual(account["account_id"], "acct-real")
+        self.assertEqual(account["email"], "op@example.com")
+        self.assertEqual(account["identity_attestation"], orchestrator.CLAUDE_IDENTITY_ATTESTATION)
+        self.assertEqual(read_proxy_claude_account()["account_id"], "acct-real")
+        self.assertIsNone(load_state().get("claude_oauth"))
+
+    def test_claude_attestation_failure_is_retryable(self) -> None:
+        save_attested_claude_account("acct-trusted", access_token_sha256="0" * 64)
+        probe = ("active", None, {"account_id": "acct-trusted", "access_token_sha256": "1" * 64})
+
+        with (
+            patch.object(orchestrator.claude_code, "account_status", return_value=probe),
+            patch.object(
+                orchestrator.claude_code,
+                "read_attested_identity",
+                side_effect=orchestrator.claude_code.ClaudeCodeError("could not reach the Claude profile endpoint"),
+            ),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "error")
+        self.assertIn(
+            "could not reach", orchestrator.runtime_status_record("claude_code").get("error_message", "")
+        )
+        self.assertEqual(read_claude_account()["access_token_sha256"], "0" * 64)
+        self.assertEqual(read_proxy_claude_account(), {})
+
+        with (
+            patch.object(orchestrator.claude_code, "account_status", return_value=probe),
+            patch.object(
+                orchestrator.claude_code,
+                "read_attested_identity",
+                return_value={"access_token_sha256": "1" * 64, "account_uuid": "acct-trusted"},
+            ),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "active")
+        self.assertEqual(read_claude_account()["access_token_sha256"], "1" * 64)
+        self.assertEqual(read_proxy_claude_account()["access_token_sha256"], "1" * 64)
+
+    def test_claude_first_capture_anchors_attested_identity(self) -> None:
+        state = load_state()
+        state["agent_runtime_statuses"]["claude_code"]["status"] = "awaiting_login"
+        state["claude_oauth"] = {
+            "status": "completed",
+            "login_url": "https://claude.com/cai/oauth/authorize",
+            "expires_at": "2099-06-08T00:10:00Z",
+            "access_token_sha256": "f" * 64,
+        }
+        save_state(state)
+
+        with (
+            patch.object(
+                orchestrator.claude_code,
+                "account_status",
+                return_value=("active", None, {"account_id": "forged-uuid", "access_token_sha256": "f" * 64}),
+            ),
+            patch.object(
+                orchestrator.claude_code,
+                "read_attested_identity",
+                return_value={
+                    "access_token_sha256": "f" * 64,
+                    "account_uuid": "acct-real",
+                    "email": "op@example.com",
+                    "organization_uuid": "org-real",
+                },
+            ),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "active")
+
+        account = read_claude_account()
+        self.assertEqual(account["account_id"], "acct-real")
+        self.assertEqual(account["email"], "op@example.com")
+        self.assertEqual(account["organization_id"], "org-real")
+        self.assertEqual(read_proxy_claude_account()["account_id"], "acct-real")
+        self.assertIsNone(load_state().get("claude_oauth"))
+
+    def test_claude_first_capture_requires_completed_token_hash(self) -> None:
+        state = load_state()
+        state["agent_runtime_statuses"]["claude_code"]["status"] = "awaiting_login"
+        state["claude_oauth"] = {
+            "status": "completed",
+            "login_url": "https://claude.com/cai/oauth/authorize",
+            "expires_at": "2099-06-08T00:10:00Z",
+        }
+        save_state(state)
+
+        with (
+            patch.object(
+                orchestrator.claude_code,
+                "account_status",
+                return_value=("active", None, {"account_id": "acct-attacker", "access_token_sha256": "f" * 64}),
+            ),
+            patch.object(
+                orchestrator.claude_code,
+                "read_attested_identity",
+                side_effect=AssertionError("unhashed completed Claude OAuth must not attest or anchor"),
+            ),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "awaiting_login")
+
+        self.assertEqual(orchestrator.runtime_status_record("claude_code"), {"status": "awaiting_login"})
+        self.assertEqual(read_claude_account(), {})
+        self.assertEqual(read_proxy_claude_account(), {})
+
+    def test_claude_pending_oauth_cannot_attest_or_anchor_first_account(self) -> None:
+        state = load_state()
+        state["agent_runtime_statuses"]["claude_code"]["status"] = "awaiting_login"
+        state["claude_oauth"] = {
+            "status": "awaiting_code",
+            "login_url": "https://claude.com/cai/oauth/authorize",
+            "expires_at": "2099-06-08T00:10:00Z",
+        }
+        save_state(state)
+
+        with (
+            patch.object(
+                orchestrator.claude_code,
+                "account_status",
+                return_value=("active", None, {"account_id": "acct-attacker", "access_token_sha256": "f" * 64}),
+            ),
+            patch.object(
+                orchestrator.claude_code,
+                "read_attested_identity",
+                side_effect=AssertionError("pending Claude OAuth must not trigger direct attestation egress"),
+            ),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "awaiting_login")
+
+        self.assertEqual(orchestrator.runtime_status_record("claude_code"), {"status": "awaiting_login"})
+        self.assertEqual(read_claude_account(), {})
+        self.assertEqual(read_proxy_claude_account(), {})
 
     def test_full_pool_evicts_the_least_recently_used_idle_server(self) -> None:
         for number in range(1, orchestrator.WORKER_COUNT + 1):
@@ -554,7 +849,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(orchestrator._CLOSING_THREADS, {})
 
     def test_runtime_status_loss_clears_account_pin_without_tearing_down_running_task(self) -> None:
-        save_openai_account({"account_id": "acct-old"})
+        save_approved_openai_account("acct-old")
         save_proxy_openai_account_id("acct-old")
         codex_busy = FakeServer()
         codex_busy.started = 1
@@ -575,45 +870,467 @@ class OrchestratorTests(unittest.TestCase):
         state = load_state()
         task = state["tasks"][0]
         self.assertEqual(task["status"], "running")
-        self.assertIsNone(read_openai_account().get("account_id"))
+        self.assertEqual(read_openai_account().get("account_id"), "acct-old")
         self.assertIsNone(read_proxy_openai_account_id())
         self.assertFalse(codex_busy.closed)
         self.assertIn("codex:codex-running", orchestrator._POOL)
 
-    def test_codex_refresh_seeds_proxy_pin_before_guarded_account_status(self) -> None:
+        def account_status_without_reseed() -> tuple[str, str | None, None]:
+            self.assertIsNone(read_proxy_openai_account_id())
+            return "awaiting_login", None, None
+
+        with patch.object(orchestrator.codex_app_server, "account_status", side_effect=account_status_without_reseed):
+            self.assertEqual(orchestrator.refresh_runtime_status("codex"), "awaiting_login")
+
+        self.assertIsNone(read_proxy_openai_account_id())
+
+    def test_codex_refresh_seeds_proxy_pin_from_trusted_account_before_guarded_status(self) -> None:
+        save_approved_openai_account("acct-local")
         self.assertIsNone(read_proxy_openai_account_id())
 
         def account_status():
             self.assertEqual(read_proxy_openai_account_id(), "acct-local")
             return "active", None, {"account_id": "acct-local"}
 
-        with (
-            patch.object(orchestrator.codex_app_server, "read_codex_account_id", return_value="acct-local"),
-            patch.object(orchestrator.codex_app_server, "account_status", side_effect=account_status),
-        ):
+        with patch.object(orchestrator.codex_app_server, "account_status", side_effect=account_status):
             self.assertEqual(orchestrator.refresh_runtime_status("codex"), "active")
 
         self.assertEqual(read_proxy_openai_account_id(), "acct-local")
 
-    def test_codex_refresh_clears_seeded_proxy_pin_when_account_is_not_active(self) -> None:
+    def test_codex_seed_clears_proxy_pin_if_reset_wins_before_status_probe(self) -> None:
+        save_approved_openai_account("acct-local")
+        real_sync = orchestrator.proxy_state_client.sync_openai_account_id
+        raced: list[str] = []
+
+        def sync_with_reset_race(account_id):
+            if account_id and not raced:
+                raced.append(account_id)
+                self.assertIsNone(orchestrator.reset_linked_account("codex"))
+            real_sync(account_id)
+
+        def account_status():
+            self.assertIsNone(read_proxy_openai_account_id())
+            return "awaiting_login", None, None
+
         with (
-            patch.object(orchestrator.codex_app_server, "read_codex_account_id", return_value="acct-local"),
-            patch.object(orchestrator.codex_app_server, "account_status", return_value=("awaiting_login", None, None)),
+            patch.object(orchestrator.proxy_state_client, "sync_openai_account_id", side_effect=sync_with_reset_race),
+            patch.object(orchestrator.codex_app_server, "account_status", side_effect=account_status),
         ):
             self.assertEqual(orchestrator.refresh_runtime_status("codex"), "awaiting_login")
 
+        self.assertEqual(raced, ["acct-local"])
+        self.assertEqual(read_openai_account(), {})
+        self.assertIsNone(read_proxy_openai_account_id())
+
+    def test_codex_legacy_openai_row_is_not_operator_approved(self) -> None:
+        save_openai_account({"account_id": "acct-legacy"})
+
+        with patch.object(
+            orchestrator.codex_app_server,
+            "account_status",
+            return_value=("active", None, {"account_id": "acct-legacy"}),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("codex"), "awaiting_login")
+
+        self.assertEqual(read_openai_account().get("account_id"), "acct-legacy")
+        self.assertIsNone(read_proxy_openai_account_id())
+        self.assertEqual(orchestrator.runtime_status_record("codex"), {"status": "awaiting_login"})
+
+    def test_codex_initial_oauth_login_can_capture_first_trusted_account(self) -> None:
+        state = load_state()
+        state["agent_runtime_statuses"]["codex"]["status"] = "awaiting_login"
+        state["codex_oauth"] = {
+            "status": "awaiting_login",
+            "device_code": "X",
+            "login_id": "login",
+            "login_url": "https://auth.openai.com/device",
+            "expires_at": "2099-06-08T00:10:00Z",
+        }
+        save_state(state)
+
+        def account_status():
+            # First-login capture now runs after the status poll (the poller is
+            # what reads the completed login off the parked server), so the pin is
+            # not seeded yet while the poller reads the account.
+            self.assertIsNone(read_proxy_openai_account_id())
+            return "active", None, {"account_id": "acct-local"}
+
+        with (
+            patch.object(orchestrator.codex_app_server, "read_completed_device_login_account_id", return_value="acct-local"),
+            patch.object(orchestrator.codex_app_server, "account_status", side_effect=account_status),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("codex"), "active")
+
+        self.assertEqual(read_openai_account().get("account_id"), "acct-local")
+        self.assertEqual(read_openai_account().get("operator_approval"), orchestrator.OPENAI_OPERATOR_APPROVAL)
+        self.assertEqual(read_proxy_openai_account_id(), "acct-local")
+        self.assertIsNone(load_state().get("codex_oauth"))
+
+    def test_codex_active_reauth_closes_the_parked_login_server(self) -> None:
+        # A reauth against an already-approved anchor parks a login server that
+        # first-login capture skips; the active commit must still close it, or
+        # every later status check keeps polling the leftover login process.
+        save_approved_openai_account("acct-local")
+        state = load_state()
+        state["agent_runtime_statuses"]["codex"]["status"] = "awaiting_login"
+        state["codex_oauth"] = {
+            "status": "awaiting_login",
+            "device_code": "X",
+            "login_id": "relogin",
+            "login_url": "https://auth.openai.com/device",
+            "expires_at": "2099-06-08T00:10:00Z",
+        }
+        save_state(state)
+
+        class _Parked:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        parked = _Parked()
+        with orchestrator.codex_app_server._login_lock:
+            orchestrator.codex_app_server._login_server = parked  # type: ignore[assignment]
+            orchestrator.codex_app_server._login_id = "relogin"
+        try:
+            with patch.object(
+                orchestrator.codex_app_server,
+                "account_status",
+                return_value=("active", None, {"account_id": "acct-local"}),
+            ):
+                self.assertEqual(orchestrator.refresh_runtime_status("codex"), "active")
+
+            self.assertTrue(parked.closed)
+            with orchestrator.codex_app_server._login_lock:
+                self.assertIsNone(orchestrator.codex_app_server._login_server)
+            self.assertIsNone(load_state().get("codex_oauth"))
+        finally:
+            orchestrator.codex_app_server.close_login_server()
+
+    def test_codex_pending_oauth_without_completed_login_cannot_capture_first_account(self) -> None:
+        state = load_state()
+        state["agent_runtime_statuses"]["codex"]["status"] = "awaiting_login"
+        state["codex_oauth"] = {
+            "status": "awaiting_login",
+            "device_code": "X",
+            "login_id": "login",
+            "login_url": "https://auth.openai.com/device",
+            "expires_at": "2099-06-08T00:10:00Z",
+        }
+        save_state(state)
+
+        with (
+            patch.object(orchestrator.codex_app_server, "read_completed_device_login_account_id", return_value=None),
+            patch.object(
+                orchestrator.codex_app_server,
+                "account_status",
+                return_value=("active", None, {"account_id": "acct-attacker"}),
+            ),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("codex"), "awaiting_login")
+
+        self.assertEqual(read_openai_account(), {})
+        self.assertIsNone(read_proxy_openai_account_id())
+        self.assertIsNotNone(load_state().get("codex_oauth"))
+
+    def test_codex_refresh_rejects_agent_changed_account_id(self) -> None:
+        save_approved_openai_account("acct-trusted")
+        save_proxy_openai_account_id("acct-trusted")
+
+        with patch.object(
+            orchestrator.codex_app_server,
+            "account_status",
+            return_value=("active", None, {"account_id": "acct-attacker"}),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("codex"), "error")
+
+        self.assertEqual(read_openai_account().get("account_id"), "acct-trusted")
+        self.assertIsNone(read_proxy_openai_account_id())
+        record = orchestrator.runtime_status_record("codex")
+        self.assertEqual(record["status"], "error")
+        self.assertIn("account changed", record["error_message"])
+
+    def test_codex_refresh_without_oauth_cannot_create_first_account_anchor(self) -> None:
+        with patch.object(
+            orchestrator.codex_app_server,
+            "account_status",
+            return_value=("active", None, {"account_id": "acct-attacker"}),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("codex"), "awaiting_login")
+
+        self.assertEqual(read_openai_account(), {})
+        self.assertIsNone(read_proxy_openai_account_id())
+
+    def test_expired_codex_oauth_cannot_create_first_account_anchor(self) -> None:
+        state = load_state()
+        state["agent_runtime_statuses"]["codex"]["status"] = "awaiting_login"
+        state["codex_oauth"] = {
+            "status": "awaiting_login",
+            "device_code": "X",
+            "login_id": "login",
+            "login_url": "https://auth.openai.com/device",
+            "expires_at": "2000-06-08T00:10:00Z",
+        }
+        save_state(state)
+
+        with (
+            patch.object(
+                orchestrator.codex_app_server,
+                "read_completed_device_login_account_id",
+                side_effect=AssertionError("expired OAuth must not seed provider pin"),
+            ),
+            patch.object(
+                orchestrator.codex_app_server,
+                "account_status",
+                return_value=("active", None, {"account_id": "acct-attacker"}),
+            ),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("codex"), "awaiting_login")
+
+        self.assertEqual(read_openai_account(), {})
+        self.assertIsNone(read_proxy_openai_account_id())
+        self.assertIsNone(load_state().get("codex_oauth"))
+
+    def test_expired_claude_oauth_cannot_create_first_account_anchor(self) -> None:
+        state = load_state()
+        state["agent_runtime_statuses"]["claude_code"]["status"] = "awaiting_login"
+        state["claude_oauth"] = {
+            "status": "awaiting_code",
+            "login_url": "https://claude.com/cai/oauth/authorize",
+            "expires_at": "2000-06-08T00:10:00Z",
+        }
+        save_state(state)
+
+        with (
+            patch.object(
+                orchestrator.claude_code,
+                "account_status",
+                return_value=("active", None, {"account_id": "acct-attacker", "access_token_sha256": "f" * 64}),
+            ),
+            patch.object(
+                orchestrator.claude_code,
+                "read_attested_identity",
+                side_effect=AssertionError("expired OAuth must not attest unapproved Claude account"),
+            ),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "awaiting_login")
+
+        self.assertEqual(read_claude_account(), {})
+        self.assertEqual(read_proxy_claude_account(), {})
+        self.assertIsNone(load_state().get("claude_oauth"))
+
+    def test_claude_refresh_without_oauth_cannot_attest_or_anchor_first_account(self) -> None:
+        with (
+            patch.object(
+                orchestrator.claude_code,
+                "account_status",
+                return_value=("active", None, {"account_id": "acct-attacker", "access_token_sha256": "f" * 64}),
+            ),
+            patch.object(
+                orchestrator.claude_code,
+                "read_attested_identity",
+                side_effect=AssertionError("unapproved Claude account must not trigger direct attestation egress"),
+            ),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "awaiting_login")
+
+        self.assertEqual(orchestrator.runtime_status_record("claude_code"), {"status": "awaiting_login"})
+        self.assertEqual(read_claude_account(), {})
+        self.assertEqual(read_proxy_claude_account(), {})
+
+    def test_claude_attestation_waits_for_policy_replacement_and_rechecks_disable(self) -> None:
+        save_attested_claude_account("acct-trusted", access_token_sha256="0" * 64)
+
+        with (
+            patch.object(
+                orchestrator.claude_code,
+                "account_status",
+                return_value=("active", None, {"account_id": "acct-trusted", "access_token_sha256": "1" * 64}),
+            ),
+            patch.object(orchestrator, "_runtime_network_enabled", side_effect=[True, True, True, False, False]),
+            patch.object(
+                orchestrator.claude_code,
+                "read_attested_identity",
+                side_effect=AssertionError("disabled Claude provider must not trigger direct attestation egress"),
+            ),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "deactivated")
+
+        self.assertEqual(read_claude_account()["account_id"], "acct-trusted")
+        self.assertEqual(read_proxy_claude_account(), {})
+
+    def test_claude_attestation_rechecks_operator_approval_before_helper_egress(self) -> None:
+        save_attested_claude_account("acct-trusted", access_token_sha256="0" * 64)
+
+        with (
+            patch.object(
+                orchestrator.claude_code,
+                "account_status",
+                return_value=("active", None, {"account_id": "acct-trusted", "access_token_sha256": "1" * 64}),
+            ),
+            patch.object(orchestrator, "_claude_attestation_allowed", side_effect=[True, False]) as allowed,
+            patch.object(
+                orchestrator.claude_code,
+                "read_attested_identity",
+                side_effect=AssertionError("revoked Claude approval must not trigger direct attestation egress"),
+            ),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "error")
+
+        self.assertEqual(allowed.call_count, 2)
+        self.assertEqual(read_claude_account()["account_id"], "acct-trusted")
+        self.assertEqual(read_proxy_claude_account(), {})
+
+    def test_codex_refresh_clears_seeded_proxy_pin_when_account_is_not_active(self) -> None:
+        save_approved_openai_account("acct-local")
+        with patch.object(orchestrator.codex_app_server, "account_status", return_value=("awaiting_login", None, None)):
+            self.assertEqual(orchestrator.refresh_runtime_status("codex"), "awaiting_login")
+
+        self.assertEqual(read_openai_account().get("account_id"), "acct-local")
+        self.assertIsNone(read_proxy_openai_account_id())
+
+    def test_reset_deletes_the_linked_account_guard_and_nothing_else(self) -> None:
+        self.seed_tasks(make_task(1, "chat", runtime="codex"))
+        snapshot = load_state()
+        snapshot["agent_runtime_statuses"]["codex"]["status"] = "active"
+        snapshot["codex_oauth"] = {
+            "status": "awaiting_login",
+            "device_code": "X",
+            "login_id": "login",
+            "login_url": "https://auth.openai.com/device",
+            "expires_at": "2099-06-08T00:10:00Z",
+        }
+        save_state(snapshot)
+        save_approved_openai_account("acct-local")
+        save_proxy_openai_account_id("acct-local")
+
+        self.assertIsNone(orchestrator.reset_linked_account("codex"))
+
+        # Guard state is gone, cached status no longer allows new claims, and
+        # queued work remains queued until a fresh linked account is active.
+        self.assertEqual(read_openai_account(), {})
+        self.assertIsNone(read_proxy_openai_account_id())
+        self.assertIsNone(load_state().get("codex_oauth"))
+        self.assertEqual(orchestrator.runtime_status("codex"), "awaiting_login")
+        self.assertEqual(self.task_status("task_1"), "queued")
+        reset_events = [event for event in read_agent_events() if event["event_type"] == "agent_runtime.linked_account_reset"]
+        self.assertEqual([event.get("payload") for event in reset_events], [{"agent_runtime": "codex"}])
+
+    def test_reset_kills_running_runtime_tasks(self) -> None:
+        self.seed_tasks(make_task(1, "chat", status="running", runtime="codex"))
+        server = FakeServer()
+        server.started = 1
+        with orchestrator._POOL_LOCK:
+            orchestrator._POOL["codex:chat"] = orchestrator._Slot(server, "codex", "chat", True, 1.0, "task_1")
+        save_approved_openai_account("acct-local")
+        save_proxy_openai_account_id("acct-local")
+
+        self.assertIsNone(orchestrator.reset_linked_account("codex"))
+
+        self.assertEqual(self.task_status("task_1"), "failed")
+        self.assertTrue(server.closed)
+        self.assertEqual(read_openai_account(), {})
+        self.assertIsNone(read_proxy_openai_account_id())
+
+    def test_reset_continues_when_runtime_close_fails(self) -> None:
+        class FailingCloseServer(FakeServer):
+            def close(self) -> None:
+                raise PermissionError("cannot signal helper")
+
+        self.seed_tasks(
+            make_task(1, "chat", status="running", runtime="codex"),
+            make_task(2, "other", status="running", runtime="codex"),
+        )
+        bad_server = FailingCloseServer()
+        bad_server.started = 1
+        good_server = FakeServer()
+        good_server.started = 1
+        with orchestrator._POOL_LOCK:
+            orchestrator._POOL["codex:chat"] = orchestrator._Slot(bad_server, "codex", "chat", True, 1.0, "task_1")
+            orchestrator._POOL["codex:other"] = orchestrator._Slot(good_server, "codex", "other", True, 1.0, "task_2")
+        save_approved_openai_account("acct-local")
+        save_proxy_openai_account_id("acct-local")
+
+        self.assertIsNone(orchestrator.reset_linked_account("codex"))
+
+        self.assertEqual(self.task_status("task_1"), "failed")
+        self.assertEqual(self.task_status("task_2"), "failed")
+        self.assertFalse(bad_server.closed)
+        self.assertTrue(good_server.closed)
+        self.assertEqual(orchestrator._POOL, {})
+        self.assertEqual(orchestrator._CLOSING_THREADS, {"codex:chat": 1})
+        self.assertEqual(read_openai_account(), {})
+        self.assertIsNone(read_proxy_openai_account_id())
+
+    def test_reset_during_slow_probe_cannot_resurrect_account(self) -> None:
+        # The stale probe classified the runtime before the reset; the anchor
+        # check inside the commit mutation is what stops it from re-approving
+        # the logged-out account.
+        save_approved_openai_account("acct-local")
+
+        def account_status():
+            self.assertIsNone(orchestrator.reset_linked_account("codex"))
+            return "active", None, {"account_id": "acct-local"}
+
+        with patch.object(orchestrator.codex_app_server, "account_status", side_effect=account_status):
+            self.assertEqual(orchestrator.refresh_runtime_status("codex"), "awaiting_login")
+
+        self.assertEqual(read_openai_account(), {})
+        self.assertIsNone(read_proxy_openai_account_id())
+
+        # Even if local agent credentials survive outside this orchestrator
+        # helper, they stay unapproved: the next probe still reports
+        # awaiting_login and re-anchors nothing.
+        with patch.object(
+            orchestrator.codex_app_server,
+            "account_status",
+            return_value=("active", None, {"account_id": "acct-local"}),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("codex"), "awaiting_login")
+        self.assertEqual(read_openai_account(), {})
+        self.assertIsNone(read_proxy_openai_account_id())
+
+    def test_reset_between_refresh_commit_and_pin_write_leaves_no_pin(self) -> None:
+        # The pin table is written after the commit mutation; a reset landing
+        # in that gap must win. The post-write anchor re-check clears the
+        # stale pin immediately.
+        save_approved_openai_account("acct-local")
+        real_sync = orchestrator.proxy_state_client.sync_openai_account_id
+        probe_done: list[bool] = []
+        raced: list[str] = []
+
+        def sync_with_reset_race(account_id):
+            if account_id and probe_done and not raced:
+                raced.append(account_id)
+                self.assertIsNone(orchestrator.reset_linked_account("codex"))
+            real_sync(account_id)
+
+        def account_status():
+            probe_done.append(True)
+            return "active", None, {"account_id": "acct-local"}
+
+        with (
+            patch.object(orchestrator.proxy_state_client, "sync_openai_account_id", side_effect=sync_with_reset_race),
+            patch.object(orchestrator.codex_app_server, "account_status", side_effect=account_status),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("codex"), "awaiting_login")
+
+        self.assertEqual(raced, ["acct-local"])
+        self.assertEqual(orchestrator.runtime_status("codex"), "awaiting_login")
+        self.assertEqual(read_openai_account(), {})
         self.assertIsNone(read_proxy_openai_account_id())
 
     def test_stale_runtime_refresh_cannot_overwrite_disabled_policy_state(self) -> None:
         state = load_state()
         state["agent_runtime_statuses"]["codex"]["status"] = "active"
         save_state(state)
-        save_openai_account({"account_id": "acct-old"})
+        save_approved_openai_account("acct-old")
         save_proxy_openai_account_id("acct-old")
 
         def status_after_policy_flip():
             save_policy(
-                {"managed_ai_provider_network_access": {}, "allowed_network_access": {}},
+                {"managed_network_integrations": {}, "allowed_network_access": {}},
                 "2026-06-08T00:00:02Z",
             )
             return "awaiting_login", None, None
@@ -623,7 +1340,7 @@ class OrchestratorTests(unittest.TestCase):
 
         state = load_state()
         self.assertEqual(state["agent_runtime_statuses"]["codex"]["status"], "deactivated")
-        self.assertIsNone(read_openai_account().get("account_id"))
+        self.assertEqual(read_openai_account().get("account_id"), "acct-old")
         self.assertIsNone(read_proxy_openai_account_id())
 
     def test_runtime_refresh_rechecks_disabled_policy_inside_final_state_write(self) -> None:
@@ -645,9 +1362,17 @@ class OrchestratorTests(unittest.TestCase):
     def test_runtime_refresh_clears_pin_if_policy_disables_after_account_save(self) -> None:
         state = load_state()
         state["agent_runtime_statuses"]["codex"]["status"] = "awaiting_login"
+        state["codex_oauth"] = {
+            "status": "awaiting_login",
+            "device_code": "X",
+            "login_id": "login",
+            "login_url": "https://auth.openai.com/device",
+            "expires_at": "2099-06-08T00:10:00Z",
+        }
         save_state(state)
 
         with (
+            patch.object(orchestrator.codex_app_server, "read_completed_device_login_account_id", return_value="acct-new"),
             patch.object(orchestrator.codex_app_server, "account_status", return_value=("active", None, "acct-new")),
             patch.object(orchestrator, "_runtime_network_enabled", side_effect=[True, True, True, True, False]),
         ):
@@ -655,7 +1380,7 @@ class OrchestratorTests(unittest.TestCase):
 
         state = load_state()
         self.assertEqual(state["agent_runtime_statuses"]["codex"]["status"], "deactivated")
-        self.assertIsNone(read_openai_account().get("account_id"))
+        self.assertEqual(read_openai_account().get("account_id"), "acct-new")
         self.assertIsNone(read_proxy_openai_account_id())
 
     def test_thread_stays_unclaimable_while_its_old_server_is_closing(self) -> None:
@@ -772,7 +1497,7 @@ class OrchestratorTests(unittest.TestCase):
     def test_policy_change_refreshes_reenabled_runtime_without_waiting_for_poll_cadence(self) -> None:
         save_policy(
             {
-                "managed_ai_provider_network_access": {"openai": True},
+                "managed_network_integrations": {"openai": {"enabled": True}},
                 "allowed_network_access": {},
             },
             "2026-06-08T00:00:01Z",
@@ -800,9 +1525,38 @@ class OrchestratorTests(unittest.TestCase):
         ):
             orchestrator.reconcile_runtime_status_after_policy_change()
 
-        self.assertEqual(calls, ["claude_code", "codex"])
+        # The disabled runtime deactivates directly (no provider probe, no
+        # refresh serialization); only the enabled one is refreshed, in the
+        # background.
+        self.assertEqual(calls, ["codex"])
         self.assertEqual(background, [("codex",)])
+        self.assertEqual(orchestrator.runtime_status("claude_code"), "deactivated")
 
+
+
+class StartWorkersOrderTests(unittest.TestCase):
+    def test_start_workers_refreshes_github_credentials_before_workers(self) -> None:
+        order: list[str] = []
+        with (
+            patch(
+                "host.runtime.orchestrator.github_credential.reconcile",
+                side_effect=lambda: order.append("refresh"),
+            ),
+            patch(
+                "host.runtime.orchestrator.threading.Thread",
+                side_effect=lambda *a, **k: order.append("thread") or _NoopThread(),
+            ),
+        ):
+            orchestrator.start_workers()
+        # The synchronous refresh must land before any worker/poller thread
+        # is spawned, so a queued task cannot start on a stale token.
+        self.assertEqual(order[0], "refresh")
+        self.assertIn("thread", order)
+
+
+class _NoopThread:
+    def start(self) -> None:
+        return None
 
 if __name__ == "__main__":
     unittest.main()

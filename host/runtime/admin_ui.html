@@ -8,15 +8,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#0a0d13">
 <title>TrustyClaw</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%2345d6c4'/%3E%3Cstop offset='1' stop-color='%238b7bf7'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='128' height='128' rx='28' fill='%230a0d13'/%3E%3Cpath d='M24 34 C24 72 41 100 64 112 C87 100 104 72 104 34' fill='none' stroke='%233d4f63' stroke-width='7' stroke-linecap='round'/%3E%3Ccircle cx='36' cy='42' r='18' fill='url(%23g)'/%3E%3Ccircle cx='92' cy='42' r='18' fill='url(%23g)'/%3E%3Cellipse cx='64' cy='80' rx='30' ry='24' fill='url(%23g)'/%3E%3Cellipse cx='53' cy='66' rx='4' ry='5' fill='%230a0d13'/%3E%3Cellipse cx='75' cy='66' rx='4' ry='5' fill='%230a0d13'/%3E%3Cpath d='M50 88 L43 95 L50 102 M78 88 L85 95 L78 102 M68 86 L60 104' fill='none' stroke='%230a0d13' stroke-width='4.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="/admin_ui.css">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=__TRUSTYCLAW_ASSET_VERSION__">
+<link rel="alternate icon" href="/favicon.ico?v=__TRUSTYCLAW_ASSET_VERSION__">
+<link rel="stylesheet" href="/admin_ui.css?v=__TRUSTYCLAW_ASSET_VERSION__">
 </head>
 <body>
 <div class="bg-glow" aria-hidden="true"></div>
 
 <header class="topbar">
   <div class="brand">
-    <svg class="brand-mark" viewBox="0 0 128 128" aria-hidden="true">
+    <svg class="brand-mark" width="30" height="30" viewBox="0 0 128 128" aria-hidden="true">
       <defs>
         <linearGradient id="claw-grad" x1="0" y1="0" x2="1" y2="1">
           <stop offset="0" stop-color="#45d6c4"/>
@@ -52,11 +53,25 @@
 
 <section id="login" hidden>
   <div class="login-card">
-    <svg class="login-mark" viewBox="0 0 128 128" aria-hidden="true">
+    <svg class="login-mark" width="44" height="44" viewBox="0 0 128 128" aria-hidden="true">
+      <defs>
+        <linearGradient id="login-claw-grad" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#45d6c4"/>
+          <stop offset="1" stop-color="#8b7bf7"/>
+        </linearGradient>
+        <mask id="login-claw-notch-l">
+          <rect width="128" height="128" fill="#fff"/>
+          <path d="M36 42 L27 11 L40 13 Z" fill="#000"/>
+        </mask>
+        <mask id="login-claw-notch-r">
+          <rect width="128" height="128" fill="#fff"/>
+          <path d="M92 42 L101 11 L88 13 Z" fill="#000"/>
+        </mask>
+      </defs>
       <path d="M20 32 C20 72 38 102 64 114 C90 102 108 72 108 32" fill="none" stroke="#3d4f63" stroke-width="7" stroke-linecap="round"/>
-      <circle cx="37" cy="43" r="19" fill="url(#claw-grad)" mask="url(#claw-notch-l)"/>
-      <circle cx="91" cy="43" r="19" fill="url(#claw-grad)" mask="url(#claw-notch-r)"/>
-      <ellipse cx="64" cy="81" rx="31" ry="25" fill="url(#claw-grad)"/>
+      <circle cx="37" cy="43" r="19" fill="url(#login-claw-grad)" mask="url(#login-claw-notch-l)"/>
+      <circle cx="91" cy="43" r="19" fill="url(#login-claw-grad)" mask="url(#login-claw-notch-r)"/>
+      <ellipse cx="64" cy="81" rx="31" ry="25" fill="url(#login-claw-grad)"/>
       <ellipse cx="53" cy="66" rx="4.2" ry="5" fill="#0a0d13"/>
       <ellipse cx="75" cy="66" rx="4.2" ry="5" fill="#0a0d13"/>
       <path d="M56 75 Q64 81 72 75" fill="none" stroke="#0a0d13" stroke-width="3.5" stroke-linecap="round"/>
@@ -73,27 +88,31 @@
   <div class="shell">
     <nav class="sidebar" aria-label="Admin sections">
       <button id="tab-home" class="tab-button active-tab" data-action="show-tab" data-tab="home">
-        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 10.2 10 4l7 6.2M5.2 9.2V16h3.2v-3.6h3.2V16h3.2V9.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 10.2 10 4l7 6.2M5.2 9.2V16h3.2v-3.6h3.2V16h3.2V9.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>Home</span>
       </button>
       <button id="tab-network" class="tab-button" data-action="show-tab" data-tab="network">
-        <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3 10h14M10 3c2.4 2 3.4 4.4 3.4 7S12.4 15 10 17c-2.4-2-3.4-4.4-3.4-7S7.6 5 10 3Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+        <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3 10h14M10 3c2.4 2 3.4 4.4 3.4 7S12.4 15 10 17c-2.4-2-3.4-4.4-3.4-7S7.6 5 10 3Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
         <span>Internet Access and Tools</span>
       </button>
-      <button id="tab-agent" class="tab-button" data-action="show-tab" data-tab="agent">
-        <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="4" y="6.5" width="12" height="9" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 4v2.5M7.5 10.5v1M12.5 10.5v1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="10" cy="3.5" r="1" fill="currentColor"/></svg>
-        <span>Agent</span>
+      <button id="tab-processes" class="tab-button" data-action="show-tab" data-tab="processes">
+        <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true"><rect x="3.5" y="4" width="13" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 8h6M7 11h6M7 14h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <span>Agent processes</span>
       </button>
       <button id="tab-files" class="tab-button" data-action="show-tab" data-tab="files">
-        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 6a1.5 1.5 0 0 1 1.5-1.5h3l1.8 2H15A1.5 1.5 0 0 1 16.5 8v6A1.5 1.5 0 0 1 15 15.5H5A1.5 1.5 0 0 1 3.5 14V6Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+        <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 6a1.5 1.5 0 0 1 1.5-1.5h3l1.8 2H15A1.5 1.5 0 0 1 16.5 8v6A1.5 1.5 0 0 1 15 15.5H5A1.5 1.5 0 0 1 3.5 14V6Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
         <span>Agent workspace</span>
       </button>
+      <button id="tab-agent" class="tab-button" data-action="show-tab" data-tab="agent">
+        <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true"><rect x="4" y="6.5" width="12" height="9" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 4v2.5M7.5 10.5v1M12.5 10.5v1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="10" cy="3.5" r="1" fill="currentColor"/></svg>
+        <span>Agent thread log</span>
+      </button>
       <button id="tab-agent-log" class="tab-button" data-action="show-tab" data-tab="agent-log">
-        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 10h3l2-5 4 10 2-5h3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 10h3l2-5 4 10 2-5h3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>Agent audit log</span>
       </button>
       <button id="tab-net-log" class="tab-button" data-action="show-tab" data-tab="net-log">
-        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.8 16 5v4.4c0 3.9-2.6 6.6-6 7.8-3.4-1.2-6-3.9-6-7.8V5l6-2.2Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M7 10.6h2l1-2.4 1.6 4 1-1.6h1.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.8 16 5v4.4c0 3.9-2.6 6.6-6 7.8-3.4-1.2-6-3.9-6-7.8V5l6-2.2Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M7 10.6h2l1-2.4 1.6 4 1-1.6h1.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>Network audit log</span>
       </button>
     </nav>
@@ -120,7 +139,12 @@
         </section>
 
         <section>
-          <h2>Provider usage</h2>
+          <div class="section-head">
+            <h2>Provider usage</h2>
+            <button class="ghost sm icon-button" data-action="refresh-provider-usage" title="Refresh provider usage" aria-label="Refresh provider usage">
+              <svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><path d="M16.2 6.5A6.8 6.8 0 1 0 17 10M16.2 3.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </div>
           <div class="table-scroll"><table id="provider-accounts"></table></div>
         </section>
       </div>
@@ -131,31 +155,12 @@
             <aside class="thread-pane" aria-label="Threads">
               <div class="pane-head">
                 <h2>Threads</h2>
-                <button class="ghost sm" data-action="new-thread">+ New thread</button>
               </div>
               <div id="threads" class="thread-list"></div>
             </aside>
             <div class="thread-view">
               <div id="thread-detail" class="thread-history"></div>
               <div id="task-events-detail"></div>
-              <div class="composer">
-                <div id="composer-target" class="field-label">New thread</div>
-                <textarea id="new-task" rows="3" placeholder="Describe the first task in this thread&hellip;"></textarea>
-                <div class="composer-controls">
-                  <label class="field" id="thread-field">
-                    <span class="field-label">Thread name</span>
-                    <input id="new-task-thread" class="thread-input" value="main" placeholder="e.g. website-redesign">
-                  </label>
-                  <label class="field" id="runtime-field">
-                    <span class="field-label">Runtime</span>
-                    <select id="new-task-runtime" class="runtime-select">
-                      <option value="codex">Codex</option>
-                      <option value="claude_code">Claude Code</option>
-                    </select>
-                  </label>
-                  <button class="primary" data-action="create-task">Create task</button>
-                </div>
-              </div>
             </div>
           </div>
         </section>
@@ -165,7 +170,19 @@
         <section>
           <h2>Agent audit log</h2>
           <p class="muted">Every task and runtime event on this host, newest first.</p>
+          <div class="audit-toolbar">
+            <span class="muted" id="agent-page-summary"></span>
+          </div>
           <div class="table-scroll"><table id="events"></table></div>
+          <div class="pager" id="agent-event-pager"></div>
+        </section>
+      </div>
+
+      <div id="panel-processes" class="tab-panel" hidden>
+        <section>
+          <h2>Agent processes</h2>
+          <p id="process-message" class="inline-message"></p>
+          <div class="table-scroll"><table id="processes"></table></div>
         </section>
       </div>
 
@@ -176,7 +193,6 @@
             <button class="ghost" data-action="file-up" title="Parent directory">&#8593; Up</button>
             <input id="file-path" value="/" spellcheck="false" aria-label="Path">
             <button data-action="file-go">Go</button>
-            <button class="ghost" data-action="file-refresh">Refresh</button>
           </div>
           <p id="file-message" class="inline-message"></p>
           <div class="file-explorer">
@@ -192,73 +208,100 @@
       </div>
 
       <div id="panel-network" class="tab-panel" hidden>
-        <div class="row">
-          <section>
-            <div class="section-head">
-              <h2>Active policy</h2>
-              <button class="ghost sm" data-action="load-policy">Refresh</button>
+        <p id="policy-message" class="inline-message"></p>
+        <div id="preset-info-popover" class="info-popover" role="dialog" hidden></div>
+        <div id="managed-integrations"></div>
+        <!-- Rendered in the GitHub integration dropdown above:
+             renderManagedIntegrations() moves this node under that card and
+             shows it only while GitHub is enabled (a disabled integration
+             carries no repositories to show). -->
+        <div id="github-expansion" class="integration-expansion" hidden>
+          <div class="expansion-card">
+            <div class="field-label">GitHub credential</div>
+            <div class="credential-current">
+              <span id="github-credential-status" class="muted"></span>
+              <button class="ghost sm" id="github-credential-clear" data-action="delete-github-credential" hidden>Clear credential</button>
             </div>
-            <p class="muted">Enforced by the proxy right now. To change it, build a proposal and replace the active policy.</p>
-            <textarea id="active-policy" class="readonly code" readonly spellcheck="false"></textarea>
-          </section>
-          <section>
-            <h2>Policy builder</h2>
-            <p id="policy-status" class="muted">Proposal matches current policy.</p>
-            <p id="policy-message" class="inline-message"></p>
-            <div class="actions preset-row">
-              <span class="preset-with-info">
-                <button id="policy-preset-openai" data-action="apply-policy-preset" data-preset="openai">Add OpenAI</button>
-                <button class="info-button" data-action="toggle-preset-info" data-info="openai" aria-label="OpenAI preset domains" aria-expanded="false">i</button>
-              </span>
-              <span class="preset-with-info">
-                <button id="policy-preset-claude" data-action="apply-policy-preset" data-preset="claude">Add Claude</button>
-                <button class="info-button" data-action="toggle-preset-info" data-info="claude" aria-label="Claude preset domains" aria-expanded="false">i</button>
-              </span>
-              <span class="preset-with-info">
-                <button id="policy-preset-github" data-action="apply-policy-preset" data-preset="github">Add GitHub</button>
-                <button class="info-button" data-action="toggle-preset-info" data-info="github" aria-label="GitHub preset domains" aria-expanded="false">i</button>
-              </span>
-              <span class="preset-with-info">
-                <button id="policy-preset-python" data-action="apply-policy-preset" data-preset="python">Add Python packages</button>
-                <button class="info-button" data-action="toggle-preset-info" data-info="python" aria-label="Python packages preset domains" aria-expanded="false">i</button>
-              </span>
-              <span class="preset-with-info">
-                <button id="policy-preset-npm" data-action="apply-policy-preset" data-preset="npm">Add npm packages</button>
-                <button class="info-button" data-action="toggle-preset-info" data-info="npm" aria-label="npm packages preset domains" aria-expanded="false">i</button>
-              </span>
+            <div class="credential-set">
+              <div id="github-credential-form-label" class="field-label">Set a new credential</div>
+              <select id="github-credential-mode">
+                <option value="pat">Fine-grained token (PAT)</option>
+                <option value="app">GitHub App (minted tokens)</option>
+              </select>
+              <input id="github-token" type="password" placeholder="GitHub fine-grained token">
+              <div id="github-app-fields" hidden>
+                <input id="github-app-id" placeholder="GitHub App id (numeric)">
+                <input id="github-app-installation-id" placeholder="Installation id (numeric)">
+                <textarea id="github-app-private-key" class="compact" placeholder="GitHub App private key (PEM)"></textarea>
+              </div>
+              <div class="actions">
+                <button data-action="set-github-credential">Set credential</button>
+              </div>
             </div>
-            <div id="preset-info-popover" class="info-popover" hidden></div>
+          </div>
+          <div class="expansion-card">
+            <div class="field-label">Require approval for <code>.github</code> pushes</div>
+            <p class="muted">A push that changes any <code>.github/</code> path is held for operator approval below instead of reaching GitHub. Clean pushes are unaffected.</p>
+            <div class="approval-controls">
+              <button class="sm" data-action="enable-github-require-approval">Enable</button>
+              <button class="ghost sm" data-action="disable-github-require-approval">Disable</button>
+              <span id="github-require-approval-status" class="muted"></span>
+            </div>
+            <div id="github-pending-pushes"></div>
+          </div>
+          <div class="expansion-card">
+            <div class="field-label">Write repositories (reads are universal; listing a repo also allows push and API writes to it)</div>
+            <div id="github-repos"></div>
+            <div id="github-repo-controls">
+              <div class="repo-add-row">
+                <input id="github-repo" placeholder="owner/repo">
+                <button data-action="add-github-repo">Add write repository</button>
+              </div>
+              <div class="actions">
+                <button class="ghost sm" data-action="recheck-github-audit">Re-check repository audits</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <section class="integration-row custom-domain-card">
+          <div class="integration-summary custom-domain-head">
+            <button id="custom-domain-toggle" class="ghost sm icon-button integration-chevron" data-action="toggle-custom-domain-access" aria-label="Toggle custom domain access details" aria-expanded="false">
+              <svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><path d="m7.5 4.5 5 5.5-5 5.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <div class="preset-with-info integration-title"><h2>Custom Domain Access</h2></div>
+            <span id="domain-rule-count" class="status disabled">0 domains enabled</span>
+          </div>
+          <div id="custom-domain-details" class="integration-details" hidden>
+            <div id="domain-rules"></div>
             <div class="manual-domain">
-              <div class="field-label">Manual domain rule</div>
+              <div class="field-label">Add domain rule</div>
               <input id="policy-domain" placeholder="api.example.com or *.example.com">
               <input id="policy-methods" placeholder="GET,HEAD,POST">
               <textarea id="policy-path-guards" class="compact" placeholder="optional path regex per line"></textarea>
               <div class="actions">
-                <button data-action="save-website-rule">Add manual domain</button>
+                <button data-action="add-domain-rule">Add domain rule</button>
               </div>
             </div>
-            <h2 class="proposed-policy-heading">Proposed policy</h2>
-            <textarea id="policy" class="code" spellcheck="false" data-action="load-policy-from-json"></textarea>
-            <div class="actions">
-              <button class="ghost" data-action="reset-proposed-policy">Reset proposal from current</button>
-              <button class="danger" data-action="save-policy">Replace active policy with proposal</button>
-            </div>
-          </section>
-        </div>
-
+          </div>
+        </section>
       </div>
 
       <div id="panel-net-log" class="tab-panel" hidden>
         <section>
           <h2>Network audit log</h2>
           <p class="muted">Every request the agent makes to the internet, and whether the proxy allowed it.</p>
+          <div class="audit-toolbar">
+            <button class="ghost sm" id="net-filter-denied" data-action="toggle-net-denied">Show denied</button>
+            <span class="muted" id="net-page-summary"></span>
+          </div>
           <div class="table-scroll"><table id="net-events"></table></div>
+          <div class="pager" id="net-event-pager"></div>
         </section>
       </div>
     </main>
   </div>
 </div>
 
-<script src="/admin_ui.js"></script>
+<script type="module" src="/admin_ui/app.js?v=__TRUSTYCLAW_ASSET_VERSION__"></script>
 </body>
 </html>

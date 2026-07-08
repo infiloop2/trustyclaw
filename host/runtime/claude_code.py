@@ -23,6 +23,9 @@ DEFAULT_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/run-cl
 DEFAULT_ACCOUNT_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/read-claude-account"]
 AGENT_CWD = "/mnt/trustyclaw-agent/agent-home"
 ACCOUNT_HELPER_TIMEOUT_SECONDS = 15
+# The attest helper makes one HTTPS round trip (10s inside the helper) on top
+# of the file read, so it gets a larger budget than the plain account read.
+ATTEST_HELPER_TIMEOUT_SECONDS = 20
 STATUS_TIMEOUT_SECONDS = 45
 USAGE_TIMEOUT_SECONDS = 30
 LOGIN_START_TIMEOUT_SECONDS = 30
@@ -109,9 +112,8 @@ class ClaudeCodeSession:
             "--output-format",
             "stream-json",
             "--verbose",
-            "--permission-mode",
-            "bypassPermissions",
-            "--safe-mode",
+            "--setting-sources",
+            "user",
             "--strict-mcp-config",
         ]
         if session_id:
@@ -378,6 +380,50 @@ def read_claude_account(command: list[str] | None = None) -> dict[str, Any] | No
     return value if isinstance(value, dict) and value.get("access_token_sha256") else None
 
 
+def read_attested_identity(
+    command: list[str] | None = None, expected_token_sha256: str | None = None
+) -> dict[str, Any]:
+    """Server-attested identity of the agent's current Claude OAuth token.
+
+    The root helper reads the agent credential file and asks
+    api.anthropic.com/api/oauth/profile who the token belongs to, so the
+    returned identity (account_uuid, email, organization_uuid, plus the
+    token's access_token_sha256) is bound to the token by the provider, not
+    by agent-writable metadata. Raises ClaudeCodeError when the token cannot
+    be attested: missing credentials, unreachable endpoint, or a rejected
+    token."""
+    try:
+        argv = list(command or [*DEFAULT_ACCOUNT_COMMAND, "--attest"])
+        if expected_token_sha256:
+            argv.extend(["--expected-token-sha256", expected_token_sha256])
+        proc = subprocess.run(
+            argv,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=ATTEST_HELPER_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ClaudeCodeError(f"could not attest Claude account: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise ClaudeCodeError(detail or "Claude account attestation failed")
+    try:
+        value = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise ClaudeCodeError("Claude account attestation returned invalid JSON") from exc
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("account_uuid"), str)
+        or not value["account_uuid"]
+        or not isinstance(value.get("access_token_sha256"), str)
+        or not value["access_token_sha256"]
+    ):
+        raise ClaudeCodeError("Claude account attestation response is incomplete")
+    return value
+
+
 def start_oauth_login() -> ClaudeLogin:
     global _login_process
     process = ClaudeLoginProcess()
@@ -407,9 +453,10 @@ def complete_oauth_login(code: str) -> None:
 def close_login_process() -> None:
     global _login_process
     with _login_lock:
-        if _login_process is not None:
-            _login_process.close()
-            _login_process = None
+        process = _login_process
+        _login_process = None
+    if process is not None:
+        process.close()
 
 
 def run_turn(

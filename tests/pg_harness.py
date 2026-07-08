@@ -183,6 +183,13 @@ def reset_database() -> None:
         if tables:
             names = ", ".join(f'"{name}"' for name in tables)
             cur.execute(f"TRUNCATE {names} RESTART IDENTITY")
+        # The schema migration seeds the secretbox key at schema time
+        # (schema present => key present); truncation wipes data, so restore
+        # that invariant the same way the migration does.
+        cur.execute(
+            "INSERT INTO secret_keys (singleton, key_hex)"
+            " VALUES (TRUE, translate(gen_random_uuid()::text || gen_random_uuid()::text, '-', ''))"
+        )
 
 
 def create_database(name: str) -> None:

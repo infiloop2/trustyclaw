@@ -114,5 +114,64 @@ class MigrateRunnerTests(unittest.TestCase):
         self.assertEqual(self.table_names(), {"schema_migrations"})
 
 
+
+class RepoMigrationDataTests(unittest.TestCase):
+    """Data-migration behavior of the real repo migrations."""
+
+    DB_NAME = "trustyclaw_migrate_repo_test"
+
+    def setUp(self) -> None:
+        pg_harness.create_database(self.DB_NAME)
+        self.env_patch = patch.dict("os.environ", {"TRUSTYCLAW_DB_NAME": self.DB_NAME})
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+        self.repo_migrations = Path(__file__).resolve().parents[1] / "host" / "migrations"
+
+    def test_0002_migrates_legacy_preset_policy_rows(self) -> None:
+        # A host upgraded from the raw-preset era: managed provider rows plus
+        # raw GitHub/PyPI/npm domain rules in the stored policy.
+        migrate.up(target=1, directory=self.repo_migrations, quiet=True)
+        with db.transaction() as cur:
+            cur.execute("INSERT INTO network_policy (singleton, updated_at) VALUES (TRUE, '2026-01-01T00:00:00Z')")
+            cur.execute("INSERT INTO managed_provider_access (provider) VALUES ('openai')")
+            for domain in (
+                "github.com", "api.github.com", "raw.githubusercontent.com",
+                "pypi.org", "files.pythonhosted.org", "*.npmjs.org",
+                "example.com",
+            ):
+                cur.execute("INSERT INTO allowed_domains (domain) VALUES (%s)", (domain,))
+            cur.execute("INSERT INTO domain_methods (domain, position, method) VALUES ('github.com', 0, 'GET')")
+            cur.execute("INSERT INTO domain_methods (domain, position, method) VALUES ('example.com', 0, 'GET')")
+
+        migrate.up(directory=self.repo_migrations, quiet=True)
+
+        with db.transaction() as cur:
+            cur.execute("SELECT integration FROM managed_integrations ORDER BY integration")
+            integrations = [row[0] for row in cur.fetchall()]
+            cur.execute("SELECT domain FROM allowed_domains")
+            domains = {row[0] for row in cur.fetchall()}
+            cur.execute("SELECT domain FROM domain_methods")
+            method_domains = {row[0] for row in cur.fetchall()}
+        # Reserved preset domains (GitHub, package) are dropped so the policy
+        # validates again, but no integration is auto-activated — only the
+        # carried-over openai provider row remains. The operator re-enables
+        # the package integrations they want. Manual rules survive.
+        self.assertEqual(integrations, ["openai"])
+        self.assertEqual(domains, {"example.com"})
+        self.assertEqual(method_domains, {"example.com"})
+
+        # The migrated policy parses — an upgraded host keeps its egress
+        # instead of failing closed on reserved domains.
+        from host.config import parse_network_controls
+        from host.runtime.network_policy import load_policy
+
+        parsed = parse_network_controls(load_policy())
+        self.assertTrue(parsed.managed_network_integrations.openai.enabled)
+        self.assertFalse(parsed.managed_network_integrations.python_packages.enabled)
+        self.assertFalse(parsed.managed_network_integrations.npm_packages.enabled)
+        self.assertFalse(parsed.managed_network_integrations.github.enabled)
+
+
+
 if __name__ == "__main__":
     unittest.main()

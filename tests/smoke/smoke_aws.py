@@ -107,7 +107,33 @@ HEALTH_TIMEOUT = 600  # bootstrap installs packages; allow time before the API a
 MESSAGE_LIMIT = 50_000  # mirrors the admin API's input_message cap
 SMOKE_RUNTIMES = ("codex", "claude_code")
 SMOKE_MANAGED_PROVIDERS = {"openai": True, "claude": True}
-SMOKE_MANAGED_DOMAINS = ("api.openai.com", "auth.openai.com", "chatgpt.com", "api.anthropic.com", "platform.claude.com")
+SMOKE_GITHUB_INTEGRATION = {"enabled": True, "write_repositories": [{"owner": "infiloop2", "repo": "trustyclaw"}]}
+SMOKE_MANAGED_DOMAINS = (
+    "api.openai.com",
+    "auth.openai.com",
+    "chatgpt.com",
+    "api.anthropic.com",
+    "platform.claude.com",
+    "github.com",
+    "api.github.com",
+    "uploads.github.com",
+    "codeload.github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "github-cloud.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+)
+
+
+def managed_integrations(providers: dict[str, bool]) -> dict:
+    return {provider: {"enabled": True} for provider, enabled in providers.items() if enabled}
+
+
+def network_policy(providers: dict[str, bool], allowed_network_access: dict | None = None) -> dict:
+    return {
+        "managed_network_integrations": managed_integrations(providers),
+        "allowed_network_access": allowed_network_access or {},
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -138,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
         smoke.check_state_transactions()
         smoke.check_event_pagination()
         smoke.check_enforcement()
+        smoke.check_github_read_paths()
         smoke.check_proxy_edge_cases()
         smoke.check_proxy_concurrency()
         smoke.check_pre_login_provider_guards()
@@ -191,14 +218,17 @@ class AwsSmoke:
         The /zen guard backs the percent-encoded-path check; the wildcard rule
         backs the wildcard domain check. Both managed provider bundles stay on
         so Codex and Claude Code can be logged in and interwoven in one run.
+        The GitHub integration backs the repo-scope enforcement checks.
         """
-        return {
-            "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
-            "allowed_network_access": {
-                "api.github.com": {"allow_http_methods": ["GET"], "path_guards": ["^/$", "^/zen$"]},
-                "*.githubusercontent.com": {"allow_http_methods": ["GET"]},
+        policy = network_policy(
+            SMOKE_MANAGED_PROVIDERS,
+            {
+                "example.com": {"allow_http_methods": ["GET"], "path_guards": ["^/$", "^/zen$"]},
+                "*.example.com": {"allow_http_methods": ["GET"]},
             },
-        }
+        )
+        policy["managed_network_integrations"]["github"] = json.loads(json.dumps(SMOKE_GITHUB_INTEGRATION))
+        return policy
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -562,38 +592,106 @@ class AwsSmoke:
         self._api("PUT", "/v1/network/policy", self.enforcement_policy())
         policy = self._api("GET", "/v1/network/policy")
         controls = policy["network_controls"]
-        expected_provider = dict(SMOKE_MANAGED_PROVIDERS)
-        if controls.get("managed_ai_provider_network_access") != expected_provider:
+        expected_provider = self.enforcement_policy()["managed_network_integrations"]
+        if controls.get("managed_network_integrations") != expected_provider:
             raise AssertionError(f"policy did not preserve explicit managed provider: {controls}")
         rules = controls["allowed_network_access"]
-        if "api.github.com" not in rules:
+        if "example.com" not in rules:
             raise AssertionError("replaced policy not reflected in GET")
         for host in self.managed_domains:
             if host in rules:
                 raise AssertionError(f"managed provider rule {host} leaked into API policy response: {rules}")
         # The stored policy is typed rows now; check them directly.
-        stored_providers = set(self._ssh_code(
-            "sudo -u postgres psql -tA -d trustyclaw_admin -c 'SELECT provider FROM managed_provider_access'"
+        stored_integrations = set(self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c 'SELECT integration FROM managed_integrations'"
         ).split())
-        expected_enabled = {name for name, enabled in expected_provider.items() if enabled}
-        if stored_providers != expected_enabled:
+        expected_enabled = set(expected_provider)
+        if stored_integrations != expected_enabled:
             raise AssertionError(
-                f"stored policy did not preserve explicit managed providers: {sorted(stored_providers)}"
+                f"stored policy did not preserve enabled integrations: {sorted(stored_integrations)}"
             )
+        stored_repos = set(self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c "
+            "\"SELECT owner || '/' || repo FROM github_repositories\""
+        ).split())
+        expected_repos = {
+            f"{repo['owner']}/{repo['repo']}" for repo in SMOKE_GITHUB_INTEGRATION["write_repositories"]
+        }
+        if stored_repos != expected_repos:
+            raise AssertionError(f"stored GitHub write-repository list mismatch: {sorted(stored_repos)}")
         stored_domains = set(self._ssh_code(
             "sudo -u postgres psql -tA -d trustyclaw_admin -c 'SELECT domain FROM allowed_domains'"
         ).split())
-        if "api.github.com" not in stored_domains:
+        if "example.com" not in stored_domains:
             raise AssertionError(f"replaced policy not reflected in stored rows: {sorted(stored_domains)}")
         for host in self.managed_domains:
             if host in stored_domains:
-                raise AssertionError(f"managed provider rule {host} leaked into stored policy: {sorted(stored_domains)}")
+                raise AssertionError(f"managed integration rule {host} leaked into stored policy: {sorted(stored_domains)}")
+        self._check_github_credential_lifecycle()
         self._ok("policy read back and stored user-facing; proxy expands managed AI provider rules in memory")
+
+    def _check_github_credential_lifecycle(self) -> None:
+        smoke_token = f"github_pat_smoke_{time.time_ns()}"
+        metadata = self._api("GET", "/v1/network-tools/github-credential")
+        if metadata.get("configured") is not False:
+            raise AssertionError(f"initial GitHub credential should be unconfigured: {metadata}")
+        saved = self._api("PUT", "/v1/network-tools/github-credential", {"mode": "pat", "token": smoke_token})
+        if saved.get("configured") is not True or smoke_token in json.dumps(saved):
+            raise AssertionError(f"GitHub credential PUT should return metadata only: {saved}")
+        # The working token lives in the proxy-readable row as secretbox
+        # ciphertext — encrypted at rest like every other stored secret, and
+        # never on disk anywhere.
+        published = self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c 'SELECT token FROM proxy_github_token'"
+        ).strip()
+        if not published.startswith("enc:v1:") or smoke_token in published:
+            raise AssertionError("the published proxy_github_token row must hold ciphertext, not the token")
+        no_file = self._ssh_code("sudo bash -c '! test -e /etc/trustyclaw-github && echo absent'").strip()
+        if no_file != "absent":
+            raise AssertionError("the agent token-file directory should not exist in the injection era")
+        # The proxy injects the stored (fake) PAT into agent GitHub requests:
+        # gh runs with a fixed placeholder GH_TOKEN, the proxy strips it and
+        # injects the smoke token, and GitHub answers 401 for the bad
+        # credential — proof the injected token (not the placeholder) reached
+        # GitHub. gh's own "not logged in" refusal would mean a broken shim.
+        proxy = f"http://127.0.0.1:{PROXY_PORT}"
+        gh_injected = self._ssh_code(
+            f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} https_proxy={proxy} "
+            "gh api repos/infiloop2/trustyclaw 2>&1 || true"
+        )
+        if "401" not in gh_injected or "gh auth login" in gh_injected:
+            raise AssertionError(f"proxy did not inject the stored token upstream: {gh_injected!r}")
+        # GraphQL is denied at the proxy regardless of credentials, so gh's
+        # GraphQL-backed path fails with the proxy's 403, not a GitHub 401.
+        gh_graphql = self._ssh_code(
+            f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} https_proxy={proxy} "
+            "gh api graphql -f query='query{viewer{login}}' 2>&1 || true"
+        )
+        if "403" not in gh_graphql:
+            raise AssertionError(f"gh graphql should be denied by the proxy: {gh_graphql!r}")
+        deleted = self._api("DELETE", "/v1/network-tools/github-credential")
+        if deleted.get("configured") is not False:
+            raise AssertionError(f"GitHub credential DELETE should clear metadata: {deleted}")
+        rows = self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c 'SELECT count(*) FROM proxy_github_token'"
+        ).strip()
+        if rows != "0":
+            raise AssertionError("proxy_github_token should be cleared after DELETE")
+        # With the row cleared, the same request goes upstream with the
+        # placeholder stripped and nothing injected: the public repo read
+        # succeeds unauthenticated — revocation is instant, and agent-supplied
+        # credentials demonstrably never pass through.
+        gh_uninjected = self._ssh_code(
+            f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} https_proxy={proxy} "
+            "gh api repos/infiloop2/trustyclaw 2>&1 || true"
+        )
+        if '"full_name"' not in gh_uninjected or "401" in gh_uninjected:
+            raise AssertionError(f"unauthenticated public read should succeed after DELETE: {gh_uninjected!r}")
 
     def check_initial_disabled_provider_deploy(self) -> None:
         self._step("initial deploy with managed providers disabled")
         expected_empty_policy = {
-            "managed_ai_provider_network_access": {},
+            "managed_network_integrations": {},
             "allowed_network_access": {},
         }
         stored_rows = self._ssh_code(
@@ -609,7 +707,7 @@ class AwsSmoke:
         health = self._api("GET", "/v1/health")
         if health["network_controls"]["status"] != "active":
             raise AssertionError(f"empty valid policy should report derived active network status: {health}")
-        if policy.get("managed_ai_provider_network_access", {}) != {}:
+        if policy.get("managed_network_integrations", {}) != {}:
             raise AssertionError(f"initial policy should keep managed providers disabled: {policy}")
         if policy.get("allowed_network_access") != {}:
             raise AssertionError(f"initial policy should not have user network rules: {policy}")
@@ -641,6 +739,7 @@ class AwsSmoke:
         request = urllib.request.Request(f"http://127.0.0.1:{ADMIN_PORT}/")
         with urllib.request.urlopen(request, timeout=30) as response:
             content_type = response.headers.get("Content-Type", "")
+            self._assert_admin_ui_security_headers(response.headers)
             page = response.read().decode()
         if "text/html" not in content_type:
             raise AssertionError(f"UI page content type is {content_type!r}")
@@ -648,21 +747,30 @@ class AwsSmoke:
             raise AssertionError("UI page does not look like the admin UI")
         for path, expected_type in (
             ("/admin_ui.css", "text/css"),
-            ("/admin_ui.js", "application/javascript"),
+            ("/admin_ui/app.js", "application/javascript"),
+            ("/admin_ui/api.js", "application/javascript"),
+            ("/admin_ui/helpers.js", "application/javascript"),
+            ("/admin_ui/health.js", "application/javascript"),
+            ("/admin_ui/threads.js", "application/javascript"),
+            ("/admin_ui/files.js", "application/javascript"),
+            ("/admin_ui/processes.js", "application/javascript"),
+            ("/admin_ui/logs.js", "application/javascript"),
+            ("/admin_ui/network.js", "application/javascript"),
         ):
             request = urllib.request.Request(f"http://127.0.0.1:{ADMIN_PORT}{path}")
             with urllib.request.urlopen(request, timeout=30) as response:
                 asset_type = response.headers.get("Content-Type", "")
+                self._assert_admin_ui_security_headers(response.headers)
                 asset_body = response.read().decode()
             if expected_type not in asset_type:
                 raise AssertionError(f"UI asset {path} content type is {asset_type!r}")
             page += "\n" + asset_body
         for expected in (
-            '<link rel="stylesheet" href="/admin_ui.css">',
-            '<script src="/admin_ui.js"></script>',
+            '<link rel="stylesheet" href="/admin_ui.css?v=',
+            '<script type="module" src="/admin_ui/app.js?v=',
             "<h2>Threads</h2>",
             "/v1/threads",
-            "/v1/threads/${encodeURIComponent(threadId)}/tasks",
+            "/v1/threads/${encodeURIComponent(selectedThreadId)}/tasks",
             "/v1/tasks/${encodeURIComponent(taskId)}/events",
             "showThread",
             "showTaskEvents",
@@ -673,85 +781,86 @@ class AwsSmoke:
             "loadMoreTaskEvents",
             'id="panel-home"',
             'id="panel-agent"',
+            'id="panel-processes"',
             'id="panel-network"',
+            'id="processes"',
+            "/v1/agent-processes",
+            "refreshAgentProcesses",
             'id="runtime-guidance"',
-            'id="active-policy"',
             'id="policy-message"',
-            'id="policy-status"',
             'id="start-codex-login"',
             'id="start-claude-login"',
             'data-runtime="codex" disabled hidden>Start Codex login</button>',
             'data-runtime="claude_code" disabled hidden>Start Claude login</button>',
             "updateLoginButtons",
-            'id="policy-preset-openai"',
-            'id="policy-preset-claude"',
-            'id="policy-preset-github"',
-            'id="policy-preset-python"',
-            'id="policy-preset-npm"',
+            'id="managed-integrations"',
+            'id="github-repos"',
+            'id="domain-rules"',
+            'id="github-repo"',
+            'id="github-token"',
+            'id="github-credential-mode"',
+            'id="github-app-fields"',
+            'id="github-app-id"',
+            'id="github-app-installation-id"',
+            'id="github-app-private-key"',
+            'id="github-credential-status"',
             'id="preset-info-popover"',
-            'aria-label="OpenAI preset domains"',
-            'aria-label="Claude preset domains"',
-            'aria-label="GitHub preset domains"',
-            'aria-label="Python packages preset domains"',
-            'aria-label="npm packages preset domains"',
-            "Open Network settings",
+            "Open Internet Access and Tools",
+            "<span>Internet Access and Tools</span>",
             "Reboot host",
-            "Current policy",
-            "Policy builder",
-            "Proposed policy",
-            "Proposal matches current policy",
-            "Replace active policy with proposal",
-            "POLICY_PRESETS",
-            "POLICY_PRESET_BUTTONS",
-            "PRESET_INFO",
-            "togglePresetInfo",
-            "renderPresetInfo",
+            "Managed integrations",
+            "Domain rules",
+            "MANAGED_INTEGRATIONS",
+            "INTEGRATION_INFO",
+            "toggleIntegrationInfo",
+            "renderIntegrationInfo",
             "objectValue",
             "!Array.isArray(value)",
             "activeNetworkPolicy",
-            "proposedNetworkPolicy",
             "clonePolicy",
-            "policiesEqual",
-            "renderActivePolicy",
-            "renderProposalStatus",
-            "policyPresetState",
-            "renderPolicyPresets",
-            "rulesEqual",
-            "wildcardCoversDomain",
-            "hasWildcardOverlap",
-            'pattern.startsWith("*.")',
-            "domain.endsWith(pattern.slice(1))",
-            "domain !== pattern.slice(2)",
-            "covered by a wildcard",
-            'button.disabled = state === "partial"',
-            "removePolicyPreset",
-            "preset-active",
-            "preset-partial",
-            "applyPolicyPreset(preset)",
-            'data-preset="openai"',
-            'data-preset="claude"',
-            'data-preset="github"',
-            'data-preset="python"',
-            'data-preset="npm"',
-            "OpenAI expands internally",
-            "Claude expands internally",
-            "GitHub expands",
+            "publishPolicy",
+            "setIntegrationEnabled",
+            "renderNetworkControls",
+            "renderManagedIntegrations",
+            "renderGithubRepos",
+            "renderDomainRules",
+            "addDomainRule",
+            "removeDomainRule",
+            'data-action="enable-integration"',
+            'data-action="disable-integration"',
+            'data-action="remove-github-repo"',
+            'data-action="remove-domain-rule"',
+            'data-action="add-github-repo"',
+            'data-action="set-github-credential"',
+            'data-action="delete-github-credential"',
+            'data-action="add-domain-rule"',
+            'id="github-expansion"',
+            'id="github-credential-clear"',
+            'data-action="recheck-github-audit"',
+            "renderGithubAudit",
+            "recheckGithubAudit",
+            "audit-banner",
+            "/v1/network-tools/github-audit",
+            "OpenAI — under the hood",
+            "Claude — under the hood",
+            "GitHub — under the hood (all reads, scoped writes)",
             "api.openai.com",
             "auth.openai.com",
             "chatgpt.com",
             "api.anthropic.com",
             "platform.claude.com",
             "api.github.com",
+            "uploads.github.com",
             "codeload.github.com",
             "objects.githubusercontent.com",
+            "github-cloud.githubusercontent.com",
             "raw.githubusercontent.com",
             "release-assets.githubusercontent.com",
             "pypi.org",
             "files.pythonhosted.org",
             "nodejs.org",
             "registry.npmjs.org",
-            "Add manual domain",
-            "saveWebsiteRule",
+            "Add domain rule",
         ):
             if expected not in page:
                 raise AssertionError(f"UI page is missing expected admin UI fragment {expected!r}")
@@ -775,6 +884,30 @@ class AwsSmoke:
             if removed in page:
                 raise AssertionError(f"UI page still contains removed finished-task path {removed!r}")
         self._ok("static UI page served unauthenticated; thread history and network policy controls present; API routes still require auth")
+
+    @staticmethod
+    def _assert_admin_ui_security_headers(headers) -> None:
+        csp = headers.get("Content-Security-Policy", "")
+        required_directives = (
+            "default-src 'self'",
+            "connect-src 'self'",
+            "script-src 'self'",
+            "style-src 'self'",
+            "img-src 'self' data:",
+            "frame-ancestors 'none'",
+        )
+        missing = [directive for directive in required_directives if directive not in csp]
+        if missing:
+            raise AssertionError(f"admin UI Content-Security-Policy missing {missing}: {csp!r}")
+        expected_headers = {
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+        }
+        for name, expected in expected_headers.items():
+            actual = headers.get(name, "")
+            if actual != expected:
+                raise AssertionError(f"admin UI {name} header is {actual!r}, expected {expected!r}")
 
     def check_admin_auth(self) -> None:
         self._step("admin API authentication")
@@ -815,18 +948,12 @@ class AwsSmoke:
     def check_policy_validation_and_concurrency(self) -> None:
         self._step("policy validation and concurrent replaces")
         # SSH is deployment config, not runtime network policy.
-        pinned = {
-            "ssh_port_opened": False,
-            "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
-            "allowed_network_access": {},
-        }
+        pinned = network_policy(SMOKE_MANAGED_PROVIDERS)
+        pinned["ssh_port_opened"] = False
         status, body = self._api_status("PUT", "/v1/network/policy", pinned, idem=self._idem("ssh-pin"))
         if status != 400:
             raise AssertionError(f"runtime ssh_port_opened field returned {status}, expected 400: {body}")
-        invalid = {
-            "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
-            "allowed_network_access": {"api.github.com": {"allow_http_methods": ["BOGUS"]}},
-        }
+        invalid = network_policy(SMOKE_MANAGED_PROVIDERS, {"api.example.com": {"allow_http_methods": ["BOGUS"]}})
         status, body = self._api_status("PUT", "/v1/network/policy", invalid, idem=self._idem("bad-method"))
         if status != 400:
             raise AssertionError(f"invalid policy returned {status}, expected 400: {body}")
@@ -864,7 +991,7 @@ class AwsSmoke:
                 "/v1/agent-runtime/codex-oauth-login",
             ),
         ):
-            policy = {"managed_ai_provider_network_access": providers, "allowed_network_access": {}}
+            policy = network_policy(providers)
             status, body = self._api_status("PUT", "/v1/network/policy", policy, idem=self._idem(label))
             if status != 200:
                 raise AssertionError(f"{label} provider policy returned {status}, expected 200: {body}")
@@ -888,25 +1015,25 @@ class AwsSmoke:
             (
                 "self-managed-openai-domain",
                 {
-                    "managed_ai_provider_network_access": {"openai": True, "claude": True},
+                    "managed_network_integrations": managed_integrations({"openai": True, "claude": True}),
                     "allowed_network_access": {"chatgpt.com": {"allow_http_methods": ["GET"]}},
                 },
-                "managed_ai_provider_network_access.openai",
+                "managed_network_integrations.openai",
             ),
             (
                 "self-managed-claude-domain",
                 {
-                    "managed_ai_provider_network_access": {"openai": True, "claude": True},
+                    "managed_network_integrations": managed_integrations({"openai": True, "claude": True}),
                     "allowed_network_access": {"api.anthropic.com": {"allow_http_methods": ["POST"]}},
                 },
-                "managed_ai_provider_network_access.claude",
+                "managed_network_integrations.claude",
             ),
             (
                 "user-openai-managed-flag",
                 {
-                    "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
+                    "managed_network_integrations": managed_integrations(SMOKE_MANAGED_PROVIDERS),
                     "allowed_network_access": {
-                        "api.github.com": {
+                        "api.example.com": {
                             "allow_http_methods": ["GET"],
                             "openai_disable_live_web_search": True,
                         }
@@ -917,9 +1044,9 @@ class AwsSmoke:
             (
                 "user-openai-account-guard-flag",
                 {
-                    "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
+                    "managed_network_integrations": managed_integrations(SMOKE_MANAGED_PROVIDERS),
                     "allowed_network_access": {
-                        "api.github.com": {
+                        "api.example.com": {
                             "allow_http_methods": ["GET"],
                             "openai_account_guard": True,
                         }
@@ -941,10 +1068,7 @@ class AwsSmoke:
         # exactly one of the successful requests, and enforcement ends active.
         # A torn or interleaved write would leave a policy nobody requested.
         variants = [
-            {
-                "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
-                "allowed_network_access": {f"smoke-{index}.example.com": {"allow_http_methods": ["GET"]}},
-            }
+            network_policy(SMOKE_MANAGED_PROVIDERS, {f"smoke-{index}.example.com": {"allow_http_methods": ["GET"]}})
             for index in range(4)
         ]
         results = self._parallel(
@@ -1271,15 +1395,7 @@ class AwsSmoke:
 
         # 4. Parallel writers allocated event seqs through the transaction, so
         # the agent event log must hold no duplicate seq anywhere.
-        seqs: list[int] = []
-        cursor = 0
-        while True:
-            page = self._api("GET", f"/v1/events?since={cursor}")["events"]
-            if not page:
-                break
-            page_seqs = [int(event["seq"]) for event in page]
-            seqs.extend(page_seqs)
-            cursor = max(page_seqs)
+        seqs = [int(event["seq"]) for event in self._agent_events()]
         if len(seqs) != len(set(seqs)):
             duplicates = sorted({seq for seq in seqs if seqs.count(seq) > 1})
             raise AssertionError(f"agent event log has duplicate seqs after the storms: {duplicates}")
@@ -1289,33 +1405,25 @@ class AwsSmoke:
         self._ok("cancel race won once, updates atomic, cancel sticky, event seqs unique")
 
     def check_event_pagination(self) -> None:
-        self._step("agent event pagination (5-event pages, strict seq ordering)")
-        seqs: list[int] = []
-        cursor = 0
-        while True:
-            page = self._api("GET", f"/v1/events?since={cursor}")["events"]
-            if not page:
-                break
-            if len(page) > 5:
-                raise AssertionError(f"event page holds {len(page)} events, expected at most 5")
-            page_seqs = [int(event["seq"]) for event in page]
-            if any(seq <= cursor for seq in page_seqs):
-                raise AssertionError(f"page contains seq <= since cursor {cursor}: {page_seqs}")
-            seqs.extend(page_seqs)
-            cursor = max(page_seqs)
-        if len(seqs) < 6:
-            raise AssertionError(f"expected the earlier checks to leave >5 events, found {len(seqs)}")
+        self._step("agent event pagination (newest-first cursor pages, strict seq ordering)")
+        events = self._agent_events()
+        if len(events) < 6:
+            raise AssertionError(f"expected the earlier checks to leave >5 events, found {len(events)}")
+        seqs = [int(event["seq"]) for event in events]
         if sorted(seqs) != seqs or len(set(seqs)) != len(seqs):
             raise AssertionError(f"event seqs are not strictly increasing/unique: {seqs}")
-        self._ok(f"{len(seqs)} events paged with strictly increasing unique seqs")
+        limited = self._api("GET", "/v1/events?limit=3")["events"]
+        if [int(event["seq"]) for event in limited] != seqs[-1:-4:-1]:
+            raise AssertionError(f"limit=3 did not return the newest three events: {limited}")
+        self._ok(f"{len(seqs)} events drained through the cursor with unique seqs")
 
     def check_enforcement(self) -> None:
         self._step("network enforcement (proxy + nftables, as the agent user)")
         proxy = f"http://127.0.0.1:{PROXY_PORT}"
         agent = "sudo -u trustyclaw-agent env"
-        allowed = self._ssh_code(f"{agent} HTTPS_PROXY={proxy} curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 https://api.github.com/")
-        denied = self._ssh_code(f"{agent} HTTPS_PROXY={proxy} curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 https://api.github.com/repos/openai/codex")
-        direct = self._ssh_code(f"{agent} curl -s -o /dev/null -w '%{{http_code}}' --max-time 12 https://api.github.com/ || true")
+        allowed = self._ssh_code(f"{agent} HTTPS_PROXY={proxy} curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 https://example.com/")
+        denied = self._ssh_code(f"{agent} HTTPS_PROXY={proxy} curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 https://example.com/denied")
+        direct = self._ssh_code(f"{agent} curl -s -o /dev/null -w '%{{http_code}}' --max-time 12 https://example.com/ || true")
         loopback_admin = self._ssh_code(
             f"{agent} curl -s -o /dev/null -w '%{{http_code}}' --connect-timeout 2 --max-time 5 "
             f"http://127.0.0.1:{ADMIN_PORT}/v1/health || true"
@@ -1330,13 +1438,261 @@ class AwsSmoke:
             raise AssertionError(
                 f"agent reached loopback admin API directly ({loopback_admin}); nftables should allow only the proxy port"
             )
+        # GitHub reads are universal: both the configured repository and a
+        # foreign public repository are forwarded and served, while GraphQL
+        # (which can mutate and cannot be parsed) fails closed at the proxy.
+        gh_allowed = self._ssh_code(
+            f"{agent} HTTPS_PROXY={proxy} curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 "
+            f"https://github.com/infiloop2/trustyclaw"
+        )
+        gh_foreign = self._ssh_code(
+            f"{agent} HTTPS_PROXY={proxy} curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 "
+            f"https://github.com/torvalds/linux"
+        )
+        gh_graphql = self._ssh_code(
+            f"{agent} HTTPS_PROXY={proxy} curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 "
+            "-X POST -d '{\"query\":\"{viewer{login}}\"}' https://api.github.com/graphql || true"
+        )
+        if gh_allowed != "200":
+            raise AssertionError(f"configured GitHub repo through proxy returned {gh_allowed!r}, expected 200")
+        if gh_foreign != "200":
+            raise AssertionError(f"foreign GitHub repo through proxy returned {gh_foreign!r}, expected 200 (reads are universal)")
+        if gh_graphql != "403":
+            raise AssertionError(f"GitHub GraphQL through proxy returned {gh_graphql!r}, expected proxy 403")
+        # End-to-end: a real git clone of the configured repository rides
+        # smart-HTTP through the proxy (git and gh are installed by bootstrap;
+        # git trusts the proxy CA via the system store).
+        tool_versions = self._ssh_code("git --version && gh --version | head -1")
+        if "git version" not in tool_versions or "gh version" not in tool_versions:
+            raise AssertionError(f"git/gh missing on the host: {tool_versions!r}")
+        self._ssh_code("sudo rm -rf /tmp/trustyclaw-smoke-clone /tmp/trustyclaw-smoke-foreign")
+        clone_ok = self._ssh_code(
+            f"{agent} HTTPS_PROXY={proxy} https_proxy={proxy} "
+            "git clone --depth 1 https://github.com/infiloop2/trustyclaw /tmp/trustyclaw-smoke-clone "
+            ">/dev/null 2>&1 && echo cloned; sudo rm -rf /tmp/trustyclaw-smoke-clone"
+        ).strip()
+        if clone_ok != "cloned":
+            raise AssertionError("git clone of the configured repository through the proxy failed")
+        # Reads are universal, so a foreign public repo clones too (a small one
+        # keeps the smoke fast); the denied network events come from the
+        # GraphQL and write denials above.
+        foreign_clone = self._ssh_code(
+            f"{agent} HTTPS_PROXY={proxy} https_proxy={proxy} "
+            "git clone --depth 1 https://github.com/octocat/Hello-World /tmp/trustyclaw-smoke-foreign "
+            ">/dev/null 2>&1 && echo cloned || echo denied; sudo rm -rf /tmp/trustyclaw-smoke-foreign"
+        ).strip()
+        if foreign_clone != "cloned":
+            raise AssertionError("git clone of a foreign public repository should be allowed (reads are universal)")
         events = self._network_events()
         decisions = {event["decision"] for event in events}
         if not {"allowed", "denied"} <= decisions:
             raise AssertionError(f"expected both allowed and denied network events, saw {decisions}")
         self._ok(
             f"proxy allowed=200 denied=403, direct blocked ({direct or 'no connection'}), "
-            f"admin loopback blocked ({loopback_admin or 'no connection'}), events logged"
+            f"admin loopback blocked ({loopback_admin or 'no connection'}), "
+            f"github reads listed={gh_allowed} foreign={gh_foreign} graphql-denied={gh_graphql}, events logged"
+        )
+
+    def check_github_read_paths(self) -> None:
+        """Every GitHub guard branch, unauthenticated — the guard decides
+        without a credential, so this covers the whole surface without one. When
+        GitHub is enabled reads are universal, so foreign repos and non-repo
+        paths (search) are forwarded and answer with GitHub's own status; writes
+        are gated on the write repo (infiloop2/trustyclaw), so a write to an
+        unlisted repo is denied by the proxy while a write to the listed repo
+        reaches upstream and returns GitHub's 401 (no credential installed).
+        Repository administration is denied even on the write repo, at the guard
+        before any credential, so the full admin-write denylist (forks, hooks,
+        keys, pages, actions secrets/permissions/oidc, protections, statuses,
+        run approval/deletion, ...) is exercised here as proxy 403s. GraphQL and
+        non-repo writes (create repo/gist) are denied too. HEAD refs keep the
+        checks default-branch-agnostic."""
+        self._step("github guard matrix (universal reads, scoped writes)")
+        proxy = f"http://127.0.0.1:{PROXY_PORT}"
+        curl = (
+            f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} "
+            "curl -s -o /dev/null -w '%{http_code}' --max-time 20"
+        )
+        # These unauthenticated API reads can be forwarded correctly while
+        # GitHub rate-limits the shared egress IP. Keep proxy-denial checks
+        # below exact; only upstream read responses get this tolerance.
+        read_ok = {"200", "403", "429"}
+        unauthenticated_read_ok = {"401", "403", "429"}
+        checks = [
+            # Reads are universal: the listed repo, a foreign public repo, and
+            # non-repo paths (search) are all forwarded to GitHub.
+            ("api listed repo read", f"{curl} https://api.github.com/repos/infiloop2/trustyclaw", read_ok),
+            ("api foreign repo read", f"{curl} https://api.github.com/repos/torvalds/linux", read_ok),
+            ("api search read", f"{curl} 'https://api.github.com/search/repositories?q=trustyclaw'", read_ok),
+            ("api rate_limit read", f"{curl} https://api.github.com/rate_limit", read_ok),
+            # /user needs auth; the proxy forwards it and GitHub's own 401 (no
+            # credential installed) comes back — a proxy denial would be 403.
+            ("api /user reaches upstream", f"{curl} https://api.github.com/user || true", unauthenticated_read_ok),
+            ("raw listed file", f"{curl} https://raw.githubusercontent.com/infiloop2/trustyclaw/HEAD/README.md", read_ok),
+            ("raw foreign file", f"{curl} https://raw.githubusercontent.com/torvalds/linux/HEAD/README", read_ok),
+            ("codeload listed tarball", f"{curl} https://codeload.github.com/infiloop2/trustyclaw/tar.gz/HEAD", read_ok),
+            ("codeload foreign tarball", f"{curl} https://codeload.github.com/torvalds/linux/tar.gz/HEAD", read_ok),
+            ("github.com web read", f"{curl} https://github.com/torvalds/linux", read_ok),
+            # The API tarball endpoint 302s to codeload; following the
+            # redirect exercises both domains in one read chain.
+            (
+                "api tarball redirect to codeload",
+                f"{curl} -L https://api.github.com/repos/infiloop2/trustyclaw/tarball/HEAD",
+                read_ok,
+            ),
+            # Writes to an unlisted repo are denied by the proxy before any
+            # credential question arises.
+            (
+                "receive-pack discovery on unlisted denied",
+                f"{curl} 'https://github.com/torvalds/linux/info/refs?service=git-receive-pack' || true",
+                "403",
+            ),
+            (
+                "api write to unlisted denied",
+                f"{curl} -X POST -d '{{}}' https://api.github.com/repos/torvalds/linux/issues || true",
+                "403",
+            ),
+            # A write to the listed repo passes the proxy and reaches upstream,
+            # which answers 401 without a credential (a proxy denial is 403).
+            (
+                "api write to listed reaches upstream",
+                f"{curl} -X POST -d '{{}}' https://api.github.com/repos/infiloop2/trustyclaw/issues || true",
+                "401",
+            ),
+            # GraphQL is denied outright (can mutate, cannot be parsed).
+            (
+                "api graphql denied",
+                f"{curl} -X POST -d '{{\"query\":\"{{viewer{{login}}}}\"}}' https://api.github.com/graphql || true",
+                "403",
+            ),
+            # Writes that target no repository at all (create a repo, create a
+            # gist) are never a configured write repo.
+            (
+                "api create-repo denied",
+                f"{curl} -X POST -d '{{\"name\":\"x\"}}' https://api.github.com/user/repos || true",
+                "403",
+            ),
+            (
+                "api create-gist denied",
+                f"{curl} -X POST -d '{{\"files\":{{}}}}' https://api.github.com/gists || true",
+                "403",
+            ),
+            # Encoded traversal: %2e%2e decodes to .. and collapses a write path
+            # onto an unlisted repo, which the canonicalizing guard must deny.
+            (
+                "encoded traversal write denied",
+                f"{curl} -X POST -d '{{}}' 'https://api.github.com/repos/infiloop2/trustyclaw/%2e%2e/%2e%2e/%2e%2e/repos/torvalds/linux/issues' || true",
+                "403",
+            ),
+            # github.com web mutations are denied everywhere: the API is the
+            # only mutation surface.
+            (
+                "github.com web mutation denied",
+                f"{curl} -X POST https://github.com/infiloop2/trustyclaw/issues || true",
+                "403",
+            ),
+            (
+                "uploads to unlisted denied",
+                f"{curl} -X POST https://uploads.github.com/repos/torvalds/linux/releases/1/assets || true",
+                "403",
+            ),
+            # LFS batch: upload is denied on any repo; an unparseable body
+            # fails closed.
+            (
+                "lfs upload denied",
+                f"{curl} -X POST -H 'Content-Type: application/json' "
+                f"-d '{{\"operation\":\"upload\",\"objects\":[]}}' "
+                f"https://github.com/infiloop2/trustyclaw.git/info/lfs/objects/batch || true",
+                "403",
+            ),
+            (
+                "lfs garbage body fails closed",
+                f"{curl} -X POST -d 'not-json' https://github.com/infiloop2/trustyclaw.git/info/lfs/objects/batch || true",
+                "403",
+            ),
+        ]
+        for name, command, expected in checks:
+            got = self._ssh_code(command).strip()
+            if isinstance(expected, set):
+                if got not in expected:
+                    raise AssertionError(f"{name}: expected one of {sorted(expected)}, got {got!r}")
+                continue
+            if got != expected:
+                raise AssertionError(f"{name}: expected {expected}, got {got!r}")
+        # Repository administration is denied even on the listed write repo, and
+        # the proxy denies it at the guard before any credential — so the full
+        # denylist is exercised here without a token (a proxy 403, not GitHub's
+        # 401/404). One representative method per sub-resource; the unit tests
+        # cover the exhaustive matrix.
+        admin_writes = [
+            ("PUT", ""),                                   # repo resource (settings/visibility)
+            ("POST", "forks"),
+            ("POST", "generate"),
+            ("POST", "transfer"),
+            ("PUT", "collaborators/attacker"),
+            ("POST", "keys"),
+            ("POST", "hooks"),
+            ("POST", "pages"),
+            ("POST", "releases"),
+            ("PUT", "environments/prod"),
+            ("PUT", "actions/secrets/TOKEN"),
+            ("PUT", "actions/variables/NAME"),
+            ("PUT", "actions/permissions"),
+            ("PUT", "actions/oidc/customization/sub"),
+            ("POST", "actions/runners/registration-token"),
+            ("PUT", "actions/workflows/ci.yml/disable"),
+            ("POST", "dispatches"),
+            ("PUT", "branches/main/protection"),
+            ("POST", "statuses/abc123"),
+            ("POST", "check-runs"),
+            ("POST", "deployments"),
+            ("POST", "actions/runs/1/approve"),
+            ("DELETE", "actions/runs/1"),
+            ("PATCH", "code-scanning/alerts/1"),
+            ("PUT", "vulnerability-alerts"),
+        ]
+        for method, sub in admin_writes:
+            suffix = f"/{sub}" if sub else ""
+            code = self._ssh_code(
+                f"{curl} -X {method} -d '{{}}' https://api.github.com/repos/infiloop2/trustyclaw{suffix} || true"
+            ).strip()
+            if code != "403":
+                raise AssertionError(f"admin write {method} {sub or '<repo>'}: expected proxy 403, got {code!r}")
+        # Real git: ls-remote of any repo rides the (now universal) read leg,
+        # while a push to an unlisted repo must be denied by the proxy at the
+        # receive-pack discovery leg.
+        agentenv = f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} https_proxy={proxy}"
+        ls_remote = self._ssh_code(
+            f"{agentenv} git ls-remote https://github.com/torvalds/linux HEAD "
+            ">/dev/null 2>&1 && echo ok || echo failed"
+        ).strip()
+        if ls_remote != "ok":
+            raise AssertionError("git ls-remote of a public repo failed through the proxy")
+        workdir = "/tmp/trustyclaw-smoke-push-denial"
+        self._ssh_code(f"sudo rm -rf {workdir}")
+        push_denied = self._ssh_code(
+            f"{agentenv} git clone --depth 1 https://github.com/infiloop2/trustyclaw {workdir} >/dev/null 2>&1 && "
+            f"{agentenv} git -C {workdir} push https://github.com/torvalds/linux HEAD:refs/heads/smoke-denied >/dev/null 2>&1 "
+            "&& echo pushed || echo denied"
+        ).strip()
+        self._ssh_code(f"sudo rm -rf {workdir}")
+        if push_denied != "denied":
+            raise AssertionError("git push to an unlisted repo should be denied by the proxy")
+        self._ok(
+            f"{len(checks)} guard-branch checks + {len(admin_writes)} admin-write denials "
+            "+ git ls-remote/push-denial across the github domains"
+        )
+
+    def _github_search_read_was_allowed(self, baseline_seq: int) -> bool:
+        """GitHub can answer unauthenticated search reads with 403 for rate or
+        abuse limits. Accept that only when the proxy recorded the exact search
+        request as allowed, so a proxy-side 403 still fails the smoke."""
+        return any(
+            event["decision"] == "allowed"
+            and event["host"] == "api.github.com"
+            and event["path"] == "/search/repositories"
+            and "q=trustyclaw" in event.get("query", "")
+            for event in self._network_events(since=baseline_seq)
         )
 
     def check_proxy_edge_cases(self) -> None:
@@ -1347,12 +1703,12 @@ class AwsSmoke:
 
         # CONNECT to a non-443 port and to an unlisted host: both denied before
         # any DNS or dial; curl reports a proxy CONNECT failure (not an HTTP code).
-        self._ssh_code(f"{agent} HTTPS_PROXY={proxy} curl -s -o /dev/null --max-time 12 https://api.github.com:444/ || true")
-        self._ssh_code(f"{agent} HTTPS_PROXY={proxy} curl -s -o /dev/null --max-time 12 https://example.com/ || true")
+        self._ssh_code(f"{agent} HTTPS_PROXY={proxy} curl -s -o /dev/null --max-time 12 https://example.com:444/ || true")
+        self._ssh_code(f"{agent} HTTPS_PROXY={proxy} curl -s -o /dev/null --max-time 12 https://iana.org/ || true")
         # Host header that does not match the CONNECT host: denied inside TLS.
         mismatch = self._ssh_code(
             f"{agent} HTTPS_PROXY={proxy} curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 "
-            f"-H 'Host: evil.example' https://api.github.com/"
+            f"-H 'Host: evil.example' https://example.com/"
         )
         # Percent-encoded path: the guard must match the decoded form —
         # /%7A%65%6E decodes to /zen, which ^/zen$ allows, while the raw
@@ -1361,25 +1717,25 @@ class AwsSmoke:
         # forwards the path as sent, and GitHub routes the encoded form to 404.
         encoded = self._ssh_code(
             f"{agent} HTTPS_PROXY={proxy} curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 "
-            f"https://api.github.com/%7A%65%6E || true"
+            f"https://example.com/%7A%65%6E || true"
         )
-        # Wildcard rule (*.githubusercontent.com) must admit a subdomain.
+        # Wildcard rule (*.example.com) must admit a subdomain.
         wildcard = self._ssh_code(
             f"{agent} HTTPS_PROXY={proxy} curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 "
-            f"https://raw.githubusercontent.com/ || true"
+            f"https://www.example.com/ || true"
         )
         # Plain HTTP rides the same policy path (curl only honors the
         # lowercase http_proxy variable for http:// URLs).
         plain = self._ssh_code(
             f"{agent} http_proxy={proxy} curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 "
-            f"http://api.github.com/ || true"
+            f"http://example.com/ || true"
         )
         malformed_length = self._ssh_code(
             "sudo -u trustyclaw-agent python3 - <<'PY'\n"
             "import socket\n"
             f"s = socket.create_connection(('127.0.0.1', {PROXY_PORT}), timeout=10)\n"
-            "s.sendall(b'GET http://api.github.com/ HTTP/1.1\\r\\n"
-            "Host: api.github.com\\r\\n"
+            "s.sendall(b'GET http://example.com/ HTTP/1.1\\r\\n"
+            "Host: example.com\\r\\n"
             "Content-Length: nope\\r\\n\\r\\n')\n"
             "s.shutdown(socket.SHUT_WR)\n"
             "print(s.recv(4096).decode('utf-8', 'replace'))\n"
@@ -1408,7 +1764,7 @@ class AwsSmoke:
             raise AssertionError(f"malformed Content-Length denial not logged; denied reasons: {reasons}")
         if not any(event["protocol"] == "http" and event["decision"] == "allowed" for event in events):
             raise AssertionError("plain HTTP request did not produce an allowed http event")
-        if not any(event["host"] == "raw.githubusercontent.com" and event["decision"] == "allowed" for event in events):
+        if not any(event["host"] == "www.example.com" and event["decision"] == "allowed" for event in events):
             raise AssertionError("wildcard-matched request did not produce an allowed event")
         if not any(event["path"] == "/%7A%65%6E" and event["decision"] == "allowed" for event in events):
             raise AssertionError("percent-encoded request was not logged as an allowed decision")
@@ -1420,9 +1776,9 @@ class AwsSmoke:
             "PUT",
             "/v1/network/policy",
             {
-                "managed_ai_provider_network_access": {},
+                "managed_network_integrations": {},
                 "allowed_network_access": {
-                    "api.github.com": {
+                    "example.com": {
                         "allow_http_methods": ["GET"],
                         "path_guards": ["^/$"],
                     },
@@ -1437,8 +1793,8 @@ class AwsSmoke:
         proxy = f"http://127.0.0.1:{PROXY_PORT}"
         curl = "curl -s -o /dev/null -w '%{http_code}\\n' --max-time 25"
         script = " ".join(
-            [f"{curl} https://api.github.com/ &" for _ in range(6)]
-            + [f"{curl} https://api.github.com/denied-{index} &" for index in range(6)]
+            [f"{curl} https://example.com/ &" for _ in range(6)]
+            + [f"{curl} https://example.com/denied-{index} &" for index in range(6)]
             + ["wait"]
         )
         codes = self._ssh_code(f'sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} bash -c "{script}"')
@@ -1451,7 +1807,7 @@ class AwsSmoke:
         # Every one of the 12 decisions must be logged with a unique seq: lost
         # or duplicated entries under parallel load mean the proxy's event
         # serialization (in-process lock + file lock + derived seq) is broken.
-        events = [event for event in self._network_events(since=baseline) if event["host"] == "api.github.com"]
+        events = [event for event in self._network_events(since=baseline) if event["host"] == "example.com"]
         seqs = [int(event["seq"]) for event in events]
         if len(events) != 12 or len(set(seqs)) != 12:
             raise AssertionError(f"expected 12 uniquely-sequenced events, got {len(events)} (seqs {sorted(seqs)})")
@@ -1466,10 +1822,7 @@ class AwsSmoke:
         self._api(
             "PUT",
             "/v1/network/policy",
-            {
-                "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
-                "allowed_network_access": {},
-            },
+            network_policy(SMOKE_MANAGED_PROVIDERS),
         )
         proxy = f"http://127.0.0.1:{PROXY_PORT}"
 
@@ -1537,10 +1890,7 @@ class AwsSmoke:
         self._api(
             "PUT",
             "/v1/network/policy",
-            {
-                "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
-                "allowed_network_access": {},
-            },
+            network_policy(SMOKE_MANAGED_PROVIDERS),
         )
         proxy = f"http://127.0.0.1:{PROXY_PORT}"
 
@@ -1663,10 +2013,7 @@ class AwsSmoke:
         self._api(
             "PUT",
             "/v1/network/policy",
-            {
-                "managed_ai_provider_network_access": dict(SMOKE_MANAGED_PROVIDERS),
-                "allowed_network_access": {},
-            },
+            network_policy(SMOKE_MANAGED_PROVIDERS),
         )
         # The status is cached and refreshed by a background poller every 10s;
         # earlier steps ran under policies that deny Codex traffic, so wait for
@@ -1805,6 +2152,7 @@ class AwsSmoke:
             if account.get("status") != "active" or not account.get("account_id"):
                 raise AssertionError(f"{runtime} account should be active before mixed tasks: {account}")
             self._assert_provider_metadata(runtime, account)
+        self._assert_provider_account_anchors(live_pins=True)
         self._ok("Codex and Claude Code are active at the same time with account pins available")
 
     def check_runtime_deactivation_stops_running_tasks(self) -> None:
@@ -1838,6 +2186,7 @@ class AwsSmoke:
             status = self._wait_for_runtime_status({"deactivated"}, runtime=runtime, timeout=90)
             if status != "deactivated":
                 raise AssertionError(f"{runtime} did not deactivate after provider disable: {status}")
+        self._assert_provider_account_anchors(live_pins=False)
         for task_id, runtime in tasks.items():
             done = self._wait_for_task(task_id, timeout=90)
             if done["status"] != "failed":
@@ -1850,6 +2199,7 @@ class AwsSmoke:
             status = self._wait_for_runtime_status({"active"}, runtime=runtime, timeout=240)
             if status != "active":
                 raise AssertionError(f"{runtime} did not recover to active after provider re-enable: {status}")
+        self._assert_provider_account_anchors(live_pins=True)
         self._ok("disabling providers failed running tasks, closed runtimes, and both runtimes recovered after re-enable")
 
     def check_agent_parallelism(self) -> None:
@@ -2176,19 +2526,17 @@ class AwsSmoke:
         stop = threading.Event()
 
         def reader() -> None:
-            cursor = baseline
             while not stop.is_set():
-                status, body = self._api_status("GET", f"/v1/network/events?since={cursor}")
+                status, body = self._api_status("GET", "/v1/network/events")
                 if status != 200:
                     reader_failures.append(f"GET /v1/network/events -> {status}: {body}")
                     return
                 reader_reads["count"] += 1
                 page_seqs = [int(event["seq"]) for event in body["events"]]
                 if page_seqs:
-                    if len(set(page_seqs)) != len(page_seqs) or min(page_seqs) <= cursor:
-                        reader_failures.append(f"inconsistent page at cursor {cursor}: {page_seqs}")
+                    if len(set(page_seqs)) != len(page_seqs) or page_seqs != sorted(page_seqs, reverse=True):
+                        reader_failures.append(f"inconsistent network event page: {page_seqs}")
                         return
-                    cursor = max(page_seqs)
                 else:
                     time.sleep(0.2)
 
@@ -2245,7 +2593,7 @@ class AwsSmoke:
         ).strip().splitlines()
         if isolation != ["t", "ok"]:
             raise AssertionError(f"proxy database role is not confined to network_events: {isolation}")
-        final = self._api("GET", f"/v1/network/events?since={verdict['max_seq'] - 5}")
+        final = self._api("GET", "/v1/network/events")
         if not final["events"]:
             raise AssertionError("admin API cannot read the network events after the storm")
         self._ok(
@@ -2366,25 +2714,36 @@ class AwsSmoke:
             last = page[-1]["task_id"]
 
     def _network_events(self, since: int = 0) -> list[dict]:
-        """Drain `/v1/network/events`, which pages 5 events at a time with a
-        `since` seq cursor, into the full list of events after ``since``."""
+        """Drain `/v1/network/events` cursor pages into events after ``since``."""
+        return self._drain_event_pages("/v1/network/events", since)
+
+    def _agent_events(self, since: int = 0) -> list[dict]:
+        """Drain `/v1/events` cursor pages into events after ``since``."""
+        return self._drain_event_pages("/v1/events", since)
+
+    def _drain_event_pages(self, endpoint: str, since: int) -> list[dict]:
+        """Walk an audit log's newest-first cursor pages, asserting the page
+        contract, and return events after ``since`` oldest-first."""
         events: list[dict] = []
-        cursor = since
+        before: int | None = None
         while True:
-            page = self._api("GET", f"/v1/network/events?since={cursor}")["events"]
+            query = "?limit=100" if before is None else f"?before={before}&limit=100"
+            page = self._api("GET", f"{endpoint}{query}")["events"]
             if not page:
-                return events
-            if len(page) > 5:
-                raise AssertionError(f"network event page holds {len(page)} events, expected at most 5")
+                return sorted(events, key=lambda event: int(event["seq"]))
+            if len(page) > 100:
+                raise AssertionError(f"{endpoint} page holds {len(page)} events, expected at most 100")
             page_seqs = [int(event["seq"]) for event in page]
-            if page_seqs != sorted(page_seqs):
-                raise AssertionError(f"network event page is not sorted by seq: {page_seqs}")
-            if any(seq <= cursor for seq in page_seqs):
-                raise AssertionError(f"network event page contains seq <= since cursor {cursor}: {page_seqs}")
+            if page_seqs != sorted(page_seqs, reverse=True):
+                raise AssertionError(f"{endpoint} page is not sorted by descending seq: {page_seqs}")
+            if before is not None and any(seq >= before for seq in page_seqs):
+                raise AssertionError(f"{endpoint} page contains seq >= before cursor {before}: {page_seqs}")
             if len(set(page_seqs)) != len(page_seqs):
-                raise AssertionError(f"network event page contains duplicate seqs: {page_seqs}")
-            events.extend(page)
-            cursor = max(page_seqs)
+                raise AssertionError(f"{endpoint} page contains duplicate seqs: {page_seqs}")
+            events.extend(event for event in page if int(event["seq"]) > since)
+            if min(page_seqs) <= since:
+                return sorted(events, key=lambda event: int(event["seq"]))
+            before = min(page_seqs)
 
     def _agent_account(self, runtime_type: str) -> dict:
         accounts = self._api("GET", "/v1/agent-runtime/account")["accounts"]
@@ -2416,6 +2775,48 @@ class AwsSmoke:
                     check_no_secretish_keys(item)
 
         check_no_secretish_keys(account)
+
+    def _assert_provider_account_anchors(self, *, live_pins: bool) -> None:
+        snapshot = self._provider_account_pin_snapshot()
+        openai = snapshot.get("openai")
+        claude = snapshot.get("claude")
+        if not isinstance(openai, dict) or not openai.get("admin_account_id"):
+            raise AssertionError(f"OpenAI admin account anchor is missing: {snapshot}")
+        if not isinstance(claude, dict) or not claude.get("admin_account_id") or not claude.get("admin_token_sha256"):
+            raise AssertionError(f"Claude admin account anchor is missing: {snapshot}")
+        if live_pins:
+            if openai.get("pin_account_id") != openai.get("admin_account_id"):
+                raise AssertionError(f"OpenAI proxy pin does not match admin account anchor: {snapshot}")
+            if claude.get("pin_account_id") != claude.get("admin_account_id"):
+                raise AssertionError(f"Claude proxy account pin does not match admin account anchor: {snapshot}")
+            if claude.get("pin_token_sha256") != claude.get("admin_token_sha256"):
+                raise AssertionError(f"Claude proxy token pin does not match admin account anchor: {snapshot}")
+        else:
+            if openai.get("pin_account_id") or openai.get("pin_token_sha256"):
+                raise AssertionError(f"OpenAI live proxy pin survived provider deactivation: {snapshot}")
+            if claude.get("pin_account_id") or claude.get("pin_token_sha256"):
+                raise AssertionError(f"Claude live proxy pin survived provider deactivation: {snapshot}")
+
+    def _provider_account_pin_snapshot(self) -> dict:
+        query = """
+SELECT jsonb_object_agg(
+    providers.provider,
+    jsonb_build_object(
+        'admin_account_id', provider_accounts.account_id,
+        'admin_token_sha256', provider_accounts.metadata->>'access_token_sha256',
+        'pin_account_id', proxy_provider_pins.account_id,
+        'pin_token_sha256', proxy_provider_pins.access_token_sha256
+    )
+)::text
+FROM (VALUES ('openai'), ('claude')) AS providers(provider)
+LEFT JOIN provider_accounts USING (provider)
+LEFT JOIN proxy_provider_pins USING (provider)
+"""
+        output = self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c "
+            + shlex.quote(query)
+        )
+        return json.loads(output) if output else {}
 
     def print_network_events(self, label: str, *, since: int = 0) -> None:
         try:

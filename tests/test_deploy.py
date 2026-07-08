@@ -1187,6 +1187,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("/usr/local/lib/trustyclaw-host/read-codex-account-id", bootstrap)
         self.assertIn("/usr/local/lib/trustyclaw-host/run-claude-code", bootstrap)
         self.assertIn("/usr/local/lib/trustyclaw-host/read-claude-account", bootstrap)
+        self.assertIn("/usr/local/lib/trustyclaw-host/clear-agent-auth", bootstrap)
         self.assertIn("/usr/local/lib/trustyclaw-host/read-agent-file", bootstrap)
         # Network policy, provider pins, and network events live in the
         # database now (proxy role read-only for policy/pins); the three sudo
@@ -1202,7 +1203,7 @@ class DeployUnitTests(unittest.TestCase):
         # for upgrade/recover) lives in host.runtime.write_config now; bootstrap
         # passes the operation mode through and stages the effective config for
         # the root-only steps. Behavior is covered by tests/test_write_config.py.
-        self.assertIn("python3 -m host.runtime.write_config) > /tmp/trustyclaw_effective_config.json", bootstrap)
+        self.assertIn("python3 -m host.runtime.write_config > /tmp/trustyclaw_effective_config.json", bootstrap)
         self.assertIn("json.dumps({'mode': payload['operation']['mode'], 'runtime_config': payload['runtime_config']})", bootstrap)
         self.assertIn("chmod 600 /tmp/trustyclaw_effective_config.json", bootstrap)
         self.assertIn("pathlib.Path('/tmp/trustyclaw_effective_config.json').read_text()", bootstrap)
@@ -1268,10 +1269,43 @@ class DeployUnitTests(unittest.TestCase):
         self.assertNotIn("chown -R trustyclaw-admin:trustyclaw-admin /mnt/trustyclaw-admin/admin-state", bootstrap)
         self.assertNotIn("chown -R trustyclaw-agent:trustyclaw-agent /mnt/trustyclaw-agent/agent-home", bootstrap)
         self.assertIn("chmod 711 /mnt/trustyclaw-agent", bootstrap)
+        self.assertIn('agent_home / "AGENTS.md"', bootstrap)
+        self.assertIn('agent_home / "CLAUDE.md"', bootstrap)
+        self.assertIn('agent_home / ".codex" / "config.toml"', bootstrap)
+        self.assertIn('agent_home / ".claude" / "settings.json"', bootstrap)
+        self.assertIn("AGENT_HOME_SOURCE_DIR=/opt/trustyclaw-host/host/bootstrap/agent-home", bootstrap)
+        self.assertIn("install -m 0644 -o root -g root", bootstrap)
+        self.assertIn("chattr -f -i", bootstrap)
+        self.assertIn("chattr +i", bootstrap)
+        agent_instructions = Path("host/bootstrap/agent-home/agents_claude.md").read_text()
+        codex_config = Path("host/bootstrap/agent-home/.codex/config.toml").read_text()
+        claude_settings = Path("host/bootstrap/agent-home/.claude/settings.json").read_text()
+        self.assertIn("You are runnign with full permissions", agent_instructions)
+        self.assertIn("Do not prompt the operator for local approvals", agent_instructions)
+        self.assertIn("TrustyClaw network policy proxy", agent_instructions)
+        self.assertIn("github_push_queued_for_approval", agent_instructions)
+        self.assertIn("queued for approval as push-<id>", agent_instructions)
+        self.assertIn("github_dot_github_rest_write_denied", agent_instructions)
+        self.assertIn("TrustyClaw admin UI", agent_instructions)
+        self.assertIn("GitHub GraphQL requests are denied by policy", agent_instructions)
+        self.assertIn("equivalent REST endpoint with `gh api`", agent_instructions)
+        self.assertNotIn("alternate transports", agent_instructions)
+        self.assertIn('"$AGENT_HOME_SOURCE_DIR/agents_claude.md" "$AGENT_HOME_PATH/AGENTS.md"', bootstrap)
+        self.assertIn('"$AGENT_HOME_SOURCE_DIR/agents_claude.md" "$AGENT_HOME_PATH/CLAUDE.md"', bootstrap)
+        self.assertIn('approval_policy = "never"', codex_config)
+        self.assertIn('sandbox_mode = "danger-full-access"', codex_config)
+        self.assertIn('"defaultMode": "bypassPermissions"', claude_settings)
+        self.assertIn('"skipDangerousModePermissionPrompt": true', claude_settings)
         self.assertIn('if [ ! -f "$PROXY_STATE_DIR/network_proxy_ca.key" ]', bootstrap)
-        # Managed Codex policy restricts the agent to cached web search.
+        # Managed Codex policy restricts the agent to cached web search and
+        # disables Codex-hosted app/plugin connector surfaces.
         self.assertIn("/etc/codex/requirements.toml", bootstrap)
         self.assertIn('allowed_web_search_modes = ["cached"]', bootstrap)
+        self.assertIn("[features]", bootstrap)
+        self.assertIn("apps = false", bootstrap)
+        self.assertIn("plugins = false", bootstrap)
+        self.assertIn("tool_search = false", bootstrap)
+        self.assertIn("tool_suggest = false", bootstrap)
         # The bootstrap runs with umask 077: the npm-installed CLI and the
         # managed config directory must be opened up so the agent can use
         # them, and the deploy verifies the agent can actually run both CLIs.
@@ -1286,12 +1320,17 @@ class DeployUnitTests(unittest.TestCase):
         self.assertNotIn("NODE_EXTRA_CA_CERTS=/mnt/trustyclaw-admin/proxy-state/network_proxy_ca.crt", helper_sources)
         self.assertIn('os.environ.get("CLAUDE_CONFIG_DIR"', helper_sources)
         self.assertIn('config_dir / ".credentials.json"', helper_sources)
+        self.assertIn('config.get("oauthAccount")', helper_sources)
+        self.assertIn('credentials.get("claudeAiOauth")', helper_sources)
+        self.assertIn('tokens.get("accessToken")', helper_sources)
         self.assertNotIn('oauth.get("billingType")', helper_sources)
         self.assertNotIn('tokens.get("subscriptionType")', helper_sources)
         self.assertNotIn('config.get("claudeCodeFirstTokenDate")', helper_sources)
         self.assertIn("chmod -R a+rX /usr/local/lib/node_modules", bootstrap)
         self.assertIn("chmod 755 /etc/codex", bootstrap)
         self.assertIn("runuser -u trustyclaw-agent -- env HOME=/mnt/trustyclaw-agent/agent-home", helper_sources)
+        self.assertNotIn("-c 'approval_policy=", helper_sources)
+        self.assertNotIn("-c 'sandbox_mode=", helper_sources)
         # Agent runtimes are resource-limited: bootstrap installs a slice with
         # CPU weight, memory bounds, and a task cap, and both launch helpers
         # start the runtime in a transient scope under it, so agent processes
@@ -1327,6 +1366,10 @@ class DeployUnitTests(unittest.TestCase):
         apt_line = next(line for line in bootstrap.splitlines() if "apt-get install" in line)
         self.assertNotIn(" npm", apt_line)
         self.assertNotIn(" nodejs", apt_line)
+        # git and gh back the managed GitHub integration; both come from the
+        # Ubuntu archive (no third-party apt repo) and ride unattended-upgrades.
+        self.assertIn(" git ", apt_line)
+        self.assertIn(" gh ", apt_line)
         self.assertIn("requires existing admin state version file", bootstrap)
         self.assertNotIn("legacy/unversioned", bootstrap)
         self.assertNotIn("LEGACY_UNVERSIONED_STATE_VERSION", bootstrap)
@@ -1432,6 +1475,7 @@ class DeployUnitTests(unittest.TestCase):
             "read-codex-account-id",
             "run-claude-code",
             "read-claude-account",
+            "clear-agent-auth",
             "read-agent-file",
             "reboot-host",
         ):
@@ -1609,6 +1653,11 @@ class DeployUnitTests(unittest.TestCase):
 
         self.assertIn("host/runtime/admin_api.py", names)
         self.assertIn("host/version.py", names)
+        self.assertIn("host/bootstrap/agent-home/agents_claude.md", names)
+        self.assertNotIn("host/bootstrap/agent-home/AGENTS.md", names)
+        self.assertNotIn("host/bootstrap/agent-home/CLAUDE.md", names)
+        self.assertIn("host/bootstrap/agent-home/.codex/config.toml", names)
+        self.assertIn("host/bootstrap/agent-home/.claude/settings.json", names)
         self.assertNotIn("host/cli", names)
         self.assertFalse(any(name.startswith("host/cli/") for name in names))
 

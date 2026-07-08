@@ -24,6 +24,9 @@ access to host state.
 - **Coming soon: workflow apps:** install purpose-built apps with richer UX than
   a terminal chat loop.
 
+These choices follow from a broader set of beliefs about running AI agents.
+See [PHILOSOPHY.md](./PHILOSOPHY.md).
+
 ## Configure
 
 To deploy TrustyClaw, you need:
@@ -348,3 +351,9 @@ For deeper architecture and contribution notes, read:
 - [`docs/architecture/index.md`](docs/architecture/index.md)
 - [`docs/development/index.md`](docs/development/index.md)
 - [`docs/api/index.md`](docs/api/index.md)
+- [`docs/audit-reports/README.md`](docs/audit-reports/README.md)
+
+## License
+
+TrustyClaw is free software, licensed under the GNU Affero General Public
+License v3.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).

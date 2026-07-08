@@ -2,6 +2,9 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 umask 077
+# Bootstrap is usually launched from the operator home over SSH. Use a neutral
+# cwd so runuser children do not inherit an unreadable directory.
+cd /
 NODE_VERSION=22.12.0
 CODEX_CLI_VERSION=0.140.0
 CLAUDE_CODE_VERSION=2.1.177
@@ -211,6 +214,7 @@ def recreate_directory(path: Path) -> None:
 admin_mount = Path("/mnt/trustyclaw-admin")
 admin_state = admin_mount / "admin-state"
 proxy_state = admin_mount / "proxy-state"
+agent_home = Path("/mnt/trustyclaw-agent/agent-home")
 pgdata = admin_mount / "postgres" / os.environ["PG_MAJOR"] / "main"
 for directory in (
     # admin-state holds only the deploy-plane version.json now; runtime admin
@@ -224,7 +228,9 @@ for directory in (
     pgdata.parent,
     pgdata,
     proxy_state,
-    Path("/mnt/trustyclaw-agent/agent-home"),
+    agent_home,
+    agent_home / ".codex",
+    agent_home / ".claude",
 ):
     ensure_directory(directory)
 recreate_directory(proxy_state / "generated-certs")
@@ -237,6 +243,10 @@ for path in (
     pgdata / "pg_hba.conf",
     proxy_state / "network_proxy_ca.key",
     proxy_state / "network_proxy_ca.crt",
+    agent_home / "AGENTS.md",
+    agent_home / "CLAUDE.md",
+    agent_home / ".codex" / "config.toml",
+    agent_home / ".claude" / "settings.json",
 ):
     ensure_regular_file_slot(path)
 PY
@@ -360,7 +370,7 @@ echo "== installing system packages =="
 # npm package pulls in hundreds of node-* dependencies. -qq keeps the output to
 # warnings and errors.
 apt-get update -qq
-apt-get install -y -qq brotli ca-certificates curl jq nftables openssl python3 python3-venv sudo unattended-upgrades xz-utils zstd
+apt-get install -y -qq brotli ca-certificates curl gh git jq nftables openssl python3 python3-venv sudo unattended-upgrades xz-utils zstd
 
 # PostgreSQL for admin state. postgresql-common is installed first so its
 # default-cluster creation can be disabled: the data directory must live on
@@ -485,14 +495,12 @@ runuser -u postgres -- psql -d trustyclaw_admin -v ON_ERROR_STOP=1 --quiet \
 # Both run as trustyclaw-admin: migrations are owned by the same role the
 # service uses, so the service never needs DDL rights it does not already
 # have, and on upgrade/recover write_config carries the stored password and
-# operator connections over from the existing config table. The subshell cd
-# keeps Python from stumbling over a working directory the service user cannot
-# read (runuser preserves the caller's cwd). write_config echoes the effective
-# config, which is staged root-only for the later bootstrap steps (SSH keys,
-# cloudflared) that need it without database access.
+# operator connections over from the existing config table. write_config echoes
+# the effective config, which is staged root-only for the later bootstrap steps
+# (SSH keys, cloudflared) that need it without database access.
 echo "== migrating admin state schema =="
-(cd / && runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.migrate up)
-python3 - <<'PY' | (cd / && runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.write_config) > /tmp/trustyclaw_effective_config.json
+runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.migrate up
+python3 - <<'PY' | runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.write_config > /tmp/trustyclaw_effective_config.json
 import json, pathlib
 payload = json.loads(pathlib.Path('/tmp/trustyclaw_payload.json').read_text())
 print(json.dumps({'mode': payload['operation']['mode'], 'runtime_config': payload['runtime_config']}))
@@ -589,13 +597,19 @@ else
   rm -f /etc/systemd/system/trustyclaw-cloudflared.service /etc/trustyclaw/cloudflared.token /etc/trustyclaw/cloudflare_hostname
 fi
 
-# Managed Codex policy: restrict the agent to cached web search, so it never
-# performs live web fetches. The network proxy is the second layer (it denies
-# live web_search payloads on the OpenAI domains).
+# Managed Codex policy: restrict the agent to cached web search and disable
+# Codex-hosted app/plugin connector surfaces. The network proxy is the second
+# layer for web search: it denies live web_search payloads on OpenAI domains.
 mkdir -p /etc/codex
 chmod 755 /etc/codex
 cat > /etc/codex/requirements.toml <<'EOF'
 allowed_web_search_modes = ["cached"]
+
+[features]
+apps = false
+plugins = false
+tool_search = false
+tool_suggest = false
 EOF
 chmod 644 /etc/codex/requirements.toml
 
@@ -631,21 +645,36 @@ update-ca-certificates
 mkdir -p /usr/local/lib/trustyclaw-host "$PROXY_STATE_DIR/generated-certs"
 chmod 755 /usr/local/lib/trustyclaw-host
 HELPER_SOURCE_DIR=/opt/trustyclaw-host/host/bootstrap/helpers
+AGENT_HOME_SOURCE_DIR=/opt/trustyclaw-host/host/bootstrap/agent-home
 HELPER_NAMES=(
   run-codex-app-server
   read-codex-account-id
   run-claude-code
   read-claude-account
+  clear-agent-auth
   read-agent-file
   reboot-host
+  mint-github-app-token
+  audit-github-repo
+  approve-github-push
 )
 for helper_name in "${HELPER_NAMES[@]}"; do
   sed "s/@""PROXY_PORT@/${PROXY_PORT}/g" \
     "$HELPER_SOURCE_DIR/${helper_name}.sh" \
     > "/usr/local/lib/trustyclaw-host/${helper_name}"
 done
-chown root:root /usr/local/lib/trustyclaw-host/run-codex-app-server /usr/local/lib/trustyclaw-host/read-codex-account-id /usr/local/lib/trustyclaw-host/run-claude-code /usr/local/lib/trustyclaw-host/read-claude-account /usr/local/lib/trustyclaw-host/read-agent-file /usr/local/lib/trustyclaw-host/reboot-host
-chmod 755 /usr/local/lib/trustyclaw-host/run-codex-app-server /usr/local/lib/trustyclaw-host/read-codex-account-id /usr/local/lib/trustyclaw-host/run-claude-code /usr/local/lib/trustyclaw-host/read-claude-account /usr/local/lib/trustyclaw-host/read-agent-file /usr/local/lib/trustyclaw-host/reboot-host
+chown root:root /usr/local/lib/trustyclaw-host/*
+chmod 755 /usr/local/lib/trustyclaw-host/*
+
+# GitHub credentials are injected by the network proxy (the agent never
+# holds the token), so the only client wiring is the gh shim: gh refuses to
+# run authenticated calls without GH_TOKEN, so the shim supplies a fixed
+# placeholder that the proxy strips and replaces. /usr/local/bin precedes
+# /usr/bin on PATH, so the shim shadows the packaged gh. git needs no wiring
+# at all — its unauthenticated requests are authenticated in transit.
+sed "s/@""PROXY_PORT@/${PROXY_PORT}/g" "$HELPER_SOURCE_DIR/gh-shim.sh" > /usr/local/bin/gh
+chown root:root /usr/local/bin/gh
+chmod 755 /usr/local/bin/gh
 
 # Final durable-volume ownership. Avoid recursive chown across preserved mutable
 # trees; only directory roots and known managed files are adjusted.
@@ -659,6 +688,7 @@ chown trustyclaw-admin:trustyclaw-admin /mnt/trustyclaw-admin/admin-home
 chmod 700 /mnt/trustyclaw-admin/admin-home
 chown trustyclaw-agent:trustyclaw-agent /mnt/trustyclaw-agent/agent-home
 chmod 700 /mnt/trustyclaw-agent/agent-home
+install -d -m 700 -o trustyclaw-agent -g trustyclaw-agent "$AGENT_HOME_PATH/.codex" "$AGENT_HOME_PATH/.claude"
 chown trustyclaw-proxy:trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state
 chmod 700 /mnt/trustyclaw-admin/proxy-state
 chown trustyclaw-proxy:trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state/generated-certs
@@ -670,8 +700,30 @@ chmod 644 /mnt/trustyclaw-admin/proxy-state/network_proxy_ca.crt
 # empty default (deny everything), which is exactly what the old seeded empty
 # policy expressed.
 
+# Durable agent runtime config and instructions. The files live in this repo so
+# harness expectations are reviewable, and bootstrap installs them root-owned,
+# world-readable, and immutable so the agent can read but not alter them.
+for managed_agent_file in \
+  "$AGENT_HOME_PATH/AGENTS.md" \
+  "$AGENT_HOME_PATH/CLAUDE.md" \
+  "$AGENT_HOME_PATH/.codex/config.toml" \
+  "$AGENT_HOME_PATH/.claude/settings.json"; do
+  if [ -e "$managed_agent_file" ]; then
+    chattr -f -i "$managed_agent_file" 2>/dev/null || true
+  fi
+done
+install -m 0644 -o root -g root "$AGENT_HOME_SOURCE_DIR/agents_claude.md" "$AGENT_HOME_PATH/AGENTS.md"
+install -m 0644 -o root -g root "$AGENT_HOME_SOURCE_DIR/agents_claude.md" "$AGENT_HOME_PATH/CLAUDE.md"
+install -m 0644 -o root -g root "$AGENT_HOME_SOURCE_DIR/.codex/config.toml" "$AGENT_HOME_PATH/.codex/config.toml"
+install -m 0644 -o root -g root "$AGENT_HOME_SOURCE_DIR/.claude/settings.json" "$AGENT_HOME_PATH/.claude/settings.json"
+chattr +i \
+  "$AGENT_HOME_PATH/AGENTS.md" \
+  "$AGENT_HOME_PATH/CLAUDE.md" \
+  "$AGENT_HOME_PATH/.codex/config.toml" \
+  "$AGENT_HOME_PATH/.claude/settings.json"
+
 cat > /etc/sudoers.d/trustyclaw-host <<'SUDOERS'
-trustyclaw-admin ALL=(root) NOPASSWD: /usr/local/lib/trustyclaw-host/reboot-host, /usr/local/lib/trustyclaw-host/run-codex-app-server, /usr/local/lib/trustyclaw-host/read-codex-account-id, /usr/local/lib/trustyclaw-host/run-claude-code, /usr/local/lib/trustyclaw-host/read-claude-account, /usr/local/lib/trustyclaw-host/read-agent-file
+trustyclaw-admin ALL=(root) NOPASSWD: /usr/local/lib/trustyclaw-host/reboot-host, /usr/local/lib/trustyclaw-host/run-codex-app-server, /usr/local/lib/trustyclaw-host/read-codex-account-id, /usr/local/lib/trustyclaw-host/run-claude-code, /usr/local/lib/trustyclaw-host/read-claude-account, /usr/local/lib/trustyclaw-host/clear-agent-auth, /usr/local/lib/trustyclaw-host/read-agent-file, /usr/local/lib/trustyclaw-host/mint-github-app-token, /usr/local/lib/trustyclaw-host/audit-github-repo, /usr/local/lib/trustyclaw-host/approve-github-push
 SUDOERS
 chmod 440 /etc/sudoers.d/trustyclaw-host
 

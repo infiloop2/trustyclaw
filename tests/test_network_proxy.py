@@ -63,7 +63,7 @@ class NetworkProxyTests(unittest.TestCase):
     def save_policy(self, allowed_network_access: dict) -> None:
         save_policy(
             {
-                "managed_ai_provider_network_access": {"openai": True},
+                "managed_network_integrations": {"openai": {"enabled": True}},
                 "allowed_network_access": allowed_network_access,
             },
             "2026-06-08T00:00:00Z",
@@ -141,7 +141,7 @@ class NetworkProxyTests(unittest.TestCase):
         # No fallback cache by design: the pins and the decision log live in
         # the same database, so nothing could keep flowing anyway — an outage
         # denies every request until the database returns. Simple, fail safe.
-        save_policy({"managed_ai_provider_network_access": {}, "allowed_network_access": {
+        save_policy({"managed_network_integrations": {}, "allowed_network_access": {
             "api.example.com": {"allow_http_methods": ["GET"]}
         }}, "2026-06-08T00:00:00Z")
         loaded = network_proxy._load_enforcement_policy()
@@ -493,7 +493,7 @@ class NetworkProxyTests(unittest.TestCase):
         self.proxy_ca()
         proxy = self.start_proxy()
         save_policy(
-            {"managed_ai_provider_network_access": {"openai": True}, "allowed_network_access": {}},
+            {"managed_network_integrations": {"openai": {"enabled": True}}, "allowed_network_access": {}},
             "2026-06-08T00:00:00Z",
         )
         save_proxy_openai_account_id("acct-test")

@@ -1,0 +1,6 @@
+# Managed by TrustyClaw bootstrap; rewritten on every deploy.
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[projects."/mnt/trustyclaw-agent/agent-home"]
+trust_level = "trusted"

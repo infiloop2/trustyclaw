@@ -35,7 +35,30 @@ VERSION = (REPO_ROOT / "VERSION").read_text().strip()
 UI_ASSETS = {
     "/": ("admin_ui.html", "text/html; charset=utf-8"),
     "/admin_ui.css": ("admin_ui.css", "text/css; charset=utf-8"),
-    "/admin_ui.js": ("admin_ui.js", "application/javascript; charset=utf-8"),
+    "/favicon.ico": ("admin_favicon.svg", "image/svg+xml"),
+    "/favicon.svg": ("admin_favicon.svg", "image/svg+xml"),
+}
+UI_ASSETS.update({
+    f"/admin_ui/{module.name}": (f"admin_ui/{module.name}", "application/javascript; charset=utf-8")
+    for module in sorted((RUNTIME_DIR / "admin_ui").glob("*.js"))
+})
+UI_ASSET_VERSION_PLACEHOLDER = "__TRUSTYCLAW_ASSET_VERSION__"
+SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "base-uri 'none'; "
+        "connect-src 'self'; "
+        "font-src 'self'; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'; "
+        "img-src 'self' data:; "
+        "object-src 'none'; "
+        "script-src 'self'; "
+        "style-src 'self'"
+    ),
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
 }
 PASSWORD = "dev"
 TASK_RE = re.compile(r"^/v1/tasks/([^/]+)(?:/(steer|cancel|kill|events))?$")
@@ -77,11 +100,12 @@ class MockState:
     network_events: list[dict[str, Any]] = field(default_factory=list)
     policy: dict[str, Any] = field(
         default_factory=lambda: {
-            "managed_ai_provider_network_access": {},
+            "managed_network_integrations": {},
             "allowed_network_access": {},
         }
     )
     logged_in: dict[str, bool] = field(default_factory=lambda: {"codex": False, "claude_code": False})
+    github_credential: dict[str, Any] | None = None
     codex_oauth: dict[str, str] = field(default_factory=dict)
     claude_oauth: dict[str, str] = field(default_factory=dict)
     reboot_requested: bool = False
@@ -105,17 +129,21 @@ class MockState:
             self.task_events.setdefault(task_id, []).append(event)
 
     def add_network_event(self, method: str, host: str, path: str, decision: str, timestamp: str | None = None) -> None:
-        self.network_events.append(
-            {
-                "seq": self.next_network_event_seq,
-                "timestamp": timestamp or self.now(),
-                "method": method,
-                "protocol": "https",
-                "host": host,
-                "path": path,
-                "decision": decision,
-            }
-        )
+        parsed = urlparse(path)
+        event = {
+            "seq": self.next_network_event_seq,
+            "timestamp": timestamp or self.now(),
+            "method": method,
+            "protocol": "https",
+            "host": host,
+            "port": 443,
+            "path": parsed.path or "/",
+            "query": parsed.query,
+            "decision": decision,
+        }
+        if decision == "denied":
+            event["reason"] = "host is not in the allowed network policy"
+        self.network_events.append(event)
         self.next_network_event_seq += 1
 
     def public_task(self, task: dict[str, Any], queue_position: int | None = None) -> dict[str, Any]:
@@ -126,8 +154,9 @@ class MockState:
 
     def runtime_status(self, runtime: str) -> str:
         provider = PROVIDER_BY_RUNTIME[runtime]
-        managed = self.policy.get("managed_ai_provider_network_access", {})
-        if not isinstance(managed, dict) or managed.get(provider) is not True:
+        managed = self.policy.get("managed_network_integrations", {})
+        integration = managed.get(provider) if isinstance(managed, dict) else None
+        if not isinstance(integration, dict) or integration.get("enabled") is not True:
             return "deactivated"
         return "active" if self.logged_in.get(runtime) else "awaiting_login"
 
@@ -216,6 +245,26 @@ def seed_state() -> None:
             "started_min": None,
             "completed_min": 1490,
         },
+        {
+            "task_id": "task_6",
+            "thread_id": "incident-response",
+            "agent_runtime": "codex",
+            "status": "running",
+            "input_message": "Investigate the production alert and draft the mitigation plan.",
+            "created_min": 18,
+            "started_min": 17,
+            "completed_min": 16,
+        },
+        {
+            "task_id": "task_7",
+            "thread_id": "docs-cleanup",
+            "agent_runtime": "claude_code",
+            "status": "queued",
+            "input_message": "Rewrite the onboarding notes to match the current deploy flow.",
+            "created_min": 9,
+            "started_min": None,
+            "completed_min": 9,
+        },
     ]
     for spec in seed_tasks:
         task = {
@@ -297,6 +346,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:
         self._handle("PUT")
 
+    def do_DELETE(self) -> None:
+        self._handle("DELETE")
+
     def log_message(self, fmt: str, *args: object) -> None:
         return
 
@@ -305,11 +357,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if method == "GET" and parsed.path in UI_ASSETS:
                 filename, content_type = UI_ASSETS[parsed.path]
-                data = (RUNTIME_DIR / filename).read_bytes()
+                if parsed.path == "/":
+                    html = (RUNTIME_DIR / filename).read_text()
+                    data = html.replace(UI_ASSET_VERSION_PLACEHOLDER, VERSION).encode()
+                else:
+                    data = (RUNTIME_DIR / filename).read_bytes()
                 self._send(HTTPStatus.OK, data, content_type)
-                return
-            if method == "GET" and parsed.path == "/favicon.ico":
-                self._send(HTTPStatus.NO_CONTENT, b"", "text/plain")
                 return
             self._authenticate()
             response = route(method, parsed.path, parse_qs(parsed.query), self._read_body())
@@ -336,6 +389,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status.value)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        if content_type.startswith(("text/html", "text/css", "application/javascript")):
+            self.send_header("Cache-Control", "no-store, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+        for name, value in SECURITY_HEADERS.items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -347,12 +406,16 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> dic
         return agent_runtime_status()
     if method == "GET" and path == "/v1/agent-runtime/account":
         return agent_accounts()
+    if method == "POST" and path == "/v1/agent-runtime/refresh":
+        return refresh_agent_accounts(body)
     if path == "/v1/agent-runtime/codex-oauth-login":
         return oauth("codex", method)
     if path == "/v1/agent-runtime/claude-oauth-login":
         return oauth("claude_code", method)
     if path == "/v1/agent-runtime/claude-oauth-login/complete" and method == "POST":
         return complete_claude_oauth(body)
+    if path == "/v1/agent-runtime/reset-linked-account" and method == "POST":
+        return reset_linked_account(body)
     if path == "/v1/tasks":
         if method == "GET":
             return list_tasks()
@@ -367,18 +430,29 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> dic
     if method == "GET" and thread_match:
         return list_thread_tasks(unquote(thread_match.group(1)))
     if method == "GET" and path == "/v1/events":
-        return {"events": agent_events(since(query))}
+        before, limit = event_page_query(query, {"before", "limit"}, "event")
+        return {"events": agent_events_before(before, limit)}
     if path == "/v1/network/policy":
         if method == "GET":
             return {"network_controls": STATE.policy}
         if method == "PUT":
             return replace_policy(body)
+    if path == "/v1/network-tools/github-credential":
+        return github_credential_route(method, body)
+    if method == "GET" and path == "/v1/network-tools/github-pending-pushes":
+        return {"pending_pushes": []}
+    if method == "POST" and path == "/v1/network-tools/github-audit":
+        return github_credential_route("GET", None)
     if method == "GET" and path == "/v1/network/events":
-        return {"events": network_events(since(query))}
+        before, limit = event_page_query(query, {"before", "decision", "limit"}, "network event")
+        decision = (query.get("decision") or ["all"])[0]
+        return {"events": network_events_before(before, decision, limit)}
     if method == "GET" and path == "/v1/agent-files":
         return list_agent_files(one(query, "path") or "/")
     if method == "GET" and path == "/v1/agent-files/read":
         return read_agent_file(one(query, "path") or "/")
+    if method == "GET" and path == "/v1/agent-processes":
+        return agent_processes()
     if method == "POST" and path == "/v1/host-runtime/reboot":
         STATE.reboot_requested = True
         return {"status": "accepted"}
@@ -471,6 +545,10 @@ def agent_accounts() -> dict[str, Any]:
                             },
                         }
                     )
+                elif STATE.logged_in.get(runtime):
+                    # The account anchor outlives sessions and deactivation:
+                    # identity stays visible while the runtime is not active.
+                    account.update({"account_id": "acct_mock_openai", "email": "akshay@infiloop.io"})
             else:
                 account = {"agent_runtime": runtime, "provider": "claude", "status": status}
                 if status == "active":
@@ -487,8 +565,19 @@ def agent_accounts() -> dict[str, Any]:
                             },
                         }
                     )
+                elif STATE.logged_in.get(runtime):
+                    account.update({"account_id": "acct_mock_claude", "email": "claude@example.invalid"})
             accounts.append(account)
         return {"accounts": accounts}
+
+
+def refresh_agent_accounts(body: Any) -> dict[str, Any]:
+    if body is not None and not isinstance(body, dict):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "request body must be an object")
+    runtime = body.get("agent_runtime") if isinstance(body, dict) else None
+    if runtime is not None and runtime not in RUNTIMES:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "agent_runtime must be codex or claude_code")
+    return agent_accounts()
 
 
 def oauth(runtime: str, method: str) -> dict[str, str]:
@@ -522,6 +611,7 @@ def oauth(runtime: str, method: str) -> dict[str, str]:
                 STATE.logged_in["codex"] = True
                 STATE.add_agent_event("agent_runtime.login_completed", None, {"agent_runtime": "codex"})
                 STATE.add_agent_event("agent_runtime.active", None, {"agent_runtime": "codex"})
+                start_queued_tasks_locked()
             return dict(STATE.codex_oauth)
     if method not in {"GET", "POST"}:
         raise ApiError(HTTPStatus.NOT_FOUND, "route not found")
@@ -549,6 +639,22 @@ def complete_claude_oauth(body: Any) -> dict[str, str]:
         STATE.add_agent_event("agent_runtime.active", None, {"agent_runtime": "claude_code"})
         start_queued_tasks_locked()
     return {"status": "accepted"}
+
+
+def reset_linked_account(body: Any) -> dict[str, str]:
+    if not isinstance(body, dict) or body.get("agent_runtime") not in RUNTIMES:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "agent_runtime must be codex or claude_code")
+    runtime = body["agent_runtime"]
+    with STATE.lock:
+        # The real reset fails running tasks as part of clearing the anchor.
+        fail_running_tasks_locked(runtime, "the linked provider account was reset by the operator")
+        STATE.logged_in[runtime] = False
+        if runtime == "codex":
+            STATE.codex_oauth = {}
+        else:
+            STATE.claude_oauth = {}
+        STATE.add_agent_event("agent_runtime.linked_account_reset", None, {"agent_runtime": runtime})
+        return {"status": "accepted"}
 
 
 def runtime_label(runtime: str) -> str:
@@ -675,17 +781,138 @@ def list_thread_tasks(thread_id: str) -> dict[str, Any]:
         return {"tasks": list(reversed(tasks))}
 
 
-def agent_events(min_seq: int) -> list[dict[str, Any]]:
+def event_page_query(
+    query: dict[str, list[str]], allowed: set[str], label: str
+) -> tuple[int | None, int]:
+    unsupported = sorted(set(query) - allowed)
+    if unsupported:
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"unsupported {label} query parameter: {unsupported[0]}")
+    before_value = query.get("before")
+    before = int(before_value[0]) if before_value else None
+    try:
+        limit = int((query.get("limit") or ["100"])[0])
+    except ValueError as exc:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "limit must be an integer") from exc
+    if limit < 1:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "limit must be positive")
+    if limit > 100:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "limit must be at most 100")
+    return before, limit
+
+
+def agent_events_before(before: int | None, limit: int) -> list[dict[str, Any]]:
     with STATE.lock:
         progress_running_tasks_locked()
         start_queued_tasks_locked()
-        return [event for event in STATE.agent_events if event["seq"] > min_seq]
+        events = list(reversed(STATE.agent_events))
+        if before is not None:
+            events = [event for event in events if event["seq"] < before]
+        return events[:limit]
 
 
-def network_events(min_seq: int) -> list[dict[str, Any]]:
+def network_events_before(before: int | None, decision: str, limit: int) -> list[dict[str, Any]]:
     with STATE.lock:
         progress_running_tasks_locked()
-        return [event for event in STATE.network_events if event["seq"] > min_seq]
+        events = list(reversed(STATE.network_events))
+        if before is not None:
+            events = [event for event in events if event["seq"] < before]
+        if decision in {"allowed", "denied"}:
+            events = [event for event in events if event["decision"] == decision]
+        return events[:limit]
+
+
+def agent_processes() -> dict[str, Any]:
+    with STATE.lock:
+        progress_running_tasks_locked()
+        processes: list[dict[str, Any]] = []
+
+        def add_process(
+            pid: int,
+            ppid: int,
+            name: str,
+            cmdline: str,
+            rss_mib: int,
+            elapsed_seconds: int,
+            scope: str,
+            state: str = "S",
+        ) -> None:
+            processes.append(
+                {
+                    "pid": pid,
+                    "ppid": ppid,
+                    "user": "trustyclaw-agent",
+                    "state": state,
+                    "name": name,
+                    "cmdline": cmdline,
+                    "rss_bytes": rss_mib * 1024 * 1024,
+                    "elapsed_seconds": elapsed_seconds,
+                    "scope": scope,
+                }
+            )
+
+        if STATE.codex_oauth and not STATE.logged_in.get("codex"):
+            add_process(
+                4300,
+                1,
+                "codex",
+                "codex login --device-code",
+                64,
+                22,
+                "run-mock-codex-login.scope",
+            )
+        if STATE.claude_oauth:
+            add_process(
+                4400,
+                1,
+                "claude",
+                "claude auth login --claudeai",
+                71,
+                18,
+                "run-mock-claude-login.scope",
+            )
+        if STATE.logged_in.get("codex"):
+            add_process(
+                4310,
+                1,
+                "codex",
+                "codex app-server --listen stdio://",
+                88,
+                184,
+                "run-mock-codex-app-server.scope",
+            )
+        if STATE.logged_in.get("claude_code"):
+            add_process(
+                4410,
+                1,
+                "claude",
+                "claude -p /usage --output-format json",
+                96,
+                9,
+                "run-mock-claude-usage.scope",
+            )
+
+        running = [task for task in STATE.tasks if task["status"] == "running"]
+        for index, task in enumerate(running, start=1):
+            runtime = task["agent_runtime"]
+            scope = f"run-mock-{task['task_id']}.scope"
+            base_pid = 4500 + (index * 10)
+            if runtime == "codex":
+                add_process(base_pid, 4310, "codex", "codex exec --json", 142, 31, scope)
+                add_process(
+                    base_pid + 1,
+                    base_pid,
+                    "python3",
+                    "python3 -m pytest tests/test_admin_api.py -q",
+                    118,
+                    24,
+                    scope,
+                    state="R",
+                )
+                add_process(base_pid + 2, base_pid, "rg", "rg -n TODO host tests", 11, 4, scope)
+            else:
+                add_process(base_pid, 1, "claude", "claude --print --output-format stream-json", 176, 28, scope)
+                add_process(base_pid + 1, base_pid, "bash", "bash -lc npm test -- --runInBand", 9, 20, scope)
+        return {"processes": processes, "truncated": False}
 
 
 def list_agent_files(path: str) -> dict[str, Any]:
@@ -694,15 +921,16 @@ def list_agent_files(path: str) -> dict[str, Any]:
             {"name": ".claude", "path": "/.claude", "type": "directory", "modified_at": ago(180)},
             {"name": ".codex", "path": "/.codex", "type": "directory", "modified_at": ago(180)},
             {"name": ".gitconfig", "path": "/.gitconfig", "type": "file", "size_bytes": 143, "modified_at": ago(2880)},
-            {"name": "AGENTS.md", "path": "/AGENTS.md", "type": "file", "size_bytes": 486, "modified_at": ago(2880)},
+            {"name": "AGENTS.md", "path": "/AGENTS.md", "type": "file", "size_bytes": 851, "modified_at": ago(2880)},
+            {"name": "CLAUDE.md", "path": "/CLAUDE.md", "type": "file", "size_bytes": 851, "modified_at": ago(2880)},
             {"name": "workspace", "path": "/workspace", "type": "directory", "modified_at": ago(84)},
         ],
         "/.claude": [
-            {"name": "settings.json", "path": "/.claude/settings.json", "type": "file", "size_bytes": 96, "modified_at": ago(180)},
+            {"name": "settings.json", "path": "/.claude/settings.json", "type": "file", "size_bytes": 117, "modified_at": ago(180)},
         ],
         "/.codex": [
             {"name": "auth.json", "path": "/.codex/auth.json", "type": "file", "size_bytes": 18, "modified_at": ago(180)},
-            {"name": "config.toml", "path": "/.codex/config.toml", "type": "file", "size_bytes": 74, "modified_at": ago(180)},
+            {"name": "config.toml", "path": "/.codex/config.toml", "type": "file", "size_bytes": 187, "modified_at": ago(180)},
         ],
         "/workspace": [
             {"name": "acme-web", "path": "/workspace/acme-web", "type": "directory", "modified_at": ago(84)},
@@ -745,15 +973,44 @@ def read_agent_file(path: str) -> dict[str, Any]:
     contents = {
         "/.gitconfig": "[user]\n\tname = TrustyClaw Agent\n\temail = agent@trustyclaw.invalid\n[init]\n\tdefaultBranch = main\n",
         "/AGENTS.md": (
-            "# Agent instructions\n\n"
-            "You are running inside a TrustyClaw sandbox. All network access goes\n"
-            "through the policy proxy; request additional domains from the operator\n"
-            "instead of retrying blocked calls.\n\n"
-            "Work under /workspace and keep commits small.\n"
+            "# TrustyClaw Agent Host\n\n"
+            "You are running as `trustyclaw-agent` on a TrustyClaw host.\n\n"
+            "You are runnign with full permissions. Do not prompt the operator for local approvals.\n\n"
+            "Network access is controlled by TrustyClaw, not by the local agent sandbox. "
+            "Agent traffic goes through the TrustyClaw network policy proxy. If a "
+            "domain, API, or package source is blocked, report the exact host and path "
+            "and ask the operator to allow it.\n\n"
+            "When GitHub access is configured, TrustyClaw injects credentials through "
+            "the proxy. Use normal `git` and REST-backed `gh api` commands from this host.\n\n"
+            "GitHub GraphQL requests are denied by policy because repository scope cannot be "
+            "verified safely from GraphQL bodies. If a `gh` command fails because it uses "
+            "GraphQL, switch to an equivalent REST endpoint with `gh api`, or use `git` "
+            "for clone, fetch, and push operations.\n"
         ),
-        "/.claude/settings.json": '{\n  "permissions": {\n    "defaultMode": "acceptEdits"\n  }\n}\n',
+        "/CLAUDE.md": (
+            "# TrustyClaw Agent Host\n\n"
+            "You are running as `trustyclaw-agent` on a TrustyClaw host.\n\n"
+            "You are runnign with full permissions. Do not prompt the operator for local approvals.\n\n"
+            "Network access is controlled by TrustyClaw, not by the local agent sandbox. "
+            "Agent traffic goes through the TrustyClaw network policy proxy. If a "
+            "domain, API, or package source is blocked, report the exact host and path "
+            "and ask the operator to allow it.\n\n"
+            "When GitHub access is configured, TrustyClaw injects credentials through "
+            "the proxy. Use normal `git` and REST-backed `gh api` commands from this host.\n\n"
+            "GitHub GraphQL requests are denied by policy because repository scope cannot be "
+            "verified safely from GraphQL bodies. If a `gh` command fails because it uses "
+            "GraphQL, switch to an equivalent REST endpoint with `gh api`, or use `git` "
+            "for clone, fetch, and push operations.\n"
+        ),
+        "/.claude/settings.json": '{\n  "permissions": {\n    "defaultMode": "bypassPermissions"\n  },\n  "skipDangerousModePermissionPrompt": true\n}\n',
         "/.codex/auth.json": '{"mock": "redacted"}\n',
-        "/.codex/config.toml": 'model = "gpt-5-codex"\napproval_policy = "never"\nsandbox_mode = "danger-full-access"\n',
+        "/.codex/config.toml": (
+            '# Managed by TrustyClaw bootstrap; rewritten on every deploy.\n'
+            'approval_policy = "never"\n'
+            'sandbox_mode = "danger-full-access"\n\n'
+            '[projects."/mnt/trustyclaw-agent/agent-home"]\n'
+            'trust_level = "trusted"\n'
+        ),
         '/workspace/bad" onclick="window.__xss=1" x=".txt': "quote-bearing mock file\n",
         '/workspace/<img src=x onerror="window.__fileNameXss=1">.txt': (
             '<script>window.__fileContentXss=1</script>'
@@ -801,6 +1058,156 @@ def read_agent_file(path: str) -> dict[str, Any]:
         "encoding": "utf-8-replacement",
         "content": content,
     }
+
+
+def github_credential_route(method: str, body: Any) -> dict[str, Any]:
+    # Like the real admin API, deliberately not gated on the GitHub
+    # integration being enabled: credentials can be staged first.
+    with STATE.lock:
+        if method == "PUT":
+            if not isinstance(body, dict):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "GitHub credential request must be an object")
+            mode = body.get("mode")
+            if mode == "pat":
+                token = body.get("token")
+                if not isinstance(token, str) or not token.strip() or any(character.isspace() for character in token):
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "token must be a non-empty token string without whitespace")
+                STATE.github_credential = {"mode": "pat", "updated_at": STATE.now(), "validation": {"status": "not_checked"}}
+            elif mode == "app":
+                for field_name in ("app_id", "installation_id", "private_key_pem"):
+                    if not isinstance(body.get(field_name), str) or not body[field_name].strip():
+                        raise ApiError(HTTPStatus.BAD_REQUEST, f"{field_name} is required for app mode")
+                STATE.github_credential = {
+                    "mode": "app",
+                    "app_id": body["app_id"].strip(),
+                    "installation_id": body["installation_id"].strip(),
+                    "app_token_expires_at": "2999-01-01T00:00:00Z",
+                    "updated_at": STATE.now(),
+                    "validation": {"status": "ok"},
+                }
+            else:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "mode must be 'pat' or 'app'")
+        elif method == "DELETE":
+            STATE.github_credential = None
+        elif method != "GET":
+            raise ApiError(HTTPStatus.NOT_FOUND, "route not found")
+        response = {"configured": False} if STATE.github_credential is None else {"configured": True, **STATE.github_credential}
+        audits = github_repo_audits_locked()
+        if audits:
+            response["repository_audits"] = audits
+        return response
+
+
+def github_repo_audits_locked() -> list[dict[str, Any]]:
+    """Canned per-repository audit results, mirroring the real API's shape:
+    present once a credential is stored and the policy lists repositories.
+    Each repository cycles through a different outcome so the UI's renderings
+    (critical warnings, plain warnings, a clean audit, failed fetches, and
+    incomplete audits) are all visible with a few repositories configured."""
+    integrations = STATE.policy.get("managed_network_integrations", {})
+    github = integrations.get("github") if isinstance(integrations, dict) else None
+    repositories = (github or {}).get("write_repositories") or []
+    if STATE.github_credential is None:
+        return [
+            {
+                "owner": repository.get("owner"),
+                "repo": repository.get("repo"),
+                "warnings": [
+                    {
+                        "code": "repository_audit_incomplete",
+                        "severity": "warning",
+                        "message": "Repository audit could not verify this write target: no credential token "
+                        "to audit with. TrustyClaw does not have enough information to check repository "
+                        "visibility, GitHub Pages, default branch protection, or workflows.",
+                    }
+                ],
+            }
+            for repository in repositories
+        ]
+    outcomes: list[dict[str, Any]] = [
+        {
+            "warnings": [
+                {
+                    "code": "public_repository",
+                    "severity": "critical",
+                    "message": "Repository is public and a write target: everything the agent "
+                    "pushes here is world-visible, and a public write repository is an "
+                    "exfiltration sink. Make write repositories private.",
+                },
+                {
+                    "code": "workflows_execute_pushes",
+                    "severity": "warning",
+                    "message": "The repository has GitHub Actions workflows: a push runs the "
+                    "workflow as it exists on the pushed branch. Run workflows for untrusted "
+                    "code in a no-internet container.",
+                },
+            ]
+        },
+        {
+            "warnings": [
+                {
+                    "code": "secrets_exposed_to_pr_workflows",
+                    "severity": "critical",
+                    "message": "Workflows use pull_request_target, which runs with the base "
+                    "repository's secrets against PR-influenced context. Restrict or remove "
+                    "these triggers.",
+                },
+                {
+                    "code": "unprotected_default_branch",
+                    "severity": "warning",
+                    "message": "The token can push and the default branch is unprotected: add a "
+                    "GitHub ruleset or branch protection so the agent only opens PRs.",
+                },
+            ]
+        },
+        {"warnings": []},
+        {
+            "error": "audit failed: GET /repos returned 403 (token cannot see this repository)",
+            "warnings": [
+                {
+                    "code": "repository_audit_incomplete",
+                    "severity": "warning",
+                    "message": "Repository audit could not verify this write target: GET /repos returned "
+                    "403 (token cannot see this repository). TrustyClaw does not have enough information "
+                    "to check repository visibility, GitHub Pages, default branch protection, or workflows.",
+                }
+            ],
+        },
+        {
+            "warnings": [
+                {
+                    "code": "repository_audit_incomplete",
+                    "severity": "warning",
+                    "message": "Repository audit could not verify this write target: repository audit has "
+                    "not run yet. TrustyClaw does not have enough information to check repository "
+                    "visibility, GitHub Pages, default branch protection, or workflows.",
+                }
+            ]
+        },
+        {
+            "warnings": [
+                {
+                    "code": "pages_visibility_unknown",
+                    "severity": "warning",
+                    "message": "GitHub Pages visibility could not be verified for this private repository: "
+                    "GitHub did not conclusively report that Pages is disabled, and denied or hid the "
+                    "Pages settings, so the audit cannot prove whether pushes to a Pages source would "
+                    "publish agent-written content to the internet.",
+                }
+            ]
+        },
+    ]
+    audits: list[dict[str, Any]] = []
+    for index, repository in enumerate(repositories):
+        audits.append(
+            {
+                "owner": repository.get("owner"),
+                "repo": repository.get("repo"),
+                "audited_at": STATE.now(),
+                **outcomes[index % len(outcomes)],
+            }
+        )
+    return audits
 
 
 def replace_policy(body: Any) -> dict[str, Any]:
@@ -927,12 +1334,53 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True, help="Local port to bind, for example 3100.")
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Start pre-configured (GitHub enabled with repositories, an App credential, manual domain rules) "
+        "for interactive exploration; the UI smoke needs the default empty state.",
+    )
     return parser.parse_args(argv)
+
+
+def seed_demo_state() -> None:
+    """A configured host for interactive exploration: GitHub enabled with
+    repositories cycling through every audit outcome, a GitHub App
+    credential, and a couple of manual domain rules."""
+    STATE.policy = {
+        "managed_network_integrations": {
+            "github": {
+                "enabled": True,
+                "write_repositories": [
+                    {"owner": "infiloop2", "repo": "trustyclaw"},
+                    {"owner": "infiloop2", "repo": "infibot"},
+                    {"owner": "infiloop2", "repo": "dotfiles"},
+                    {"owner": "acme", "repo": "private-infra"},
+                    {"owner": "acme", "repo": "docs-site"},
+                    {"owner": "acme", "repo": "pages-source"},
+                ],
+            },
+        },
+        "allowed_network_access": {
+            "api.example.com": {"allow_http_methods": ["GET", "HEAD"], "path_guards": ["^/v1(?:/.*)?$"]},
+            "*.assets.example.com": {"allow_http_methods": ["GET"]},
+        },
+    }
+    STATE.github_credential = {
+        "mode": "app",
+        "app_id": "12345",
+        "installation_id": "67890",
+        "app_token_expires_at": "2026-07-06T23:59:00Z",
+        "updated_at": STATE.now(),
+        "validation": {"status": "ok", "checked_at": STATE.now()},
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     seed_state()
+    if args.demo:
+        seed_demo_state()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     actual_host, actual_port = server.server_address
     print(f"TrustyClaw mock admin UI: http://{actual_host}:{actual_port}/")

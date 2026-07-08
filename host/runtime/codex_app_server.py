@@ -8,8 +8,13 @@ short-lived servers, while task turns run on per-thread servers the
 orchestrator keeps warm between tasks.
 
 A device-code login only completes while the app-server that started it keeps
-polling, so ``start_device_login`` parks its server in ``_login_server`` until
-``account_status`` sees the login land (or a new login starts).
+polling, so ``start_device_login`` parks its server in ``_login_server``. The
+status poller is the sole reader of that parked server: it drives the login
+forward and persists the completion notification into ``_completed_login_accounts``
+for the orchestrator to capture. The parked server lives until the orchestrator
+captures the completed login, a new login starts, or an operator reset closes
+it. Status probes never close it: agent-side credentials can look active while
+an operator flow is still pending.
 
 The Codex app-server initialize request includes a fixed TrustyClaw client
 version. Keep this stable unless TrustyClaw intentionally changes the client
@@ -34,6 +39,8 @@ ACCOUNT_ID_HELPER_TIMEOUT_SECONDS = 10
 CLIENT_VERSION = "v1.0"
 
 _login_server: "CodexAppServer | None" = None
+_login_id: str | None = None
+_completed_login_accounts: dict[str, str | None] = {}
 _login_lock = threading.Lock()
 
 
@@ -170,6 +177,23 @@ class CodexAppServer:
             return self._pending.popleft()
         return self._next_message(timeout)
 
+    def collect_completed_login_accounts(self) -> dict[str, str | None]:
+        """Consume successful account/login/completed notifications."""
+        completed: dict[str, str | None] = {}
+        pending: deque[dict[str, Any]] = deque()
+        while self._pending:
+            message = self._pending.popleft()
+            if message.get("method") == "account/login/completed":
+                params = message.get("params")
+                if isinstance(params, dict) and params.get("success") is True:
+                    login_id = params.get("loginId")
+                    if isinstance(login_id, str) and login_id:
+                        completed[login_id] = _account_id_from_login_payload(params)
+                continue
+            pending.append(message)
+        self._pending = pending
+        return completed
+
     def _next_message(self, timeout: float) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
         while True:
@@ -206,9 +230,49 @@ def account_status() -> tuple[str, str | None, dict[str, Any] | None]:
     # restrictive policy) must not wedge the poller — it resolves to "error"
     # with a detail until conditions improve. The init timeout leaves room for
     # a cold Node start on a small instance.
+    login_server = _current_login_server()
+    if login_server is not None:
+        return _login_server_status(login_server)
+
     server = CodexAppServer()
     try:
         server.start(init_timeout=45)
+        return _account_status_from_server(server)
+    except CodexAppServerError as exc:
+        return _codex_status_error(exc, server)
+    finally:
+        server.close()
+
+
+def _current_login_server() -> "CodexAppServer | None":
+    with _login_lock:
+        server = _login_server
+    if server is None:
+        return None
+    if server.alive():
+        return server
+    dead_server = _pop_login_server_if_current(server)
+    if dead_server is not None:
+        dead_server.close()
+    return None
+
+
+def _login_server_status(server: "CodexAppServer") -> tuple[str, str | None, dict[str, Any] | None]:
+    # The status poller is the only reader of the parked login server, so it also
+    # drains the account/login/completed notifications that
+    # read_completed_device_login_account_id later looks up. collect is
+    # destructive, so persist whatever this read surfaced before returning.
+    status = _account_status_from_server(server)
+    completed = server.collect_completed_login_accounts()
+    if completed:
+        with _login_lock:
+            if _login_server is server:
+                _completed_login_accounts.update(completed)
+    return status
+
+
+def _account_status_from_server(server: "CodexAppServer") -> tuple[str, str | None, dict[str, Any] | None]:
+    try:
         result = server.call("account/read", {"refreshToken": False}, timeout=15)
         if not isinstance(result, dict):
             raise CodexAppServerError("Codex account/read returned invalid result")
@@ -216,28 +280,39 @@ def account_status() -> tuple[str, str | None, dict[str, Any] | None]:
         if account:
             account_id = read_codex_account_id()
             if account_id:
-                close_login_server()
                 account_metadata = _safe_account_metadata(account if isinstance(account, dict) else {})
                 account_metadata["account_id"] = account_id
-                rate_limits = _safe_rate_limits_metadata(server.call("account/rateLimits/read", {}, timeout=15))
+                try:
+                    rate_limits = _safe_rate_limits_metadata(server.call("account/rateLimits/read", {}, timeout=15))
+                except CodexAppServerError:
+                    # Usage is optional metadata. An account without a proxy
+                    # pin (agent-side credentials awaiting operator approval)
+                    # cannot reach the guarded usage endpoint; that must still
+                    # classify as a readable account, not a runtime error.
+                    rate_limits = {}
                 if rate_limits:
                     account_metadata["codex_usage"] = rate_limits
                 return "active", None, account_metadata
             raise CodexAppServerError("Codex account/read returned an account without a supported account id")
         return "awaiting_login", None, None
     except CodexAppServerError as exc:
-        message = str(exc).lower()
-        # Only treat specific "not logged in" phrasings as awaiting_login, so a
-        # real failure that merely mentions auth infrastructure (e.g. "could not
-        # reach auth.openai.com", "authorization server unreachable") surfaces as
-        # an error with its detail instead of an impossible login prompt.
-        login_markers = ("not logged in", "logged out", "login required", "must log in",
-                         "no account", "unauthorized", "401")
-        if any(marker in message for marker in login_markers):
-            return "awaiting_login", None, None
-        return "error", _error_detail(str(exc), server.stderr_tail()), None
-    finally:
-        server.close()
+        return _codex_status_error(exc, server)
+
+
+def _codex_status_error(
+    exc: CodexAppServerError,
+    server: "CodexAppServer",
+) -> tuple[str, str | None, dict[str, Any] | None]:
+    message = str(exc).lower()
+    # Only treat specific "not logged in" phrasings as awaiting_login, so a
+    # real failure that merely mentions auth infrastructure (e.g. "could not
+    # reach auth.openai.com", "authorization server unreachable") surfaces as
+    # an error with its detail instead of an impossible login prompt.
+    login_markers = ("not logged in", "logged out", "login required", "must log in",
+                     "no account", "unauthorized", "401")
+    if any(marker in message for marker in login_markers):
+        return "awaiting_login", None, None
+    return "error", _error_detail(str(exc), server.stderr_tail()), None
 
 
 def _error_detail(message: str, stderr: str) -> str:
@@ -266,6 +341,25 @@ def _string_field(value: dict[str, Any], key: str) -> str | None:
     if not isinstance(item, str):
         return None
     return item.strip() or None
+
+
+def _account_id_from_login_payload(value: Any) -> str | None:
+    """Extract account id only from the app-server login/account payload.
+
+    First capture must not fall back to ``~/.codex/auth.json``: that file is
+    agent-writable and can be swapped after the device-code login completes.
+    """
+    if not isinstance(value, dict):
+        return None
+    for key in ("account_id", "accountId", "chatgpt_account_id", "chatgptAccountId"):
+        item = _string_field(value, key)
+        if item:
+            return item
+    for key in ("account", "tokens", "auth", "user"):
+        item = _account_id_from_login_payload(value.get(key))
+        if item:
+            return item
+    return None
 
 
 def _rate_limit_scalar(value: Any) -> Any:
@@ -349,7 +443,7 @@ def read_codex_account_id(command: list[str] | None = None) -> str | None:
 
 
 def start_device_login() -> CodexLogin:
-    global _login_server
+    global _login_id, _login_server
     server = CodexAppServer()
     server.start()
     try:
@@ -360,9 +454,12 @@ def start_device_login() -> CodexLogin:
         server.close()
         raise
     with _login_lock:
-        if _login_server is not None:
-            _login_server.close()
+        old_server = _login_server
         _login_server = server
+        _login_id = result["loginId"]
+        _completed_login_accounts.clear()
+    if old_server is not None:
+        old_server.close()
     return CodexLogin(
         login_id=result["loginId"],
         verification_url=result["verificationUrl"],
@@ -370,12 +467,89 @@ def start_device_login() -> CodexLogin:
     )
 
 
-def close_login_server() -> None:
-    global _login_server
+def _pop_login_server() -> "CodexAppServer | None":
+    global _login_id, _login_server
     with _login_lock:
-        if _login_server is not None:
-            _login_server.close()
-            _login_server = None
+        server = _login_server
+        _login_server = None
+        _login_id = None
+        _completed_login_accounts.clear()
+    return server
+
+
+def _pop_login_server_if_current(server: "CodexAppServer") -> "CodexAppServer | None":
+    global _login_id, _login_server
+    with _login_lock:
+        if _login_server is not server:
+            return None
+        _login_server = None
+        _login_id = None
+        _completed_login_accounts.clear()
+    return server
+
+
+def _pop_login_server_if_login(login_id: str) -> "CodexAppServer | None":
+    global _login_id, _login_server
+    with _login_lock:
+        if _login_server is None or _login_id != login_id:
+            return None
+        server = _login_server
+        _login_server = None
+        _login_id = None
+        _completed_login_accounts.clear()
+    return server
+
+
+def current_login_server() -> "CodexAppServer | None":
+    """Snapshot the parked login server so a caller (an operator reset) can later
+    close that exact instance, never one a concurrent login has since parked."""
+    with _login_lock:
+        return _login_server
+
+
+def read_completed_device_login_account_id(login_id: str) -> str | None:
+    """Return the completed login's account id, if the app-server provides it.
+
+    A stored OAuth row means the operator saw a device code, not that the login
+    completed. First-account capture must therefore require the successful
+    account/login/completed notification for that exact login id, captured from
+    the app-server payload (never the agent-writable auth file) by the status
+    poller that reads the parked login server.
+    """
+    with _login_lock:
+        if _login_server is None or _login_id != login_id:
+            return None
+        if login_id not in _completed_login_accounts:
+            return None
+        account_id = _completed_login_accounts[login_id]
+        if not account_id:
+            raise CodexAppServerError("Codex completed login did not include a supported account id")
+        return account_id
+
+
+def close_login_server() -> None:
+    server = _pop_login_server()
+    if server is not None:
+        server.close()
+
+
+def close_login_server_if_current(expected: "CodexAppServer | None") -> None:
+    """Close the parked login server only if it is still ``expected`` (an operator
+    reset that snapshotted it before clearing its OAuth record). A login that
+    started during the reset has replaced the global, so it is left running."""
+    if expected is None:
+        return
+    server = _pop_login_server_if_current(expected)
+    if server is not None:
+        server.close()
+
+
+def close_completed_login_server(login_id: str) -> None:
+    """Close the parked login server for a captured login, unless a newer login
+    has replaced it under a different login id."""
+    server = _pop_login_server_if_login(login_id)
+    if server is not None:
+        server.close()
 
 
 def run_turn(
