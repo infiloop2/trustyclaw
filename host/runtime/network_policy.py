@@ -8,6 +8,7 @@ outage denies every request (no fallback cache; see ``network_proxy``).
 
 from __future__ import annotations
 
+import base64
 import gzip
 import hashlib
 import io
@@ -18,11 +19,14 @@ import subprocess
 import threading
 import zlib
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote
 
+from host.runtime import github_push_gate
 from host.runtime.state import (
+    enqueue_pending_push,
     network_policy_record,
     read_proxy_claude_account,
+    read_proxy_github_token,
     read_proxy_openai_account_id,
     save_network_policy,
 )
@@ -49,7 +53,7 @@ MAX_DECODED_BODY_BYTES = 128 * 1024 * 1024
 def load_policy() -> dict[str, Any]:
     record = network_policy_record()
     if record is None:
-        return {"managed_ai_provider_network_access": {}, "allowed_network_access": {}}
+        return {"managed_network_integrations": {}, "allowed_network_access": {}}
     controls = record["controls"]
     return controls if isinstance(controls, dict) else {}
 
@@ -190,6 +194,333 @@ def anthropic_request_denied(
         return "Claude bearer token is required for this domain"
     if any(hashlib.sha256(value.encode()).hexdigest() != expected_hash for value in presented):
         return "Claude bearer token does not match the configured account"
+    return None
+
+
+# The domains where the proxy injects the active GitHub credential after the
+# repo guard has passed, keyed by the auth scheme each host expects: git
+# smart HTTP (and the web/raw/codeload hosts) authenticate tokens as the
+# Basic password with GitHub's conventional x-access-token username, while
+# the REST hosts take Bearer. The signed-URL domains are strip-only: an
+# Authorization header actively breaks a presigned download, and the signed
+# URL is the access control there.
+GITHUB_BEARER_DOMAINS = {"api.github.com", "uploads.github.com"}
+GITHUB_BASIC_DOMAINS = {"github.com", "codeload.github.com", "raw.githubusercontent.com"}
+GITHUB_STRIP_ONLY_DOMAINS = {
+    "github-cloud.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+}
+
+
+def github_credential_headers(
+    host: str, headers: list[tuple[str, str]], *, secure: bool = True
+) -> list[tuple[str, str]]:
+    """Credential injection: on GitHub domains, strip whatever
+    ``Authorization`` the agent sent and inject the active working token
+    (``proxy_github_token`` row) instead. The agent never holds the
+    credential — there is nothing to copy or exfiltrate, revocation is one
+    row delete — and an agent-smuggled token cannot substitute another
+    identity. Runs only after the request passed the repo guard; raw rules
+    for these domains are rejected at validation, so every allowed request
+    here came through the managed integration. Without a working token the
+    request goes upstream unauthenticated (public reads work, private access
+    gets GitHub's plain 401). ``secure=False`` (the plain-HTTP proxy path)
+    still strips but never injects: the credential must not travel an
+    unencrypted socket, whatever the policy allows."""
+    lowered = host.lower()
+    if lowered not in GITHUB_BEARER_DOMAINS and lowered not in GITHUB_BASIC_DOMAINS and lowered not in GITHUB_STRIP_ONLY_DOMAINS:
+        return headers
+    headers = [(key, value) for key, value in headers if key.lower() != "authorization"]
+    if lowered in GITHUB_STRIP_ONLY_DOMAINS or not secure:
+        return headers
+    token = read_proxy_github_token()
+    if not token:
+        return headers
+    if lowered in GITHUB_BEARER_DOMAINS:
+        headers.append(("Authorization", f"Bearer {token}"))
+    else:
+        credentials = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        headers.append(("Authorization", f"Basic {credentials}"))
+    return headers
+
+
+def github_request_denied(
+    policy: dict[str, Any],
+    method: str,
+    host: str,
+    path: str,
+    query: str,
+    body: bytes,
+) -> str | None:
+    """GitHub access model: when the integration is enabled, every read is
+    allowed (an agent's utility comes from many data-in paths — read any repo,
+    public or private, that the injected token reaches). The controlled side
+    is writes: a mutation must target a configured write repository, and the
+    subset that reaches past repository content is denied outright. So the
+    guard only ever gates writes; reads pass through."""
+    rule = find_domain_rule(policy, host) or {}
+    guard = rule.get("github_repo_guard")
+    if not isinstance(guard, dict):
+        return None
+    write_repos = _github_write_repositories(guard)
+    require_approval = guard.get("require_dot_github_approval") is True
+    method = method.upper()
+    host = host.lower()
+    path = _normalized_path(path)
+    if host == "github.com":
+        return _github_com_request_denied(write_repos, method, path, query, body)
+    if host == "api.github.com":
+        return _github_api_request_denied(write_repos, method, path, host=host, require_approval=require_approval)
+    if host == "uploads.github.com":
+        return _github_api_request_denied(write_repos, method, path, host=host, require_approval=False)
+    return "github_repo_scope_required"
+
+
+def github_push_gate_response(
+    policy: dict[str, Any], method: str, host: str, path: str, body: bytes
+) -> tuple[bytes | None, str | None]:
+    """The ``.github`` approval gate, applied after a push has passed the write
+    guard. Returns ``(response, reason)``:
+
+    - ``(None, None)`` — not a gated push, or a clean one: forward normally.
+    - ``(bytes, reason)`` — send ``bytes`` (a git ``report-status``) back to the
+      agent instead of forwarding; the push is queued for approval.
+    - ``(None, reason)`` — fail closed with a plain proxy denial (the push could
+      not be parsed or inspected).
+    """
+    rule = find_domain_rule(policy, host) or {}
+    guard = rule.get("github_repo_guard")
+    if not isinstance(guard, dict):
+        return None, None
+    target = github_push_gate.should_inspect(guard, host, method.upper(), _normalized_path(path))
+    if target is None:
+        return None, None
+    owner, repo = target
+    try:
+        result = github_push_gate.inspect(owner, repo, body, read_proxy_github_token())
+    except github_push_gate.GateError:
+        return None, "github_push_gate_unavailable"
+    if not result.touches_github:
+        return None, None  # nothing under .github/ changed: forward the push
+    push_id = github_push_gate.new_push_id()
+    try:
+        response = result.hold_for_approval(push_id)
+        enqueue_pending_push(push_id, owner, repo, result.ref_updates, sorted(result.paths))
+    except Exception:  # noqa: BLE001 - any quarantine/enqueue failure fails closed
+        try:
+            result.cleanup_pending(push_id)
+        except Exception:
+            pass
+        return None, "github_push_gate_unavailable"
+    return response, "github_push_queued_for_approval"
+
+
+def _github_write_repositories(guard: dict[str, Any]) -> set[tuple[str, str]]:
+    repositories: set[tuple[str, str]] = set()
+    raw = guard.get("write_repositories", [])
+    if not isinstance(raw, list):
+        return repositories
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        owner = item.get("owner")
+        repo = item.get("repo")
+        if isinstance(owner, str) and isinstance(repo, str):
+            repositories.add((owner.lower(), repo.removesuffix(".git").lower()))
+    return repositories
+
+
+def _github_repo_writable(write_repos: set[tuple[str, str]], owner: str, repo: str) -> bool:
+    return (owner.lower(), repo.removesuffix(".git").lower()) in write_repos
+
+
+def _github_repo_from_path(path: str) -> tuple[str, str] | None:
+    parts = [part for part in path.split("/") if part]
+    if len(parts) < 2:
+        return None
+    return parts[0].lower(), parts[1].removesuffix(".git").lower()
+
+
+def _github_com_request_denied(
+    write_repos: set[tuple[str, str]],
+    method: str,
+    path: str,
+    query: str,
+    body: bytes,
+) -> str | None:
+    repo = _github_repo_from_path(path)
+    service = parse_qs(query).get("service", [""])[0]
+    suffix = "/".join(part for part in path.split("/")[3:] if part) if repo is not None else ""
+    # Git push: gated on a configured write repository, at both steps of the
+    # smart-HTTP push (the ref-advertisement probe and the pack upload).
+    if repo is not None and (
+        (method == "GET" and suffix == "info/refs" and service == "git-receive-pack")
+        or (method == "POST" and suffix == "git-receive-pack")
+    ):
+        return None if _github_repo_writable(write_repos, *repo) else "github_write_repo_required"
+    # Git LFS negotiates through the batch endpoint; only download (clone/fetch)
+    # passes, upload is denied (see helper).
+    if method == "POST" and suffix == "info/lfs/objects/batch":
+        return _github_lfs_batch_denied(body)
+    # Everything else on github.com is a read — git fetch (upload-pack), web
+    # pages, compare views, raw blobs — an allowed data-in path.
+    if method in {"GET", "HEAD"}:
+        return None
+    if method == "POST" and suffix == "git-upload-pack":
+        return None
+    return "github_write_repo_required"
+
+
+def _github_lfs_batch_denied(body: bytes) -> str | None:
+    """Git LFS transfers negotiate through ``info/lfs/objects/batch`` on the
+    repo path. ``download`` batches (clone/fetch) are a read and pass. ``upload``
+    batches are denied at the batch step — the follow-up object PUTs would go to
+    signed URLs whose opaque paths cannot be repo-checked, and GET/HEAD-only on
+    those domains is a deliberate boundary — so a push with new LFS objects fails
+    immediately with a crisp denial instead of mid-transfer. Anything unparseable
+    fails closed. Other LFS endpoints (locks, verify) stay denied until a need is
+    proven by a live denial."""
+    try:
+        payload = json.loads(body or b"")
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "github_lfs_operation_unresolved"
+    operation = payload.get("operation") if isinstance(payload, dict) else None
+    if operation == "download":
+        return None
+    if operation == "upload":
+        return "github_lfs_push_unsupported"
+    return "github_lfs_operation_unresolved"
+
+
+def _github_api_request_denied(
+    write_repos: set[tuple[str, str]],
+    method: str,
+    path: str,
+    *,
+    host: str,
+    require_approval: bool,
+) -> str | None:
+    # Every read is allowed; the token (if any) bounds what private data is
+    # visible. GraphQL is the exception: a POST that can mutate and cannot be
+    # checked with path rules (argument order, aliased variables, fragments,
+    # and string escapes all evade anything short of a real parser), so it
+    # fails closed. REST covers the same repo-scoped operations.
+    if method in {"GET", "HEAD"}:
+        return None
+    if method == "POST" and path == "/graphql":
+        return "github_graphql_denied"
+    if method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return "github_write_repo_required"
+    parts = [part for part in path.split("/") if part]
+    if len(parts) >= 3 and parts[0] == "repos":
+        owner, repo = parts[1].lower(), parts[2].removesuffix(".git").lower()
+        denial = _github_repo_admin_write_denied(parts, method, host=host)
+        if denial is not None:
+            return denial
+        if not _github_repo_writable(write_repos, owner, repo):
+            return "github_write_repo_required"
+        if require_approval:
+            dot_github_denial = _github_dot_github_rest_write_denied(parts, method)
+            if dot_github_denial is not None:
+                return dot_github_denial
+        return None
+    # A mutation that targets no repository at all — creating a repo or gist
+    # (a fresh egress surface), starring, org-level changes — is never one of
+    # the configured write repositories.
+    return "github_write_repo_required"
+
+
+def _github_dot_github_rest_write_denied(parts: list[str], method: str) -> str | None:
+    """REST writes that can create a .github-changing commit without entering
+    git-receive-pack. Path-specific content writes are denied only when the path
+    is under .github; lower-level object/ref and merge APIs are denied as
+    opaque content-moving surfaces while approval mode is enabled."""
+    if len(parts) < 4:
+        return None
+    sub = parts[3]
+    if sub == "contents" and len(parts) >= 5:
+        content_path = "/".join(parts[4:])
+        if content_path == ".github" or content_path.startswith(".github/"):
+            return "github_dot_github_rest_write_denied"
+    if sub == "git" and len(parts) >= 5 and parts[4] in {"commits", "refs", "trees"}:
+        return "github_dot_github_rest_write_denied"
+    if sub in {"merges", "merge-upstream"}:
+        return "github_dot_github_rest_write_denied"
+    if sub == "pulls" and method == "PUT" and len(parts) >= 6 and parts[5] == "merge":
+        return "github_dot_github_rest_write_denied"
+    return None
+
+
+def _github_repo_admin_write_denied(parts: list[str], method: str, *, host: str) -> str | None:
+    """Writes that reach past repository content are denied even for a
+    configured write repository — reads of all of them stay plain repo reads.
+    ``parts`` is the split api.github.com/uploads.github.com path with
+    ``parts[:3] == ['repos', owner, repo]``. These mutations change who or what
+    can reach the repository (access grants, deploy keys, webhooks), mint
+    credentials, publish to the web, run code outside the proxy, weaken
+    branch/tag protection (classic and rulesets), turn off security features,
+    or forge/stop automation signals (commit statuses, check runs, deployments,
+    run cancellation) that humans and external systems act on — not repository
+    content."""
+    if len(parts) == 3:
+        # /repos/<owner>/<repo> itself: PATCH changes settings including
+        # private -> public visibility, DELETE removes the repository. Agent
+        # writes always target a sub-resource (>=4 segments).
+        return "github_repo_admin_write_denied"
+    sub = parts[3]
+    if sub in {
+        # Escape the repository entirely: fork into the caller's account,
+        # template to a new repo, move ownership.
+        "forks", "generate", "transfer",
+        # Access grants, credentials, exfiltration/persistence, publish, and
+        # compute or security administration. properties: custom property
+        # values can steer which organization rulesets apply, so writing them
+        # moves the repository out of a protective ruleset.
+        "collaborators", "invitations", "keys", "hooks", "pages", "environments",
+        "codespaces", "dependabot", "rulesets", "properties", "interaction-limits",
+        "immutable-releases", "autolinks", "topics", "lfs",
+        "vulnerability-alerts", "automated-security-fixes", "private-vulnerability-reporting",
+        "code-scanning", "secret-scanning", "dependency-graph", "security-advisories",
+        "bypass-requests",
+        # Automation signals humans and external systems act on; dispatches
+        # feeds agent-chosen payloads into workflows that run with secrets.
+        "statuses", "check-runs", "check-suites", "deployments", "dispatches", "attestations",
+    }:
+        return "github_repo_admin_write_denied"
+    if host == "api.github.com" and sub == "releases":
+        # Creating a release can create a tag. Keep uploads.github.com
+        # release-asset uploads as normal repo-scoped writes.
+        return "github_repo_admin_write_denied"
+    if sub == "branches" and "protection" in parts[4:]:
+        return "github_repo_admin_write_denied"
+    if sub == "tags" and "protection" in parts[4:]:
+        return "github_repo_admin_write_denied"
+    if sub == "pulls" and parts[-1] == "update-branch":
+        # Merges the base branch into the PR's head branch — a write to the
+        # head repository, which may be an unlisted fork.
+        return "github_repo_admin_write_denied"
+    if sub == "actions":
+        tail = parts[4:]
+        if tail[:1] and tail[0] in {"secrets", "variables", "runners", "permissions", "oidc", "cache", "caches"}:
+            # oidc: PUT actions/oidc/customization/sub sets the repository's
+            # OIDC subject-claim template, which changes the cloud trust and
+            # identity claims future workflows present — security
+            # administration, not repository content.
+            return "github_repo_admin_write_denied"
+        if tail[:1] == ["workflows"] and parts[-1] in {"enable", "disable", "dispatches"}:
+            # Turning a workflow off (CI, security scans) or dispatching one;
+            # re-running an existing run stays a plain write.
+            return "github_repo_admin_write_denied"
+        if tail[:1] == ["runs"] and (
+            method == "DELETE"
+            or parts[-1] in {"cancel", "force-cancel", "approve", "pending_deployments", "deployment_protection_rule"}
+        ):
+            # Deleting a run/its logs erases evidence; cancel/approve/gate are
+            # automation control that exists so a human reviews first.
+            return "github_repo_admin_write_denied"
+        if tail[:1] == ["artifacts"]:
+            return "github_repo_admin_write_denied"
     return None
 
 

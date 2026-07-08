@@ -38,6 +38,14 @@ file list/read routes cross into the private agent home through
 entries, opens files nonblocking, and caps reads at 1 MiB. The orchestrator
 runs six worker threads, with a claim cap of three tasks per agent runtime:
 
+`GET /v1/agent-processes` is a read-only diagnostic endpoint. It walks
+descendant `cgroup.procs` files under `trustyclaw_agent.slice`, then reads
+basic process metadata from `/proc/<pid>` without sudo or shelling out to `ps`.
+The result is intentionally not task state: warm Codex app-servers may outlive
+a task, Claude Code turn processes usually exit after each turn, and child
+processes normally inherit the runtime cgroup and show up in the same agent
+slice.
+
 - Every task names a client-chosen `thread_id`. The first task on a thread
   and an `agent_runtime` (`codex` or `claude_code`). The first task on a
   runtime/thread pair starts a runtime conversation; later tasks on that same

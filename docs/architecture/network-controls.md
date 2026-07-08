@@ -20,10 +20,11 @@ Defense in depth, fail closed at each layer:
 Deployment config does not include runtime network controls. The active
 policy lives in the `network_policy` database row; a missing row (fresh
 deploy) is the fail-closed empty default, and a preserved database keeps its
-policy across redeploys. Operators then enable managed AI providers or
+policy across redeploys. Operators then enable managed network integrations or
 website/domain rules through the admin UI/API. See
 [`../api/NetworkControls.md`](../api/NetworkControls.md) for the runtime policy
-schema.
+schema, the managed integration model, and the GitHub repo-scope decision
+tables.
 
 The proxy enforces, per request:
 
@@ -32,20 +33,36 @@ The proxy enforces, per request:
 - Method against `allow_http_methods`; plain HTTP only on port 80, HTTPS/WSS
   only on port 443.
 - `path_guards` regexes against path plus query.
-- OpenAI guards: `managed_ai_provider_network_access.openai` expands to the required OpenAI domains,
+- OpenAI guards: `managed_network_integrations.openai` expands to the required OpenAI domains,
   denies live web search on the API/data-plane domains (the
   `web_search_preview` tool, or `web_search` without
   `external_web_access: false`) while allowing the cached tool, and requires
   data-plane traffic to match the account id inferred from Codex login status
   (failing closed while that id is unavailable). The agent's Codex runtime is
   also pinned to cached web search via a managed
-  `/etc/codex/requirements.toml`, so this guard is a second layer.
-- Anthropic guards: `managed_ai_provider_network_access.claude` expands to the
+  `/etc/codex/requirements.toml`, which also disables Codex app/plugin
+  connector surfaces. The proxy remains a second web-search enforcement layer.
+- Anthropic guards: `managed_network_integrations.claude` expands to the
   Claude Code OAuth path on `platform.claude.com` and the Anthropic API domain.
   The API domain fails closed until Claude Code OAuth has produced a locally
   readable account file; after that, API requests must carry the exact bearer
   token whose SHA-256 hash was inferred from the agent user's Claude credentials.
   The proxy reads only that hash, never the bearer token itself.
+- GitHub guards: `managed_network_integrations.github` expands to the GitHub
+  domain set with an all-reads, scoped-writes guard. When enabled, every read
+  is allowed (the agent may read any repository the injected token reaches);
+  the guard only gates writes, which must target a repository in
+  `write_repositories`. Writes that reach past repository content — repository
+  administration, forks/generate/transfer, publishing, running code outside the
+  proxy — are denied even for a write repository, under one reason
+  (`github_repo_admin_write_denied`). GraphQL is denied entirely until a real
+  GraphQL parser lands, because a `POST /graphql` can mutate and repository
+  references in request bodies cannot be verified with path rules. Denials
+  carry write-scope reasons in network events. The decision tables live in
+  [`../api/NetworkControls.md`](../api/NetworkControls.md#access-enforcement).
+- Package guards: `python_packages` and `npm_packages` expand to fixed
+  read-only domain and path rules for PyPI, pythonhosted, the npm registry,
+  and Node.js downloads.
 
 The proxy refuses to connect upstream to any address that is not publicly routable
 (loopback, link-local, or private ranges), so an allowed domain pointed at an
@@ -84,3 +101,129 @@ proxy reads and validates the policy per request, with deliberately no
 fallback cache: a database outage denies every request until the database
 returns, and an invalid stored policy equally denies all requests. Fail
 closed in every state.
+
+## Internal Guard Fields
+
+Managed integrations are stored as operator intent only. Before enforcement the
+proxy expands them, in memory, into domain rules carrying internal guard fields
+that are never exposed through the admin API, never accepted in
+`allowed_network_access`, and never persisted. This section is the canonical
+reference for those fields.
+
+| Internal field | Set by | Implementation |
+| --- | --- | --- |
+| `allow_http_methods` (generated) | every integration | Same mechanics as manual rules; the integration registry fixes the method list per generated domain (for example `POST` only on `api.openai.com`, `GET`/`HEAD` only on `raw.githubusercontent.com`). |
+| `path_guards` (generated) | `claude`, `python_packages`, `npm_packages` | Same regex mechanics as manual rules, with registry-fixed patterns (for example `^/v1/oauth(?:/.*)?$` on `platform.claude.com`, `^/packages(?:/.*)?$` on `files.pythonhosted.org`). Request paths are percent-decoded and dot-segment-normalized before matching so `..` segments cannot escape a guard. |
+| `openai_account_guard` | `openai` | Requires a `chatgpt-account-id` header on data-plane requests that is present and equal to the account id inferred from Codex login status (stored as the openai row in `proxy_provider_pins`). Missing id or missing header fails closed. |
+| `openai_disable_live_web_search` | `openai` | Buffers and decodes the request body (gzip/deflate in-process, zstd/brotli via system binaries, decoded output capped at 128 MiB), then denies `web_search_preview` anywhere and `web_search` tools without `external_web_access: false`. Also applied to each client-to-upstream WebSocket message on guarded domains. |
+| `anthropic_account_guard` | `claude` | Denies `api.anthropic.com` requests unless the presented bearer token's SHA-256 hash equals the hash stored in the claude `proxy_provider_pins` row after Claude OAuth. Allows the unauthenticated `GET /api/hello` readiness probe and a fixed set of bearer-authenticated pre-pin bootstrap `GET` paths. The proxy stores and compares only the hash. |
+| `github_repo_guard` | `github` | Carries the normalized `write_repositories` list and `require_dot_github_approval` toggle. Applies the access decision tables — every read allowed on `github.com` web/smart-HTTP, `api.github.com` REST, and `codeload`/`raw`; writes gated to the write list, with repository administration denied outright, GraphQL denied outright, and REST content-write bypasses denied when `.github` approval is required. The signed-URL domains carry no guard: they expand to plain `GET`/`HEAD` rules (presigned S3 paths have no owner/repo; the signed URL is the access control). Runs after the generic domain/method/path checks, before upstream connection, with no DNS dependency. |
+
+### Path canonicalization
+
+Every guarded path — `path_guards` regexes and the GitHub repository match
+alike — is canonicalized before matching (`_normalized_path`): one
+percent-decode pass, then dot-segment collapse (`posixpath.normpath`), with
+the leading slash restored and a trailing slash preserved. The principle is
+that the guard must evaluate the path in the form the upstream server will
+resolve, because any difference between what the guard matches and what the
+server serves is a bypass:
+
+- **Percent-decoding** defeats encoding differentials. GitHub decodes
+  `%XX` escapes before routing, so `/repos/infiloop2/%74rustyclaw` reaches
+  the same resource as `/repos/infiloop2/trustyclaw`; a raw-string
+  comparison would let an encoded spelling dodge (or dress up) the repo
+  match.
+- **Dot-segment collapse** defeats traversal. A naive prefix check on
+  `/repos/listed/repo/../../other/secret/contents` sees a listed repo, while
+  the server resolves the `..` segments and serves `other/secret`.
+  Decoding runs first, so `%2e%2e` becomes `..` and is then collapsed —
+  the two steps compose against encoded traversal.
+- The GitHub guard additionally strips one optional **`.git` suffix** from
+  the repository path segment. This is compatibility, not security: git's
+  smart-HTTP endpoints use `owner/repo.git/...` while the web UI and REST
+  API use `owner/repo`, and the policy stores repositories normalized
+  without the suffix, so both spellings must land on the same policy row.
+
+
+Guard inputs that are secrets or account pins live where the proxy can read
+no more than it needs: the OpenAI/Claude pins are the two comparison values in
+the `proxy_provider_pins` table (SELECT-only for the proxy role), and the
+GitHub credential — a pasted PAT or a GitHub App key with its minted
+installation tokens — lives in the admin-owned `github_credential` table with
+no proxy grant at all, because the network guard only decides repository
+reachability and never needs the secret; its secret columns are additionally
+encrypted at rest (key in the `secret_keys` table, so a stray read of the
+credential table alone reveals nothing). The admin API exposes at most
+credential metadata (`configured`, mode, app/installation ids, expiry,
+validation status), never token or key material.
+
+The active working token lives in the proxy-readable `proxy_github_token`
+row (the `proxy_provider_pins` pattern): the admin service publishes it on
+mint/set/replace and clears it on disable or delete, while the credential row
+itself — App PEM key, PAT storage — keeps no proxy grant. The row holds
+`secretbox` ciphertext like every other stored secret, and the proxy also
+holds SELECT on `secret_keys` to decrypt it; grants are per-table, so key
+plus row decrypt exactly the proxy's working set and nothing else — in app
+mode a short-lived installation token, refreshed hourly; in pat mode the PAT
+itself, one reason to prefer app mode. Two narrow root helpers
+carry the egress the admin service does not have: `mint-github-app-token`
+(short-lived, installation-wide App tokens) and `audit-github-repo` (the
+repository facts behind the operator warnings). Minted tokens are
+deliberately not scoped to the policy's repository list — the
+`github_repo_guard` above is the per-repository boundary on every request,
+and the App installation bounds what the token could reach if the proxy were
+bypassed.
+
+The proxy injects the credential per request: on the GitHub auth domains
+(`github.com`, `api.github.com`, `uploads.github.com`,
+`codeload.github.com`, `raw.githubusercontent.com`) it strips whatever
+`Authorization` the agent sent and adds the working token after the repo
+guard has passed — as `Bearer` on the REST hosts and as the Basic password
+(username `x-access-token`, GitHub's convention for tokens over git smart
+HTTP) on the git/web hosts, and only ever inside TLS (the plain-HTTP proxy
+path strips agent auth but never injects); on the signed-URL domains it only strips (an Authorization
+header breaks a presigned download, and the signed URL is the access control
+there). The proxy already terminates TLS on every GitHub request and could
+read a bearer token in transit, so injection gives a compromised proxy
+nothing it could not already see — what it removes is the **agent's** copy,
+and with it the exfiltration channel, the smuggled-credential identity swap,
+and the whole agent-file lifecycle (install/remove, staging windows,
+credential helpers). git and gh both come from the Ubuntu archive at
+bootstrap; git simply sends unauthenticated requests that arrive at GitHub
+authenticated, and `/usr/local/bin/gh` is a shim that supplies a fixed
+placeholder `GH_TOKEN` (gh refuses to run authenticated calls without one)
+that never reaches GitHub. Because the token is applied in transit, a
+rotation or a revocation reaches every process — however warm — on its very
+next request, and disabling the integration is one row delete with nothing
+to uninstall on the agent side.
+
+Each configured repository is additionally audited through
+`audit-github-repo` using the working token — visibility, the token's own
+effective permissions, default-branch protection, workflows and their
+triggers — into the admin-owned `github_repo_audit` table. Facts live in the
+database, judgments in code (`github_repo_audit._warnings`), so message
+changes never need a re-fetch. Refreshes are forced after credential and
+repository-list changes and by the UI re-check action, and TTL-gated (daily)
+from the poller; audits warn, never gate.
+
+The admin service converges the working-token row with one
+`reconcile()` path — after every credential or policy change and from the
+orchestrator poller each cycle. Enablement and credential health are separate
+concerns: the policy decides reachability, the credential row decides the
+token, and they meet only in reconcile's convergence rule — the working
+token is published exactly while GitHub is enabled with a credential stored,
+absent otherwise. A credential change or a publish that widens the GitHub
+scope (enables it, lists a new repository, or turns a listed repository
+writable) mints a fresh App token — installation tokens carry the
+repositories *and App permissions* granted at mint time, so the token must
+postdate whatever was just granted; every other reconcile (the poller,
+narrowing or unrelated policy edits) reuses the cached token until it nears
+its one-hour expiry. Failure handling is one rule, fail closed: any failure
+records itself in the credential's validation status, withdraws the working
+token and the cached mint — a token that may not match the stored credential
+or the published repository list must never stay injectable — and is retried
+on the next poller cycle. Until it converges, git and gh simply run
+unauthenticated. A startup reconcile that cannot run at all (database
+briefly unavailable) is retried on a short interval so workers do not claim
+tasks against a stale working token for a full poller cycle.

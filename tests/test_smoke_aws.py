@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from host.config import parse_input_config
 from tests.smoke.smoke_aws import AwsSmoke
-from tests.stage.stage_aws import StageAwsSmoke, _required_env_path
+from tests.stage.stage_aws import StageAwsSmoke, _github_app_config_from_env, _required_env_path
 
 
 class AwsSmokeTeardownTests(unittest.TestCase):
@@ -211,6 +211,51 @@ class StageAwsSmokeTests(unittest.TestCase):
             with patch.dict("os.environ", {"STAGE_SSH_KEY": str(ssh_key)}):
                 self.assertEqual(_required_env_path("STAGE_SSH_KEY"), ssh_key)
 
+    def test_stage_suite_runtimes_scope_each_suite(self) -> None:
+        self.assertEqual(StageAwsSmoke.suite_runtimes("codex"), ("codex",))
+        self.assertEqual(StageAwsSmoke.suite_runtimes("claude"), ("claude_code",))
+        self.assertEqual(StageAwsSmoke.suite_runtimes("github"), ())
+        self.assertEqual(StageAwsSmoke.suite_runtimes("all"), ("codex", "claude_code"))
+
+    def test_github_app_config_from_env_parses_or_requires_all(self) -> None:
+        keys = (
+            "STAGE_GITHUB_WRITE_REPO",
+            "STAGE_GITHUB_APP_ID",
+            "STAGE_GITHUB_APP_INSTALLATION_ID",
+            "STAGE_GITHUB_APP_PRIVATE_KEY",
+        )
+        with patch.dict("os.environ", {key: "" for key in keys}, clear=False):
+            self.assertIsNone(_github_app_config_from_env())
+        full = {
+            "STAGE_GITHUB_WRITE_REPO": "infiloop2/sandbox",
+            "STAGE_GITHUB_APP_ID": "123",
+            "STAGE_GITHUB_APP_INSTALLATION_ID": "456",
+            "STAGE_GITHUB_APP_PRIVATE_KEY": "-----BEGIN KEY-----\nx\n-----END KEY-----",
+        }
+        with patch.dict("os.environ", full, clear=False):
+            config = _github_app_config_from_env()
+        self.assertEqual(config["owner"], "infiloop2")
+        self.assertEqual(config["repo"], "sandbox")
+        self.assertEqual(config["app_id"], "123")
+        self.assertEqual(config["installation_id"], "456")
+        with patch.dict("os.environ", {**full, "STAGE_GITHUB_APP_ID": ""}, clear=False):
+            with self.assertRaises(SystemExit):
+                _github_app_config_from_env()
+
+    def test_stage_enforcement_policy_lists_stage_repo_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result_path = Path(tmp) / "trustyclaw-stage.json"
+            result_path.write_text(
+                json.dumps({"agent_name": "trustyclaw-stage", "region": "us-east-1", "public_dns": "stage.example.com"})
+            )
+            ssh_key = Path(tmp) / "stage_operator"
+            ssh_key.write_text("private key")
+            smoke = StageAwsSmoke(result_path, ssh_key)
+        smoke.stage_github_repositories = [{"owner": "sandbox-owner", "repo": "sandbox"}]
+        repos = smoke.enforcement_policy()["managed_network_integrations"]["github"]["write_repositories"]
+        self.assertEqual(repos[0], {"owner": "sandbox-owner", "repo": "sandbox"})
+        self.assertIn({"owner": "infiloop2", "repo": "trustyclaw"}, repos)
+
 
 class WorkflowSmokeTests(unittest.TestCase):
     def test_stage_workflows_use_first_class_power_cli(self) -> None:
@@ -237,11 +282,34 @@ class WorkflowSmokeTests(unittest.TestCase):
         self.assertNotIn(removed_action, stage_start)
         self.assertNotIn(removed_action, stage_stop)
 
+    def test_stage_workflow_exposes_suite_and_github_secrets(self) -> None:
+        stage = Path(".github/workflows/trustyclaw-stage.yml").read_text()
+        for option in ("all", "claude", "codex", "github"):
+            self.assertIn(f"- {option}", stage)
+        self.assertIn("--suite", stage)
+        for env_name in (
+            "STAGE_GITHUB_WRITE_REPO",
+            "STAGE_GITHUB_APP_ID",
+            "STAGE_GITHUB_APP_INSTALLATION_ID",
+            "STAGE_GITHUB_APP_PRIVATE_KEY",
+        ):
+            self.assertIn(env_name, stage)
+
     def test_fresh_smoke_workflow_uses_fresh_smoke_script(self) -> None:
         smoke = Path(".github/workflows/trustyclaw-smoke.yml").read_text()
 
         self.assertIn("python3 tests/smoke/smoke_aws.py", smoke)
         self.assertIn("context trustyclaw-smoke", smoke)
+        self.assertIn("github.event_name == 'workflow_dispatch'", smoke)
+        self.assertIn("Fresh AWS smoke is already running; wait for the previous smoke to complete.", smoke)
+        self.assertIn("for status in queued in_progress", smoke)
+        self.assertIn("group: trustyclaw-smoke", smoke)
+
+    def test_public_sync_copies_version_changes_by_content(self) -> None:
+        sync = Path(".github/workflows/sync-public-repo.yml").read_text()
+
+        self.assertIn("rsync -a --checksum --delete", sync)
+        self.assertIn('cmp "${source_dir}/VERSION" "${target_dir}/VERSION"', sync)
 
 
 def _workflow_json_heredoc(workflow: str, path: str) -> str:

@@ -3,7 +3,7 @@
 | User | Purpose | Privileges |
 | --- | --- | --- |
 | `trustyclaw-operator` | Human SSH login. | Full passwordless sudo. |
-| `trustyclaw-admin` | Runs the admin API; owns admin state (the `trustyclaw_admin` database role). | sudo for exactly six root helpers (below). |
+| `trustyclaw-admin` | Runs the admin API; owns admin state (the `trustyclaw_admin` database role). | sudo for exactly nine root helpers (below). |
 | `trustyclaw-proxy` | Runs the policy proxy; owns proxy policy/log/CA files. | No sudo, no database role. Only nftables-approved DNS and TCP 80/443 egress. |
 | `trustyclaw-agent` | Runs Codex and Claude Code runtime processes. | None. No sudo, no direct network, no database role. |
 | `cloudflared` | Runs the optional Cloudflare Tunnel connector. | No sudo, no database role. Only nftables-approved DNS, TCP 443, and TCP/UDP 7844 egress. |
@@ -33,7 +33,7 @@ guards. If a helper or sudoers entry were writable by a service user, that user
 could turn the sudo rule into arbitrary root execution, so these files stay on
 the root volume as root-owned code.
 
-`trustyclaw-admin`'s sudoers entry allows only six fixed helpers in
+`trustyclaw-admin`'s sudoers entry allows only nine fixed helpers in
 `/usr/local/lib/trustyclaw-host/`:
 
 - `reboot-host` — runs `systemctl reboot`.
@@ -47,13 +47,34 @@ the root volume as root-owned code.
   slice.
 - `read-claude-account` — reads the agent user's Claude Code auth files and
   prints only account metadata plus a SHA-256 hash of the OAuth bearer token.
+- `clear-agent-auth` — removes Codex/Claude local auth files as
+  `trustyclaw-agent` during linked-account reset.
 - `read-agent-file` — demotes to `trustyclaw-agent`, confines paths to
   `agent-home`, rejects symlinks, bounds directory scan work, and lists
   directories or returns bounded text previews.
+- `mint-github-app-token` — mints a short-lived, installation-wide GitHub App
+  token from an App id, installation id, and private key piped on stdin. It
+  runs as root because only root (besides the proxy) has outbound network
+  access; the key only ever moves through pipes (admin stdin in, openssl
+  stdin on) and nothing is persisted.
+- `audit-github-repo` — fetches the per-repository facts behind the operator
+  warnings with a token piped on stdin, the same shape as the mint helper:
+  root for the egress, facts on stdout, no state.
+- `approve-github-push` — replays or cleans up a push held by the `.github`
+  approval gate. The admin service passes the reviewed push id, ref updates,
+  and working GitHub token on stdin; the helper uses root egress and the
+  proxy-state quarantine mirror, then reports JSON success or failure.
+
 Network policy, provider account pins, and network events need no helpers:
 they are database tables the admin service (schema owner) writes after
 validation and the proxy's narrow database role can only read (plus insert on
-its own event table).
+its own event table). The GitHub credential is also a database table — admin-owned
+with no proxy grant; the admin service publishes only the short-lived working
+token to the proxy-readable `proxy_github_token` row, and the proxy injects
+it into policy-approved GitHub requests. The agent never holds the credential
+— there is no agent-readable token file — so app-token minting, repository
+audit, and approved push replay cross privilege boundaries through the helpers
+above.
 
 Admin state adds one more boundary with the same shape: the database accepts
 Unix-socket connections only, authenticated by OS identity (`peer`), with roles

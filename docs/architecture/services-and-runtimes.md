@@ -23,6 +23,9 @@
 | `run-claude-code` helper | starts as root, then `trustyclaw-agent` | admin API via sudo | Starts one Claude Code CLI process. |
 | `claude` | `trustyclaw-agent` | launch helper | Executes one Claude Code turn, then exits. |
 | `read-codex-account-id` / `read-claude-account` | starts as root, then `trustyclaw-agent` | admin API via sudo | Reads provider auth files narrowly and prints only account guard metadata. |
+| `clear-agent-auth` | starts as root, then `trustyclaw-agent` | admin API via sudo | Removes local Codex/Claude auth files during linked-account reset. |
+| `mint-github-app-token` helper | root | admin API via sudo | Mints installation-wide GitHub App tokens (root is the only egress path besides the proxy); the proxy repo guard is the per-repository boundary. |
+| `approve-github-push` helper | root | admin API via sudo | Replays or cleans up a push held by the `.github` approval gate using the proxy-state quarantine mirror and a working GitHub token piped on stdin. |
 | `reboot-host` helper | root | admin API via sudo | Requests a host reboot. |
 
 ## Thread Inventory
