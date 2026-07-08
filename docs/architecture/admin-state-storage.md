@@ -21,7 +21,10 @@ exists.
 
 ## What lives in the database
 
-The schema is `host/migrations/0001_admin_state_schema.sql`. Columns are
+The schema lives in `host/migrations/` as ordered, numbered SQL migrations
+applied by the migration runner; the current shape is the result of applying
+them all, so this document describes the resulting tables, never the
+migration history. Columns are
 typed and constrained wherever the shape is ours; the single remaining JSON
 value is provider account metadata — the provider CLI's own evolving shape,
 cached verbatim, deliberately not ours to type.
@@ -36,11 +39,31 @@ cached verbatim, deliberately not ours to type.
 | `thread_sessions` | User thread -> provider session/thread maps (pruned to the 100,000 most recently used per runtime). |
 | `oauth_logins` | In-flight OAuth logins, fully typed per flow (device code + login handle for Codex, browser code for Claude). |
 | `provider_accounts` | Admin-side provider account records: `account_id` typed, remaining provider-owned metadata as a cached document. |
-| `network_policy` + `managed_provider_access`, `allowed_domains`, `domain_methods`, `domain_path_guards` | The active network policy as typed, ordered rows (shape defined by `host/config.py`); replaced atomically, and a missing `network_policy` row is the fail-closed empty default. |
+| `network_policy` + `managed_integrations`, `github_repositories`, `github_settings`, `allowed_domains`, `domain_methods`, `domain_path_guards` | The active network policy as typed, ordered rows (shape defined by `host/config.py`): enabled integrations are presence rows, the GitHub `write_repositories` list keeps operator order (reads are universal, so the rows name only write targets), and `github_settings` is the singleton for integration-level GitHub toggles (`require_dot_github_approval`); replaced atomically, and a missing `network_policy` row is the fail-closed empty default. |
+| `github_credential` | The single fixed GitHub credential (PAT, or GitHub App identity/key). Admin-owned only — no proxy grant; secret columns hold `secretbox` ciphertext, and plaintext never leaves the admin service except into the two credential root helpers. The working token the App mints lives only in `proxy_github_token`. |
 | `proxy_provider_pins` | Exactly the two values the proxy guards compare: account id and token hash (format-checked). |
+| `proxy_github_token` | The proxy's working copy of the active GitHub token, injected into policy-approved GitHub requests. `secretbox` ciphertext like every other stored secret; the proxy role holds SELECT on this row and on `secret_keys`, and because grants are per-table that pair decrypts exactly this working set — the credential and audit tables keep no proxy grant. A proxy compromise therefore exposes just this token: short-lived in app mode, the PAT itself in pat mode (one reason to prefer app mode). |
+| `github_repo_audit` | Per-repository audit facts (visibility, the token's effective permissions, default-branch protection, workflows and triggers) fetched by the `audit-github-repo` helper. Admin-owned, no proxy grant; the warning judgments live in code, so message changes never touch stored facts. |
+| `pending_pushes` | Pushes held by the `.github` approval gate. Written by the proxy's role (INSERT, like `network_events`) when a gated push touches `.github/`; the admin service lists and resolves them (approve/reject). The held objects live under `refs/pending/<id>` in the proxy's quarantine mirror on disk, not in this table. |
 | `network_events` | Network allow/deny decisions, written by the proxy's role, fully typed (pruned to the newest 1,000,000; URL fields are size-capped so the row cap is a real disk bound). |
 | `counters` | `next_task_number` (event seqs are a database serial). |
+| `secret_keys` | The at-rest encryption key for stored secrets (see below). Proxy SELECT grant so the proxy can decrypt `proxy_github_token`, the only secret-bearing row it can read. |
 | `schema_migrations` | Applied migration versions (owned by the migration runner). |
+
+Stored secrets — the GitHub token/private key/working token and the
+Cloudflare tunnel token — are encrypted at rest (`host/runtime/secretbox.py`:
+AES-256-CBC via openssl) with a key in the `secret_keys` table, created by
+the schema migration (from Postgres's CSPRNG), so the key exists from the
+moment the schema does. Keeping the key in the database keeps all admin
+state in one place; upgrade and recovery carry key and ciphertext together by
+construction. This is an accidental-exposure control, not a root/offline
+defense: a stray `SELECT *` on a secret-bearing table (or a pasted table
+dump) no longer reveals credential material, while a full database dump
+necessarily includes the key. Rows written before encryption existed keep
+working and re-encrypt on their next write: `decrypt` passes non-ciphertext
+values through unchanged, `write_config` re-saves the tunnel token on every
+deploy/upgrade, and the proxy's working GitHub token is republished by the
+next mint or credential change. No startup sweep is needed.
 
 Ephemeral values — idempotency-key replay records
 (`admin_api.IDEMPOTENCY_ENTRIES`) and cached agent runtime statuses

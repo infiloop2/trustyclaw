@@ -20,7 +20,9 @@ host/
     orchestrator.py          # task worker pool + runtime session cache
     admin_ui.html            # single-page admin UI shell served at GET /
     admin_ui.css             # admin UI styling
-    admin_ui.js              # admin UI behavior
+    admin_ui/                # admin UI behavior: native ES modules, one per feature
+                             # (app.js entry + api, helpers, health, threads,
+                             # files, processes, logs, network)
     codex_app_server.py      # stdio JSON-RPC client for the Codex app-server
     claude_code.py           # Claude Code CLI adapter + OAuth login process
     network_proxy.py         # policy-enforcing HTTP(S)/WS(S) proxy
@@ -54,13 +56,16 @@ Important source files and the context that runs them:
 | `host/bootstrap/helpers/run-claude-code.sh` | root via sudo helper | Root-owned launcher that demotes to `trustyclaw-agent` and starts Claude Code with proxy/CA environment. |
 | `host/bootstrap/helpers/read-codex-account-id.sh` | root via sudo helper | Narrow helper that reads Codex auth as `trustyclaw-agent` and prints only the inferred OpenAI account id. |
 | `host/bootstrap/helpers/read-claude-account.sh` | root via sudo helper | Narrow helper that reads Claude auth as `trustyclaw-agent` and prints only account metadata plus the OAuth bearer hash. |
+| `host/bootstrap/helpers/clear-agent-auth.sh` | root via sudo helper | Narrow helper that clears Codex/Claude auth files as `trustyclaw-agent` during linked-account reset. |
 | `host/bootstrap/helpers/read-agent-file.sh` | root via sudo helper | Narrow helper that reads agent-home directories and bounded file previews as `trustyclaw-agent`. |
+| `host/bootstrap/helpers/mint-github-app-token.sh` | root via sudo helper | Mints installation-wide GitHub App tokens. |
+| `host/bootstrap/helpers/approve-github-push.sh` | root via sudo helper | Replays or rejects a `.github` push held in the proxy quarantine mirror. |
 | `host/bootstrap/helpers/reboot-host.sh` | root via sudo helper | Root-owned reboot helper used by the admin API. |
 | `host/runtime/admin_api.py` | `trustyclaw-admin` | Localhost admin API on `127.0.0.1:7443`. |
 | `host/runtime/orchestrator.py` | `trustyclaw-admin` | Task worker pool, runtime process cache, and runtime status poller. |
 | `host/runtime/admin_ui.html` | served by admin API | Single-page admin UI shell; a thin layer over the API. |
 | `host/runtime/admin_ui.css` | served by admin API | Admin UI styling. |
-| `host/runtime/admin_ui.js` | served by admin API | Admin UI behavior and API calls. |
+| `host/runtime/admin_ui/` | served by admin API | Admin UI behavior and API calls as native ES modules, one per feature (`app.js` entry). |
 | `host/runtime/codex_app_server.py` | `trustyclaw-admin` | Stdio JSON-RPC client for the Codex app-server. |
 | `host/runtime/claude_code.py` | `trustyclaw-admin` | Claude Code CLI adapter and OAuth login process management. |
 | `host/runtime/network_proxy.py` | `trustyclaw-proxy` | Policy-enforcing HTTP(S)/WS(S) proxy on `127.0.0.1:7445`. |

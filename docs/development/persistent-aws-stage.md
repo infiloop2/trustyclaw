@@ -29,18 +29,49 @@ and deploy config files. The stage test receives
 workflow passes the generated stage SSH key path through `--ssh-key-env
 TRUSTYCLAW_STAGE_SSH_KEY`.
 
-The stage test starts by resetting the active network policy to the enforcement
-baseline and killing or canceling any leftover active tasks. It then requires
-both runtimes to already be active. If Codex or Claude needs login, the test
-fails with a manual-login message instead of starting an OAuth flow.
+The stage test takes a `--suite` argument selecting which checks run: `claude`,
+`codex`, or `github` run that provider's checks plus the shared preamble, and
+`all` (the default) additionally runs the cross-runtime checks. Whichever suite
+is selected, the run first performs a configuration preflight that verifies the
+one-time operator setup the suite needs is present, failing fast and listing
+every missing item at once before any long-running check. The preflight is
+scoped to the selection: `codex`/`claude` require that provider's runtime to be
+active; `github` requires the GitHub credential and a sandbox write repository
+(and needs no provider login); `all` requires all three. If something is
+missing, the test prints a configuration snapshot and a manual-setup message
+instead of starting an OAuth flow.
 
-It covers the runtime checks omitted from fresh smoke: Codex account guards and
-real web-search task traffic, Claude bearer-token guards and real task traffic,
-mixed Codex/Claude concurrency, steering, kill and thread survival, persisted
-thread recall, runtime deactivation behavior, host reboot recovery, and the
-network event prune race.
+GitHub is the exception to "manual setup": when the `STAGE_GITHUB_*` stage
+secrets are set (a GitHub App id, installation id, private key, and
+`owner/repo`), the run installs that App credential and makes the `owner/repo`
+the sole GitHub write repository, fully replacing any repo already on the host,
+before the preflight. So a `github` or `all` run needs no manual GitHub
+configuration, and the write end-to-end always targets the sandbox repo from the
+secrets. The provider OAuth logins still cannot be automated and remain one-time
+admin-UI setup.
+
+After the preflight, the test resets the active network policy to the
+enforcement baseline and kills or cancels any leftover active tasks. The shared
+preamble (health, admin UI, admin auth, agent file explorer) runs for every
+suite.
+
+The `all` suite covers the runtime checks omitted from fresh smoke: Codex
+account guards and real web-search task traffic, Claude bearer-token guards and
+real task traffic, mixed Codex/Claude concurrency, steering, kill and thread
+survival, persisted thread recall, runtime deactivation behavior, host reboot
+recovery, the network event prune race, and the GitHub write end-to-end. A
+single-provider suite runs only that provider's guard, task, steering, and kill
+checks; `github` runs only the GitHub write end-to-end.
 
 ## One-time AWS and GitHub setup for stage
+
+Besides the AWS/IAM setup below, the stage host needs Codex and Claude OAuth
+logins completed once through its admin UI (these cannot be automated). GitHub
+is configured from the `STAGE_GITHUB_*` repository secrets instead (see the
+secrets table below), so it needs no admin-UI setup; if those secrets are absent
+the run falls back to a write-capable GitHub credential and sandbox write
+repository configured through the admin UI (see the GitHub write end-to-end
+check below).
 
 Create a separate IAM user for stage, with the stage-scoped policy:
 
@@ -78,6 +109,14 @@ Add these repository secrets:
 | `TRUSTYCLAW_STAGE_AWS_SECRET_ACCESS_KEY` | Secret access key for the stage IAM user. |
 | `TRUSTYCLAW_STAGE_SSH_PRIVATE_KEY` | Full contents of `~/.ssh/trustyclaw/stage_operator`. |
 | `TRUSTYCLAW_STAGE_ADMIN_PASSWORD` | Stable password generated above. |
+| `TRUSTYCLAW_STAGE_GITHUB_WRITE_REPO` | Sandbox write repo as `owner/repo` (branches are pushed and deleted there, so use a dedicated sandbox, never a real repo). |
+| `TRUSTYCLAW_STAGE_GITHUB_APP_ID` | Numeric GitHub App id whose installation can push to the sandbox repo. |
+| `TRUSTYCLAW_STAGE_GITHUB_APP_INSTALLATION_ID` | Numeric installation id of that App on the sandbox repo. |
+| `TRUSTYCLAW_STAGE_GITHUB_APP_PRIVATE_KEY` | The GitHub App PEM private key. |
+
+The four `TRUSTYCLAW_STAGE_GITHUB_*` secrets are optional: set all four to have a
+`github` or `all` run auto-configure GitHub, or none to configure a credential
+and write repo manually through the admin UI. Setting only some fails the run.
 
 The stage account also needs a default VPC with a public default subnet in
 `us-east-1`.
@@ -89,6 +128,13 @@ The stage account also needs a default VPC with a public default subnet in
 comments, pull request branches, or temporary feature branches: stage is a
 persistent environment, so upgrades must use the stable mainline version and
 mainline migration path.
+
+The `workflow_dispatch` form takes a **suite** input (`all`, `claude`, `codex`,
+or `github`; default `all`) that maps to the test's `--suite` argument. Use a
+single-provider suite to exercise or debug just that integration, for example
+`github` once the GitHub credential and sandbox write repo are configured, or
+`codex`/`claude` while GitHub is still being set up. Each suite still runs its
+scoped configuration preflight first.
 
 The workflow first runs an `authorize` job that checks out trusted workflow
 actions from `main`, verifies the triggering actor is a repository admin,
@@ -109,6 +155,23 @@ stopped the instance, run `.github/workflows/trustyclaw-stage-start.yml` from
 `main` first so the tunnel target exists. That workflow can only be dispatched
 by a repository admin from `main`; it starts the existing tagged
 `trustyclaw-stage` EC2 instance and prints the SSH tunnel command.
+
+Every run that includes GitHub (the `github` or `all` suite) exercises the
+GitHub write paths end to end. This depends on GitHub being configured: from the
+`TRUSTYCLAW_STAGE_GITHUB_*` secrets (auto-installed before the preflight) or,
+absent those, from a manually configured credential and write repo. The
+preflight fails with instructions until one of those is in place. Required, both through
+the admin UI (Internet Access and Tools): a **write-capable GitHub
+credential** stored, and **at least one sandbox write repository** in the
+policy that the credential can push to (real branches are pushed and deleted
+there, so use a dedicated sandbox repo — never a real one). The configured
+write repositories survive the run's baseline policy reset: the harness
+captures them before the reset and merges them into every policy it
+publishes. The check clones, pushes a uniquely named branch, reads it back
+and deletes it through authenticated `gh api`, and verifies a push to an
+unlisted repo is denied by the proxy. The fresh smoke covers every
+unauthenticated GitHub guard branch automatically; stage covers what only a
+real credential can.
 
 To stop stage manually after inspection, run
 `.github/workflows/trustyclaw-stage-stop.yml` from `main`. It is also

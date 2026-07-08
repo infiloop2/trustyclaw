@@ -96,7 +96,7 @@ python3 tests/smoke-ui/admin_ui_smoke.py --port 3100
 
 The smoke starts the mock server, opens Chromium, logs in with `dev`, creates a
 task, opens the thread and task event views, edits network policy through the
-GitHub preset, and checks the Codex login panel. CI installs Playwright and
+GitHub managed integration controls, and checks the Codex login panel. CI installs Playwright and
 Chromium during the Docker image build, then runs this smoke through
 `.github/ci/run-in-sandbox.sh` with `--network none`. On development boxes with
 a preinstalled Playwright browser cache, the smoke reuses the newest cached

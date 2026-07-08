@@ -35,7 +35,7 @@ import threading
 import time
 from typing import Any, Iterator
 
-from host.runtime import db
+from host.runtime import db, secretbox
 
 
 DEFAULT_STATE_DIR = Path("/mnt/trustyclaw-admin/admin-state")
@@ -66,6 +66,10 @@ MAX_EVENTS = 1_000_000
 PRUNE_EVERY = 500
 # The network event table keeps the same generous cap as the agent events.
 MAX_NETWORK_EVENTS = 1_000_000
+# Both audit logs (agent events, network events) page newest-first in pages
+# of EVENT_PAGE_LIMIT rows; the limit query parameter can only shrink a page.
+EVENT_PAGE_LIMIT = 100
+PENDING_PUSH_RESOLVING_TIMEOUT_SECONDS = 15 * 60
 
 _TASK_COLUMNS = (
     "number",
@@ -186,7 +190,7 @@ def load_config() -> dict[str, Any]:
             if hostname is not None:
                 connection["hostname"] = hostname
             if tunnel_token is not None:
-                connection["tunnel_token"] = tunnel_token
+                connection["tunnel_token"] = secretbox.decrypt(tunnel_token)
             connections.append(connection)
         if connections:
             config["operator_connections"] = connections
@@ -215,7 +219,7 @@ def save_config(config: dict[str, Any]) -> None:
                     connection.get("mode"),
                     connection.get("ssh_public_key"),
                     connection.get("hostname"),
-                    connection.get("tunnel_token"),
+                    _encrypt_secret(connection.get("tunnel_token")),
                 ),
             )
 
@@ -500,7 +504,7 @@ def prune_thread_sessions(cur: Any, runtime: str, keep: int) -> None:
 # -- OAuth logins -------------------------------------------------------------------
 
 
-_OAUTH_COLUMNS = ("status", "login_url", "expires_at", "device_code", "login_id")
+_OAUTH_COLUMNS = ("status", "login_url", "expires_at", "device_code", "login_id", "access_token_sha256")
 
 
 def oauth_login(key: str, cur: Any = None) -> dict[str, Any] | None:
@@ -523,11 +527,12 @@ def set_oauth_login(cur: Any, key: str, data: dict[str, Any] | None) -> None:
     if unknown:
         raise ValueError(f"unsupported oauth login keys: {sorted(unknown)}")
     cur.execute(
-        "INSERT INTO oauth_logins (runtime, status, login_url, expires_at, device_code, login_id)"
-        " VALUES (%s, %s, %s, %s, %s, %s)"
+        "INSERT INTO oauth_logins (runtime, status, login_url, expires_at, device_code, login_id, access_token_sha256)"
+        " VALUES (%s, %s, %s, %s, %s, %s, %s)"
         " ON CONFLICT (runtime) DO UPDATE SET status = EXCLUDED.status,"
         " login_url = EXCLUDED.login_url, expires_at = EXCLUDED.expires_at,"
-        " device_code = EXCLUDED.device_code, login_id = EXCLUDED.login_id",
+        " device_code = EXCLUDED.device_code, login_id = EXCLUDED.login_id,"
+        " access_token_sha256 = EXCLUDED.access_token_sha256",
         (key, *(data.get(column) for column in _OAUTH_COLUMNS)),
     )
 
@@ -535,39 +540,42 @@ def set_oauth_login(cur: Any, key: str, data: dict[str, Any] | None) -> None:
 # -- provider account records ---------------------------------------------------------
 
 
-def save_openai_account(account: dict[str, Any] | None) -> None:
-    _save_provider_account("openai", account if account is not None else {"account_id": None})
+def save_openai_account(account: dict[str, Any] | None, cur: Any = None) -> None:
+    _save_provider_account("openai", account if account is not None else {"account_id": None}, cur)
 
 
-def read_openai_account() -> dict[str, Any]:
-    value = _read_provider_account("openai")
+def read_openai_account(cur: Any = None) -> dict[str, Any]:
+    value = _read_provider_account("openai", cur)
     return value if isinstance(value, dict) else {}
 
 
-def save_claude_account(account: dict[str, Any] | None) -> None:
-    _save_provider_account("claude", account or {})
+def save_claude_account(account: dict[str, Any] | None, cur: Any = None) -> None:
+    _save_provider_account("claude", account or {}, cur)
 
 
-def read_claude_account() -> dict[str, Any]:
-    value = _read_provider_account("claude")
+def read_claude_account(cur: Any = None) -> dict[str, Any]:
+    value = _read_provider_account("claude", cur)
     return value if isinstance(value, dict) else {}
 
 
-def _save_provider_account(provider: str, data: dict[str, Any]) -> None:
+def _save_provider_account(provider: str, data: dict[str, Any], cur: Any = None) -> None:
     # account_id is a typed column; the rest is the provider CLI's own shape,
     # cached verbatim as metadata.
+    if cur is None:
+        with mutation() as fresh:
+            _save_provider_account(provider, data, fresh)
+        return
     metadata = {key: value for key, value in data.items() if key != "account_id"}
-    with mutation() as cur:
-        cur.execute(
-            "INSERT INTO provider_accounts (provider, account_id, metadata) VALUES (%s, %s, %s)"
-            " ON CONFLICT (provider) DO UPDATE SET account_id = EXCLUDED.account_id,"
-            " metadata = EXCLUDED.metadata",
-            (provider, data.get("account_id"), db.jsonb(metadata)),
-        )
+    cur.execute(
+        "INSERT INTO provider_accounts (provider, account_id, metadata) VALUES (%s, %s, %s)"
+        " ON CONFLICT (provider) DO UPDATE SET account_id = EXCLUDED.account_id,"
+        " metadata = EXCLUDED.metadata",
+        (provider, data.get("account_id"), db.jsonb(metadata)),
+    )
 
 
-def _read_provider_account(provider: str) -> dict[str, Any]:
-    with db.transaction() as cur:
+def _read_provider_account(provider: str, cur: Any = None) -> dict[str, Any]:
+    with _read(cur) as cur:
         cur.execute(
             "SELECT account_id, metadata FROM provider_accounts WHERE provider = %s", (provider,)
         )
@@ -656,12 +664,16 @@ class Page:
     items: list[dict[str, Any]]
 
 
-def page_agent_events(since: int | None) -> Page:
+def page_agent_events_before(before: int | None, *, limit: int = EVENT_PAGE_LIMIT) -> Page:
+    """One newest-first page of the agent audit log: events with
+    ``seq < before`` (all events when ``before`` is None), newest first."""
+    where = " WHERE seq < %s" if before is not None else ""
+    params: tuple[Any, ...] = (before,) if before is not None else ()
     with db.transaction() as cur:
         cur.execute(
-            f"SELECT {_EVENT_FIELDS} FROM agent_events"
-            " WHERE seq > %s ORDER BY seq LIMIT %s",
-            (since if since is not None else 0, EVENT_LIMIT),
+            f"SELECT {_EVENT_FIELDS} FROM agent_events{where}"
+            " ORDER BY seq DESC LIMIT %s",
+            params + (limit,),
         )
         return Page([_event_dict(row) for row in cur.fetchall()])
 
@@ -684,13 +696,30 @@ def network_policy_record() -> dict[str, Any] | None:
     ``{"controls": ..., "updated_at": ...}``, or None when nothing was ever
     stored (the fail-closed empty default)."""
     with db.transaction() as cur:
+        # One snapshot for every SELECT: under the default READ COMMITTED a
+        # concurrent policy replace could commit between statements and this
+        # read would recombine two policies (for example old allowed methods
+        # with new missing path guards).
+        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         cur.execute("SELECT updated_at FROM network_policy")
         row = cur.fetchone()
         if row is None:
             return None
         updated_at = row[0]
-        cur.execute("SELECT provider FROM managed_provider_access")
-        managed = {str(provider): True for (provider,) in cur.fetchall()}
+        cur.execute("SELECT integration FROM managed_integrations")
+        integrations: dict[str, dict[str, Any]] = {
+            str(integration): {"enabled": True} for (integration,) in cur.fetchall()
+        }
+        cur.execute("SELECT owner, repo FROM github_repositories ORDER BY position")
+        write_repositories = [{"owner": str(owner), "repo": str(repo)} for owner, repo in cur.fetchall()]
+        # Validation guarantees write repositories exist only while GitHub is
+        # enabled, so a row without the enabled integration is unreachable.
+        if write_repositories and "github" in integrations:
+            integrations["github"]["write_repositories"] = write_repositories
+        cur.execute("SELECT require_dot_github_approval FROM github_settings")
+        settings_row = cur.fetchone()
+        if settings_row and settings_row[0] and "github" in integrations:
+            integrations["github"]["require_dot_github_approval"] = True
         allowed: dict[str, dict[str, Any]] = {}
         cur.execute("SELECT domain FROM allowed_domains ORDER BY domain")
         for (domain,) in cur.fetchall():
@@ -703,7 +732,7 @@ def network_policy_record() -> dict[str, Any] | None:
             allowed[str(domain)].setdefault("path_guards", []).append(pattern)
     return {
         "controls": {
-            "managed_ai_provider_network_access": managed,
+            "managed_network_integrations": integrations,
             "allowed_network_access": allowed,
         },
         "updated_at": updated_at,
@@ -718,16 +747,29 @@ def save_network_policy(controls: dict[str, Any], updated_at: str) -> None:
         cur.execute("DELETE FROM domain_path_guards")
         cur.execute("DELETE FROM domain_methods")
         cur.execute("DELETE FROM allowed_domains")
-        cur.execute("DELETE FROM managed_provider_access")
+        cur.execute("DELETE FROM github_repositories")
+        cur.execute("DELETE FROM github_settings")
+        cur.execute("DELETE FROM managed_integrations")
         cur.execute(
             "INSERT INTO network_policy (singleton, updated_at) VALUES (TRUE, %s)"
             " ON CONFLICT (singleton) DO UPDATE SET updated_at = EXCLUDED.updated_at",
             (updated_at,),
         )
-        managed = controls.get("managed_ai_provider_network_access") or {}
-        for provider, enabled in managed.items():
-            if enabled is True:
-                cur.execute("INSERT INTO managed_provider_access (provider) VALUES (%s)", (provider,))
+        integrations = controls.get("managed_network_integrations") or {}
+        for integration, value in integrations.items():
+            if isinstance(value, dict) and value.get("enabled") is True:
+                cur.execute("INSERT INTO managed_integrations (integration) VALUES (%s)", (integration,))
+        github = integrations.get("github")
+        if isinstance(github, dict):
+            for position, repository in enumerate(github.get("write_repositories") or []):
+                cur.execute(
+                    "INSERT INTO github_repositories (position, owner, repo) VALUES (%s, %s, %s)",
+                    (position, repository["owner"], repository["repo"]),
+                )
+            if github.get("require_dot_github_approval") is True:
+                cur.execute(
+                    "INSERT INTO github_settings (singleton, require_dot_github_approval) VALUES (TRUE, TRUE)"
+                )
         for domain, rule in (controls.get("allowed_network_access") or {}).items():
             cur.execute("INSERT INTO allowed_domains (domain) VALUES (%s)", (domain,))
             for position, method in enumerate(rule.get("allow_http_methods") or []):
@@ -790,6 +832,271 @@ def _read_proxy_pin(provider: str) -> dict[str, Any]:
     if row[1] is not None:
         pin["access_token_sha256"] = row[1]
     return pin
+
+
+# -- github credential (admin only; the proxy role has no grant on it) ----------------
+
+
+_GITHUB_CREDENTIAL_COLUMNS = (
+    "mode",
+    "token",
+    "app_id",
+    "installation_id",
+    "private_key_pem",
+    "updated_at",
+    "validation",
+)
+_GITHUB_CREDENTIAL_SECRET_COLUMNS = ("token", "private_key_pem")
+
+
+def _encrypt_secret(value: Any) -> str | None:
+    """Encrypt a secret column value. Secrets are either absent or non-empty
+    strings — anything else is a programming error, refused loudly rather
+    than ever stored unencrypted."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError("stored secrets must be non-empty strings")
+    return secretbox.encrypt(value)
+
+
+def read_github_credential() -> dict[str, Any]:
+    with db.transaction() as cur:
+        cur.execute(f"SELECT {', '.join(_GITHUB_CREDENTIAL_COLUMNS)} FROM github_credential")
+        row = cur.fetchone()
+    if row is None:
+        return {}
+    credential = {column: value for column, value in zip(_GITHUB_CREDENTIAL_COLUMNS, row) if value is not None}
+    for column in _GITHUB_CREDENTIAL_SECRET_COLUMNS:
+        if isinstance(credential.get(column), str):
+            credential[column] = secretbox.decrypt(credential[column])
+    return credential
+
+
+def save_github_credential(credential: dict[str, Any] | None) -> None:
+    """Replace or clear the single fixed GitHub credential row."""
+    with mutation() as cur:
+        cur.execute("DELETE FROM github_credential")
+        if credential is None:
+            return
+        cur.execute(
+            f"INSERT INTO github_credential (singleton, {', '.join(_GITHUB_CREDENTIAL_COLUMNS)})"
+            f" VALUES (TRUE, {', '.join(['%s'] * len(_GITHUB_CREDENTIAL_COLUMNS))})",
+            tuple(
+                db.jsonb(credential.get(column) or {})
+                if column == "validation"
+                else _encrypt_secret(credential.get(column))
+                if column in _GITHUB_CREDENTIAL_SECRET_COLUMNS
+                else credential.get(column)
+                for column in _GITHUB_CREDENTIAL_COLUMNS
+            ),
+        )
+
+
+def set_github_credential_validation(validation: dict[str, Any]) -> None:
+    with mutation() as cur:
+        cur.execute("UPDATE github_credential SET validation = %s", (db.jsonb(validation),))
+
+
+# -- proxy github token (the proxy's working copy; SELECT grant) ----------------------
+
+
+def save_proxy_github_token(token: str | None, expires_at: str | None = None) -> None:
+    """Replace or clear the proxy's working copy of the active GitHub token —
+    the only copy: ``expires_at`` (app mode; None for a PAT) is what reconcile
+    checks to re-mint in time. Stored as secretbox ciphertext like every other
+    secret; the proxy role holds SELECT on this row and on secret_keys (see
+    migration 0002), which together decrypt exactly this working set and
+    nothing else."""
+    if token is not None and (not isinstance(token, str) or not token):
+        raise ValueError("the proxy github token must be a non-empty string or None")
+    with mutation() as cur:
+        cur.execute("DELETE FROM proxy_github_token")
+        if token is not None:
+            cur.execute(
+                "INSERT INTO proxy_github_token (singleton, token, expires_at, updated_at) VALUES (TRUE, %s, %s, %s)",
+                (secretbox.encrypt(token), expires_at, utc_now()),
+            )
+
+
+_proxy_github_token_cache: tuple[str, str] | None = None
+
+
+def read_proxy_github_token() -> str | None:
+    """The active token the proxy injects, or None while GitHub is disabled
+    or no credential is stored. Runs under the proxy role (SELECT grant)."""
+    record = read_proxy_github_token_record()
+    return record["token"] if record else None
+
+
+def read_proxy_github_token_record() -> dict[str, Any] | None:
+    """The working-token row (``token`` decrypted, plus ``expires_at``), or
+    None when nothing is published. Reconcile reads the expiry to decide
+    whether the published app token still has margin or must be re-minted."""
+    global _proxy_github_token_cache
+    with db.transaction() as cur:
+        cur.execute("SELECT token, expires_at FROM proxy_github_token")
+        row = cur.fetchone()
+    if not row:
+        return None
+    ciphertext, expires_at = str(row[0]), row[1]
+    cached = _proxy_github_token_cache
+    if cached is not None and cached[0] == ciphertext:
+        token = cached[1]
+    else:
+        token = secretbox.decrypt(ciphertext)
+        _proxy_github_token_cache = (ciphertext, token)
+    return {"token": token, "expires_at": expires_at}
+
+
+# -- github repository audits (admin only; no proxy grant) ----------------------------
+
+
+def save_github_repo_audit(owner: str, repo: str, facts: dict[str, Any], error: str | None) -> None:
+    """Upsert one repository's audit facts (or the fetch error)."""
+    with mutation() as cur:
+        cur.execute(
+            "INSERT INTO github_repo_audit (owner, repo, fetched_at, facts, error)"
+            " VALUES (%s, %s, %s, %s, %s)"
+            " ON CONFLICT (owner, repo) DO UPDATE SET"
+            " fetched_at = EXCLUDED.fetched_at, facts = EXCLUDED.facts, error = EXCLUDED.error",
+            (owner, repo, utc_now(), db.jsonb(facts), error),
+        )
+
+
+def read_github_repo_audits() -> dict[tuple[str, str], dict[str, Any]]:
+    """All stored audits keyed by (owner, repo):
+    ``{"fetched_at": ..., "facts": {...}, "error": ...?}``."""
+    with db.transaction() as cur:
+        cur.execute("SELECT owner, repo, fetched_at, facts, error FROM github_repo_audit")
+        rows = cur.fetchall()
+    audits: dict[tuple[str, str], dict[str, Any]] = {}
+    for owner, repo, fetched_at, facts, error in rows:
+        audit: dict[str, Any] = {"fetched_at": fetched_at, "facts": facts if isinstance(facts, dict) else {}}
+        if error is not None:
+            audit["error"] = str(error)
+        audits[(str(owner), str(repo))] = audit
+    return audits
+
+
+def prune_github_repo_audits(keep: set[tuple[str, str]]) -> None:
+    """Drop audits for repositories no longer in the policy."""
+    with mutation() as cur:
+        cur.execute("SELECT owner, repo FROM github_repo_audit")
+        for owner, repo in cur.fetchall():
+            if (str(owner), str(repo)) not in keep:
+                cur.execute("DELETE FROM github_repo_audit WHERE owner = %s AND repo = %s", (owner, repo))
+
+
+# -- github .github push-approval gate (pending_pushes) ------------------------
+# The proxy enqueues a row when a gated push touches .github/ (INSERT grant);
+# the admin service lists and resolves them.
+
+def enqueue_pending_push(
+    push_id: str,
+    owner: str,
+    repo: str,
+    ref_updates: list[dict[str, str]],
+    changed_paths: list[str],
+) -> None:
+    with mutation() as cur:
+        cur.execute(
+            "INSERT INTO pending_pushes (id, owner, repo, ref_updates, changed_paths, requested_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s)",
+            (push_id, owner, repo, db.jsonb(ref_updates), db.jsonb(changed_paths), utc_now()),
+        )
+
+
+def _pending_push_row(row: tuple[Any, ...]) -> dict[str, Any]:
+    push_id, owner, repo, ref_updates, changed_paths, requested_at, status, _claimed_at, resolved_at, detail = row
+    value: dict[str, Any] = {
+        "id": str(push_id),
+        "owner": str(owner),
+        "repo": str(repo),
+        "ref_updates": ref_updates if isinstance(ref_updates, list) else [],
+        "changed_paths": changed_paths if isinstance(changed_paths, list) else [],
+        "requested_at": requested_at,
+        "status": str(status),
+    }
+    if resolved_at is not None:
+        value["resolved_at"] = resolved_at
+    if detail is not None:
+        value["detail"] = str(detail)
+    return value
+
+
+_PENDING_PUSH_COLUMNS = "id, owner, repo, ref_updates, changed_paths, requested_at, status, claimed_at, resolved_at, detail"
+
+
+def read_pending_pushes(status: str | None = None) -> list[dict[str, Any]]:
+    """Pending pushes, newest first. ``status`` filters to one state."""
+    with db.transaction() as cur:
+        if status is None:
+            cur.execute(f"SELECT {_PENDING_PUSH_COLUMNS} FROM pending_pushes ORDER BY requested_at DESC")
+        else:
+            cur.execute(
+                f"SELECT {_PENDING_PUSH_COLUMNS} FROM pending_pushes WHERE status = %s ORDER BY requested_at DESC",
+                (status,),
+            )
+        return [_pending_push_row(row) for row in cur.fetchall()]
+
+
+def get_pending_push(push_id: str) -> dict[str, Any] | None:
+    with db.transaction() as cur:
+        cur.execute(f"SELECT {_PENDING_PUSH_COLUMNS} FROM pending_pushes WHERE id = %s", (push_id,))
+        row = cur.fetchone()
+    return _pending_push_row(row) if row else None
+
+
+def claim_pending_push(push_id: str) -> dict[str, Any] | None:
+    """Move a pending or stale resolving push into ``resolving`` and return it."""
+    now = utc_now()
+    stale_before = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ",
+        time.gmtime(time.time() - PENDING_PUSH_RESOLVING_TIMEOUT_SECONDS),
+    )
+    with mutation() as cur:
+        cur.execute(
+            "UPDATE pending_pushes SET status = 'resolving', claimed_at = %s"
+            " WHERE id = %s AND (status = 'pending'"
+            " OR (status = 'resolving' AND (claimed_at IS NULL OR claimed_at < %s)))"
+            f" RETURNING {_PENDING_PUSH_COLUMNS}",
+            (now, push_id, stale_before),
+        )
+        row = cur.fetchone()
+    return _pending_push_row(row) if row else None
+
+
+def resolve_pending_push(push_id: str, status: str, detail: str | None = None) -> None:
+    """Mark a pending push resolved (approved/rejected/failed) with an optional
+    detail message. A no-op if the row is gone or already in a final state."""
+    with mutation() as cur:
+        cur.execute(
+            "UPDATE pending_pushes SET status = %s, claimed_at = NULL, resolved_at = %s, detail = %s"
+            " WHERE id = %s AND status IN ('pending', 'resolving')",
+            (status, utc_now(), detail or None, push_id),
+        )
+
+
+def read_github_credential_metadata() -> dict[str, Any]:
+    credential = read_github_credential()
+    mode = credential.get("mode")
+    if mode not in ("pat", "app"):
+        return {"configured": False}
+    value: dict[str, Any] = {"configured": True, "mode": mode}
+    if isinstance(credential.get("updated_at"), str):
+        value["updated_at"] = credential["updated_at"]
+    if mode == "app":
+        if isinstance(credential.get("app_id"), str):
+            value["app_id"] = credential["app_id"]
+        if isinstance(credential.get("installation_id"), str):
+            value["installation_id"] = credential["installation_id"]
+        published = read_proxy_github_token_record()
+        if published and isinstance(published.get("expires_at"), str):
+            value["app_token_expires_at"] = published["expires_at"]
+    validation = credential.get("validation")
+    value["validation"] = validation if isinstance(validation, dict) else {"status": "not_checked"}
+    return value
 
 
 def append_network_event(
@@ -876,11 +1183,25 @@ def read_network_events() -> list[dict[str, Any]]:
         return [_network_event_dict(row) for row in cur.fetchall()]
 
 
-def page_network_events(since: int | None) -> Page:
+def page_network_events_before(
+    before: int | None,
+    *,
+    decision: str | None = None,
+    limit: int = EVENT_PAGE_LIMIT,
+) -> Page:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if decision is not None:
+        clauses.append("decision = %s")
+        params.append(decision)
+    if before is not None:
+        clauses.append("seq < %s")
+        params.append(before)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     with db.transaction() as cur:
         cur.execute(
-            f"SELECT {_NETWORK_EVENT_FIELDS} FROM network_events"
-            " WHERE seq > %s ORDER BY seq LIMIT %s",
-            (since if since is not None else 0, EVENT_LIMIT),
+            f"SELECT {_NETWORK_EVENT_FIELDS} FROM network_events{where}"
+            " ORDER BY seq DESC LIMIT %s",
+            tuple(params) + (limit,),
         )
         return Page([_network_event_dict(row) for row in cur.fetchall()])

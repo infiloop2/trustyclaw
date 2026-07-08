@@ -2,6 +2,16 @@ name: trustyclaw-stage
 
 on:
   workflow_dispatch:
+    inputs:
+      suite:
+        description: Which stage test suite to run
+        type: choice
+        default: all
+        options:
+          - all
+          - claude
+          - codex
+          - github
 
 permissions:
   actions: read
@@ -175,12 +185,18 @@ jobs:
         env:
           AWS_DEFAULT_REGION: us-east-1
           TRUSTYCLAW_STAGE_ADMIN_PASSWORD: ${{ secrets.TRUSTYCLAW_STAGE_ADMIN_PASSWORD }}
+          STAGE_SUITE: ${{ inputs.suite }}
+          STAGE_GITHUB_WRITE_REPO: ${{ secrets.TRUSTYCLAW_STAGE_GITHUB_WRITE_REPO }}
+          STAGE_GITHUB_APP_ID: ${{ secrets.TRUSTYCLAW_STAGE_GITHUB_APP_ID }}
+          STAGE_GITHUB_APP_INSTALLATION_ID: ${{ secrets.TRUSTYCLAW_STAGE_GITHUB_APP_INSTALLATION_ID }}
+          STAGE_GITHUB_APP_PRIVATE_KEY: ${{ secrets.TRUSTYCLAW_STAGE_GITHUB_APP_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           python3 tests/stage/stage_aws.py \
             --result-file trustyclaw-stage.json \
             --ssh-key-env TRUSTYCLAW_STAGE_SSH_KEY \
-            --admin-password-env TRUSTYCLAW_STAGE_ADMIN_PASSWORD 2>&1 | tee stage-test.log
+            --admin-password-env TRUSTYCLAW_STAGE_ADMIN_PASSWORD \
+            --suite "${STAGE_SUITE:-all}" 2>&1 | tee stage-test.log
 
       - name: Stop stage instance
         id: stop_stage
@@ -211,6 +227,7 @@ jobs:
           TEST_OUTCOME: ${{ steps.stage_tests.outcome }}
           STOP_OUTCOME: ${{ steps.stop_stage.outcome }}
           TRUSTYCLAW_STAGE_REF: ${{ needs.authorize.outputs.ref }}
+          STAGE_SUITE: ${{ inputs.suite }}
         run: |
           set -euo pipefail
           instance_id="n/a"
@@ -237,6 +254,7 @@ jobs:
             echo "| Field | Value |"
             echo "| --- | --- |"
             echo "| Ref | ${TRUSTYCLAW_STAGE_REF:-n/a} |"
+            echo "| Suite | ${STAGE_SUITE:-all} |"
             echo "| Region | ${region} |"
             echo "| Instance | ${instance_id} |"
             echo "| Public DNS | ${public_dns} |"

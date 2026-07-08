@@ -17,7 +17,8 @@ from host.config import ConfigError, parse_network_controls
 from host.runtime import pgclient
 from host.runtime.network_policy import load_policy, load_policy_updated_at
 from host.runtime.state import (
-    page_network_events,
+    EVENT_PAGE_LIMIT,
+    page_network_events_before,
     save_proxy_claude_account,
     save_proxy_openai_account_id,
 )
@@ -43,8 +44,13 @@ def network_policy() -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def network_events(since: int | None) -> list[dict[str, Any]]:
-    return page_network_events(since).items
+def network_events_before(
+    before: int | None,
+    *,
+    decision: str | None = None,
+    limit: int = EVENT_PAGE_LIMIT,
+) -> list[dict[str, Any]]:
+    return page_network_events_before(before, decision=decision, limit=limit).items
 
 
 def sync_openai_account_id(account_id: str | None) -> None:

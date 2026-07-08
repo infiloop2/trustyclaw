@@ -48,7 +48,7 @@ Provisioning happens in two stages:
    script to the instance and runs the bootstrap as root. Bootstrap mounts the
    durable data volumes, enforces the command/version preconditions against the
    authoritative admin disk state, installs packages (Python, PostgreSQL,
-   Node, npm, Codex CLI, Claude Code CLI, nftables, OpenSSL),
+   Node, npm, Codex CLI, Claude Code CLI, git, gh, nftables, OpenSSL),
    applies pending security updates, starts the admin-state Postgres on the
    durable admin volume and applies schema migrations, creates a 6 GiB
    swapfile, creates the proxy CA, installs the systemd services, seeds an
