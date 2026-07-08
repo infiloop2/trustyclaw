@@ -23,13 +23,13 @@ directory below. Those writable locations are not trusted code or policy inputs.
 | --- | --- | --- |
 | `/opt/trustyclaw-host` | root-owned, `a+rX`, not service-writable | Host runtime Python package imported by the services. |
 | `/usr/local/bin`, `/usr/local/lib/node_modules` | root-owned, readable/executable, not service-writable | Node.js, Codex CLI, and Claude Code CLI. |
-| `/usr/local/lib/trustyclaw-host/*` | root-owned, `755`, not service-writable | Fixed sudo helpers for runtime launch, account reads, agent-home file reads, reboot, policy updates, proxy-state reads, and provider-pin sync. |
+| `/usr/local/lib/trustyclaw-host/*` | root-owned, `755`, not service-writable | Fixed sudo helpers for runtime launch, account reads, auth clearing, agent-home file reads, reboot, GitHub App token minting/audits, and `.github` push approval. |
 | `/etc/sudoers.d/trustyclaw-host` | root-owned, `440`, not service-writable | Exact helper allowlist for `trustyclaw-admin`. |
 | `/etc/systemd/system/trustyclaw-*.service` | root-owned system config, not service-writable | Admin API, network proxy, and optional Cloudflare Tunnel service units. |
 | `/etc/trustyclaw/cloudflared.token` | root-owned, `0640`, group `cloudflared` | Cloudflare Tunnel token for the optional `cloudflared` service. Readable by root and `cloudflared`, not by TrustyClaw admin/proxy/agent/operator users. |
 | `/etc/trustyclaw/cloudflare_hostname` | root-owned, `644` | Configured Cloudflare Access hostname used for bootstrap verification and operator diagnostics. |
 | `/etc/nftables.conf` | root-owned system config, not service-writable | Host firewall rules. |
-| `/etc/codex/requirements.toml` | root-owned, `644`, not service-writable | Managed Codex policy restricting web search mode. |
+| `/etc/codex/requirements.toml` | root-owned, `644`, not service-writable | Managed Codex policy restricting web search mode and disabling Codex app/plugin connector surfaces. |
 | `/usr/local/share/ca-certificates/trustyclaw-network-proxy.crt` | root-owned, `644`, public certificate | Public proxy CA certificate installed in the system trust store for agent runtimes. |
 | `/swapfile` | root only | 6 GiB swapfile. |
 
@@ -59,7 +59,7 @@ redeploys.
 
 | Path | Access | Contents |
 | --- | --- | --- |
-| `/mnt/trustyclaw-admin/postgres/<major>/main/` | postgres user only | Postgres data directory: config (including stored operator endpoints and Cloudflare Tunnel tokens, so upgrade and recovery can recreate access), task history, events, session maps, account records, network policy/pins/events. |
+| `/mnt/trustyclaw-admin/postgres/<major>/main/` | postgres user only | Postgres data directory: config (including stored operator endpoints and Cloudflare Tunnel tokens, so upgrade and recovery can recreate access), task history, events, session maps, account records, network policy/pins/events, and the GitHub credential (PAT or App key plus minted installation tokens). |
 | `/mnt/trustyclaw-admin/admin-state/version.json` | admin only | Authoritative admin disk version, read by bootstrap before the database is up to enforce the deploy/upgrade/recover policy. |
 | `/mnt/trustyclaw-admin/proxy-state/network_proxy_ca.key` | proxy only | Proxy CA private key. |
 | `/mnt/trustyclaw-admin/proxy-state/network_proxy_ca.crt` | mode 644, but behind proxy-state traversal controls | Proxy CA certificate copied into the system trust store for agent/runtime use. |
@@ -72,7 +72,9 @@ The agent volume is mounted at `/mnt/trustyclaw-agent`, with the agent home at
 `/mnt/trustyclaw-agent/agent-home`. It is preserved across redeploys. This is
 the agent user's only durable writable storage: runtime auth, session files,
 workspace state, and user-installed non-root tools should land here because the
-runtime helpers set `HOME` and the working directory to this path.
+runtime helpers set `HOME` and the working directory to this path. Bootstrap
+also maintains a few root-owned, readable, immutable runtime files here:
+`AGENTS.md`, `CLAUDE.md`, `.codex/config.toml`, and `.claude/settings.json`.
 
 That does not mean the agent has literally no other writable path. As a normal
 unprivileged Linux user it can still write to standard ephemeral locations such
@@ -86,4 +88,4 @@ privilege escalation.
 
 | Path | Access | Contents |
 | --- | --- | --- |
-| `/mnt/trustyclaw-agent/agent-home/` | agent only | Agent runtime auth, provider session files, CLI caches, and workspace data. |
+| `/mnt/trustyclaw-agent/agent-home/` | agent writable, with selected immutable root-owned files | Agent runtime auth, provider session files, CLI caches, workspace data, and the small bootstrap-managed instruction/config files installed after symlink slots are sanitized. |

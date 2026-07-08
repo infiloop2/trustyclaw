@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 import pg_harness
 
-from host.runtime import db, state
+from host.runtime import db, secretbox, state
 from host.runtime.state import (
     load_config,
     network_proxy_cert_files,
@@ -186,16 +186,17 @@ class StateStorageTests(unittest.TestCase):
         seqs = [event["seq"] for event in events]
         self.assertEqual(len(seqs), len(set(seqs)), f"duplicate event seqs: {seqs}")
 
-    def test_event_pages_are_since_filtered_and_bounded(self) -> None:
+    def test_event_pages_are_newest_first_and_cursor_bounded(self) -> None:
         with state.mutation() as cur:
             for index in range(8):
                 state.append_agent_event(cur, "task.message", "task_1" if index % 2 else None, {"message": f"m{index}", "source": "user"})
-        page = state.page_agent_events(None)
-        self.assertEqual(len(page.items), state.EVENT_LIMIT)
+        page = state.page_agent_events_before(None, limit=5)
+        self.assertEqual(len(page.items), 5)
         seqs = [event["seq"] for event in page.items]
-        self.assertEqual(seqs, sorted(seqs))
-        later = state.page_agent_events(seqs[-1])
-        self.assertTrue(all(event["seq"] > seqs[-1] for event in later.items))
+        self.assertEqual(seqs, sorted(seqs, reverse=True))
+        older = state.page_agent_events_before(seqs[-1], limit=5)
+        self.assertTrue(older.items)
+        self.assertTrue(all(event["seq"] < seqs[-1] for event in older.items))
         task_page = state.page_task_events("task_1", None)
         self.assertTrue(all(event["task_id"] == "task_1" for event in task_page.items))
 
@@ -269,10 +270,277 @@ class StateStorageTests(unittest.TestCase):
         self.assertEqual(read_proxy_openai_account_id(), "acct_pin")
         self.assertEqual(read_proxy_claude_account(), {"access_token_sha256": "d" * 64})
         self.assertIsNone(state.network_policy_record())
-        state.save_network_policy({"managed_ai_provider_network_access": {}, "allowed_network_access": {}}, "2026-06-08T00:00:00Z")
+        state.save_network_policy({"managed_network_integrations": {}, "allowed_network_access": {}}, "2026-06-08T00:00:00Z")
         record = state.network_policy_record()
         assert record is not None
         self.assertEqual(record["updated_at"], "2026-06-08T00:00:00Z")
+
+    def test_network_policy_round_trips_integrations_and_github_repos(self) -> None:
+        controls = {
+            "managed_network_integrations": {
+                "openai": {"enabled": True},
+                "github": {
+                    "enabled": True,
+                    "write_repositories": [
+                        {"owner": "infiloop2", "repo": "trustyclaw"},
+                        {"owner": "infiloop2", "repo": "infibot"},
+                    ],
+                },
+                "npm_packages": {"enabled": True},
+            },
+            "allowed_network_access": {"example.com": {"allow_http_methods": ["GET"]}},
+        }
+        state.save_network_policy(controls, "2026-06-08T00:00:00Z")
+        record = state.network_policy_record()
+        assert record is not None
+        self.assertEqual(record["controls"], controls)
+        # Narrowing the repository list round-trips too.
+        narrowed = {
+            "managed_network_integrations": {
+                "github": {"enabled": True, "write_repositories": [{"owner": "infiloop2", "repo": "trustyclaw"}]},
+            },
+            "allowed_network_access": {},
+        }
+        state.save_network_policy(narrowed, "2026-06-08T00:00:01Z")
+        record = state.network_policy_record()
+        assert record is not None
+        self.assertEqual(record["controls"], narrowed)
+        # Replacing with a github-free policy clears the repository rows too.
+        state.save_network_policy(
+            {"managed_network_integrations": {"claude": {"enabled": True}}, "allowed_network_access": {}},
+            "2026-06-08T00:00:02Z",
+        )
+        record = state.network_policy_record()
+        assert record is not None
+        self.assertEqual(
+            record["controls"]["managed_network_integrations"], {"claude": {"enabled": True}}
+        )
+
+    def test_require_dot_github_approval_round_trips(self) -> None:
+        controls = {
+            "managed_network_integrations": {
+                "github": {
+                    "enabled": True,
+                    "write_repositories": [{"owner": "infiloop2", "repo": "trustyclaw"}],
+                    "require_dot_github_approval": True,
+                }
+            },
+            "allowed_network_access": {},
+        }
+        state.save_network_policy(controls, "2026-06-08T00:00:00Z")
+        record = state.network_policy_record()
+        assert record is not None
+        self.assertEqual(record["controls"], controls)
+
+    def test_pending_pushes_lifecycle(self) -> None:
+        state.enqueue_pending_push(
+            "abc123",
+            "infiloop2",
+            "trustyclaw",
+            [{"old": "0" * 40, "new": "1" * 40, "ref": "refs/heads/main"}],
+            [".github/workflows/ci.yml"],
+        )
+        pending = state.read_pending_pushes("pending")
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["id"], "abc123")
+        self.assertEqual(pending[0]["changed_paths"], [".github/workflows/ci.yml"])
+        self.assertEqual(pending[0]["status"], "pending")
+        self.assertEqual(state.get_pending_push("abc123")["ref_updates"][0]["ref"], "refs/heads/main")
+        claimed = state.claim_pending_push("abc123")
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+        self.assertEqual(claimed["status"], "resolving")
+        with state.db.transaction() as cur:
+            cur.execute("SELECT claimed_at FROM pending_pushes WHERE id = %s", ("abc123",))
+            first_claimed_at = cur.fetchone()[0]
+        self.assertIsNotNone(first_claimed_at)
+        self.assertEqual(state.read_pending_pushes("pending"), [])
+        resolving = state.read_pending_pushes("resolving")
+        self.assertEqual(len(resolving), 1)
+        self.assertEqual(resolving[0]["status"], "resolving")
+        self.assertIsNone(state.claim_pending_push("abc123"))
+        with state.mutation() as cur:
+            cur.execute("UPDATE pending_pushes SET claimed_at = %s WHERE id = %s", ("1970-01-01T00:00:00Z", "abc123"))
+        stale_resolving = state.read_pending_pushes("resolving")
+        self.assertEqual(len(stale_resolving), 1)
+        self.assertEqual(stale_resolving[0]["status"], "resolving")
+        reclaimed = state.claim_pending_push("abc123")
+        self.assertIsNotNone(reclaimed)
+        assert reclaimed is not None
+        self.assertEqual(reclaimed["status"], "resolving")
+        state.resolve_pending_push("abc123", "approved")
+        approved = state.get_pending_push("abc123")
+        self.assertIsNotNone(approved)
+        assert approved is not None
+        self.assertEqual(approved["status"], "approved")
+        with state.db.transaction() as cur:
+            cur.execute("SELECT claimed_at FROM pending_pushes WHERE id = %s", ("abc123",))
+            self.assertIsNone(cur.fetchone()[0])
+        self.assertEqual(state.read_pending_pushes("pending"), [])
+        # Resolving again is a no-op (already resolved).
+        state.resolve_pending_push("abc123", "rejected")
+        self.assertEqual(state.get_pending_push("abc123")["status"], "approved")
+
+    def test_encrypt_secret_refuses_non_string_values(self) -> None:
+        # Secrets are either absent or non-empty strings; anything else is a
+        # programming error that must never be stored (unencrypted or at all).
+        self.assertIsNone(state._encrypt_secret(None))
+        for bad in ("", 42, b"bytes", {"nested": "value"}):
+            with self.subTest(value=bad), self.assertRaises(ValueError):
+                state._encrypt_secret(bad)
+
+    def test_github_credential_round_trips_and_masks_metadata(self) -> None:
+        self.assertEqual(state.read_github_credential_metadata(), {"configured": False})
+        state.save_github_credential(
+            {
+                "mode": "pat",
+                "token": "github_pat_secret",
+                "updated_at": "2026-06-08T00:00:00Z",
+                "validation": {"status": "not_checked"},
+            }
+        )
+        self.assertEqual(state.read_github_credential()["token"], "github_pat_secret")
+        with state.db.transaction() as cur:
+            cur.execute("SELECT token FROM github_credential")
+            raw_token = cur.fetchone()[0]
+        self.assertTrue(raw_token.startswith("enc:v1:"))
+        self.assertNotIn("github_pat_secret", raw_token)
+        metadata = state.read_github_credential_metadata()
+        self.assertEqual(metadata["mode"], "pat")
+        self.assertTrue(metadata["configured"])
+        self.assertNotIn("github_pat_secret", str(metadata))
+
+        state.save_github_credential(
+            {
+                "mode": "app",
+                "app_id": "12345",
+                "installation_id": "67890",
+                "private_key_pem": "-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END RSA PRIVATE KEY-----",
+                "updated_at": "2026-06-08T00:00:00Z",
+                "validation": {"status": "not_checked"},
+            }
+        )
+        with state.db.transaction() as cur:
+            cur.execute("SELECT private_key_pem FROM github_credential")
+            (raw_key,) = cur.fetchone()
+        self.assertTrue(raw_key.startswith("enc:v1:"))
+        # The minted working token lives only in the proxy row; its expiry
+        # surfaces as app_token_expires_at in the credential metadata.
+        state.save_proxy_github_token("ghs_minted", "2026-06-08T01:00:00Z")
+        self.assertEqual(
+            state.read_proxy_github_token_record(),
+            {"token": "ghs_minted", "expires_at": "2026-06-08T01:00:00Z"},
+        )
+        metadata = state.read_github_credential_metadata()
+        self.assertEqual(metadata["mode"], "app")
+        self.assertEqual(metadata["app_token_expires_at"], "2026-06-08T01:00:00Z")
+        self.assertNotIn("ghs_minted", str(metadata))
+        self.assertNotIn("PRIVATE KEY", str(metadata))
+        state.save_proxy_github_token(None)
+
+        state.save_github_credential(None)
+        self.assertEqual(state.read_github_credential_metadata(), {"configured": False})
+
+    def test_proxy_github_token_round_trips_and_drives_injection_headers(self) -> None:
+        from host.runtime.network_policy import github_credential_headers
+
+        self.assertIsNone(state.read_proxy_github_token())
+        # Without a working token: agent-supplied Authorization is stripped
+        # on GitHub domains (a smuggled token cannot substitute another
+        # identity), nothing is injected, and other domains pass untouched.
+        smuggled = [("Authorization", "token smuggled"), ("Accept", "application/json")]
+        self.assertEqual(github_credential_headers("api.github.com", smuggled), [("Accept", "application/json")])
+        self.assertEqual(github_credential_headers("example.com", smuggled), smuggled)
+
+        state.save_proxy_github_token("ghs_working")
+        self.assertEqual(state.read_proxy_github_token(), "ghs_working")
+        # The row itself holds secretbox ciphertext (encrypted at rest like
+        # every other secret); only the read path yields the plaintext.
+        with db.transaction() as cur:
+            cur.execute("SELECT token FROM proxy_github_token")
+            (stored,) = cur.fetchone()
+        self.assertTrue(secretbox.is_encrypted(stored))
+        self.assertNotIn("ghs_working", stored)
+        # A replaced row can never serve a cached stale token.
+        state.save_proxy_github_token("ghs_replaced")
+        self.assertEqual(state.read_proxy_github_token(), "ghs_replaced")
+        state.save_proxy_github_token("ghs_working")
+        self.assertEqual(state.read_proxy_github_token(), "ghs_working")
+        # REST hosts take Bearer; git smart HTTP (and raw/codeload) take the
+        # token as the Basic password with the x-access-token username.
+        self.assertEqual(
+            github_credential_headers("api.github.com", smuggled),
+            [("Accept", "application/json"), ("Authorization", "Bearer ghs_working")],
+        )
+        import base64 as _b64
+
+        basic = _b64.b64encode(b"x-access-token:ghs_working").decode()
+        self.assertEqual(
+            github_credential_headers("github.com", [("Authorization", "token smuggled")]),
+            [("Authorization", f"Basic {basic}")],
+        )
+        # The plain-HTTP proxy path strips but never injects: the credential
+        # must not travel an unencrypted socket.
+        self.assertEqual(
+            github_credential_headers("github.com", [("Authorization", "token smuggled")], secure=False), []
+        )
+        # Signed-URL domains are strip-only: an Authorization header breaks
+        # the presigned download, and the signed URL is the access control.
+        self.assertEqual(
+            github_credential_headers("objects.githubusercontent.com", [("Authorization", "token x")]), []
+        )
+        self.assertEqual(
+            github_credential_headers("github-cloud.githubusercontent.com", [("Authorization", "token x")]), []
+        )
+        state.save_proxy_github_token(None)
+        self.assertIsNone(state.read_proxy_github_token())
+        with self.assertRaises(ValueError):
+            state.save_proxy_github_token("")
+
+    def test_github_repo_audits_upsert_and_prune(self) -> None:
+        self.assertEqual(state.read_github_repo_audits(), {})
+        state.save_github_repo_audit(
+            "infiloop2",
+            "trustyclaw",
+            {"visibility": "public", "has_pages": False, "pages_public": False},
+            None,
+        )
+        state.save_github_repo_audit("infiloop2", "infibot", {}, "audit fetch failed: 403")
+        audits = state.read_github_repo_audits()
+        self.assertEqual(
+            audits[("infiloop2", "trustyclaw")]["facts"],
+            {"visibility": "public", "has_pages": False, "pages_public": False},
+        )
+        self.assertNotIn("error", audits[("infiloop2", "trustyclaw")])
+        self.assertEqual(audits[("infiloop2", "infibot")]["error"], "audit fetch failed: 403")
+        # Re-auditing replaces the stored facts for that repo.
+        state.save_github_repo_audit(
+            "infiloop2",
+            "trustyclaw",
+            {"visibility": "private", "has_pages": True, "pages_public": None},
+            None,
+        )
+        self.assertEqual(
+            state.read_github_repo_audits()[("infiloop2", "trustyclaw")]["facts"],
+            {"visibility": "private", "has_pages": True, "pages_public": None},
+        )
+        # An errored row is never fresh: the poller retries it on the next
+        # pass instead of waiting out the TTL.
+        from host.runtime import github_repo_audit
+
+        audits = state.read_github_repo_audits()
+        self.assertTrue(github_repo_audit._stale(audits[("infiloop2", "infibot")]))
+        self.assertFalse(github_repo_audit._stale(audits[("infiloop2", "trustyclaw")]))
+        # A row from before the Pages facts existed re-audits immediately.
+        self.assertTrue(github_repo_audit._stale({"fetched_at": state.utc_now(), "facts": {"visibility": "private"}}))
+        self.assertTrue(
+            github_repo_audit._stale(
+                {"fetched_at": state.utc_now(), "facts": {"visibility": "private", "pages_public": None}}
+            )
+        )
+        # Pruning drops repositories no longer in the policy.
+        state.prune_github_repo_audits({("infiloop2", "trustyclaw")})
+        self.assertEqual(list(state.read_github_repo_audits()), [("infiloop2", "trustyclaw")])
 
     def test_admin_provider_accounts_live_in_the_database(self) -> None:
         save_openai_account({"account_id": "acct_rich", "planType": "pro"})

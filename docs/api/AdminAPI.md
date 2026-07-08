@@ -145,19 +145,19 @@ Response fields:
 | `host_runtime.cpu.usage_percent` | number | 0-100 | Current host CPU usage percentage. |
 | `host_runtime.memory.used_bytes` | integer |  | Current host memory used, in bytes. |
 | `host_runtime.memory.total_bytes` | integer |  | Total host memory, in bytes. |
-| `host_runtime.filesystem.used_bytes` | integer |  | Current root filesystem used space, in bytes. |
-| `host_runtime.filesystem.total_bytes` | integer |  | Total root filesystem capacity, in bytes. |
+| `host_runtime.filesystem.used_bytes` | integer |  | Current root filesystem (`/`) used space, in bytes. Kept for compatibility; the admin UI focuses on the admin and agent data-volume mounts below. |
+| `host_runtime.filesystem.total_bytes` | integer |  | Total root filesystem (`/`) capacity, in bytes. Kept for compatibility; the admin UI focuses on the admin and agent data-volume mounts below. |
 | `host_runtime.filesystem.mounts.root.used_bytes` | integer |  | Current root filesystem used space, in bytes. |
 | `host_runtime.filesystem.mounts.root.total_bytes` | integer |  | Total root filesystem capacity, in bytes. |
-| `host_runtime.filesystem.mounts.admin.used_bytes` | integer | optional | Current admin data volume used space, in bytes. |
-| `host_runtime.filesystem.mounts.admin.total_bytes` | integer | optional | Total admin data volume capacity, in bytes. |
-| `host_runtime.filesystem.mounts.agent.used_bytes` | integer | optional | Current agent data volume used space, in bytes. |
-| `host_runtime.filesystem.mounts.agent.total_bytes` | integer | optional | Total agent data volume capacity, in bytes. |
+| `host_runtime.filesystem.mounts.admin.used_bytes` | integer | optional | Current admin data volume (`/mnt/trustyclaw-admin`) used space, in bytes. |
+| `host_runtime.filesystem.mounts.admin.total_bytes` | integer | optional | Total admin data volume (`/mnt/trustyclaw-admin`) capacity, in bytes. |
+| `host_runtime.filesystem.mounts.agent.used_bytes` | integer | optional | Current agent data volume (`/mnt/trustyclaw-agent`) used space, in bytes. |
+| `host_runtime.filesystem.mounts.agent.total_bytes` | integer | optional | Total agent data volume (`/mnt/trustyclaw-agent`) capacity, in bytes. |
 | `host_runtime.swap.allocated_bytes` | integer |  | Filesystem-backed RAM swap allocated to the host, in bytes. |
 | `host_runtime.swap.used_bytes` | integer |  | Current filesystem-backed RAM swap used, in bytes. |
 
-Runtime status is `deactivated` when that runtime's managed AI provider network
-access is false, `loading` while the runtime is starting, `awaiting_login` while
+Runtime status is `deactivated` when that runtime's managed provider
+integration is disabled, `loading` while the runtime is starting, `awaiting_login` while
 the runtime needs operator login, `active` while it can accept work, and `error`
 when the runtime supervisor cannot make it healthy.
 
@@ -171,11 +171,13 @@ The `error` state fails closed and denies all network access.
 ```text
 GET  /v1/agent-runtime/status
 GET  /v1/agent-runtime/account
+POST /v1/agent-runtime/refresh
 POST /v1/agent-runtime/codex-oauth-login
 GET  /v1/agent-runtime/codex-oauth-login
 POST /v1/agent-runtime/claude-oauth-login
 GET  /v1/agent-runtime/claude-oauth-login
 POST /v1/agent-runtime/claude-oauth-login/complete
+POST /v1/agent-runtime/reset-linked-account
 ```
 
 Agent runtime endpoints:
@@ -184,17 +186,34 @@ Agent runtime endpoints:
 | --- | --- | --- | --- | --- |
 | `GET` | `/v1/agent-runtime/status` | none | Agent runtime status response | Returns current state for every runtime. |
 | `GET` | `/v1/agent-runtime/account` | none | Agent account response | Returns the current account status for every runtime. |
+| `POST` | `/v1/agent-runtime/refresh` | Agent runtime refresh request | Agent account response | Attempts to refresh provider account/status for one runtime or all runtimes, then returns the current account response. |
 | `POST` | `/v1/agent-runtime/codex-oauth-login` | none | Codex OAuth login response | Starts a Codex OAuth login flow and returns the device code and login link. |
 | `GET` | `/v1/agent-runtime/codex-oauth-login` | none | Codex OAuth login response | Returns the current Codex OAuth device code and login link. |
 | `POST` | `/v1/agent-runtime/claude-oauth-login` | none | Claude OAuth login response | Starts a Claude Code OAuth login process and returns the login link. |
 | `GET` | `/v1/agent-runtime/claude-oauth-login` | none | Claude OAuth login response | Returns the current Claude Code OAuth login link. |
 | `POST` | `/v1/agent-runtime/claude-oauth-login/complete` | `{"code": "..."}` | status response | Submits the browser login code back to the waiting Claude Code OAuth process. |
+| `POST` | `/v1/agent-runtime/reset-linked-account` | `{"agent_runtime": "..."}` | status response | Clears the linked (operator-approved) account anchor, local agent auth files, pending OAuth state, and the proxy account pin for that runtime. |
 
-The runtime-specific OAuth login endpoints only work while that runtime's status
-is `awaiting_login`. They return `409` when the runtime is in any other state,
-including `deactivated`.
+The runtime-specific OAuth login endpoints work while that runtime's status is
+`awaiting_login` or `error` — an errored runtime (changed account, malformed
+local credentials) is recovered by simply logging in again. They return `409`
+in any other state, including `deactivated`.
+`POST /v1/agent-runtime/reset-linked-account` takes `{"agent_runtime": "codex"}`
+or `{"agent_runtime": "claude_code"}` and deletes that runtime's linked-account
+guard: the operator-approved anchor, its proxy pin, and any pending OAuth
+approval. Use it to unlink the account, for example to switch a runtime to a
+different provider account. It may be called in any
+runtime status. It also moves the runtime out of `active`, clears local agent
+auth files, closes that runtime's live processes, and fails its running tasks
+so no process from the old linked account keeps executing. The runtime is then
+ready for a fresh operator login that links an account again.
 `GET /v1/agent-runtime/account` does not accept query parameters; it always returns
 one account-status entry per runtime.
+`POST /v1/agent-runtime/refresh` accepts `{}` to refresh all runtimes, or
+`{"agent_runtime": "codex"}` / `{"agent_runtime": "claude_code"}` to refresh one.
+It runs the same provider status refresh used by the background status loop and
+may invoke the provider CLI. It returns the same response shape as
+`GET /v1/agent-runtime/account`.
 
 Agent runtime status response:
 
@@ -282,9 +301,9 @@ Agent account response fields:
 | `accounts[].agent_runtime` | enum | `codex`, `claude_code` | Agent runtime type. |
 | `accounts[].provider` | enum | `openai`, `claude` | Managed AI provider for the runtime. |
 | `accounts[].status` | enum | `deactivated`, `loading`, `awaiting_login`, `active`, `error` | Current runtime account status. |
-| `accounts[].account_id` | string | optional | Inferred provider account id. Present only when the active runtime has a known account id. |
-| `accounts[].email` | string | optional | Present when available from provider account metadata. |
-| `accounts[].plan_type` | string | optional | Common plan name for the provider account. |
+| `accounts[].account_id` | string | optional | The linked provider account id (the operator-approved anchor). Present whenever an account is linked, including while the runtime is not active: the anchor outlives session expiry and deactivation until an operator reset clears it. |
+| `accounts[].email` | string | optional | Present when available from the linked account metadata. |
+| `accounts[].plan_type` | string | optional | Common plan name for the provider account. Present only while the runtime is active. |
 | `accounts[].codex_usage` | object | optional | Codex-specific usage metadata. Present only for the Codex runtime when Codex reports rate limits. |
 | `accounts[].codex_usage.last_checked_at` | string | optional | UTC timestamp when TrustyClaw last refreshed the cached Codex usage snapshot. Active runtimes are rechecked every 300 seconds. |
 | `accounts[].codex_usage.rate_limits` | object | optional | Codex rate-limit snapshot. |
@@ -341,6 +360,20 @@ After opening the URL and completing browser login, submit the displayed code to
   "code": "..."
 }
 ```
+
+Agent runtime reset-linked-account response:
+
+```json
+{
+  "status": "accepted"
+}
+```
+
+Agent runtime reset-linked-account response fields:
+
+| Field | Type | Values | Meaning |
+| --- | --- | --- | --- |
+| `status` | enum | `accepted` | The linked account was reset. |
 
 ### Tasks
 
@@ -602,21 +635,27 @@ cancelled
 
 ```text
 GET /v1/tasks/{task_id}/events?since=<seq>
-GET /v1/events?since=<seq>
+GET /v1/events?before=<seq>&limit=<n>
 ```
 
 Event endpoints:
 
 | Method | Path | Request | Response | Behavior |
 | --- | --- | --- | --- | --- |
-| `GET` | `/v1/tasks/{task_id}/events?since=<seq>` | `since` query parameter is optional | Event list response | Lists up to 5 events for one task. |
-| `GET` | `/v1/events?since=<seq>` | `since` query parameter is optional | Event list response | Lists up to 5 agent events across all tasks. |
+| `GET` | `/v1/tasks/{task_id}/events?since=<seq>` | `since` query parameter is optional | Event list response | Streams up to 5 events for one task, oldest first. |
+| `GET` | `/v1/events?before=<seq>&limit=<n>` | query parameters optional | Event list response | Lists newest agent events before an optional sequence cursor. |
 
-When `since` is present, event list endpoints return events with `seq > since`.
-For the next request, use the highest `seq` returned in the previous response as
-`since`. If the response has no events, keep using the same `since`.
+The two endpoints serve different access patterns. Task events tail one task
+while it runs: with `since` present, the response holds events with
+`seq > since`, oldest first; use the highest returned `seq` as the next
+`since`, and keep the same `since` when a response is empty.
 
-The host retains only the most recent 10,000 agent events; older events are
+The audit log across all tasks pages newest-first like the network audit log:
+the first request returns the newest events, and `before=<seq>` continues with
+events whose `seq` is lower than that cursor. `limit=<n>` is optional,
+defaults to 100, and must be between 1 and 100.
+
+The host retains only the most recent 1,000,000 agent events; older events are
 discarded and can no longer be listed.
 
 Event list response:
@@ -643,7 +682,7 @@ Event list response fields:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `events` | event array | Up to 5 events ordered by `seq`. Empty when no newer events are available. |
+| `events` | event array | Events ordered by `seq`: oldest first for task events, newest first for `/v1/events`. Empty when no matching events are available. |
 
 Event fields:
 
@@ -666,6 +705,7 @@ task.failed
 task.cancelled
 agent_runtime.active
 agent_runtime.login_completed
+agent_runtime.linked_account_reset
 agent_runtime.deactivated
 ```
 
@@ -695,9 +735,14 @@ It is emitted when a queued task is cancelled or a running task is killed.
 `agent_runtime.login_completed` uses `task_id: null` and payload
 `{"agent_runtime": "codex"}` or `{"agent_runtime": "claude_code"}`.
 
+`agent_runtime.linked_account_reset` uses `task_id: null` and payload
+`{"agent_runtime": "codex"}` or `{"agent_runtime": "claude_code"}` when an
+operator reset cleared that runtime's linked account (the audit record of the
+reset-linked-account endpoint).
+
 `agent_runtime.deactivated` uses `task_id: null` and payload
 `{"agent_runtime": "codex"}` or `{"agent_runtime": "claude_code"}` when a
-runtime is disabled because its managed provider network access is false.
+runtime is disabled because its managed provider integration is disabled.
 
 ## Agent Files
 
@@ -755,12 +800,52 @@ File reads are capped at 1 MiB. If the file is larger, `truncated` is `true`
 and `content` contains the first 1 MiB decoded with replacement characters for
 invalid UTF-8 bytes.
 
+## Agent Processes
+
+```text
+GET /v1/agent-processes
+```
+
+Returns a read-only diagnostic snapshot of Codex, Claude Code, and processes
+spawned by those runtimes. This is process state, not task state: app-server
+processes may stay warm between tasks, and short-lived turn processes may exit
+before the next snapshot. The response contains at most 1,000 processes; when
+more matching processes exist, `truncated` is `true`.
+
+Response:
+
+```json
+{
+  "truncated": false,
+  "processes": [
+    {
+      "pid": 1234,
+      "ppid": 1,
+      "user": "trustyclaw-agent",
+      "state": "S",
+      "name": "codex",
+      "cmdline": "codex app-server --listen stdio://",
+      "rss_bytes": 92274688,
+      "elapsed_seconds": 184,
+      "scope": "run-r123.scope"
+    }
+  ]
+}
+```
+
 ## Network
 
 ```text
 GET    /v1/network/policy
 PUT    /v1/network/policy
-GET    /v1/network/events?since=<seq>
+GET    /v1/network-tools/github-credential
+PUT    /v1/network-tools/github-credential
+DELETE /v1/network-tools/github-credential
+POST   /v1/network-tools/github-audit
+GET    /v1/network-tools/github-pending-pushes
+POST   /v1/network-tools/github-pending-pushes/<id>/approve
+POST   /v1/network-tools/github-pending-pushes/<id>/reject
+GET    /v1/network/events?before=<seq>&decision=<allowed|denied|all>&limit=<n>
 ```
 
 Network endpoints:
@@ -768,20 +853,38 @@ Network endpoints:
 | Method | Path | Request | Response | Behavior |
 | --- | --- | --- | --- | --- |
 | `GET` | `/v1/network/policy` | none | Network policy response | Returns active network policy. |
-| `PUT` | `/v1/network/policy` | Network policy request | Network policy response | Replaces network policy atomically. Disabling a managed provider deactivates its runtime, clears its account pin, closes its live runtime processes, and fails its running tasks. |
-| `GET` | `/v1/network/events?since=<seq>` | `since` query parameter is optional | Network event response | Lists network decision events. |
+| `PUT` | `/v1/network/policy` | Network policy request | Network policy response | Replaces network policy atomically. Disabling a managed provider integration deactivates its runtime, clears its account pin, closes its live runtime processes, and fails its running tasks. |
+| `GET` | `/v1/network-tools/github-credential` | none | GitHub credential metadata | Returns credential metadata only; never the token. |
+| `PUT` | `/v1/network-tools/github-credential` | GitHub credential request | GitHub credential metadata | Stores or replaces the single fixed GitHub token. The `token` field is write-only. |
+| `DELETE` | `/v1/network-tools/github-credential` | none | GitHub credential metadata | Removes the stored credential and withdraws the proxy-injected working token. |
+| `POST` | `/v1/network-tools/github-audit` | none | GitHub credential metadata | Force-refreshes the per-repository audits and returns the updated metadata (including `repository_audits`). |
+| `GET` | `/v1/network-tools/github-pending-pushes` | none | `{pending_pushes: [...]}` | Lists pushes held by the `.github` approval gate: `id`, `owner`, `repo`, `ref_updates`, `changed_paths`, `requested_at`, `status`. |
+| `POST` | `/v1/network-tools/github-pending-pushes/<id>/approve` | none | `{pending_push: {...}}` | Replays the held push to GitHub with the working token through the `approve-github-push` root helper and marks it approved. `404` if unknown, `409` if already resolved or the replay fails. Replay failures mark the row `failed` after one best-effort cleanup. |
+| `POST` | `/v1/network-tools/github-pending-pushes/<id>/reject` | none | `{pending_push: {...}}` | Cleans up pending quarantine refs and marks the held push rejected. `404`/`409` as above; cleanup failures mark the row `failed`. |
+| `GET` | `/v1/network/events?before=<seq>&decision=<allowed\|denied\|all>&limit=<n>` | query parameters optional | Network event response | Lists newest network decision events before an optional sequence cursor. |
+
+The `github-credential` routes work whether or not
+`managed_network_integrations.github` is enabled, so the credential can be
+staged before the integration is turned on; the proxy-injected working token
+is only ever published while GitHub is enabled.
 
 Network policy request:
 
 ```json
 {
-  "managed_ai_provider_network_access": {
-    "openai": true
+  "managed_network_integrations": {
+    "openai": {"enabled": true},
+    "github": {
+      "enabled": true,
+      "write_repositories": [
+        {"owner": "infiloop2", "repo": "trustyclaw"}
+      ]
+    }
   },
   "allowed_network_access": {
-    "api.github.com": {
+    "example.com": {
       "allow_http_methods": ["GET", "HEAD"],
-      "path_guards": ["^/repos/[^/]+/[^/]+(?:/.*)?$"]
+      "path_guards": ["^/$", "^/docs(?:/.*)?$"]
     }
   }
 }
@@ -797,19 +900,26 @@ request can return `409` if another replacement is already in progress.
 Network policy response:
 
 The API response uses the operator-facing network controls shape. Managed
-provider domains are not listed in `allowed_network_access`; they are expanded
-only in the internal enforcement policy.
+integration domains are not listed in `allowed_network_access`; they are
+expanded only in the internal enforcement policy, and credential secrets are
+never included.
 
 ```json
 {
   "network_controls": {
-    "managed_ai_provider_network_access": {
-      "openai": true
+    "managed_network_integrations": {
+      "openai": {"enabled": true},
+      "github": {
+        "enabled": true,
+        "write_repositories": [
+          {"owner": "infiloop2", "repo": "trustyclaw"}
+        ]
+      }
     },
     "allowed_network_access": {
-      "api.github.com": {
+      "example.com": {
         "allow_http_methods": ["GET", "HEAD"],
-        "path_guards": ["^/repos/[^/]+/[^/]+(?:/.*)?$"]
+        "path_guards": ["^/$", "^/docs(?:/.*)?$"]
       }
     }
   },
@@ -824,17 +934,112 @@ Network policy response fields:
 | `network_controls` | object | Runtime network controls using the schema from [`NetworkControls.md`](NetworkControls.md). |
 | `updated_at` | string | RFC 3339 timestamp for the last policy update. Present in responses only. |
 
+GitHub credential request — fine-grained PAT mode:
+
+```json
+{
+  "mode": "pat",
+  "token": "github_pat_..."
+}
+```
+
+GitHub credential request — GitHub App mode (the host mints
+installation-wide tokens and refreshes them before their one-hour expiry;
+the proxy's repo guard, not the token, is the per-repository boundary — see
+[NetworkControls.md](NetworkControls.md#github-integration)):
+
+```json
+{
+  "mode": "app",
+  "app_id": "12345",
+  "installation_id": "67890",
+  "private_key_pem": "-----BEGIN RSA PRIVATE KEY-----\n..."
+}
+```
+
+GitHub credential request fields (fields outside the chosen mode are
+rejected):
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `mode` | string | Yes | `pat` or `app`. |
+| `token` | string | `pat` mode only | The fine-grained personal access token. |
+| `app_id` | string | `app` mode only | The numeric GitHub App id. |
+| `installation_id` | string | `app` mode only | The numeric installation id. |
+| `private_key_pem` | string | `app` mode only | The App's PEM private key. |
+
+`token` and `private_key_pem` are write-only: they are encrypted at rest and
+never returned by any endpoint or echoed by the UI. While GitHub is enabled
+and a credential is stored, the network proxy injects the active token into
+policy-approved GitHub requests — the agent never holds the credential —
+and plain `git` and `gh` read any repository the token reaches and write to
+the configured `write_repositories`; see
+[`NetworkControls.md`](NetworkControls.md#github-credential).
+
+GitHub credential metadata response — returned by all three
+`github-credential` methods and by `POST /v1/network-tools/github-audit`:
+
+```json
+{
+  "configured": true,
+  "mode": "app",
+  "app_id": "12345",
+  "installation_id": "67890",
+  "app_token_expires_at": "2026-06-08T01:00:00Z",
+  "updated_at": "2026-06-08T00:00:00Z",
+  "validation": {"status": "ok", "checked_at": "2026-06-08T00:00:00Z"},
+  "repository_audits": [
+    {
+      "owner": "infiloop2",
+      "repo": "trustyclaw",
+      "audited_at": "2026-06-08T00:00:00Z",
+      "warnings": [
+        {
+          "code": "unprotected_default_branch",
+          "severity": "critical",
+          "message": "The token can push and the default branch is unprotected: ..."
+        }
+      ]
+    }
+  ]
+}
+```
+
+GitHub credential metadata response fields:
+
+| Field | Type | Present | Meaning |
+| --- | --- | --- | --- |
+| `configured` | boolean | Always | Whether a credential is stored. |
+| `mode` | string | When configured | `pat` or `app`. |
+| `updated_at` | string | When configured | RFC 3339 time the credential was last stored. |
+| `app_id` | string | `app` mode only | The stored GitHub App id. |
+| `installation_id` | string | `app` mode only | The stored installation id. |
+| `app_token_expires_at` | string | `app` mode, once the host has minted an installation token | Expiry of the current minted token (the host re-mints before it passes). Absent until the first successful mint. |
+| `validation` | object | When configured | Credential health: `{"status": "not_checked"}` before the first check, `{"status": "ok", "checked_at": ...}` after a success, `{"status": "error", "message": ..., "checked_at": ...}` after a failure — on failure the working token is withdrawn (fail closed) and the poller retries. |
+| `repository_audits` | array | When the policy lists `write_repositories` | One entry per listed write repository, in policy order. Audits warn, never gate: a failed or missing audit never blocks the credential or a policy publish. If no credential is configured, each repository reports an incomplete-audit warning. |
+
+`repository_audits[]` entry fields:
+
+| Field | Type | Present | Meaning |
+| --- | --- | --- | --- |
+| `owner` | string | Always | The write repository's owner. |
+| `repo` | string | Always | The write repository's name. |
+| `audited_at` | string | Once an audit attempt has been stored; absent while the first attempt is still pending | RFC 3339 time of the last audit attempt (success or failure). |
+| `warnings` | array | Always | Operator warnings, each `{"code", "severity", "message"}` with `severity` `critical` or `warning` — for example a public write repository, an unprotected default branch the token can push, workflows whose triggers expose secrets to PR-influenced code, or an incomplete audit when TrustyClaw lacks enough information. Empty means a clean audit. |
+| `error` | string | When the last audit attempt failed | Raw failure detail for diagnostics; the same condition also appears as a warning and the next poller pass retries it. |
+
 Network event response:
 
-Network event endpoints return up to 5 network decision events. When
-`since` is present, they return events with `seq > since`. For the next request, use
-the highest `seq` returned in the previous response as `since`. If the response has no
-events, keep using the same `since`.
+Network event endpoints return newest-first events. Pass `before=<seq>` to
+continue with events whose `seq` is lower than that cursor. `decision=allowed`
+or `decision=denied` filters the listed events; `decision=all` is equivalent
+to omitting the filter. `limit=<n>` is optional, defaults to 100, and must be
+between 1 and 100.
 
 Network events are only defined for HTTP, HTTPS, WebSocket, and secure WebSocket
 requests. SSH and other non-HTTP traffic are not represented by this endpoint.
 
-The host retains only the most recent 10,000 network events; older events are
+The host retains only the most recent 1,000,000 network events; older events are
 discarded and can no longer be listed.
 
 ```json
@@ -863,7 +1068,7 @@ Network event response fields:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `events` | network event array | Up to 5 network decision events ordered by `seq`. Empty when no newer events are available. |
+| `events` | network event array | Up to `limit` newest-first events. |
 
 Network event fields:
 

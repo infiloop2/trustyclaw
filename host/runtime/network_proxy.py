@@ -36,6 +36,9 @@ from host.constants import LOOPBACK, PROXY_PORT
 from host.runtime.network_policy import (
     decide_http_request,
     anthropic_request_denied,
+    github_credential_headers,
+    github_push_gate_response,
+    github_request_denied,
     host_allowed,
     load_policy,
     openai_request_denied,
@@ -130,6 +133,7 @@ def request_denial_reason(
     return (
         openai_request_denied(policy, host, headers, body)
         or anthropic_request_denied(policy, method, host, path, headers)
+        or github_request_denied(policy, method, host, path, query, body)
     )
 
 
@@ -249,6 +253,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if reason is not None:
             self.send_error(403, reason)
             return
+        # After the allow decision: on GitHub domains agent-supplied
+        # Authorization is stripped here too, but the token is never injected
+        # on this plain-HTTP path — the credential must not travel an
+        # unencrypted socket.
+        headers = github_credential_headers(host, headers, secure=False)
         try:
             upstream = connect_public(host, port, timeout=15)
             upstream.settimeout(IDLE_TIMEOUT)
@@ -315,7 +324,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 or policy_error
                 or request_denial_reason(policy, protocol, method, host, path, query, headers, body)
             )
+            # The .github approval gate runs after the write guard passes: a
+            # gated push that changes .github/ is answered with a git
+            # report-status ("queued for approval") instead of being forwarded.
+            gate_response = None
+            if reason is None:
+                gate_response, gate_reason = github_push_gate_response(policy, method, host, path, body)
+                if gate_reason is not None:
+                    reason = gate_reason
             record_network_event(protocol, method, host, port, path, query, reason is None, reason)
+            if gate_response is not None:
+                client_tls.sendall(gate_response)
+                return
             if reason is not None:
                 message = reason.encode()
                 client_tls.sendall(
@@ -325,6 +345,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     + message
                 )
                 return
+            # After the allow decision: on GitHub domains the proxy
+            # authenticates the request itself (agent Authorization stripped,
+            # the working token injected) — the agent never holds the token.
+            headers = github_credential_headers(host, headers)
             upstream_raw = connect_public(host, port, timeout=15)
             upstream_tls = ssl.create_default_context().wrap_socket(upstream_raw, server_hostname=host)
             upstream_tls.settimeout(IDLE_TIMEOUT)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import sys
 import tempfile
 import unittest
@@ -19,6 +21,47 @@ class ClaudeCodeTests(unittest.TestCase):
             {"account_id": "acct", "organization_id": "org", "access_token_sha256": "hash"},
         )
         self.assertIsNone(claude_code.read_claude_account([sys.executable, "-c", "import sys; sys.exit(1)"]))
+
+    def test_read_attested_identity_parses_helper_json(self) -> None:
+        command = [
+            sys.executable,
+            "-c",
+            "import json; print(json.dumps({'access_token_sha256':'hash','account_uuid':'acct','email':'op@example.com'}))",
+        ]
+        self.assertEqual(
+            claude_code.read_attested_identity(command),
+            {"access_token_sha256": "hash", "account_uuid": "acct", "email": "op@example.com"},
+        )
+
+    def test_read_attested_identity_passes_expected_token_hash(self) -> None:
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import json, sys; "
+                "assert sys.argv[-2:] == ['--expected-token-sha256', 'hash']; "
+                "print(json.dumps({'access_token_sha256':'hash','account_uuid':'acct'}))"
+            ),
+        ]
+        self.assertEqual(
+            claude_code.read_attested_identity(command, expected_token_sha256="hash"),
+            {"access_token_sha256": "hash", "account_uuid": "acct"},
+        )
+
+    def test_read_attested_identity_raises_with_helper_stderr_detail(self) -> None:
+        command = [
+            sys.executable,
+            "-c",
+            "import sys; print('could not reach the Claude profile endpoint', file=sys.stderr); sys.exit(1)",
+        ]
+        with self.assertRaises(claude_code.ClaudeCodeError) as error:
+            claude_code.read_attested_identity(command)
+        self.assertIn("could not reach the Claude profile endpoint", str(error.exception))
+
+    def test_read_attested_identity_rejects_incomplete_response(self) -> None:
+        command = [sys.executable, "-c", "import json; print(json.dumps({'account_uuid': 'acct'}))"]
+        with self.assertRaises(claude_code.ClaudeCodeError):
+            claude_code.read_attested_identity(command)
 
     def test_account_status_maps_missing_helper_to_awaiting_login(self) -> None:
         original_command = claude_code.DEFAULT_COMMAND
@@ -267,6 +310,23 @@ class ClaudeCodeTests(unittest.TestCase):
             with claude_code._login_lock:
                 claude_code._login_process = original
 
+    def test_close_login_process_clears_handle_when_close_fails(self) -> None:
+        class FakeLoginProcess:
+            def close(self) -> None:
+                raise PermissionError("cannot signal helper")
+
+        process = FakeLoginProcess()
+        with claude_code._login_lock:
+            original = claude_code._login_process
+            claude_code._login_process = process  # type: ignore[assignment]
+        try:
+            with self.assertRaises(PermissionError):
+                claude_code.close_login_process()
+            self.assertIsNone(claude_code._login_process)
+        finally:
+            with claude_code._login_lock:
+                claude_code._login_process = original
+
     def test_run_turn_waits_for_result_after_delivered_steer(self) -> None:
         script = r"""
 import json, sys
@@ -376,6 +436,44 @@ print(json.dumps({
             claude_code.AGENT_CWD = original_cwd
         self.assertEqual(session_id, "default-helper-session")
         self.assertEqual(output, "OK")
+
+    def test_task_launch_uses_managed_user_settings_without_safe_mode(self) -> None:
+        script = r"""
+import json, pathlib, sys
+
+pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))
+json.loads(sys.stdin.readline())
+print(json.dumps({
+    "type": "result",
+    "subtype": "success",
+    "session_id": "argv-session",
+    "result": "OK",
+}), flush=True)
+"""
+        original_cwd = claude_code.AGENT_CWD
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                claude_code.AGENT_CWD = tmp
+                argv_path = Path(tmp) / "argv.json"
+                server = claude_code.ClaudeCodeSession([sys.executable, "-u", "-c", script, str(argv_path)])
+                claude_code.run_turn(
+                    server,
+                    "initial",
+                    None,
+                    lambda: [],
+                    lambda _message: None,
+                    lambda _message: None,
+                )
+                argv = json.loads(argv_path.read_text())
+        finally:
+            claude_code.AGENT_CWD = original_cwd
+
+        self.assertIn("--setting-sources", argv)
+        self.assertIn("user", argv)
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertNotIn("--dangerously-skip-permissions", argv)
+        self.assertNotIn("--safe-mode", argv)
+        self.assertNotIn("--permission-mode", argv)
 
 
 if __name__ == "__main__":

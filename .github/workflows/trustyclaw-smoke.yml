@@ -13,10 +13,6 @@ permissions:
   pull-requests: read
   statuses: write
 
-concurrency:
-  group: trustyclaw-smoke
-  cancel-in-progress: false
-
 jobs:
   authorize:
     name: Authorize AWS smoke
@@ -34,6 +30,7 @@ jobs:
           persist-credentials: false
 
       - name: Authorize repo admin
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         uses: ./.github/actions/authorize-repo-admin
 
       - name: Resolve safe ref
@@ -64,6 +61,66 @@ jobs:
           echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
           echo "Testing ref ${ref}"
 
+      - name: Reject when smoke is already active
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          REF: ${{ steps.resolve.outputs.ref }}
+          TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          active_json="$(mktemp)"
+          jq -n '{workflow_runs: []}' > "${active_json}"
+          for status in queued in_progress; do
+            page="$(curl -fsS --get \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              --data-urlencode "per_page=100" \
+              --data-urlencode "status=${status}" \
+              "${{ github.api_url }}/repos/${REPO}/actions/workflows/trustyclaw-smoke.yml/runs")"
+            jq -s '{workflow_runs: (.[0].workflow_runs + .[1].workflow_runs)}' "${active_json}" <(printf '%s' "${page}") > "${active_json}.next"
+            mv "${active_json}.next" "${active_json}"
+          done
+          active_run="$(jq -r --arg current "${CURRENT_RUN_ID}" '
+            .workflow_runs
+            | map(select((.id | tostring) != $current))
+            | sort_by(.created_at)
+            | reverse
+            | .[0]
+            | if . == null then "" else "\(.id) \(.html_url)" end
+          ' "${active_json}")"
+          if [[ -n "${active_run}" ]]; then
+            active_id="${active_run%% *}"
+            active_url="${active_run#* }"
+            description="Fresh AWS smoke is already running; wait for the previous smoke to complete."
+            echo "${description}" >&2
+            echo "Active smoke run: ${active_url}" >&2
+            payload="$(jq -n \
+              --arg state failure \
+              --arg context trustyclaw-smoke \
+              --arg description "${description}" \
+              --arg target_url "${TARGET_URL}" \
+              '{state: $state, context: $context, description: $description, target_url: $target_url}')"
+            curl -fsS \
+              -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${{ github.api_url }}/repos/${REPO}/statuses/${REF}" \
+              -d "${payload}" >/dev/null
+            {
+              echo "## TrustyClaw smoke rejected"
+              echo
+              echo "Fresh AWS smoke is already running. Wait for the previous smoke to complete, then comment \`/smoke\` again."
+              echo
+              echo "Active run: ${active_url}"
+              echo "Active run id: ${active_id}"
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 1
+          fi
+          echo "No active trustyclaw-smoke run is currently queued or in progress."
+
       - name: Rate limit live AWS runs
         uses: ./.github/actions/rate-limit-live-aws-runs
         with:
@@ -75,6 +132,9 @@ jobs:
     name: Fresh AWS smoke
     if: ${{ needs.authorize.result == 'success' }}
     runs-on: ubuntu-latest
+    concurrency:
+      group: trustyclaw-smoke
+      cancel-in-progress: false
     timeout-minutes: 90
     steps:
       - name: Mark smoke pending
