@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Chat</title>
+<link rel="stylesheet" href="/admin_ui.css">
+<link rel="stylesheet" href="agent_chat.css">
+</head>
+<body>
+<main class="app-shell">
+  <div class="app-frame-head">
+    <div class="app-title-group">
+      <div class="app-mark" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 20 20"><rect x="3.5" y="4" width="13" height="12" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 8h6M7 11h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </div>
+      <div>
+        <h1 class="app-frame-title">Agent Chat</h1>
+        <div class="app-frame-subtitle">Infiverse TrustyClaw</div>
+      </div>
+    </div>
+    <div class="app-frame-actions">
+      <button class="primary sm" id="new-thread">+ New thread</button>
+    </div>
+  </div>
+  <div class="agent-layout">
+    <aside class="thread-pane" aria-label="Threads">
+      <div class="pane-head">
+        <h2>Threads</h2>
+      </div>
+      <div id="threads" class="thread-list"></div>
+    </aside>
+    <div class="thread-view">
+      <div id="thread-detail" class="thread-history"></div>
+      <div class="composer">
+        <div id="composer-target" class="field-label">New thread</div>
+        <div id="status" class="app-status" hidden></div>
+        <textarea id="new-task" rows="3" placeholder="Describe the first task in this thread"></textarea>
+        <div class="composer-controls">
+          <label class="field" id="thread-field">
+            <span class="field-label">Thread name</span>
+            <input id="new-task-thread" class="thread-input" value="main" placeholder="e.g. website-redesign">
+          </label>
+          <label class="field" id="runtime-field">
+            <span class="field-label">Runtime</span>
+            <select id="new-task-runtime" class="runtime-select">
+              <option value="codex">Codex</option>
+              <option value="claude_code">Claude Code</option>
+            </select>
+          </label>
+          <button class="primary" id="create-task">Create task</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+<script src="agent_chat.js"></script>
+</body>
+</html>

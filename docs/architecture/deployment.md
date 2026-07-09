@@ -63,6 +63,11 @@ stored endpoint list contains an `ssh` endpoint. If only Cloudflare Access is
 configured, bootstrap removes persistent SSH keys and the lifecycle CLI revokes
 EC2 security-group SSH ingress before returning success.
 
+Operator endpoints expose the admin API/UI only. App backend services bind
+host-assigned loopback ports and are not forwarded directly over SSH,
+Cloudflare Access, or the EC2 security group; operator app requests go through
+the authenticated admin API app proxy.
+
 For Cloudflare Access, bootstrap installs a pinned `cloudflared` binary and a
 `trustyclaw-cloudflared.service` systemd unit with `Restart=always` and
 `WantedBy=multi-user.target`, so the tunnel reconnects after service crashes and

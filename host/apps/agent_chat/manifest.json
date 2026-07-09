@@ -1,0 +1,13 @@
+{
+  "id": "agent_chat",
+  "title": "Agent Chat",
+  "backend": {
+    "entrypoint": "backend.py"
+  },
+  "database": {
+    "migrations": "migrations"
+  },
+  "ui": {
+    "path": "ui"
+  }
+}

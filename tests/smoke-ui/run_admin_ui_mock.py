@@ -28,7 +28,10 @@ from urllib.parse import parse_qs, unquote, urlparse
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+import app_mocks
 from host.config import ConfigError, parse_network_controls
+from host.constants import LOOPBACK
+from host.runtime import app_platform
 
 RUNTIME_DIR = REPO_ROOT / "host/runtime"
 VERSION = (REPO_ROOT / "VERSION").read_text().strip()
@@ -364,6 +367,12 @@ class Handler(BaseHTTPRequestHandler):
                     data = (RUNTIME_DIR / filename).read_bytes()
                 self._send(HTTPStatus.OK, data, content_type)
                 return
+            if method == "GET":
+                app_asset = app_platform.ui_asset(parsed.path)
+                if app_asset is not None:
+                    _app, asset, content_type = app_asset
+                    self._send_app_asset(HTTPStatus.OK, asset.read_bytes(), content_type)
+                    return
             self._authenticate()
             response = route(method, parsed.path, parse_qs(parsed.query), self._read_body())
             self._send_json(HTTPStatus.OK, response)
@@ -398,6 +407,36 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_app_asset(self, status: HTTPStatus, data: bytes, content_type: str) -> None:
+        asset_origin = self._asset_origin()
+        self.send_response(status.value)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; base-uri 'none'; connect-src 'none'; "
+            f"font-src 'self' {asset_origin} data:; form-action 'none'; frame-ancestors 'self'; "
+            f"img-src 'self' {asset_origin} data:; navigate-to 'self'; object-src 'none'; "
+            f"sandbox allow-scripts allow-forms allow-modals; script-src 'self' 'unsafe-inline' {asset_origin}; "
+            f"style-src 'self' 'unsafe-inline' {asset_origin}",
+        )
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _asset_origin(self) -> str:
+        host = self.headers.get("Host", "")
+        if not re.fullmatch(r"[A-Za-z0-9.:-]+", host):
+            host = f"{LOOPBACK}:{self.server.server_port}"
+        forwarded_proto = self.headers.get("X-Forwarded-Proto", "")
+        scheme = forwarded_proto if forwarded_proto in {"http", "https"} else "http"
+        return f"{scheme}://{host}"
+
 
 def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> dict[str, Any]:
     if method == "GET" and path == "/v1/health":
@@ -408,6 +447,11 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> dic
         return agent_accounts()
     if method == "POST" and path == "/v1/agent-runtime/refresh":
         return refresh_agent_accounts(body)
+    if method == "GET" and path == "/v1/apps":
+        return {"apps": [app.public() for app in app_platform.installed_apps()]}
+    app_response = app_mocks.route_app_api(method, path, query, body, ApiError, route)
+    if app_response is not None:
+        return app_response
     if path == "/v1/agent-runtime/codex-oauth-login":
         return oauth("codex", method)
     if path == "/v1/agent-runtime/claude-oauth-login":

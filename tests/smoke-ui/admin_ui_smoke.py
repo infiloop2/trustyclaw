@@ -14,6 +14,8 @@ import sys
 import time
 import urllib.request
 
+import app_smokes
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SERVER = REPO_ROOT / "tests/smoke-ui/run_admin_ui_mock.py"
@@ -36,7 +38,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         wait_for_server(port, server)
-        run_browser_smoke(f"http://127.0.0.1:{port}/", headed=args.headed)
+        run_browser_smoke(f"http://127.0.0.1:{port}/", headed=args.headed, scope=args.scope)
     finally:
         server.terminate()
         try:
@@ -51,6 +53,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=0, help="Local port to use; defaults to a free ephemeral port.")
     parser.add_argument("--headed", action="store_true", help="Run the browser visibly.")
+    parser.add_argument(
+        "--scope",
+        choices=("all", "core", "apps"),
+        default="all",
+        help="Smoke only the host UI core, only installed apps, or both.",
+    )
     return parser.parse_args(argv)
 
 
@@ -76,7 +84,7 @@ def wait_for_server(port: int, proc: subprocess.Popen[str]) -> None:
     raise TimeoutError(f"mock server did not become ready at {url}")
 
 
-def run_browser_smoke(url: str, *, headed: bool) -> None:
+def run_browser_smoke(url: str, *, headed: bool, scope: str) -> None:
     try:
         from playwright.sync_api import Error as PlaywrightError
         from playwright.sync_api import sync_playwright
@@ -101,13 +109,31 @@ def run_browser_smoke(url: str, *, headed: bool) -> None:
                 f"or set {CHROMIUM_EXECUTABLE_ENV} to an existing Chromium/Chrome executable."
             ) from exc
         try:
-            desktop = browser.new_context()
-            desktop_smoke(desktop.new_page(), url)
-            desktop.close()
+            if scope in {"all", "core"}:
+                desktop = browser.new_context()
+                desktop_smoke(desktop.new_page(), url)
+                desktop.close()
 
-            mobile = browser.new_context(viewport=IPHONE_VIEWPORT, device_scale_factor=3, is_mobile=True, has_touch=True)
-            mobile_smoke(mobile.new_page(), url)
-            mobile.close()
+                mobile = browser.new_context(
+                    viewport=IPHONE_VIEWPORT, device_scale_factor=3, is_mobile=True, has_touch=True
+                )
+                mobile_smoke(mobile.new_page(), url)
+                mobile.close()
+
+            if scope in {"all", "apps"}:
+                desktop_apps = browser.new_context()
+                app_page = desktop_apps.new_page()
+                log_in(app_page, url)
+                app_smokes.desktop_smoke(app_page)
+                desktop_apps.close()
+
+                mobile_apps = browser.new_context(
+                    viewport=IPHONE_VIEWPORT, device_scale_factor=3, is_mobile=True, has_touch=True
+                )
+                app_mobile_page = mobile_apps.new_page()
+                log_in(app_mobile_page, url)
+                app_smokes.mobile_smoke(app_mobile_page)
+                mobile_apps.close()
         finally:
             browser.close()
 
@@ -157,14 +183,14 @@ def desktop_smoke(page, url: str) -> None:
     expect(page.get_by_role("button", name="Start Codex login")).to_have_count(0)
     expect(page.get_by_role("button", name="Start Claude login")).to_have_count(0)
 
-    page.get_by_role("button", name="Agent thread log", exact=True).click()
+    page.get_by_role("button", name="Agent session log", exact=True).click()
     expect(page.locator("#panel-agent")).to_be_visible()
     expect(page.locator("#panel-agent").get_by_role("button", name="Reboot host")).to_have_count(0)
     expect(page.locator("#panel-agent #runtime")).to_have_count(0)
     expect(page.locator("#panel-agent #provider-accounts")).to_have_count(0)
     expect(page.locator("#panel-agent .thread-pane")).to_be_visible()
-    expect(page.locator("#thread-detail .thread-title")).to_have_text("Agent thread log")
-    expect(page.locator("#panel-agent").get_by_role("button", name="+ New thread")).to_have_count(0)
+    expect(page.locator("#thread-detail .thread-title")).to_have_text("Agent session log")
+    expect(page.locator("#panel-agent").get_by_role("button", name="+ New session")).to_have_count(0)
     expect(page.locator("#panel-agent").get_by_role("button", name="Create task")).to_have_count(0)
     expect(page.locator("#new-task")).to_have_count(0)
     expect(page.locator(".composer")).to_have_count(0)
@@ -495,7 +521,7 @@ def mobile_smoke(page, url: str) -> None:
     expect(page.locator("#health")).to_contain_text("ok")
     assert_no_horizontal_overflow(page, "home")
 
-    page.get_by_role("button", name="Agent thread log", exact=True).click()
+    page.get_by_role("button", name="Agent session log", exact=True).click()
     expect(page.locator("#panel-agent")).to_be_visible()
     expect(page.locator("#threads")).to_contain_text("website-redesign")
     page.locator("#threads .thread-item", has_text="website-redesign").click()

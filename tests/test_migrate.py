@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import pg_harness
 
-from host.runtime import db, migrate
+from host.runtime import app_migrate, app_platform, db, migrate
 
 
 def _write(directory: Path, name: str, up: str, down: str = "") -> None:
@@ -171,6 +171,132 @@ class RepoMigrationDataTests(unittest.TestCase):
         self.assertFalse(parsed.managed_network_integrations.npm_packages.enabled)
         self.assertFalse(parsed.managed_network_integrations.github.enabled)
 
+
+class AppMigrationTests(unittest.TestCase):
+    DB_NAME = "trustyclaw_app_migrate_test"
+
+    def setUp(self) -> None:
+        pg_harness.create_database(self.DB_NAME)
+        self.env_patch = patch.dict("os.environ", {"TRUSTYCLAW_DB_NAME": self.DB_NAME})
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+        migrate.up(quiet=True)
+        with db.transaction() as cur:
+            cur.execute(
+                """
+                DO $$
+                BEGIN
+                  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'trustyclaw-app-agent_chat') THEN
+                    CREATE ROLE "trustyclaw-app-agent_chat" LOGIN;
+                  END IF;
+                END
+                $$;
+                """
+            )
+            cur.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
+            cur.execute('CREATE SCHEMA app_agent_chat AUTHORIZATION "trustyclaw-app-agent_chat"')
+
+    def test_app_migration_runs_in_app_schema_and_records_host_version(self) -> None:
+        self.assertEqual(app_migrate.up("agent_chat", quiet=True), [1])
+        self.assertEqual(app_migrate.up("agent_chat", quiet=True), [])
+
+        with db.transaction() as cur:
+            cur.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'app_agent_chat'")
+            self.assertEqual({row[0] for row in cur.fetchall()}, {"preferences", "thread_tasks", "threads"})
+            cur.execute(
+                """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'app_agent_chat' AND table_name = 'preferences'
+                ORDER BY ordinal_position
+                """
+            )
+            self.assertEqual(
+                cur.fetchall(),
+                [
+                    ("singleton", "boolean"),
+                    ("density", "text"),
+                    ("show_completed", "boolean"),
+                    ("updated_at", "text"),
+                ],
+            )
+            cur.execute(
+                """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'app_agent_chat' AND table_name = 'threads'
+                ORDER BY ordinal_position
+                """
+            )
+            self.assertEqual(
+                cur.fetchall(),
+                [
+                    ("thread_id", "text"),
+                    ("agent_runtime", "text"),
+                    ("archived", "boolean"),
+                    ("created_at", "text"),
+                    ("updated_at", "text"),
+                ],
+            )
+            cur.execute(
+                """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'app_agent_chat' AND table_name = 'thread_tasks'
+                ORDER BY ordinal_position
+                """
+            )
+            self.assertEqual(
+                cur.fetchall(),
+                [
+                    ("task_id", "text"),
+                    ("thread_id", "text"),
+                    ("created_at", "text"),
+                ],
+            )
+            cur.execute("SELECT app_id, version, name FROM app_schema_migrations")
+            self.assertEqual(cur.fetchall(), [("agent_chat", 1, "app_state")])
+            cur.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'preferences'")
+            self.assertEqual(cur.fetchall(), [])
+
+    def test_app_migration_recovers_when_sql_commits_before_host_record(self) -> None:
+        app_migrate.apply_sql("agent_chat", 1, connection_user="trustyclaw-app-agent_chat")
+
+        self.assertEqual(app_migrate.up("agent_chat", quiet=True), [1])
+
+        with db.transaction() as cur:
+            cur.execute("SELECT app_id, version, name FROM app_schema_migrations")
+            self.assertEqual(cur.fetchall(), [("agent_chat", 1, "app_state")])
+            cur.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'app_agent_chat'")
+            self.assertEqual({row[0] for row in cur.fetchall()}, {"preferences", "thread_tasks", "threads"})
+
+    def test_app_migration_cannot_reset_back_to_host_role(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            migrations = Path(temp_dir) / "migrations"
+            migrations.mkdir()
+            _write(
+                migrations,
+                "0001_escape.sql",
+                "RESET ROLE; CREATE TABLE public.host_escape_attempt (id INT);",
+            )
+            app = app_platform.AppManifest(
+                id="agent_chat",
+                title="Agent Chat",
+                package_dir=Path(temp_dir),
+                backend_entrypoint=Path(temp_dir) / "backend.py",
+                migrations_dir=migrations,
+                ui_dir=Path(temp_dir),
+                port=7450,
+            )
+            with patch("host.runtime.app_platform.app_by_id", return_value=app):
+                with self.assertRaises(Exception):
+                    app_migrate.up("agent_chat", quiet=True)
+
+        with db.transaction() as cur:
+            cur.execute("SELECT to_regclass('public.host_escape_attempt')")
+            self.assertEqual(cur.fetchone(), (None,))
+            cur.execute("SELECT app_id, version, name FROM app_schema_migrations")
+            self.assertEqual(cur.fetchall(), [])
 
 
 if __name__ == "__main__":

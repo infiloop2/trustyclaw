@@ -5,11 +5,13 @@ Defense in depth, fail closed at each layer:
 1. **nftables**: inbound is dropped except loopback, established traffic, and
    SSH port 22 when SSH operator access is configured. Outbound is dropped for
    everyone except root, `trustyclaw-proxy`, optional `cloudflared`,
-   `systemd-resolved`, and `systemd-timesyncd`; the agent and admin users have
-   no direct network path at all. Non-root DNS is blocked even toward the local
-   `systemd-resolved` stub (DNS lookups are an exfiltration channel); only
-   `systemd-resolved`, the proxy, and optional `cloudflared` may query upstream
-   DNS. If the proxy is down, the agent simply has no connectivity.
+   `systemd-resolved`, and `systemd-timesyncd`, with narrow loopback exceptions:
+   the agent may reach only the proxy port, the admin API may reach app backend
+   ports, and app service users may answer established admin-proxy connections.
+   Non-root DNS is blocked even toward the local `systemd-resolved` stub (DNS
+   lookups are an exfiltration channel); only `systemd-resolved`, the proxy, and
+   optional `cloudflared` may query upstream DNS. If the proxy is down, the
+   agent simply has no connectivity.
 2. **Proxy environment**: agent processes run with `HTTP_PROXY`/`HTTPS_PROXY`/
    `ALL_PROXY` pointing at the local proxy and trust its CA via the system
    store and `NODE_EXTRA_CA_CERTS`.
@@ -87,9 +89,16 @@ Tunnel egress is limited to DNS, TCP 443, and TCP/UDP 7844, and the EC2 security
 group keeps TCP/UDP 7844 open only when a `cloudflare_access` operator endpoint
 is configured. That 7844 allowance is outbound-only and paired with nftables uid
 checks: it is usable by the `cloudflared` connector, not by the agent, admin
-API, or proxy users. It does not expose an inbound EC2 port. The agent — a
-non-root user with no sudo — only inherits root's blanket path by first
-escalating to root.
+API, or proxy users. It does not expose an inbound EC2 port.
+
+Loopback is also uid-scoped. The agent can open new loopback TCP connections
+only to the network proxy port. App backend ports are opened only to the
+`trustyclaw-admin` uid, and a port-specific drop blocks all other local users
+before the general loopback accept. App service users may send established
+loopback responses for admin-proxied requests, but may not initiate loopback
+connections to the proxy, the browser-facing admin API, other app backends, or
+other local listeners. The agent — a non-root user with no sudo — only inherits
+root's blanket path by first escalating to root.
 
 Decisions are logged to the `network_events` database table, which the proxy
 writes under its own narrow database role. A denied `CONNECT` (no inner

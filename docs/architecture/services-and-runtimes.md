@@ -5,6 +5,7 @@
 | `trustyclaw-network-proxy.service` | `trustyclaw-proxy` | Policy proxy on `127.0.0.1:7445`. |
 | `trustyclaw-postgres.service` | `postgres` | Admin-state PostgreSQL, Unix socket only (no TCP listener). |
 | `trustyclaw-admin-api.service` | `trustyclaw-admin` | Admin API on `127.0.0.1:7443`. |
+| `trustyclaw-app-<app_id>.service` | `trustyclaw-app-<app_id>` | Installed app backend on its host-assigned loopback app port, reachable only from the admin API service uid. |
 | `trustyclaw-cloudflared.service` | `cloudflared` | Optional Cloudflare Tunnel connector for Cloudflare Access operator endpoints. Installed only when `operator_connections` contains `cloudflare_access`. |
 | `trustyclaw_agent.slice` | — | Top-level cgroup slice holding every agent runtime scope (underscore, not dash: dashes in slice names encode nesting, and the weight must compare against `system.slice` directly). `CPUWeight=50` guarantees the host services CPU time under contention while leaving idle cores to the agent; `MemoryHigh=70%`/`MemoryMax=80%`/`MemorySwapMax=5G` contain a runaway agent's RAM and swap to its own cgroup; `TasksMax=4096` stops a fork bomb from exhausting kernel PIDs. |
 
@@ -17,6 +18,7 @@
 | `trustyclaw-network-proxy.service` | `trustyclaw-proxy` | systemd | Handles all agent HTTP(S)/WS(S) egress and writes network events. |
 | `trustyclaw-postgres.service` | `postgres` | systemd | Stores admin state; local Unix-socket connections only. |
 | `trustyclaw-admin-api.service` | `trustyclaw-admin` | systemd | Serves localhost API/UI, owns task state, and supervises runtime work. |
+| `trustyclaw-app-<app_id>.service` | `trustyclaw-app-<app_id>` | systemd | Serves an installed app API on a loopback app port selected by the host. The admin API is the only uid allowed to open new TCP connections to that listener. |
 | `trustyclaw-cloudflared.service` | `cloudflared` | systemd | Optional Cloudflare Tunnel connector. Reads `/etc/trustyclaw/cloudflared.token` and exposes the admin API through the configured Cloudflare Access hostname. |
 | `run-codex-app-server` helper | starts as root, then `trustyclaw-agent` | admin API via sudo | Starts one Codex stdio app-server process. |
 | `codex app-server` | `trustyclaw-agent` | launch helper | Executes Codex turns for one active/warm thread. |

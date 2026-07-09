@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from unittest.mock import patch
 from host.config import ConfigError, parse_input_config
 from host.cli import lifecycle as deploy
 from host.cli import power
+from host.runtime import app_platform
 
 
 
@@ -1159,6 +1161,11 @@ class DeployUnitTests(unittest.TestCase):
         # 0600/0700 cluster files on the admin volume must keep a valid owner
         # across root-volume replacement.
         self.assertIn("POSTGRES_UID=47745", bootstrap)
+        self.assertIn("Installed app service users use the reserved static range 48000-48099", bootstrap)
+        self.assertIn("TRUSTYCLAW_APP_AGENT_CHAT_UID=48000", bootstrap)
+        self.assertIn("TRUSTYCLAW_APP_AGENT_CHAT_GID=48000", bootstrap)
+        self.assertIn("App ports are host-owned static assignments", bootstrap)
+        self.assertIn("APP_AGENT_CHAT_PORT=7450", bootstrap)
         self.assertIn("ensure_user postgres \"$POSTGRES_UID\" postgres /var/lib/postgresql", bootstrap)
         self.assertLess(
             bootstrap.index('ensure_user postgres "$POSTGRES_UID"'),
@@ -1180,6 +1187,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn('useradd --uid "$uid" --gid "$group" $extra_args --home-dir "$home" --no-create-home --shell /usr/sbin/nologin "$name"', bootstrap)
         self.assertIn("ensure_user trustyclaw-proxy \"$TRUSTYCLAW_PROXY_UID\" trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state", bootstrap)
         self.assertIn("ensure_user cloudflared \"$CLOUDFLARED_UID\" cloudflared /nonexistent", bootstrap)
+        self.assertIn("ensure_user trustyclaw-app-agent_chat \"$TRUSTYCLAW_APP_AGENT_CHAT_UID\" trustyclaw-app-agent_chat /nonexistent", bootstrap)
         self.assertNotIn("usermod -a -G trustyclaw-admin trustyclaw-proxy", bootstrap)
         self.assertNotIn("--groups trustyclaw-admin", bootstrap)
         self.assertIn('--no-create-home --shell /usr/sbin/nologin "$name"', bootstrap)
@@ -1197,8 +1205,26 @@ class DeployUnitTests(unittest.TestCase):
         self.assertNotIn("update-provider-account", bootstrap)
         self.assertIn("chmod 755 /usr/local/lib/trustyclaw-host", bootstrap)
         self.assertIn("User=trustyclaw-admin", bootstrap)
+        self.assertIn("RuntimeDirectory=trustyclaw-admin-api", bootstrap)
+        self.assertIn("RuntimeDirectoryMode=0755", bootstrap)
         self.assertIn("User=trustyclaw-proxy", bootstrap)
         self.assertIn("User=cloudflared", bootstrap)
+        self.assertIn("User=trustyclaw-app-agent_chat", bootstrap)
+        self.assertIn("trustyclaw-app-agent_chat.service", bootstrap)
+        self.assertIn("python3 -m host.runtime.app_migrate pending agent_chat", bootstrap)
+        self.assertIn(
+            "runuser -u trustyclaw-app-agent_chat -- env PYTHONPATH=/opt/trustyclaw-host "
+            'python3 -m host.runtime.app_migrate apply-sql agent_chat "$app_migration_version"',
+            bootstrap,
+        )
+        self.assertIn(
+            "runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host "
+            'python3 -m host.runtime.app_migrate record agent_chat "$app_migration_version"',
+            bootstrap,
+        )
+        self.assertNotIn('GRANT \\"trustyclaw-app-agent_chat\\" TO \\"trustyclaw-admin\\"', bootstrap)
+        self.assertIn("CREATE SCHEMA IF NOT EXISTS app_agent_chat AUTHORIZATION", bootstrap)
+        self.assertIn("trustyclaw-app-agent_chat", bootstrap)
         # Credential carry-over (payload for deploy/reconfigure, stored config
         # for upgrade/recover) lives in host.runtime.write_config now; bootstrap
         # passes the operation mode through and stages the effective config for
@@ -1222,6 +1248,25 @@ class DeployUnitTests(unittest.TestCase):
         # listener stays outside its network boundary.
         self.assertIn('oif lo tcp dport 7445 meta skuid "trustyclaw-agent" accept', bootstrap)
         self.assertIn('oif lo meta skuid "trustyclaw-agent" drop', bootstrap)
+        # App services may answer the host admin API reverse proxy but cannot
+        # open arbitrary loopback connections, including to the unauthenticated
+        # network proxy or browser-facing admin API.
+        self.assertIn('oif lo meta skuid "trustyclaw-app-agent_chat" drop', bootstrap)
+        self.assertNotIn('oif lo tcp dport 7443 meta skuid "trustyclaw-app-agent_chat" accept', bootstrap)
+        self.assertNotIn('oif lo tcp dport 7445 meta skuid "trustyclaw-app-agent_chat" accept', bootstrap)
+        # App backend TCP listeners are loopback-only and reachable only from
+        # the admin API service uid. Other local users hit the explicit drop
+        # before the broad loopback accept.
+        self.assertIn('oif lo tcp dport $APP_AGENT_CHAT_PORT meta skuid "trustyclaw-admin" accept', bootstrap)
+        self.assertIn("oif lo tcp dport $APP_AGENT_CHAT_PORT drop", bootstrap)
+        self.assertLess(
+            bootstrap.index('oif lo tcp dport $APP_AGENT_CHAT_PORT meta skuid "trustyclaw-admin" accept'),
+            bootstrap.index("oif lo tcp dport $APP_AGENT_CHAT_PORT drop"),
+        )
+        self.assertLess(
+            bootstrap.index("oif lo tcp dport $APP_AGENT_CHAT_PORT drop"),
+            bootstrap.index("oif lo accept"),
+        )
         self.assertIn("pathlib.Path('/tmp/trustyclaw_cloudflare_rules').write_text(", bootstrap)
         self.assertIn("if cloudflare_enabled else ''", bootstrap)
         self.assertIn("$(cat /tmp/trustyclaw_cloudflare_rules)", bootstrap)
@@ -1374,6 +1419,112 @@ class DeployUnitTests(unittest.TestCase):
         self.assertNotIn("legacy/unversioned", bootstrap)
         self.assertNotIn("LEGACY_UNVERSIONED_STATE_VERSION", bootstrap)
 
+    def test_rendered_bootstrap_provisions_every_installed_app(self) -> None:
+        bootstrap = deploy._render_bootstrap(parse_input_config(sample_config()))
+
+        apps = app_platform.installed_apps()
+        self.assertGreaterEqual(len(apps), 1)
+        for app in apps:
+            env_prefix = f"TRUSTYCLAW_APP_{app.id.upper()}"
+            with self.subTest(app_id=app.id):
+                self.assertIn(f"{env_prefix}_UID=", bootstrap)
+                self.assertIn(f"{env_prefix}_GID=", bootstrap)
+                self.assertIn(f"ensure_group {app.linux_user}", bootstrap)
+                self.assertIn(f"ensure_user {app.linux_user} \"${env_prefix}_UID\" {app.linux_user} /nonexistent", bootstrap)
+                self.assertIn(f"local  trustyclaw_admin  {app.db_role}  peer", bootstrap)
+                self.assertIn(f"rolname = '{app.db_role}'", bootstrap)
+                self.assertIn(f'CREATE ROLE "{app.db_role}" LOGIN;', bootstrap)
+                self.assertIn(f'CREATE SCHEMA IF NOT EXISTS {app.db_schema} AUTHORIZATION \\"{app.db_role}\\";', bootstrap)
+                self.assertIn(f'GRANT CONNECT ON DATABASE trustyclaw_admin TO \\"{app.db_role}\\";', bootstrap)
+                self.assertIn(f"python3 -m host.runtime.app_migrate pending {app.id}", bootstrap)
+                self.assertIn(
+                    f"runuser -u {app.linux_user} -- env PYTHONPATH=/opt/trustyclaw-host "
+                    f'python3 -m host.runtime.app_migrate apply-sql {app.id} "$app_migration_version"',
+                    bootstrap,
+                )
+                self.assertIn(
+                    f"runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host "
+                    f'python3 -m host.runtime.app_migrate record {app.id} "$app_migration_version"',
+                    bootstrap,
+                )
+                self.assertIn(f'oif lo ct state established,related meta skuid "{app.linux_user}" accept', bootstrap)
+                self.assertIn(f'meta skuid "{app.linux_user}" drop', bootstrap)
+                port_var = f"$APP_{app.id.upper()}_PORT"
+                self.assertIn(f'oif lo tcp dport {port_var} meta skuid "trustyclaw-admin" accept', bootstrap)
+                self.assertIn(f"oif lo tcp dport {port_var} drop", bootstrap)
+                self.assertIn(f"cat > /etc/systemd/system/{app.service_name} <<'UNIT'", bootstrap)
+                self.assertIn(f"User={app.linux_user}", bootstrap)
+                self.assertIn("Environment=TRUSTYCLAW_APP_ADMIN_API_SOCKET=/run/trustyclaw-admin-api/app-backend.sock", bootstrap)
+                self.assertIn(f"Environment=TRUSTYCLAW_APP_PORT={app.port}", bootstrap)
+                backend_entrypoint = app.backend_entrypoint.relative_to(app.package_dir)
+                self.assertIn(
+                    f"ExecStart=/usr/bin/python3 /opt/trustyclaw-host/host/apps/{app.id}/{backend_entrypoint}",
+                    bootstrap,
+                )
+                self.assertIn(f"systemctl enable {app.service_name}", bootstrap)
+                self.assertIn(f"systemctl start {app.service_name}", bootstrap)
+
+    def test_rendered_bootstrap_uses_manifest_backend_entrypoint_safely(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            app_dir = Path(temp) / "custom_app"
+            app_dir.mkdir()
+            backend = app_dir / "server.py"
+            backend.write_text("")
+            migrations = app_dir / "migrations"
+            migrations.mkdir()
+            ui = app_dir / "ui"
+            ui.mkdir()
+            app = app_platform.AppManifest(
+                id="custom_app",
+                title="Custom $(touch /tmp/unsafe)",
+                package_dir=app_dir,
+                backend_entrypoint=backend,
+                migrations_dir=migrations,
+                ui_dir=ui,
+                port=7457,
+                allocation=app_platform.AppAllocation(uid=48007, gid=48007, port_offset=7),
+            )
+
+            with (
+                patch("host.cli.lifecycle_bootstrap.app_platform.installed_apps", return_value=[app]),
+                patch(
+                    "host.cli.lifecycle_bootstrap.app_platform.app_registry",
+                    return_value={"custom_app": app_platform.AppAllocation(uid=48007, gid=48007, port_offset=7)},
+                ),
+            ):
+                bootstrap = deploy._render_bootstrap(parse_input_config(sample_config()))
+
+        self.assertIn("cat > /etc/systemd/system/trustyclaw-app-custom_app.service <<'UNIT'", bootstrap)
+        self.assertIn("Description=TrustyClaw App: Custom $(touch /tmp/unsafe)", bootstrap)
+        self.assertIn("Environment=TRUSTYCLAW_APP_PORT=7457", bootstrap)
+        self.assertIn("ExecStart=/usr/bin/python3 /opt/trustyclaw-host/host/apps/custom_app/server.py", bootstrap)
+        self.assertNotIn("/opt/trustyclaw-host/host/apps/custom_app/backend.py", bootstrap)
+
+    def test_rendered_bootstrap_pins_every_app_uid_in_reserved_range(self) -> None:
+        bootstrap = deploy._render_bootstrap(parse_input_config(sample_config()))
+        expected_app_uids = {
+            "agent_chat": 48000,
+        }
+        apps = app_platform.installed_apps()
+        self.assertEqual(set(expected_app_uids), {app.id for app in apps})
+        seen_uids: set[int] = set()
+
+        for app in apps:
+            env_prefix = f"TRUSTYCLAW_APP_{app.id.upper()}"
+            with self.subTest(app_id=app.id):
+                uid_match = re.search(rf"^{env_prefix}_UID=(\d+)$", bootstrap, re.MULTILINE)
+                gid_match = re.search(rf"^{env_prefix}_GID=(\d+)$", bootstrap, re.MULTILINE)
+                self.assertIsNotNone(uid_match)
+                self.assertIsNotNone(gid_match)
+                uid = int(uid_match.group(1))
+                gid = int(gid_match.group(1))
+                self.assertEqual(uid, expected_app_uids[app.id])
+                self.assertEqual(gid, uid)
+                self.assertGreaterEqual(uid, 48000)
+                self.assertLessEqual(uid, 48099)
+                self.assertNotIn(uid, seen_uids)
+                seen_uids.add(uid)
+
     def test_rendered_bootstrap_provisions_admin_state_postgres(self) -> None:
         bootstrap = deploy._render_bootstrap(parse_input_config(sample_config()))
 
@@ -1439,6 +1590,18 @@ class DeployUnitTests(unittest.TestCase):
         self.assertLess(
             bootstrap.index("python3 -m host.runtime.write_config"),
             bootstrap.index("systemctl enable --now trustyclaw-admin-api.service"),
+        )
+        self.assertLess(
+            bootstrap.index("rm -f /tmp/trustyclaw_payload.json /tmp/trustyclaw_effective_config.json"),
+            bootstrap.index("systemctl enable trustyclaw-app-agent_chat.service"),
+        )
+        self.assertLess(
+            bootstrap.index("systemctl enable trustyclaw-app-agent_chat.service"),
+            bootstrap.index("systemctl start trustyclaw-app-agent_chat.service"),
+        )
+        self.assertLess(
+            bootstrap.index("systemctl start trustyclaw-app-agent_chat.service"),
+            bootstrap.index("TRUSTYCLAW_TARGET_VERSION"),
         )
         # No database driver anywhere: the runtime speaks the wire protocol
         # itself (host/runtime/pgclient.py).
