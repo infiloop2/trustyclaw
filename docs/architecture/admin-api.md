@@ -8,6 +8,13 @@ password, which is hashed and compared in constant time against the stored hash.
 `GET /` serves the bundled single-page UI (no secrets in the page itself; the
 browser keeps the password in a cookie and sends it as the bearer header).
 
+App backends are reached only through the admin API reverse proxy. Each app
+service binds a host-assigned `127.0.0.1` port, and nftables accepts new
+connections to that port only from the `trustyclaw-admin` uid before dropping
+the same port for every other local uid. The app receives a host proxy marker,
+not the operator's raw admin bearer. Agent runtimes, app service users, and
+ordinary local users cannot call app backend TCP listeners directly.
+
 Mutating requests are idempotent: the response for each `Idempotency-Key` is
 kept in the service's memory for 24 hours (or until a service restart —
 replay records are a retry convenience, not durable state), and a replay with

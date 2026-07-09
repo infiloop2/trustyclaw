@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -26,15 +27,19 @@ import pwd
 import re
 import shutil
 import socket
+import socketserver
+import stat
+import struct
 import subprocess
 import threading
 import time
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from host.config import AGENT_RUNTIMES, ConfigError, parse_network_controls
 from host.constants import ADMIN_API_PORT, LOOPBACK, PROXY_PORT
 from host.runtime import (
+    app_platform,
     claude_code,
     codex_app_server,
     github_credential,
@@ -67,6 +72,7 @@ from host.version import repo_version, version_status
 
 HOST = LOOPBACK
 PORT = ADMIN_API_PORT
+APP_BACKEND_ADMIN_SOCKET = Path(os.environ.get("TRUSTYCLAW_APP_BACKEND_ADMIN_SOCKET", "/run/trustyclaw-admin-api/app-backend.sock"))
 UI_ASSETS = {
     "/": ("admin_ui.html", "text/html; charset=utf-8"),
     "/admin_ui.css": ("admin_ui.css", "text/css; charset=utf-8"),
@@ -131,6 +137,9 @@ AGENT_AUTH_CLEAR_HELPER_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trusty
 AGENT_CGROUP_ROOT = Path(os.environ.get("TRUSTYCLAW_AGENT_CGROUP_ROOT", "/sys/fs/cgroup/trustyclaw_agent.slice"))
 PROC_ROOT = Path(os.environ.get("TRUSTYCLAW_PROC_ROOT", "/proc"))
 AGENT_PROCESS_LIMIT = 1000
+APP_BACKEND_TIMEOUT_SECONDS = 10
+APP_BACKEND_AUTH_HEADER = "X-TrustyClaw-App-Backend"
+APP_BACKEND_ALLOWED_APP_IDS = {"agent_chat"}
 # Lock inventory for this module (each request runs on its own handler
 # thread, so every handler is concurrent with every other and with the
 # orchestrator's workers):
@@ -155,6 +164,7 @@ OAUTH_LOGIN_LOCK = threading.Lock()
 # re-executes at most once per process lifetime.
 IDEMPOTENCY_ENTRIES: dict[str, dict[str, Any]] = {}
 IDEMPOTENCY_LOCK = threading.Lock()
+REQUEST_CONTEXT = threading.local()
 
 
 class ApiError(Exception):
@@ -184,11 +194,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle(self, method: str) -> None:
         try:
+            REQUEST_CONTEXT.bearer = None
+            REQUEST_CONTEXT.app_id = None
+            REQUEST_CONTEXT.bridge_app_id = None
             path = urlparse(self.path)
             if method == "GET" and path.path in UI_ASSETS:
                 self._send_ui_asset(path.path)
                 return
+            if method == "GET":
+                app_asset = app_platform.ui_asset(path.path)
+                if app_asset is not None:
+                    self._send_app_ui_asset(*app_asset)
+                    return
             self._authenticate()
+            REQUEST_CONTEXT.bridge_app_id = self.headers.get("X-TrustyClaw-App-Bridge", "") or None
+            app_backend_id = getattr(REQUEST_CONTEXT, "app_id", None)
+            if app_backend_id is not None:
+                _require_app_backend_route(app_backend_id, method, path.path)
             if method in {"POST", "PUT", "DELETE"}:
                 response = self._mutate_idempotently(method, path)
             else:
@@ -196,6 +218,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, response)
         except ApiError as exc:
             self._send_json(exc.status, {"error": {"message": exc.message}})
+        except app_platform.AppError as exc:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": {"message": str(exc)}})
         except Exception as exc:
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": {"message": str(exc)}})
 
@@ -260,6 +284,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_app_ui_asset(self, _app: app_platform.AppManifest, asset: Path, content_type: str) -> None:
+        data = asset.read_bytes()
+        self.send_response(HTTPStatus.OK.value)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self._send_ui_cache_headers()
+        self._send_app_ui_security_headers()
+        self.end_headers()
+        self.wfile.write(data)
+
     def _send_ui_cache_headers(self) -> None:
         self.send_header("Cache-Control", "no-store, max-age=0")
         self.send_header("Pragma", "no-cache")
@@ -269,12 +303,60 @@ class Handler(BaseHTTPRequestHandler):
         for name, value in SECURITY_HEADERS.items():
             self.send_header(name, value)
 
+    def _send_app_ui_security_headers(self) -> None:
+        asset_origin = self._app_ui_asset_origin()
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; "
+            "base-uri 'none'; "
+            "connect-src 'none'; "
+            f"font-src 'self' {asset_origin} data:; "
+            "form-action 'none'; "
+            "frame-ancestors 'self'; "
+            f"img-src 'self' {asset_origin} data:; "
+            "navigate-to 'self'; "
+            "object-src 'none'; "
+            "sandbox allow-scripts allow-forms allow-modals; "
+            f"script-src 'self' 'unsafe-inline' {asset_origin}; "
+            f"style-src 'self' 'unsafe-inline' {asset_origin}",
+        )
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+
+    def _app_ui_asset_origin(self) -> str:
+        host = self.headers.get("Host", "")
+        if not re.fullmatch(r"[A-Za-z0-9.:-]+", host):
+            host = f"{LOOPBACK}:{ADMIN_API_PORT}"
+        forwarded_proto = self.headers.get("X-Forwarded-Proto", "")
+        scheme = forwarded_proto if forwarded_proto in {"http", "https"} else "http"
+        return f"{scheme}://{host}"
+
     def _authenticate(self) -> None:
         expected = load_config().get("admin_password_sha256", "")
         auth = self.headers.get("Authorization", "")
-        presented = hashlib.sha256(auth.removeprefix("Bearer ").encode()).hexdigest()
-        if not expected or not auth.startswith("Bearer ") or not hmac.compare_digest(presented, expected):
+        if auth.startswith("Bearer "):
+            presented = hashlib.sha256(auth.removeprefix("Bearer ").encode()).hexdigest()
+            if expected and hmac.compare_digest(presented, expected):
+                REQUEST_CONTEXT.bearer = auth.removeprefix("Bearer ")
+                return
             raise ApiError(HTTPStatus.UNAUTHORIZED, "missing or invalid admin password")
+        app_id = self._authenticated_app_backend_id()
+        if app_id is not None:
+            REQUEST_CONTEXT.app_id = app_id
+            return
+        raise ApiError(HTTPStatus.UNAUTHORIZED, "missing or invalid admin password")
+
+    def _authenticated_app_backend_id(self) -> str | None:
+        if not getattr(self.server, "app_backend_socket", False):
+            return None
+        expected_app_id = self.headers.get(APP_BACKEND_AUTH_HEADER, "")
+        if not expected_app_id:
+            return None
+        app_id = _app_id_for_peer_uid(_peer_uid(self.request))
+        if app_id is None or app_id != expected_app_id:
+            return None
+        return app_id
 
     def _read_body(self) -> Any:
         try:
@@ -302,6 +384,63 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+    app_backend_socket = True
+
+
+def _peer_uid(conn: socket.socket) -> int:
+    raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    _pid, uid, _gid = struct.unpack("3i", raw)
+    return uid
+
+
+def _app_id_for_peer_uid(uid: int) -> str | None:
+    for app in app_platform.installed_apps():
+        try:
+            if pwd.getpwnam(app.linux_user).pw_uid == uid:
+                return app.id
+        except KeyError:
+            continue
+    return None
+
+
+def _require_app_backend_route(app_id: str, method: str, path: str) -> None:
+    if app_id not in APP_BACKEND_ALLOWED_APP_IDS:
+        raise ApiError(HTTPStatus.FORBIDDEN, "app backend is not allowed to call host admin APIs")
+    if not _is_agent_chat_backend_route(method, path):
+        raise ApiError(HTTPStatus.FORBIDDEN, "app backend route is not allowed")
+
+
+def _is_agent_chat_backend_route(method: str, path: str) -> bool:
+    if method == "POST" and path == "/v1/tasks":
+        return True
+    parts = path.strip("/").split("/")
+    if len(parts) == 3 and parts[:2] == ["v1", "tasks"] and method == "GET":
+        return True
+    if len(parts) == 4 and parts[:2] == ["v1", "tasks"] and parts[3] in {"cancel", "kill", "steer"}:
+        return method == "POST"
+    if len(parts) == 4 and parts[:2] == ["v1", "threads"] and parts[3] == "tasks":
+        return method == "GET"
+    return False
+
+
+def create_app_backend_admin_server() -> ThreadingUnixHTTPServer:
+    APP_BACKEND_ADMIN_SOCKET.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode = APP_BACKEND_ADMIN_SOCKET.lstat().st_mode
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISSOCK(mode):
+            APP_BACKEND_ADMIN_SOCKET.unlink()
+        else:
+            raise OSError(f"refusing to replace non-socket app backend admin path: {APP_BACKEND_ADMIN_SOCKET}")
+    server = ThreadingUnixHTTPServer(str(APP_BACKEND_ADMIN_SOCKET), Handler)
+    APP_BACKEND_ADMIN_SOCKET.chmod(0o666)
+    return server
+
+
 def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> Any:
     if method == "GET" and path == "/v1/health":
         return health()
@@ -313,6 +452,10 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> Any
         return current_agent_accounts()
     if method == "POST" and path == "/v1/agent-runtime/refresh":
         return refresh_agent_runtime_accounts(body)
+    if path == "/v1/apps" and method == "GET":
+        return list_apps()
+    if path.startswith("/v1/apps/"):
+        return app_route(method, path, query, body)
     if path == "/v1/agent-runtime/codex-oauth-login":
         if method == "POST":
             return start_codex_oauth_login()
@@ -398,6 +541,64 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> Any
         return reboot_host()
     raise ApiError(HTTPStatus.NOT_FOUND, "route not found")
 
+
+def list_apps() -> dict[str, Any]:
+    return {"apps": [app.public() for app in app_platform.installed_apps()]}
+
+
+def app_route(method: str, path: str, query: dict[str, list[str]], body: Any) -> Any:
+    parts = path.strip("/").split("/")
+    if len(parts) >= 4 and parts[0] == "v1" and parts[1] == "apps" and parts[3] == "api":
+        bridge_app_id = getattr(REQUEST_CONTEXT, "bridge_app_id", None)
+        if bridge_app_id and bridge_app_id != parts[2]:
+            raise ApiError(HTTPStatus.FORBIDDEN, "app bridge cannot target a different app")
+        app = app_platform.app_by_id(parts[2])
+        if app is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, "app not found")
+        suffix = "/" + "/".join(parts[4:]) if len(parts) > 4 else "/"
+        return proxy_app_api(app, method, suffix, query, body)
+    raise ApiError(HTTPStatus.NOT_FOUND, "app route not found")
+
+
+def proxy_app_api(
+    app: app_platform.AppManifest,
+    method: str,
+    path: str,
+    query: dict[str, list[str]],
+    body: Any,
+) -> Any:
+    encoded_body = None if body is None else json.dumps(body, sort_keys=True).encode()
+    headers = {"X-TrustyClaw-App-Proxy": app.id}
+    if encoded_body is not None:
+        headers["Content-Type"] = "application/json"
+        headers["Content-Length"] = str(len(encoded_body))
+    target = path
+    if query:
+        target += "?" + urlencode([(key, value) for key, values in query.items() for value in values])
+    conn: http.client.HTTPConnection | None = None
+    try:
+        conn = http.client.HTTPConnection(LOOPBACK, app.port, timeout=APP_BACKEND_TIMEOUT_SECONDS)
+        conn.request(method, target, body=encoded_body, headers=headers)
+        response = conn.getresponse()
+        raw = response.read(MAX_REQUEST_BODY_BYTES + 1)
+    except OSError as exc:
+        raise ApiError(HTTPStatus.BAD_GATEWAY, f"app backend unavailable: {app.id}") from exc
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    if len(raw) > MAX_REQUEST_BODY_BYTES:
+        raise ApiError(HTTPStatus.BAD_GATEWAY, "app backend response too large")
+    try:
+        data = json.loads(raw.decode() or "{}")
+    except json.JSONDecodeError as exc:
+        raise ApiError(HTTPStatus.BAD_GATEWAY, "app backend returned invalid JSON") from exc
+    if response.status >= 400:
+        message = data.get("error", {}).get("message") if isinstance(data, dict) else None
+        raise ApiError(HTTPStatus(response.status), message or "app backend request failed")
+    return data
 
 def resolve_pending_push(push_id: str, action: str) -> dict[str, Any]:
     try:
@@ -1536,10 +1737,19 @@ def main() -> int:
     # rather than fail the live instance's running task and drop its in-flight
     # idempotency reservations first.
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
+    app_backend_httpd = create_app_backend_admin_server()
     initialize_state()
     orchestrator.start_workers()
     threading.Thread(target=maintenance_loop, daemon=True).start()
-    httpd.serve_forever()
+    threading.Thread(target=app_backend_httpd.serve_forever, daemon=True).start()
+    try:
+        httpd.serve_forever()
+    finally:
+        app_backend_httpd.server_close()
+        try:
+            APP_BACKEND_ADMIN_SOCKET.unlink()
+        except FileNotFoundError:
+            pass
     return 0
 
 

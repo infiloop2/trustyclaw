@@ -3,8 +3,8 @@
 // data-action buttons to feature handlers. Feature code lives in the sibling
 // modules; this file is the only place that wires them together.
 
-import { getPassword, setUnauthorizedHandler } from "./api.js";
-import { $ } from "./helpers.js";
+import { api, getPassword, setUnauthorizedHandler } from "./api.js";
+import { $, notice } from "./helpers.js";
 import {
   completeClaudeLogin, refreshHealth, refreshProviderAccounts,
   refreshProviderUsage, rebootHost, startLogin,
@@ -28,6 +28,9 @@ import {
 } from "./network.js";
 
 let activeTab = "home";
+let installedApps = [];
+const appFrames = new Map();
+const staticTabs = ["home", "agent", "processes", "agent-log", "files", "network", "net-log"];
 
 function adminCookieAttributes(maxAge) {
   return `; path=/; max-age=${maxAge}; samesite=strict${location.protocol === "https:" ? "; secure" : ""}`;
@@ -55,9 +58,15 @@ function showLogin() {
 
 function showTab(name) {
   activeTab = name;
-  for (const tabName of ["home", "agent", "processes", "agent-log", "files", "network", "net-log"]) {
+  for (const tabName of staticTabs) {
     $(`tab-${tabName}`).classList.toggle("active-tab", tabName === name);
     $(`panel-${tabName}`).hidden = tabName !== name;
+  }
+  for (const app of installedApps) {
+    const selected = name === `app:${app.id}`;
+    $(`tab-app-${app.id}`)?.classList.toggle("active-tab", selected);
+    const panel = $(`panel-app-${app.id}`);
+    if (panel) panel.hidden = !selected;
   }
   refreshVisibleTab(name).catch(() => {});
 }
@@ -100,10 +109,108 @@ function start() {
   $("login").hidden = true;
   $("app").hidden = false;
   $("logout-button").hidden = false;
+  loadApps().catch(error => notice(error.message));
   renderThreadHistory();
   loadPolicy().catch(() => {});
   tick();
   setInterval(tick, 5000);
+}
+
+async function loadApps() {
+  const response = await api("GET", "/v1/apps");
+  installedApps = response.apps || [];
+  renderAppTabs();
+}
+
+function renderAppTabs() {
+  const container = $("app-tabs");
+  container.innerHTML = "";
+  document.querySelectorAll(".app-tab-panel").forEach(panel => panel.remove());
+  appFrames.clear();
+  if (!installedApps.length) {
+    container.innerHTML = `<div class="sidebar-empty">No apps installed</div>`;
+    return;
+  }
+  const main = document.querySelector("main");
+  for (const app of installedApps) {
+    const button = document.createElement("button");
+    button.id = `tab-app-${app.id}`;
+    button.className = "tab-button app-tab-button";
+    button.dataset.action = "show-tab";
+    button.dataset.tab = `app:${app.id}`;
+    button.innerHTML = `${appIconSvg()}<span></span>`;
+    button.querySelector("span").textContent = app.title || app.id;
+    container.appendChild(button);
+
+    const panel = document.createElement("div");
+    panel.id = `panel-app-${app.id}`;
+    panel.className = "tab-panel app-tab-panel";
+    panel.hidden = activeTab !== `app:${app.id}`;
+    const section = document.createElement("section");
+    section.className = "app-frame-section";
+    const iframe = document.createElement("iframe");
+    iframe.className = "app-frame";
+    iframe.title = app.title || app.id;
+    iframe.src = app.ui.iframe_src;
+    iframe.setAttribute("sandbox", (app.ui.sandbox || ["allow-scripts", "allow-forms"]).join(" "));
+    section.appendChild(iframe);
+    panel.appendChild(section);
+    main.appendChild(panel);
+    appFrames.set(app.id, iframe);
+  }
+}
+
+function appIconSvg() {
+  return `<svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h9A1.5 1.5 0 0 1 16 5.5v9a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 4 14.5v-9Z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 8h6M7 11h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`;
+}
+
+window.addEventListener("message", event => {
+  const message = event.data;
+  if (!message || message.type !== "trustyclaw-app-api") return;
+  const app = installedApps.find(candidate => appFrames.get(candidate.id)?.contentWindow === event.source);
+  if (!app) return;
+  handleAppApiMessage(app, event.source, message).catch(error => {
+    event.source.postMessage({
+      type: "trustyclaw-app-api-result",
+      request_id: message.request_id,
+      ok: false,
+      error: error.message,
+    }, "*");
+  });
+});
+
+async function handleAppApiMessage(app, source, message) {
+  if (!["GET", "POST", "PUT", "DELETE"].includes(message.method) || typeof message.path !== "string" || !message.path.startsWith("/v1/")) {
+    throw new Error("invalid app API request");
+  }
+  const canonical = canonicalAppBridgePath(message.path);
+  if (!canonical || !isAppBridgeAllowed(app, canonical.pathname)) {
+    throw new Error("app API route is not allowed");
+  }
+  const body = await api(message.method, canonical.requestPath, message.body, { "X-TrustyClaw-App-Bridge": app.id });
+  source.postMessage({
+    type: "trustyclaw-app-api-result",
+    request_id: String(message.request_id || ""),
+    ok: true,
+    body,
+  }, "*");
+}
+
+function canonicalAppBridgePath(path) {
+  if (path.includes("\\")) return null;
+  let url;
+  try {
+    url = new URL(path, window.location.origin);
+  } catch (_error) {
+    return null;
+  }
+  if (url.origin !== window.location.origin || !url.pathname.startsWith("/v1/")) return null;
+  return { pathname: url.pathname, requestPath: url.pathname + url.search };
+}
+
+function isAppBridgeAllowed(app, path) {
+  const route = app && app.backend && app.backend.api_route;
+  return typeof route === "string" && path.startsWith(route);
 }
 
 document.addEventListener("click", event => {

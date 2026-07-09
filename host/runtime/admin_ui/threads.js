@@ -1,4 +1,4 @@
-// Read-only agent thread view: thread list, thread history with task cards,
+// Read-only agent session view: thread list, thread history with task cards,
 // and per-task event tailing.
 
 import { api } from "./api.js";
@@ -18,7 +18,7 @@ export async function loadThreads() {
 
 function renderThreads() {
   if (!threads.length) {
-    setHtml($("threads"), `<div class="empty-state">No retained threads yet.</div>`);
+    setHtml($("threads"), `<div class="empty-state">No retained sessions yet.</div>`);
     return;
   }
   setHtml($("threads"), threads.map(thread => `
@@ -62,9 +62,9 @@ export function renderThreadHistory() {
   if (selectedThreadId === null) {
     setHtml($("thread-detail"), `
       <div class="thread-head">
-        <span class="thread-title">Agent thread log</span>
+        <span class="thread-title">Agent session log</span>
       </div>
-      <div class="empty-state thread-empty">Select a thread to inspect retained tasks and events.</div>`);
+      <div class="empty-state thread-empty">Select a session to inspect retained tasks and events.</div>`);
     return;
   }
   const ordered = threadTasks.slice().sort((a, b) =>
@@ -77,7 +77,7 @@ export function renderThreadHistory() {
       <span class="muted">${esc(runtimeLabel(selectedThreadRuntime))}</span>
     </div>
     ${ordered.length ? ordered.map(renderTaskCard).join("")
-      : `<div class="empty-state thread-empty">No retained tasks for this thread yet.</div>`}`);
+      : `<div class="empty-state thread-empty">No retained tasks for this session yet.</div>`}`);
 }
 
 function renderTaskCard(task) {

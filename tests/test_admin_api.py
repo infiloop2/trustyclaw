@@ -68,8 +68,79 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertIn(".memory-swap-values", css)
         self.assertIn("button.icon-button svg", css)
         self.assertNotIn("animation: panel-in", css)
+        self.assertIn("position: fixed", css)
         self.assertIn('id="tab-processes"', html)
         self.assertIn('id="processes"', html)
+        self.assertIn('id="sidebar-apps"', html)
+        self.assertIn('id="app-tabs"', html)
+        app_js = (runtime / "admin_ui" / "app.js").read_text()
+        self.assertIn("trustyclaw-app-api", app_js)
+        self.assertNotIn("const APP_BRIDGE_ROUTES", app_js)
+        self.assertIn("function canonicalAppBridgePath", app_js)
+        self.assertIn('path.includes("\\\\")', app_js)
+        self.assertIn("new URL(path, window.location.origin)", app_js)
+        self.assertIn("canonical.pathname", app_js)
+        self.assertIn("canonical.requestPath", app_js)
+        self.assertIn('"X-TrustyClaw-App-Bridge": app.id', app_js)
+        bridge_code = app_js.split("function isAppBridgeAllowed", 1)[1].split("document.addEventListener", 1)[0]
+        self.assertIn("app.backend.api_route", bridge_code)
+        self.assertNotIn("/v1/tasks", bridge_code)
+        self.assertNotIn("host-runtime", bridge_code)
+        self.assertNotIn("network/policy", bridge_code)
+        self.assertNotIn("agent-files", bridge_code)
+
+    def test_app_backend_auth_maps_peer_uid_to_installed_app(self) -> None:
+        class User:
+            pw_uid = 12345
+
+        with patch("host.runtime.admin_api.pwd.getpwnam", return_value=User()):
+            self.assertEqual(admin_api._app_id_for_peer_uid(12345), "agent_chat")
+            self.assertIsNone(admin_api._app_id_for_peer_uid(54321))
+
+    def test_app_backend_route_allowlist_starts_with_agent_chat_task_routes(self) -> None:
+        allowed = [
+            ("POST", "/v1/tasks"),
+            ("GET", "/v1/tasks/task_1"),
+            ("POST", "/v1/tasks/task_1/cancel"),
+            ("POST", "/v1/tasks/task_1/kill"),
+            ("POST", "/v1/tasks/task_1/steer"),
+            ("GET", "/v1/threads/thread_1/tasks"),
+        ]
+
+        for method, path in allowed:
+            with self.subTest(method=method, path=path):
+                admin_api._require_app_backend_route("agent_chat", method, path)
+
+    def test_app_backend_route_allowlist_rejects_host_admin_routes(self) -> None:
+        denied = [
+            ("GET", "/v1/tasks"),
+            ("PUT", "/v1/tasks/task_1"),
+            ("GET", "/v1/threads"),
+            ("GET", "/v1/health"),
+            ("PUT", "/v1/network/policy"),
+            ("GET", "/v1/agent-files"),
+        ]
+
+        for method, path in denied:
+            with self.subTest(method=method, path=path):
+                with self.assertRaises(admin_api.ApiError) as error:
+                    admin_api._require_app_backend_route("agent_chat", method, path)
+                self.assertEqual(error.exception.status, HTTPStatus.FORBIDDEN)
+
+    def test_app_backend_route_allowlist_rejects_apps_without_policy(self) -> None:
+        with self.assertRaises(admin_api.ApiError) as error:
+            admin_api._require_app_backend_route("future_app", "POST", "/v1/tasks")
+
+        self.assertEqual(error.exception.status, HTTPStatus.FORBIDDEN)
+
+    def test_app_bridge_marker_cannot_target_different_app(self) -> None:
+        admin_api.REQUEST_CONTEXT.bridge_app_id = "other-app"
+        self.addCleanup(lambda: setattr(admin_api.REQUEST_CONTEXT, "bridge_app_id", None))
+
+        with self.assertRaises(admin_api.ApiError) as error:
+            admin_api.app_route("GET", "/v1/apps/agent_chat/api/health", {}, None)
+
+        self.assertEqual(error.exception.status, HTTPStatus.FORBIDDEN)
 
 
 class AgentProcessSnapshotTests(unittest.TestCase):
@@ -218,6 +289,103 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(self.runtime(body, "claude_code")["status"], "deactivated")
         self.assertEqual(body["network_controls"]["status"], "active")
         self.assertEqual(body["version"], {"status": "ok", "runtime": "0.2.0", "state": "0.2.0"})
+
+    def test_apps_endpoint_requires_auth_and_lists_agent_chat(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request("GET", "/v1/apps", auth=False)
+        self.assertEqual(error.exception.code, 401)
+
+        status, body = self.request("GET", "/v1/apps")
+
+        self.assertEqual(status, 200)
+        app = next(item for item in body["apps"] if item["id"] == "agent_chat")
+        self.assertEqual(app["title"], "Agent Chat")
+        self.assertEqual(app["ui"]["iframe_src"], "/v1/apps/agent_chat/ui/index.html")
+        self.assertEqual(app["database"]["schema"], "app_agent_chat")
+
+    def test_app_backend_header_does_not_authenticate_tcp_admin_api(self) -> None:
+        request = urllib.request.Request(f"{self.base_url}/v1/threads", method="GET")
+        request.add_header("X-TrustyClaw-App-Backend", "agent_chat")
+
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=5)
+
+        self.assertEqual(error.exception.code, 401)
+
+    def test_app_ui_asset_is_frameable_static_content(self) -> None:
+        request = urllib.request.Request(f"{self.base_url}/v1/apps/agent_chat/ui/index.html", method="GET")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = response.read().decode()
+
+        self.assertEqual(response.status, 200)
+        self.assertIn("Agent Chat", body)
+        self.assertIn('href="agent_chat.css"', body)
+        self.assertIn('src="agent_chat.js"', body)
+        self.assertEqual(response.headers["X-Frame-Options"], "SAMEORIGIN")
+        csp = response.headers["Content-Security-Policy"]
+        self.assertIn("frame-ancestors 'self'", csp)
+        img_src = next((directive for directive in csp.split("; ") if directive.startswith("img-src ")), "")
+        self.assertIn("'self'", img_src)
+        self.assertIn("data:", img_src)
+        self.assertIn("navigate-to 'self'", csp)
+        self.assertIn("sandbox allow-scripts allow-forms allow-modals", csp)
+        self.assertNotIn("allow-same-origin", csp)
+        self.assertIn("script-src 'self' 'unsafe-inline'", csp)
+        self.assertIn("style-src 'self' 'unsafe-inline'", csp)
+        self.assertNotIn("img-src *", csp)
+        self.assertNotIn("style-src *", csp)
+
+        for asset_name, content_type, expected in (
+            ("agent_chat.css", "text/css", ".app-shell"),
+            ("agent_chat.js", "application/javascript", "trustyclaw-app-api"),
+        ):
+            request = urllib.request.Request(f"{self.base_url}/v1/apps/agent_chat/ui/{asset_name}", method="GET")
+            with urllib.request.urlopen(request, timeout=5) as response:
+                asset_body = response.read().decode()
+
+            self.assertEqual(response.status, 200)
+            self.assertTrue(response.headers["Content-Type"].startswith(content_type))
+            self.assertIn(expected, asset_body)
+
+    def test_app_api_proxy_does_not_forward_admin_bearer_to_app_backend(self) -> None:
+        captured: dict[str, Any] = {}
+
+        class FakeResponse:
+            status = 200
+
+            def read(self, _limit: int) -> bytes:
+                return b'{"status":"ok"}'
+
+        class FakeConnection:
+            def __init__(self, host: str, port: int, timeout: int) -> None:
+                captured["connect"] = (host, port, timeout)
+
+            def request(
+                self,
+                method: str,
+                target: str,
+                body: bytes | None = None,
+                headers: dict[str, str] | None = None,
+            ) -> None:
+                captured["request"] = (method, target, body, headers or {})
+
+            def getresponse(self) -> FakeResponse:
+                return FakeResponse()
+
+            def close(self) -> None:
+                captured["closed"] = True
+
+        app = admin_api.app_platform.app_by_id("agent_chat")
+        if app is None:
+            self.fail("agent_chat app should be installed")
+        with patch("host.runtime.admin_api.http.client.HTTPConnection", FakeConnection):
+            body = admin_api.proxy_app_api(app, "GET", "/health", {}, None)
+
+        self.assertEqual(body, {"status": "ok"})
+        self.assertEqual(captured["connect"][1], 7450)
+        headers = captured["request"][3]
+        self.assertEqual(headers["X-TrustyClaw-App-Proxy"], "agent_chat")
+        self.assertNotIn("Authorization", headers)
 
     def test_filesystem_metrics_reports_root_and_data_mounts(self) -> None:
         class Usage:
@@ -669,7 +837,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                          *sorted((runtime / "admin_ui").glob("*.js"))]
         )
         api = (runtime / "admin_api.py").read_text()
-        self.assertIn("<h2>Threads</h2>", html)
+        self.assertIn("<h2>Sessions</h2>", html)
         self.assertIn('<link rel="stylesheet" href="/admin_ui.css?v=__TRUSTYCLAW_ASSET_VERSION__">', html)
         self.assertIn('<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=__TRUSTYCLAW_ASSET_VERSION__">', html)
         self.assertIn('<script type="module" src="/admin_ui/app.js?v=__TRUSTYCLAW_ASSET_VERSION__"></script>', html)
@@ -723,9 +891,10 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertIn("expandedTaskEvents", ui)
         self.assertIn("taskRecency", ui)
         self.assertIn("function taskEventsHtml(task, eventState)", ui)
-        self.assertIn("Agent thread log", html)
-        self.assertLess(html.index("Agent workspace"), html.index("Agent thread log"))
-        self.assertLess(html.index("Agent thread log"), html.index("Agent audit log"))
+        self.assertIn("Agent session log", html)
+        self.assertNotIn("Agent thread log", html)
+        self.assertLess(html.index("Agent workspace"), html.index("Agent session log"))
+        self.assertLess(html.index("Agent session log"), html.index("Agent audit log"))
         self.assertIn('data-action="show-thread"', ui)
         self.assertIn('data-action="show-task-events"', ui)
         self.assertNotIn('data-action="refresh-task"', ui)

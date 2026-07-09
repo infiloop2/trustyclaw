@@ -72,18 +72,20 @@ def jsonb(value: Any) -> pgclient.Jsonb:
     return pgclient.Jsonb(value)
 
 
-def connect_kwargs() -> dict[str, Any]:
+def connect_kwargs(*, user: str | None = None) -> dict[str, Any]:
     kwargs: dict[str, Any] = {"dbname": os.environ.get("TRUSTYCLAW_DB_NAME", DEFAULT_DB_NAME)}
     if os.environ.get("TRUSTYCLAW_DB_SOCKET_DIR"):
         kwargs["socket_dir"] = os.environ["TRUSTYCLAW_DB_SOCKET_DIR"]
     if os.environ.get("TRUSTYCLAW_DB_PORT"):
         kwargs["port"] = int(os.environ["TRUSTYCLAW_DB_PORT"])
-    if os.environ.get("TRUSTYCLAW_DB_USER"):
+    if user is not None:
+        kwargs["user"] = user
+    elif os.environ.get("TRUSTYCLAW_DB_USER"):
         kwargs["user"] = os.environ["TRUSTYCLAW_DB_USER"]
     return kwargs
 
 
-def _checkout() -> pgclient.Connection:
+def _checkout(*, user: str | None = None) -> pgclient.Connection:
     """Take a live connection for the current parameters from the pool, or
     open a new one. Pooled connections created under different parameters
     (tests repoint the environment) are discarded, and every checkout is
@@ -96,7 +98,7 @@ def _checkout() -> pgclient.Connection:
             " something is holding transactions open"
         )
     try:
-        key = tuple(sorted(connect_kwargs().items()))
+        key = tuple(sorted(connect_kwargs(user=user).items()))
         while True:
             with _POOL_LOCK:
                 if not _POOL:
@@ -115,7 +117,7 @@ def _checkout() -> pgclient.Connection:
         # our bursts are short, so back off briefly before giving up.
         for attempt in range(3):
             try:
-                return pgclient.connect(**connect_kwargs())
+                return pgclient.connect(**connect_kwargs(user=user))
             except pgclient.Error as exc:
                 if exc.sqlstate != _TOO_MANY_CONNECTIONS or attempt == 2:
                     raise
@@ -126,11 +128,11 @@ def _checkout() -> pgclient.Connection:
         raise
 
 
-def _checkin(conn: pgclient.Connection) -> None:
+def _checkin(conn: pgclient.Connection, *, user: str | None = None) -> None:
     try:
         if conn.closed:
             return
-        key = tuple(sorted(connect_kwargs().items()))
+        key = tuple(sorted(connect_kwargs(user=user).items()))
         with _POOL_LOCK:
             if len(_POOL) < POOL_LIMIT:
                 _POOL.append((key, conn))
@@ -157,11 +159,11 @@ def close_pool() -> None:
 
 
 @contextmanager
-def transaction() -> Iterator[pgclient.Cursor]:
+def transaction(*, user: str | None = None) -> Iterator[pgclient.Cursor]:
     """One database transaction: yields a cursor, commits on normal exit,
     rolls back on exception. Reentrant per thread by taking a second
     connection, never by nesting on one connection."""
-    conn = _checkout()
+    conn = _checkout(user=user)
     try:
         conn.execute("BEGIN")
         with pgclient.Cursor(conn) as cur:
@@ -175,4 +177,4 @@ def transaction() -> Iterator[pgclient.Cursor]:
             _close_quietly(conn)
         raise
     finally:
-        _checkin(conn)
+        _checkin(conn, user=user)

@@ -16,6 +16,7 @@ so operators and contributors can jump to the trust boundary they need.
 | [Services and runtimes](services-and-runtimes.md) | systemd units, process inventory, threads, Codex, and Claude runtime model. |
 | [Runtime harness dependencies](harness-dependencies.md) | Codex and Claude Code interfaces, auth files, request shapes, and upgrade review points. |
 | [Admin API architecture](admin-api.md) | Local API security, idempotency, task orchestration, and maintenance. |
+| [Apps](apps.md) | App services, storage and migrations, embedded admin UI surfaces, and app security boundaries. |
 | [Network controls](network-controls.md) | nftables, proxy policy, managed integration guards (AI providers, GitHub, packages), internal guard fields, and fail-closed behavior. |
 | [GitHub write-path controls](github-write-path-controls.md) | Design record for enforcement beyond the advisory audit: PR-only mode and the `.github` push-approval gate (not implemented). |
 | [IAM policy notes](iam-policy.md) | Why each deploy IAM statement exists and why its scope is constrained. |

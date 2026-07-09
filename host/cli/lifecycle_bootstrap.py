@@ -12,7 +12,8 @@ import time
 from typing import Any
 
 from host.config import ConfigError, InputConfig, RuntimeOperatorConnection
-from host.constants import ADMIN_API_PORT, PROXY_PORT
+from host.constants import ADMIN_API_PORT, APP_PORT_BASE, PROXY_PORT
+from host.runtime import app_platform
 from host.cli.lifecycle_constants import SSH_USER, SSH_WAIT_ATTEMPTS, SSH_WAIT_SECONDS
 from host.cli.lifecycle_logging import _log
 
@@ -202,11 +203,138 @@ def _render_user_data(deploy_public_key: str) -> str:
 
 
 def _render_bootstrap(config: InputConfig) -> str:
-    return (
+    rendered = (
         BOOTSTRAP_TEMPLATE
         .replace("@ADMIN_PORT@", str(ADMIN_API_PORT))
+        .replace("@APP_PORT_BASE@", str(APP_PORT_BASE))
         .replace("@PROXY_PORT@", str(PROXY_PORT))
     )
+    return _render_app_bootstrap(rendered)
+
+
+def _render_app_bootstrap(template: str) -> str:
+    apps = app_platform.installed_apps()
+    registry = app_platform.app_registry()
+    missing_allocations = [app.id for app in apps if app.id not in registry]
+    if missing_allocations:
+        raise ConfigError(f"missing app registry allocation for: {', '.join(missing_allocations)}")
+
+    def env_prefix(app_id: str) -> str:
+        return app_id.upper()
+
+    def port_name(app_id: str) -> str:
+        return f"APP_{env_prefix(app_id)}_PORT"
+
+    uid_lines = [
+        "# Installed app service users use the reserved static range 48000-48099.",
+        "# Add new apps to host/apps/registry.json; keep existing UID/GID values",
+        "# unchanged across upgrades and update the deploy invariant test.",
+    ]
+    port_lines = [
+        "# App ports are host-owned static assignments from host/apps/registry.json.",
+        "# Add new apps there so bootstrap provisioning and /v1/apps stay aligned.",
+    ]
+    ensure_group_lines: list[str] = []
+    ensure_user_lines: list[str] = []
+    pg_hba_lines: list[str] = []
+    role_lines: list[str] = []
+    schema_grant_lines: list[str] = []
+    connect_grant_lines: list[str] = []
+    migration_lines: list[str] = []
+    nftables_lines: list[str] = []
+    unit_blocks: list[str] = []
+    enable_start_lines: list[str] = []
+
+    for app in apps:
+        allocation = registry[app.id]
+        env = env_prefix(app.id)
+        backend_entrypoint = app.backend_entrypoint.relative_to(app.package_dir)
+        port = port_name(app.id)
+        uid_lines.extend([
+            f"TRUSTYCLAW_APP_{env}_UID={allocation.uid}",
+            f"TRUSTYCLAW_APP_{env}_GID={allocation.gid}",
+        ])
+        port_lines.append(f"{port}={app.port}")
+        ensure_group_lines.append(f"ensure_group {app.linux_user} \"$TRUSTYCLAW_APP_{env}_GID\"")
+        ensure_user_lines.append(
+            f"ensure_user {app.linux_user} \"$TRUSTYCLAW_APP_{env}_UID\" {app.linux_user} /nonexistent"
+        )
+        pg_hba_lines.append(f"local  trustyclaw_admin  {app.linux_user}  peer")
+        role_lines.extend([
+            f"  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{app.linux_user}') THEN",
+            f"    CREATE ROLE \"{app.linux_user}\" LOGIN;",
+            "  END IF;",
+        ])
+        schema_grant_lines.append(
+            f"  -c \"CREATE SCHEMA IF NOT EXISTS {app.db_schema} AUTHORIZATION \\\"{app.db_role}\\\";\" \\"
+        )
+        connect_grant_lines.append(
+            f"  -c \"GRANT CONNECT ON DATABASE trustyclaw_admin TO \\\"{app.db_role}\\\";\""
+        )
+        pending_var = f"app_{app.id}_pending"
+        migration_lines.extend([
+            f"{pending_var}=\"$(runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.app_migrate pending {app.id})\"",
+            "while IFS= read -r app_migration_version; do",
+            "  [ -n \"$app_migration_version\" ] || continue",
+            f"  runuser -u {app.linux_user} -- env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.app_migrate apply-sql {app.id} \"$app_migration_version\"",
+            f"  runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.app_migrate record {app.id} \"$app_migration_version\"",
+            f"done <<< \"${pending_var}\"",
+        ])
+        nftables_lines.extend([
+            f"    oif lo ct state established,related meta skuid \"{app.linux_user}\" accept",
+            f"    oif lo meta skuid \"{app.linux_user}\" drop",
+            f"    oif lo tcp dport ${port} meta skuid \"trustyclaw-admin\" accept",
+            f"    oif lo tcp dport ${port} drop",
+        ])
+        unit_blocks.append(
+            "\n".join([
+                f"cat > /etc/systemd/system/{app.service_name} <<'UNIT'",
+                "[Unit]",
+                f"Description=TrustyClaw App: {app.title}",
+                "After=network-online.target trustyclaw-admin-api.service trustyclaw-postgres.service",
+                "Wants=network-online.target trustyclaw-admin-api.service trustyclaw-postgres.service",
+                "StartLimitIntervalSec=0",
+                "",
+                "[Service]",
+                f"User={app.linux_user}",
+                "UMask=0077",
+                "Environment=PYTHONPATH=/opt/trustyclaw-host",
+                "Environment=TRUSTYCLAW_APP_HOST=127.0.0.1",
+                f"Environment=TRUSTYCLAW_APP_PORT={app.port}",
+                f"Environment=TRUSTYCLAW_APP_DB_SCHEMA={app.db_schema}",
+                "Environment=TRUSTYCLAW_APP_ADMIN_API_SOCKET=/run/trustyclaw-admin-api/app-backend.sock",
+                f"WorkingDirectory=/opt/trustyclaw-host/host/apps/{app.id}",
+                f"ExecStart=/usr/bin/python3 /opt/trustyclaw-host/host/apps/{app.id}/{backend_entrypoint}",
+                "Restart=always",
+                "RestartSec=3",
+                "",
+                "[Install]",
+                "WantedBy=multi-user.target",
+                "UNIT",
+            ])
+        )
+        enable_start_lines.extend([
+            f"systemctl enable {app.service_name}",
+            f"systemctl start {app.service_name}",
+        ])
+
+    replacements = {
+        "@APP_UID_GID_CONSTANTS@": "\n".join(uid_lines),
+        "@APP_PORT_CONSTANTS@": "\n".join(port_lines),
+        "@APP_ENSURE_GROUPS@": "\n".join(ensure_group_lines),
+        "@APP_ENSURE_USERS@": "\n".join(ensure_user_lines),
+        "@APP_PG_HBA_LINES@": "\n".join(pg_hba_lines),
+        "@APP_ROLE_SQL@": "\n".join(role_lines),
+        "@APP_POSTGRES_SCHEMA_GRANTS@": "\n".join(schema_grant_lines),
+        "@APP_POSTGRES_CONNECT_GRANTS@": " \\\n".join(connect_grant_lines),
+        "@APP_MIGRATION_COMMANDS@": "\n".join(migration_lines),
+        "@APP_NFTABLES_RULES@": "\n".join(nftables_lines),
+        "@APP_SYSTEMD_UNITS@": "\n\n".join(unit_blocks),
+        "@APP_ENABLE_START_COMMANDS@": "\n".join(enable_start_lines),
+    }
+    for placeholder, value in replacements.items():
+        template = template.replace(placeholder, value)
+    return template
 
 
 # Stage 1, EC2 user data: trustyclaw-operator account and deploy SSH key only, no secrets.

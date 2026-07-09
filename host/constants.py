@@ -9,3 +9,4 @@ from __future__ import annotations
 LOOPBACK = "127.0.0.1"
 ADMIN_API_PORT = 7443
 PROXY_PORT = 7445
+APP_PORT_BASE = 7450

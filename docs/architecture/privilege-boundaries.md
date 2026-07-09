@@ -6,15 +6,21 @@
 | `trustyclaw-admin` | Runs the admin API; owns admin state (the `trustyclaw_admin` database role). | sudo for exactly nine root helpers (below). |
 | `trustyclaw-proxy` | Runs the policy proxy; owns proxy policy/log/CA files. | No sudo, no database role. Only nftables-approved DNS and TCP 80/443 egress. |
 | `trustyclaw-agent` | Runs Codex and Claude Code runtime processes. | None. No sudo, no direct network, no database role. |
+| `trustyclaw-app-<app_id>` | Runs one installed app backend and owns that app's derived Postgres schema, `app_<app_id>`. | No sudo and no host database role. May answer established admin API reverse-proxy connections on its assigned loopback app port; host admin and Postgres calls use peer-authenticated Unix sockets. Cannot initiate arbitrary TCP loopback or external network connections. |
 | `cloudflared` | Runs the optional Cloudflare Tunnel connector. | No sudo, no database role. Only nftables-approved DNS, TCP 443, and TCP/UDP 7844 egress. |
 | `postgres` | Runs the admin-state Postgres. | Database superuser over the local socket; no sudo, no network egress. |
 
-The five service accounts use fixed numeric IDs: `trustyclaw-admin` is
+The service accounts use fixed numeric IDs: `trustyclaw-admin` is
 `47741`, `trustyclaw-proxy` is `47742`, `trustyclaw-agent` is `47743`,
 `cloudflared` is `47744`, and `postgres` is `47745` (created by bootstrap
-before the PostgreSQL packages would assign a dynamic id). Stable IDs keep
-durable EBS ownership — including the preserved Postgres data directory —
-valid when the root volume and `/etc/passwd` are replaced.
+before the PostgreSQL packages would assign a dynamic id). Installed app service
+users use the reserved UID/GID range `48000-48099`, matching the 100-app
+registry cap. The app manifest does not choose numeric IDs. The root-owned
+`host/apps/registry.json` allocation maps each app id to a stable UID/GID in
+that range, and bootstrap creates `trustyclaw-app-<app_id>` from that registry.
+Stable IDs keep durable EBS ownership — including the preserved Postgres data
+directory and app-owned schemas/files — valid when the root volume and
+`/etc/passwd` are replaced.
 
 ## Root-Owned Helper Pattern
 

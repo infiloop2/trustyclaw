@@ -45,6 +45,7 @@ body {
   line-height: 1.55;
   margin: 0;
   min-height: 100vh;
+  padding-top: 3.5rem;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -62,7 +63,7 @@ body {
   z-index: 0;
 }
 
-header.topbar, #notice, #login, #app { position: relative; z-index: 1; }
+#notice, #login, #app { position: relative; z-index: 1; }
 
 /* ---------- Top bar ---------- */
 
@@ -73,11 +74,13 @@ header.topbar, #notice, #login, #app { position: relative; z-index: 1; }
   border-bottom: 1px solid var(--border);
   display: flex;
   justify-content: space-between;
+  left: 0;
   min-height: 3.5rem;
   padding: 0.55rem clamp(1rem, 3vw, 2rem);
-  position: sticky;
+  position: fixed;
+  right: 0;
   top: 0;
-  z-index: 20;
+  z-index: 100;
 }
 
 .brand {
@@ -216,6 +219,31 @@ main { min-width: 0; }
 
 .tab-button.active-tab:hover { border-color: rgba(69, 214, 196, 0.25); }
 
+.sidebar-divider {
+  border-top: 1px solid var(--border-strong);
+  margin: 0.55rem 0 0.45rem;
+}
+
+.sidebar-section {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.sidebar-section-title {
+  color: var(--text-dim);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  padding: 0 0.65rem;
+  text-transform: uppercase;
+}
+
+.sidebar-empty {
+  color: var(--text-dim);
+  font-size: 0.78rem;
+  padding: 0.2rem 0.65rem;
+}
+
 .tab-panel[hidden] { display: none; }
 
 .tab-panel {
@@ -259,6 +287,23 @@ h2 {
   display: grid;
   gap: 1.2rem;
   grid-template-columns: repeat(auto-fit, minmax(min(26rem, 100%), 1fr));
+}
+
+/* ---------- Embedded apps ---------- */
+
+.app-frame-section {
+  background: var(--bg);
+  height: min(66rem, calc(100vh - 7rem));
+  min-height: 44rem;
+  overflow: hidden;
+  padding: 0;
+}
+
+.app-frame {
+  border: 0;
+  display: block;
+  height: 100%;
+  width: 100%;
 }
 
 /* ---------- Health tiles ---------- */

@@ -23,7 +23,9 @@ CLOUDFLARED_UID=47744
 CLOUDFLARED_GID=47744
 POSTGRES_UID=47745
 POSTGRES_GID=47745
+@APP_UID_GID_CONSTANTS@
 PROXY_PORT=@PROXY_PORT@
+@APP_PORT_CONSTANTS@
 
 # Persistent volume layout. The admin volume is durable across redeploys, so
 # the admin-state Postgres data directory and proxy-owned mutable state live
@@ -149,10 +151,12 @@ ensure_group trustyclaw-admin "$TRUSTYCLAW_ADMIN_GID"
 ensure_group trustyclaw-proxy "$TRUSTYCLAW_PROXY_GID"
 ensure_group trustyclaw-agent "$TRUSTYCLAW_AGENT_GID"
 ensure_group cloudflared "$CLOUDFLARED_GID"
+@APP_ENSURE_GROUPS@
 ensure_user trustyclaw-admin "$TRUSTYCLAW_ADMIN_UID" trustyclaw-admin /mnt/trustyclaw-admin/admin-home
 ensure_user trustyclaw-proxy "$TRUSTYCLAW_PROXY_UID" trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state
 ensure_user trustyclaw-agent "$TRUSTYCLAW_AGENT_UID" trustyclaw-agent /mnt/trustyclaw-agent/agent-home
 ensure_user cloudflared "$CLOUDFLARED_UID" cloudflared /nonexistent
+@APP_ENSURE_USERS@
 # The postgres account is created here, before the postgresql packages would
 # create it with a dynamic system uid: the preserved cluster files on the
 # admin volume are 0600/0700 postgres-owned, so like the trustyclaw-* users
@@ -421,6 +425,7 @@ cat > "$PGDATA_DIR/pg_hba.conf" <<'PGHBA'
 # migration); the agent user has no role and no rule that admits it.
 local  trustyclaw_admin  trustyclaw-admin  peer
 local  trustyclaw_admin  trustyclaw-proxy  peer
+@APP_PG_HBA_LINES@
 local  all               postgres          peer
 local  all               all               reject
 PGHBA
@@ -472,6 +477,7 @@ BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'trustyclaw-proxy') THEN
     CREATE ROLE "trustyclaw-proxy" LOGIN;
   END IF;
+@APP_ROLE_SQL@
 END
 $$;
 SQL
@@ -482,7 +488,9 @@ runuser -u postgres -- psql -d trustyclaw_admin -v ON_ERROR_STOP=1 --quiet \
   -c "REVOKE ALL ON DATABASE trustyclaw_admin FROM PUBLIC;" \
   -c "REVOKE CREATE ON SCHEMA public FROM PUBLIC;" \
   -c "GRANT CREATE ON SCHEMA public TO \"trustyclaw-admin\";" \
-  -c "GRANT CONNECT ON DATABASE trustyclaw_admin TO \"trustyclaw-proxy\";"
+@APP_POSTGRES_SCHEMA_GRANTS@
+  -c "GRANT CONNECT ON DATABASE trustyclaw_admin TO \"trustyclaw-proxy\";" \
+@APP_POSTGRES_CONNECT_GRANTS@
 # The PUBLIC revoke also stripped the proxy role's inherited CONNECT, so it is
 # granted back explicitly; without it the proxy cannot log network decisions
 # and, being fail-closed, would fail every agent request. PostgreSQL 14 ships
@@ -500,6 +508,8 @@ runuser -u postgres -- psql -d trustyclaw_admin -v ON_ERROR_STOP=1 --quiet \
 # (SSH keys, cloudflared) that need it without database access.
 echo "== migrating admin state schema =="
 runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.migrate up
+echo "== migrating app schemas =="
+@APP_MIGRATION_COMMANDS@
 python3 - <<'PY' | runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.write_config > /tmp/trustyclaw_effective_config.json
 import json, pathlib
 payload = json.loads(pathlib.Path('/tmp/trustyclaw_payload.json').read_text())
@@ -783,6 +793,7 @@ $(cat /tmp/trustyclaw_cloudflare_rules)
     tcp dport 53 meta skuid != 0 drop
     oif lo tcp dport @PROXY_PORT@ meta skuid "trustyclaw-agent" accept
     oif lo meta skuid "trustyclaw-agent" drop
+@APP_NFTABLES_RULES@
     oif lo accept
     ct state established,related accept
     meta skuid 0 accept
@@ -859,6 +870,8 @@ StartLimitIntervalSec=0
 [Service]
 User=trustyclaw-admin
 UMask=0077
+RuntimeDirectory=trustyclaw-admin-api
+RuntimeDirectoryMode=0755
 Environment=PYTHONPATH=/opt/trustyclaw-host
 Environment=HOME=/mnt/trustyclaw-admin/admin-home
 WorkingDirectory=/mnt/trustyclaw-admin/admin-home
@@ -869,6 +882,8 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 UNIT
+
+@APP_SYSTEMD_UNITS@
 
 if [ "$cloudflare_connection_count" -gt 0 ]; then
   cat > /etc/systemd/system/trustyclaw-cloudflared.service <<'UNIT'
@@ -932,24 +947,11 @@ if [ "$cloudflare_connection_count" -gt 0 ]; then
   esac
 fi
 
-# The admin disk version is authoritative for preserved state. Advance it only
-# after the root-volume install and service setup have succeeded.
-python3 - <<'PY'
-import json, pathlib, time
-
-payload = json.loads(pathlib.Path('/tmp/trustyclaw_payload.json').read_text())
-version_path = pathlib.Path('/mnt/trustyclaw-admin/admin-state/version.json')
-version_path.write_text(json.dumps({
-    'version': payload['operation']['target_version'],
-    'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-}, indent=2, sort_keys=True) + '\n')
-PY
-chown trustyclaw-admin:trustyclaw-admin /mnt/trustyclaw-admin/admin-state/version.json
-chmod 600 /mnt/trustyclaw-admin/admin-state/version.json
-
-# Provisioning is done: emit only the non-secret access facts the lifecycle CLI
-# needs for AWS security group cleanup, then drop the single-use deploy key and
-# staged files.
+# Provisioning is almost done: capture the non-secret target version and emit
+# only the non-secret access facts the lifecycle CLI needs for AWS security group
+# cleanup, then drop the single-use deploy key and staged files before starting
+# arbitrary app service code.
+target_version="$(payload_value operation.target_version)"
 python3 - <<'PY'
 import json, pathlib
 
@@ -962,3 +964,18 @@ print('TRUSTYCLAW_BOOTSTRAP_ACCESS_SUMMARY ' + json.dumps({
 PY
 rm -f /home/trustyclaw-operator/.ssh/authorized_keys2
 rm -f /tmp/trustyclaw_payload.json /tmp/trustyclaw_effective_config.json /tmp/trustyclaw-host-code.tar.gz /tmp/trustyclaw_bootstrap.sh
+@APP_ENABLE_START_COMMANDS@
+
+# The admin disk version is authoritative for preserved state. Advance it only
+# after the root-volume install and service setup have succeeded.
+TRUSTYCLAW_TARGET_VERSION="$target_version" python3 - <<'PY'
+import json, os, pathlib, time
+
+version_path = pathlib.Path('/mnt/trustyclaw-admin/admin-state/version.json')
+version_path.write_text(json.dumps({
+    'version': os.environ['TRUSTYCLAW_TARGET_VERSION'],
+    'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+}, indent=2, sort_keys=True) + '\n')
+PY
+chown trustyclaw-admin:trustyclaw-admin /mnt/trustyclaw-admin/admin-state/version.json
+chmod 600 /mnt/trustyclaw-admin/admin-state/version.json
