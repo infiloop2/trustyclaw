@@ -297,6 +297,7 @@ def _render_app_bootstrap(template: str) -> str:
                 "",
                 "[Service]",
                 f"User={app.linux_user}",
+                "Slice=trustyclaw_app.slice",
                 "UMask=0077",
                 "Environment=PYTHONPATH=/opt/trustyclaw-host",
                 "Environment=TRUSTYCLAW_APP_HOST=127.0.0.1",

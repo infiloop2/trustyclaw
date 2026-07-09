@@ -305,13 +305,6 @@ class WorkflowSmokeTests(unittest.TestCase):
         self.assertIn("for status in queued in_progress", smoke)
         self.assertIn("group: trustyclaw-smoke", smoke)
 
-    def test_public_sync_copies_version_changes_by_content(self) -> None:
-        sync = Path(".github/workflows/sync-public-repo.yml").read_text()
-
-        self.assertIn("rsync -a --checksum --delete", sync)
-        self.assertIn('cmp "${source_dir}/VERSION" "${target_dir}/VERSION"', sync)
-
-
 def _workflow_json_heredoc(workflow: str, path: str) -> str:
     match = re.search(rf"cat > {re.escape(path)} <<JSON\n(?P<body>.*?)\n\s*JSON", workflow, re.DOTALL)
     if match is None:

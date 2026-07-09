@@ -20,7 +20,15 @@ import urllib.request
 import pg_harness
 
 from host.config import parse_network_controls
-from host.runtime import admin_api, github_credential, github_pending_push, orchestrator, proxy_state_client
+from host.runtime import (
+    app_api_proxy,
+    app_backend_admin_api,
+    admin_api,
+    github_credential,
+    github_pending_push,
+    orchestrator,
+    proxy_state_client,
+)
 from host.runtime.network_policy import load_policy, save_policy
 from host.runtime.state import save_github_credential
 from host.runtime import state
@@ -93,11 +101,28 @@ class AdminUiStaticTests(unittest.TestCase):
         class User:
             pw_uid = 12345
 
-        with patch("host.runtime.admin_api.pwd.getpwnam", return_value=User()):
-            self.assertEqual(admin_api._app_id_for_peer_uid(12345), "agent_chat")
-            self.assertIsNone(admin_api._app_id_for_peer_uid(54321))
+        with patch("host.runtime.app_backend_admin_api.pwd.getpwnam", return_value=User()):
+            self.assertEqual(app_backend_admin_api.app_id_for_peer_uid(12345), "agent_chat")
+            self.assertIsNone(app_backend_admin_api.app_id_for_peer_uid(54321))
 
-    def test_app_backend_route_allowlist_starts_with_agent_chat_task_routes(self) -> None:
+    def test_app_backend_auth_rejects_claimed_app_id_mismatch(self) -> None:
+        class Request:
+            pass
+
+        class Handler:
+            headers = {"X-TrustyClaw-App-Backend": "agent_chat"}
+            request = Request()
+
+        with (
+            patch("host.runtime.app_backend_admin_api._peer_uid", return_value=12345),
+            patch("host.runtime.app_backend_admin_api.app_id_for_peer_uid", return_value="other_app"),
+            self.assertRaises(admin_api.ApiError) as error,
+        ):
+            app_backend_admin_api.Handler._authenticate_app_backend_id(Handler())  # type: ignore[arg-type]
+
+        self.assertEqual(error.exception.status, HTTPStatus.UNAUTHORIZED)
+
+    def test_app_backend_route_allowlist_starts_with_task_routes(self) -> None:
         allowed = [
             ("POST", "/v1/tasks"),
             ("GET", "/v1/tasks/task_1"),
@@ -109,7 +134,7 @@ class AdminUiStaticTests(unittest.TestCase):
 
         for method, path in allowed:
             with self.subTest(method=method, path=path):
-                admin_api._require_app_backend_route("agent_chat", method, path)
+                app_backend_admin_api._require_app_backend_route(method, path)
 
     def test_app_backend_route_allowlist_rejects_host_admin_routes(self) -> None:
         denied = [
@@ -124,21 +149,109 @@ class AdminUiStaticTests(unittest.TestCase):
         for method, path in denied:
             with self.subTest(method=method, path=path):
                 with self.assertRaises(admin_api.ApiError) as error:
-                    admin_api._require_app_backend_route("agent_chat", method, path)
+                    app_backend_admin_api._require_app_backend_route(method, path)
                 self.assertEqual(error.exception.status, HTTPStatus.FORBIDDEN)
 
-    def test_app_backend_route_allowlist_rejects_apps_without_policy(self) -> None:
-        with self.assertRaises(admin_api.ApiError) as error:
-            admin_api._require_app_backend_route("future_app", "POST", "/v1/tasks")
+    def test_app_backend_prefixes_thread_ids_and_strips_responses(self) -> None:
+        body = app_backend_admin_api._internal_body(
+            "agent_chat",
+            "POST",
+            "/v1/tasks",
+            {"input_message": "x", "thread_id": "chat", "agent_runtime": "codex"},
+        )
+        self.assertEqual(body["thread_id"], "agent_chat__chat")
+        self.assertEqual(
+            app_backend_admin_api._internal_path("agent_chat", "GET", "/v1/threads/chat/tasks"),
+            "/v1/threads/agent_chat__chat/tasks",
+        )
 
-        self.assertEqual(error.exception.status, HTTPStatus.FORBIDDEN)
+        response = app_backend_admin_api._visible_response(
+            "agent_chat",
+            {"tasks": [{"task_id": "task_1", "thread_id": "agent_chat__chat"}]},
+        )
+        self.assertEqual(response["tasks"][0]["task_id"], "task_1")
+        self.assertEqual(response["tasks"][0]["thread_id"], "chat")
+
+    def test_app_backend_thread_task_listing_uses_app_prefixed_thread_path(self) -> None:
+        with patch(
+            "host.runtime.app_backend_admin_api.admin_api.route",
+            return_value={"tasks": [{"task_id": "task_1", "thread_id": "agent_chat__chat"}]},
+        ) as route:
+            response = app_backend_admin_api.route_app_backend_request(
+                "agent_chat", "GET", "/v1/threads/chat/tasks", {}, None, ""
+            )
+
+        route.assert_called_once_with("GET", "/v1/threads/agent_chat__chat/tasks", {}, None)
+        self.assertEqual(response["tasks"], [{"task_id": "task_1", "thread_id": "chat"}])
+
+    def test_app_backend_visible_response_rejects_unscoped_thread_ids(self) -> None:
+        with self.assertRaises(admin_api.ApiError) as error:
+            app_backend_admin_api._visible_response(
+                "agent_chat",
+                {"tasks": [{"task_id": "task_2", "thread_id": "other_app__chat"}]},
+            )
+
+        self.assertEqual(error.exception.status, HTTPStatus.BAD_GATEWAY)
+
+    def test_app_backend_task_scope_rejects_other_thread_prefixes(self) -> None:
+        with (
+            patch("host.runtime.app_backend_admin_api.state.get_task", return_value={"thread_id": "other_app__chat"}),
+            self.assertRaises(admin_api.ApiError) as error,
+        ):
+            app_backend_admin_api._require_app_task_scope("agent_chat", "GET", "/v1/tasks/task_1")
+
+        self.assertEqual(error.exception.status, HTTPStatus.NOT_FOUND)
+
+    def test_app_backend_task_routes_scope_raw_task_ids_before_forwarding(self) -> None:
+        with (
+            patch("host.runtime.app_backend_admin_api.state.get_task", return_value={"thread_id": "agent_chat__chat"}),
+            patch(
+                "host.runtime.app_backend_admin_api.admin_api.route",
+                return_value={"task_id": "task_1", "thread_id": "agent_chat__chat"},
+            ) as route,
+        ):
+            response = app_backend_admin_api.route_app_backend_request(
+                "agent_chat", "GET", "/v1/tasks/task_1", {}, None, ""
+            )
+
+        route.assert_called_once_with("GET", "/v1/tasks/task_1", {}, None)
+        self.assertEqual(response, {"task_id": "task_1", "thread_id": "chat"})
+
+    def test_host_task_ids_stay_raw_for_app_threads(self) -> None:
+        task = {
+            "task_id": "task_1",
+            "status": "queued",
+            "agent_runtime": "codex",
+            "thread_id": "agent_chat__chat",
+            "input_message": "x",
+            "created_at": "2026-06-08T00:00:00Z",
+            "updated_at": "2026-06-08T00:00:00Z",
+        }
+        with patch("host.runtime.admin_api.state.get_task", return_value=task) as get_task:
+            response = admin_api.get_task("task_1")
+
+        get_task.assert_called_once_with("task_1")
+        self.assertEqual(response["task_id"], "task_1")
+        self.assertEqual(response["thread_id"], "agent_chat__chat")
+
+    def test_admin_task_create_rejects_app_reserved_thread_prefixes(self) -> None:
+        admin_api.REQUEST_CONTEXT.app_backend_id = None
+        self.addCleanup(lambda: setattr(admin_api.REQUEST_CONTEXT, "app_backend_id", None))
+
+        with self.assertRaises(admin_api.ApiError) as error:
+            admin_api._validate_thread_id_not_reserved_by_app("agent_chat__chat")
+
+        self.assertEqual(error.exception.status, HTTPStatus.BAD_REQUEST)
+
+        admin_api.REQUEST_CONTEXT.app_backend_id = "agent_chat"
+        admin_api._validate_thread_id_not_reserved_by_app("agent_chat__chat")
 
     def test_app_bridge_marker_cannot_target_different_app(self) -> None:
         admin_api.REQUEST_CONTEXT.bridge_app_id = "other-app"
         self.addCleanup(lambda: setattr(admin_api.REQUEST_CONTEXT, "bridge_app_id", None))
 
         with self.assertRaises(admin_api.ApiError) as error:
-            admin_api.app_route("GET", "/v1/apps/agent_chat/api/health", {}, None)
+            admin_api.route("GET", "/v1/apps/agent_chat/api/health", {}, None)
 
         self.assertEqual(error.exception.status, HTTPStatus.FORBIDDEN)
 
@@ -276,6 +389,23 @@ class AdminApiIntegrationTests(unittest.TestCase):
         runtimes = body["agent_runtime"]["runtimes"]  # type: ignore[index]
         return next(item for item in runtimes if item["type"] == runtime_type)  # type: ignore[union-attr]
 
+    def app_backend_request(
+        self,
+        method: str,
+        path: str,
+        body: object | None = None,
+        *,
+        idem: str = "",
+    ) -> dict[str, Any]:
+        return app_backend_admin_api.route_app_backend_request(
+            "agent_chat",
+            method,
+            path,
+            {},
+            body,
+            idem,
+        )
+
     def test_health_requires_auth_and_reports_state(self) -> None:
         with self.assertRaises(urllib.error.HTTPError) as error:
             self.request("GET", "/v1/health", auth=False)
@@ -311,6 +441,74 @@ class AdminApiIntegrationTests(unittest.TestCase):
             urllib.request.urlopen(request, timeout=5)
 
         self.assertEqual(error.exception.code, 401)
+
+    def test_app_backend_task_threads_are_internally_app_prefixed(self) -> None:
+        task = self.app_backend_request(
+            "POST",
+            "/v1/tasks",
+            {"input_message": "from app", "thread_id": "chat", "agent_runtime": "codex"},
+            idem="app-prefix-create",
+        )
+
+        self.assertEqual(task["thread_id"], "chat")
+        stored = state.get_task(task["task_id"])
+        self.assertIsNotNone(stored)
+        assert stored is not None
+        self.assertEqual(stored["thread_id"], "agent_chat__chat")
+
+        _, host_visible_thread_task = self.request(
+            "POST",
+            "/v1/tasks",
+            {"input_message": "host-visible chat", "thread_id": "chat", "agent_runtime": "codex"},
+            idem="host-visible-chat-create",
+        )
+
+        listed = self.app_backend_request("GET", "/v1/threads/chat/tasks")
+        self.assertEqual(
+            [(item["task_id"], item["thread_id"]) for item in listed["tasks"]],
+            [(task["task_id"], "chat")],
+        )
+        self.assertNotIn(
+            host_visible_thread_task["task_id"],
+            {item["task_id"] for item in listed["tasks"]},
+        )
+
+        app_task = self.app_backend_request("GET", f"/v1/tasks/{task['task_id']}")
+        self.assertEqual(app_task["task_id"], task["task_id"])
+        self.assertEqual(app_task["thread_id"], "chat")
+
+        _, host_listed = self.request("GET", "/v1/threads/agent_chat__chat/tasks")
+        self.assertEqual(host_listed["tasks"][0]["task_id"], task["task_id"])
+        self.assertEqual(host_listed["tasks"][0]["thread_id"], "agent_chat__chat")
+
+        _, host_task = self.request("GET", f"/v1/tasks/{task['task_id']}")
+        self.assertEqual(host_task["task_id"], task["task_id"])
+        self.assertEqual(host_task["thread_id"], "agent_chat__chat")
+
+    def test_app_backend_task_lookup_rejects_unscoped_task_ids(self) -> None:
+        _, outside = self.request(
+            "POST",
+            "/v1/tasks",
+            {"input_message": "outside app", "thread_id": "outside", "agent_runtime": "codex"},
+            idem="outside-create",
+        )
+
+        with self.assertRaises(admin_api.ApiError) as error:
+            self.app_backend_request("GET", f"/v1/tasks/{outside['task_id']}")
+
+        self.assertEqual(error.exception.status, HTTPStatus.NOT_FOUND)
+
+    def test_app_backend_thread_id_limit_includes_hidden_prefix(self) -> None:
+        with self.assertRaises(admin_api.ApiError) as error:
+            self.app_backend_request(
+                "POST",
+                "/v1/tasks",
+                {"input_message": "too long", "thread_id": "a" * 64, "agent_runtime": "codex"},
+                idem="app-prefix-too-long",
+            )
+
+        self.assertEqual(error.exception.status, HTTPStatus.BAD_REQUEST)
+        self.assertIn("too long", error.exception.message)
 
     def test_app_ui_asset_is_frameable_static_content(self) -> None:
         request = urllib.request.Request(f"{self.base_url}/v1/apps/agent_chat/ui/index.html", method="GET")
@@ -378,8 +576,8 @@ class AdminApiIntegrationTests(unittest.TestCase):
         app = admin_api.app_platform.app_by_id("agent_chat")
         if app is None:
             self.fail("agent_chat app should be installed")
-        with patch("host.runtime.admin_api.http.client.HTTPConnection", FakeConnection):
-            body = admin_api.proxy_app_api(app, "GET", "/health", {}, None)
+        with patch("host.runtime.app_api_proxy.http.client.HTTPConnection", FakeConnection):
+            body = app_api_proxy.proxy_app_api(app, "GET", "/health", {}, None)
 
         self.assertEqual(body, {"status": "ok"})
         self.assertEqual(captured["connect"][1], 7450)

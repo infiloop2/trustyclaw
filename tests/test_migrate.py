@@ -197,7 +197,7 @@ class AppMigrationTests(unittest.TestCase):
             cur.execute('CREATE SCHEMA app_agent_chat AUTHORIZATION "trustyclaw-app-agent_chat"')
 
     def test_app_migration_runs_in_app_schema_and_records_host_version(self) -> None:
-        self.assertEqual(app_migrate.up("agent_chat", quiet=True), [1])
+        self.assertEqual(app_migrate.up("agent_chat", quiet=True), [1, 2])
         self.assertEqual(app_migrate.up("agent_chat", quiet=True), [])
 
         with db.transaction() as cur:
@@ -255,20 +255,52 @@ class AppMigrationTests(unittest.TestCase):
                 ],
             )
             cur.execute("SELECT app_id, version, name FROM app_schema_migrations")
-            self.assertEqual(cur.fetchall(), [("agent_chat", 1, "app_state")])
+            self.assertEqual(
+                cur.fetchall(),
+                [("agent_chat", 1, "app_state"), ("agent_chat", 2, "clear_stale_host_refs")],
+            )
             cur.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'preferences'")
             self.assertEqual(cur.fetchall(), [])
 
     def test_app_migration_recovers_when_sql_commits_before_host_record(self) -> None:
         app_migrate.apply_sql("agent_chat", 1, connection_user="trustyclaw-app-agent_chat")
 
-        self.assertEqual(app_migrate.up("agent_chat", quiet=True), [1])
+        self.assertEqual(app_migrate.up("agent_chat", quiet=True), [1, 2])
 
         with db.transaction() as cur:
             cur.execute("SELECT app_id, version, name FROM app_schema_migrations")
-            self.assertEqual(cur.fetchall(), [("agent_chat", 1, "app_state")])
+            self.assertEqual(
+                cur.fetchall(),
+                [("agent_chat", 1, "app_state"), ("agent_chat", 2, "clear_stale_host_refs")],
+            )
             cur.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'app_agent_chat'")
             self.assertEqual({row[0] for row in cur.fetchall()}, {"preferences", "thread_tasks", "threads"})
+
+    def test_agent_chat_cleanup_migration_deletes_stale_host_references(self) -> None:
+        app_migrate.apply_sql("agent_chat", 1, connection_user="trustyclaw-app-agent_chat")
+        app_migrate.record("agent_chat", 1)
+        with db.transaction() as cur:
+            cur.execute("SET LOCAL search_path TO app_agent_chat")
+            cur.execute(
+                """
+                INSERT INTO threads (thread_id, agent_runtime, archived, created_at, updated_at)
+                VALUES ('old-thread', 'codex', FALSE, '2026-06-08T00:00:00Z', '2026-06-08T00:00:00Z')
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO thread_tasks (task_id, thread_id, created_at)
+                VALUES ('task_1', 'old-thread', '2026-06-08T00:00:00Z')
+                """
+            )
+
+        self.assertEqual(app_migrate.up("agent_chat", quiet=True), [2])
+
+        with db.transaction() as cur:
+            cur.execute("SELECT count(*) FROM app_agent_chat.thread_tasks")
+            self.assertEqual(cur.fetchone(), (0,))
+            cur.execute("SELECT count(*) FROM app_agent_chat.threads")
+            self.assertEqual(cur.fetchone(), (0,))
 
     def test_app_migration_cannot_reset_back_to_host_role(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
