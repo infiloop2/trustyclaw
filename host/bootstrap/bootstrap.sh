@@ -838,6 +838,19 @@ MemorySwapMax=5G
 TasksMax=4096
 UNIT
 
+# App backend services share one top-level slice. Like the agent slice, the
+# underscore keeps this as a direct sibling of system.slice rather than a nested
+# dash-encoded slice. CPUWeight is intentionally soft: apps may use idle cores,
+# but under contention host services such as the admin API, proxy, and Postgres
+# keep priority over app backend CPU loops.
+cat > /etc/systemd/system/trustyclaw_app.slice <<'UNIT'
+[Unit]
+Description=TrustyClaw App Backends
+
+[Slice]
+CPUWeight=50
+UNIT
+
 cat > /etc/systemd/system/trustyclaw-network-proxy.service <<'UNIT'
 [Unit]
 Description=TrustyClaw Network Policy Proxy

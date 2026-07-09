@@ -77,16 +77,6 @@ body {
   text-transform: none;
 }
 
-.app-frame-subtitle {
-  color: rgba(255, 139, 95, 0.88);
-  font-size: 0.72rem;
-  font-weight: 650;
-  letter-spacing: 0.08em;
-  line-height: 1.25;
-  margin-top: 0.12rem;
-  text-transform: uppercase;
-}
-
 .app-status {
   background: rgba(239, 77, 61, 0.14);
   border: 1px solid var(--border);

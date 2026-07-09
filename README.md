@@ -355,5 +355,10 @@ For deeper architecture and contribution notes, read:
 
 ## License
 
-TrustyClaw is free software, licensed under the GNU Affero General Public
-License v3.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+TrustyClaw is source-available under the Business Source License 1.1.
+Production or commercial use is not granted by the public license. Commercial
+licenses are available on request from the copyright holder.
+
+The Change Date is 2030-07-09, after which the Change License is the GNU
+Affero General Public License v3.0 or any later version. See [LICENSE](LICENSE)
+and [NOTICE](NOTICE).

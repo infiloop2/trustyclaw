@@ -108,6 +108,12 @@ does not get direct access to agent home directories, proxy state, root helpers,
 runtime auth files, or host-owned database tables. It may connect to Postgres as
 the matching app role.
 
+All app backend service units run in the top-level `trustyclaw_app.slice` with
+a lower CPU weight than `system.slice`. This is a soft resource priority rather
+than a hard quota: app backends can use idle cores, but under CPU contention
+the admin API, proxy, Postgres, SSH, and other host services in `system.slice`
+keep priority over app backend CPU loops.
+
 App UI does not call host admin APIs directly and never receives the operator's
 admin credential. The isolated frame posts app-backend requests to the parent
 admin shell. The parent adds the operator's existing admin auth only for that
@@ -120,13 +126,29 @@ backend.
 When an app backend needs host resources such as tasks or threads, it calls the
 host admin API server-to-server over a local Unix-domain socket. The admin API
 authenticates that socket by checking the peer process uid against the installed
-app's Linux user. This avoids storing a second app secret while keeping the
-browser-facing TCP admin API protected by the operator password. Server-to-server
-calls are then checked against an app-backend route allowlist. The first
-allowlist is intentionally narrow: it includes only task creation and task/thread
-lookup or control route shapes needed by the first app workflow. It does not
+app's Linux user, then verifies that the request's claimed app id matches the
+uid-derived app id. This avoids storing a second app secret while keeping the
+browser-facing TCP admin API protected by the operator password, and prevents
+one app service user from impersonating another app over the shared socket.
+Server-to-server calls are then checked against an app-backend route allowlist.
+The first allowlist is intentionally narrow: it includes only task creation and
+task/thread lookup or control route shapes needed by app workflows. It does not
 allow broad host routes such as network policy, files, process inventory,
 runtime auth, app registry, or generic task/thread listing.
+
+Task and thread names sent by an app backend are app-scoped at the socket
+boundary. The app sends and receives its normal `thread_id` values, but the host
+admin API rewrites app-visible thread ids to `<app_id>__<thread_id>` before
+storing or looking up host task and runtime-session state. Host task ids are
+still allocated from the host task counter and remain normal `task_N` values on
+both the app and operator-facing admin APIs. App task-id routes over the socket
+verify that the target task belongs to that app's prefixed thread; otherwise
+the task is reported as not found. Responses sent back to the app strip the
+internal thread prefix. Operator-facing admin API routes keep showing the
+host-internal thread names, which makes app-created work visibly distinct from
+core admin work. Because host thread ids remain capped at 64 characters, an
+app-visible thread id
+must fit after the hidden `<app_id>__` prefix.
 
 The host chooses the backend port and passes it through environment. App code is
 expected to bind the provided loopback address and port, but the host does not
@@ -237,16 +259,17 @@ is designed around bad or compromised app assets:
   use peer-authenticated Unix sockets for host admin API and Postgres access.
   External network behavior is mediated by host integrations and network
   controls. App backend calls to the host admin API are restricted to an
-  app-backend route allowlist. The first allowlist covers only the task/thread
-  route shapes needed by the first app workflow; app-object ownership,
-  app-specific credentials, broader route/capability scopes, and rate limits are
-  future extensions.
-  App service units do not yet have app-specific cgroup resource bounds such as
-  an app slice, CPU quota or weight, memory and swap caps, task-count caps, or
-  bounded restart bursts. A malicious app backend can therefore still try to
-  starve host services with CPU loops, fork bombs, or memory growth. Adding
-  host-owned app unit resource limits is future hardening before third-party app
-  backends are treated as strongly contained against resource exhaustion.
+  app-backend route allowlist. The first allowlist covers only task/thread route
+  shapes and the socket boundary scopes task/thread names to the authenticated
+  app id before the normal host route handlers run. App-specific credentials,
+  broader route/capability scopes, explicit grants for non-task host objects,
+  and rate limits are future extensions.
+  App service units run under `trustyclaw_app.slice` with a lower CPU weight
+  than host services, so CPU loops in app code do not get equal priority with
+  the admin plane under contention. This is not full resource containment:
+  memory and swap caps, task-count caps, and bounded restart bursts remain
+  future hardening before third-party app backends are treated as strongly
+  contained against resource exhaustion.
 - Malicious database tables or migration SQL can try to read or modify
   host-owned tables, grant itself privileges, collide with another app's schema,
   poison migration records, or create non-replay-safe state that bricks future
@@ -258,6 +281,8 @@ Those threat cases drive the concrete controls:
 
 - App ids are validated and all host object names are derived by the host.
 - App services run as separate Linux users.
+- App services share a host-owned `trustyclaw_app.slice` with reduced CPU
+  weight, preserving admin-plane CPU priority under contention.
 - App backend TCP listeners bind only loopback, are not exposed by operator
   access endpoints, and are reachable only from the admin API service uid.
 - App database objects are namespaced and owned by app roles.
@@ -268,29 +293,32 @@ Those threat cases drive the concrete controls:
 - App backend code reaches agent tasks, runtime credentials, files, processes,
   and network controls only through host admin APIs over the local app-backend
   socket.
+- App backend task/thread access is scoped by the app service uid and claimed
+  app id: app-visible thread ids are internally prefixed with the app id, and
+  task-id operations are allowed only for tasks under that prefix.
 - External side effects require host integrations and host network enforcement.
 
-## Future App Credential Scoping
+## Future App Capability Scoping
 
 The current app-backend credential is the app service user's Unix peer identity
 on the local admin API socket. It authenticates which installed app process made
-the request and then applies a route-shape allowlist. It does not yet scope host
-objects by app ownership. A backend for one installed app can therefore call the
-currently allowlisted task/thread routes for task ids or thread ids that were
-created by another app or by the core admin UI if it knows those ids. This is an
-accepted limitation of the first implementation. The same limitation applies to
-caller-provided host thread ids: an app can ask the host task API to use a
-thread id that already exists outside that app, so future hardening needs
-app-scoped thread identity or explicit grants before host sessions are reused.
+the request and then applies a route-shape allowlist. Task and thread routes are
+now app-scoped at this boundary: caller-provided thread ids are rewritten under
+the authenticated app id, task-id operations verify the target task's prefixed
+thread, and app responses hide the internal thread prefix. That prevents an app
+backend from reusing or controlling task/thread state created by another app or
+by the core admin UI through the app-backend socket.
 
 The hardening direction is an app-scoped host capability model:
 
 - Host-issued app backend credentials or peer-authenticated app identities map
   to explicit capabilities by app id.
-- Task, thread, file, and other host objects gain app ownership or capability
-  grants at creation time.
-- Host thread/session identifiers created through app backends are app-scoped,
-  or the host rejects reuse of ungranted existing thread/session ids.
+- File, process, runtime credential, network-policy, and other host objects gain
+  app ownership or capability grants before any app-backend route can expose
+  them.
+- Host thread/session identifiers created through app backends stay app-scoped;
+  explicit cross-app or app-to-core grants would need a separate operator-owned
+  grant model.
 - Host admin API dispatch checks both route capability and object ownership
   before returning or mutating data.
 - App backend permissions include rate limits and audit labels per app.

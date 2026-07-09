@@ -1210,6 +1210,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("User=trustyclaw-proxy", bootstrap)
         self.assertIn("User=cloudflared", bootstrap)
         self.assertIn("User=trustyclaw-app-agent_chat", bootstrap)
+        self.assertIn("Slice=trustyclaw_app.slice", bootstrap)
         self.assertIn("trustyclaw-app-agent_chat.service", bootstrap)
         self.assertIn("python3 -m host.runtime.app_migrate pending agent_chat", bootstrap)
         self.assertIn(
@@ -1402,6 +1403,26 @@ class DeployUnitTests(unittest.TestCase):
             # The scope must not outlive the admin API: stopping, restarting,
             # or crashing the admin service stops the agent scopes with it.
             self.assertIn("--property=BindsTo=trustyclaw-admin-api.service", launch_source)
+        # App backends are long-running services, so bootstrap creates a
+        # separate top-level slice and each generated app service joins it.
+        # The lower CPU weight is soft: apps can use idle cores, but the admin
+        # API and other host services in system.slice stay prioritized under
+        # contention.
+        self.assertIn("/etc/systemd/system/trustyclaw_app.slice", bootstrap)
+        self.assertNotIn("trustyclaw-app.slice", bootstrap)
+        self.assertIn(
+            "\n".join([
+                "cat > /etc/systemd/system/trustyclaw_app.slice <<'UNIT'",
+                "[Unit]",
+                "Description=TrustyClaw App Backends",
+                "",
+                "[Slice]",
+                "CPUWeight=50",
+                "UNIT",
+            ]),
+            bootstrap,
+        )
+        self.assertIn("Slice=trustyclaw_app.slice", bootstrap)
         # The unused, world-accessible snapd socket is masked.
         self.assertIn("mask snapd.socket", bootstrap)
         # Pending security updates are applied during bootstrap.
@@ -1454,6 +1475,7 @@ class DeployUnitTests(unittest.TestCase):
                 self.assertIn(f"oif lo tcp dport {port_var} drop", bootstrap)
                 self.assertIn(f"cat > /etc/systemd/system/{app.service_name} <<'UNIT'", bootstrap)
                 self.assertIn(f"User={app.linux_user}", bootstrap)
+                self.assertIn("Slice=trustyclaw_app.slice", bootstrap)
                 self.assertIn("Environment=TRUSTYCLAW_APP_ADMIN_API_SOCKET=/run/trustyclaw-admin-api/app-backend.sock", bootstrap)
                 self.assertIn(f"Environment=TRUSTYCLAW_APP_PORT={app.port}", bootstrap)
                 backend_entrypoint = app.backend_entrypoint.relative_to(app.package_dir)
@@ -1496,6 +1518,7 @@ class DeployUnitTests(unittest.TestCase):
 
         self.assertIn("cat > /etc/systemd/system/trustyclaw-app-custom_app.service <<'UNIT'", bootstrap)
         self.assertIn("Description=TrustyClaw App: Custom $(touch /tmp/unsafe)", bootstrap)
+        self.assertIn("Slice=trustyclaw_app.slice", bootstrap)
         self.assertIn("Environment=TRUSTYCLAW_APP_PORT=7457", bootstrap)
         self.assertIn("ExecStart=/usr/bin/python3 /opt/trustyclaw-host/host/apps/custom_app/server.py", bootstrap)
         self.assertNotIn("/opt/trustyclaw-host/host/apps/custom_app/backend.py", bootstrap)

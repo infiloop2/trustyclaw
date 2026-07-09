@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import http.client
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -27,14 +26,11 @@ import pwd
 import re
 import shutil
 import socket
-import socketserver
-import stat
-import struct
 import subprocess
 import threading
 import time
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlparse
 
 from host.config import AGENT_RUNTIMES, ConfigError, parse_network_controls
 from host.constants import ADMIN_API_PORT, LOOPBACK, PROXY_PORT
@@ -72,7 +68,6 @@ from host.version import repo_version, version_status
 
 HOST = LOOPBACK
 PORT = ADMIN_API_PORT
-APP_BACKEND_ADMIN_SOCKET = Path(os.environ.get("TRUSTYCLAW_APP_BACKEND_ADMIN_SOCKET", "/run/trustyclaw-admin-api/app-backend.sock"))
 UI_ASSETS = {
     "/": ("admin_ui.html", "text/html; charset=utf-8"),
     "/admin_ui.css": ("admin_ui.css", "text/css; charset=utf-8"),
@@ -137,9 +132,7 @@ AGENT_AUTH_CLEAR_HELPER_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trusty
 AGENT_CGROUP_ROOT = Path(os.environ.get("TRUSTYCLAW_AGENT_CGROUP_ROOT", "/sys/fs/cgroup/trustyclaw_agent.slice"))
 PROC_ROOT = Path(os.environ.get("TRUSTYCLAW_PROC_ROOT", "/proc"))
 AGENT_PROCESS_LIMIT = 1000
-APP_BACKEND_TIMEOUT_SECONDS = 10
-APP_BACKEND_AUTH_HEADER = "X-TrustyClaw-App-Backend"
-APP_BACKEND_ALLOWED_APP_IDS = {"agent_chat"}
+APP_SCOPED_ID_SEPARATOR = "__"
 # Lock inventory for this module (each request runs on its own handler
 # thread, so every handler is concurrent with every other and with the
 # orchestrator's workers):
@@ -195,8 +188,8 @@ class Handler(BaseHTTPRequestHandler):
     def _handle(self, method: str) -> None:
         try:
             REQUEST_CONTEXT.bearer = None
-            REQUEST_CONTEXT.app_id = None
             REQUEST_CONTEXT.bridge_app_id = None
+            REQUEST_CONTEXT.app_backend_id = None
             path = urlparse(self.path)
             if method == "GET" and path.path in UI_ASSETS:
                 self._send_ui_asset(path.path)
@@ -208,9 +201,6 @@ class Handler(BaseHTTPRequestHandler):
                     return
             self._authenticate()
             REQUEST_CONTEXT.bridge_app_id = self.headers.get("X-TrustyClaw-App-Bridge", "") or None
-            app_backend_id = getattr(REQUEST_CONTEXT, "app_id", None)
-            if app_backend_id is not None:
-                _require_app_backend_route(app_backend_id, method, path.path)
             if method in {"POST", "PUT", "DELETE"}:
                 response = self._mutate_idempotently(method, path)
             else:
@@ -226,48 +216,14 @@ class Handler(BaseHTTPRequestHandler):
     def _mutate_idempotently(self, method: str, path: Any) -> Any:
         """Replays of the same Idempotency-Key for the same method and path
         return the original response without re-executing the request."""
-        key = self.headers.get("Idempotency-Key", "")
-        if not IDEMPOTENCY_RE.fullmatch(key):
-            raise ApiError(HTTPStatus.BAD_REQUEST, "missing or invalid Idempotency-Key")
         body = self._read_body()
-        # Atomically claim the key: under the lock, either return a completed
-        # response, reject an in-flight duplicate, or reserve the key. Without
-        # the reservation, two concurrent retries with the same key both pass
-        # a check-then-act gap and execute twice — exactly what idempotency
-        # must prevent.
-        with IDEMPOTENCY_LOCK:
-            now = time.time()
-            prune_idempotency(IDEMPOTENCY_ENTRIES, now=now)
-            stored = IDEMPOTENCY_ENTRIES.get(key)
-            if stored is not None:
-                if stored["method"] != method or stored["path"] != path.path:
-                    raise ApiError(HTTPStatus.BAD_REQUEST, "Idempotency-Key was already used for a different request")
-                if stored.get("in_flight"):
-                    raise ApiError(HTTPStatus.CONFLICT, "a request with this Idempotency-Key is already in progress")
-                # Honor the 24h retention on the read path too, not only when a
-                # new key is stored.
-                if now - stored["stored_at"] <= IDEMPOTENCY_RETENTION_SECONDS:
-                    return stored["response"]
-            IDEMPOTENCY_ENTRIES[key] = {"method": method, "path": path.path, "in_flight": True, "stored_at": now}
-            prune_idempotency(IDEMPOTENCY_ENTRIES, now=now, preserve_key=key)
-        # Execute outside the lock so a slow mutation (runtime spawn, policy
-        # subprocess, process shutdown) never blocks other requests.
-        try:
-            response = route(method, path.path, parse_qs(path.query), body)
-        except BaseException:
-            # Release the reservation so a retry can proceed after a failure.
-            with IDEMPOTENCY_LOCK:
-                entry = IDEMPOTENCY_ENTRIES.get(key)
-                if entry is not None and entry.get("in_flight"):
-                    del IDEMPOTENCY_ENTRIES[key]
-            raise
-        with IDEMPOTENCY_LOCK:
-            now = time.time()
-            IDEMPOTENCY_ENTRIES[key] = {
-                "method": method, "path": path.path, "response": response, "stored_at": now,
-            }
-            prune_idempotency(IDEMPOTENCY_ENTRIES, now=now, preserve_key=key)
-        return response
+        return mutate_idempotently(
+            method,
+            path.path,
+            self.headers.get("Idempotency-Key", ""),
+            caller_id="admin",
+            execute=lambda: route(method, path.path, parse_qs(path.query), body),
+        )
 
     def _send_ui_asset(self, path: str) -> None:
         filename, content_type = UI_ASSETS[path]
@@ -341,22 +297,7 @@ class Handler(BaseHTTPRequestHandler):
                 REQUEST_CONTEXT.bearer = auth.removeprefix("Bearer ")
                 return
             raise ApiError(HTTPStatus.UNAUTHORIZED, "missing or invalid admin password")
-        app_id = self._authenticated_app_backend_id()
-        if app_id is not None:
-            REQUEST_CONTEXT.app_id = app_id
-            return
         raise ApiError(HTTPStatus.UNAUTHORIZED, "missing or invalid admin password")
-
-    def _authenticated_app_backend_id(self) -> str | None:
-        if not getattr(self.server, "app_backend_socket", False):
-            return None
-        expected_app_id = self.headers.get(APP_BACKEND_AUTH_HEADER, "")
-        if not expected_app_id:
-            return None
-        app_id = _app_id_for_peer_uid(_peer_uid(self.request))
-        if app_id is None or app_id != expected_app_id:
-            return None
-        return app_id
 
     def _read_body(self) -> Any:
         try:
@@ -384,63 +325,6 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-    daemon_threads = True
-    app_backend_socket = True
-
-
-def _peer_uid(conn: socket.socket) -> int:
-    raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
-    _pid, uid, _gid = struct.unpack("3i", raw)
-    return uid
-
-
-def _app_id_for_peer_uid(uid: int) -> str | None:
-    for app in app_platform.installed_apps():
-        try:
-            if pwd.getpwnam(app.linux_user).pw_uid == uid:
-                return app.id
-        except KeyError:
-            continue
-    return None
-
-
-def _require_app_backend_route(app_id: str, method: str, path: str) -> None:
-    if app_id not in APP_BACKEND_ALLOWED_APP_IDS:
-        raise ApiError(HTTPStatus.FORBIDDEN, "app backend is not allowed to call host admin APIs")
-    if not _is_agent_chat_backend_route(method, path):
-        raise ApiError(HTTPStatus.FORBIDDEN, "app backend route is not allowed")
-
-
-def _is_agent_chat_backend_route(method: str, path: str) -> bool:
-    if method == "POST" and path == "/v1/tasks":
-        return True
-    parts = path.strip("/").split("/")
-    if len(parts) == 3 and parts[:2] == ["v1", "tasks"] and method == "GET":
-        return True
-    if len(parts) == 4 and parts[:2] == ["v1", "tasks"] and parts[3] in {"cancel", "kill", "steer"}:
-        return method == "POST"
-    if len(parts) == 4 and parts[:2] == ["v1", "threads"] and parts[3] == "tasks":
-        return method == "GET"
-    return False
-
-
-def create_app_backend_admin_server() -> ThreadingUnixHTTPServer:
-    APP_BACKEND_ADMIN_SOCKET.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        mode = APP_BACKEND_ADMIN_SOCKET.lstat().st_mode
-    except FileNotFoundError:
-        pass
-    else:
-        if stat.S_ISSOCK(mode):
-            APP_BACKEND_ADMIN_SOCKET.unlink()
-        else:
-            raise OSError(f"refusing to replace non-socket app backend admin path: {APP_BACKEND_ADMIN_SOCKET}")
-    server = ThreadingUnixHTTPServer(str(APP_BACKEND_ADMIN_SOCKET), Handler)
-    APP_BACKEND_ADMIN_SOCKET.chmod(0o666)
-    return server
-
-
 def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> Any:
     if method == "GET" and path == "/v1/health":
         return health()
@@ -455,7 +339,10 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> Any
     if path == "/v1/apps" and method == "GET":
         return list_apps()
     if path.startswith("/v1/apps/"):
-        return app_route(method, path, query, body)
+        from host.runtime import app_api_proxy
+
+        bridge_app_id = getattr(REQUEST_CONTEXT, "bridge_app_id", None)
+        return app_api_proxy.route_app_request(method, path, query, body, bridge_app_id=bridge_app_id)
     if path == "/v1/agent-runtime/codex-oauth-login":
         if method == "POST":
             return start_codex_oauth_login()
@@ -545,60 +432,6 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> Any
 def list_apps() -> dict[str, Any]:
     return {"apps": [app.public() for app in app_platform.installed_apps()]}
 
-
-def app_route(method: str, path: str, query: dict[str, list[str]], body: Any) -> Any:
-    parts = path.strip("/").split("/")
-    if len(parts) >= 4 and parts[0] == "v1" and parts[1] == "apps" and parts[3] == "api":
-        bridge_app_id = getattr(REQUEST_CONTEXT, "bridge_app_id", None)
-        if bridge_app_id and bridge_app_id != parts[2]:
-            raise ApiError(HTTPStatus.FORBIDDEN, "app bridge cannot target a different app")
-        app = app_platform.app_by_id(parts[2])
-        if app is None:
-            raise ApiError(HTTPStatus.NOT_FOUND, "app not found")
-        suffix = "/" + "/".join(parts[4:]) if len(parts) > 4 else "/"
-        return proxy_app_api(app, method, suffix, query, body)
-    raise ApiError(HTTPStatus.NOT_FOUND, "app route not found")
-
-
-def proxy_app_api(
-    app: app_platform.AppManifest,
-    method: str,
-    path: str,
-    query: dict[str, list[str]],
-    body: Any,
-) -> Any:
-    encoded_body = None if body is None else json.dumps(body, sort_keys=True).encode()
-    headers = {"X-TrustyClaw-App-Proxy": app.id}
-    if encoded_body is not None:
-        headers["Content-Type"] = "application/json"
-        headers["Content-Length"] = str(len(encoded_body))
-    target = path
-    if query:
-        target += "?" + urlencode([(key, value) for key, values in query.items() for value in values])
-    conn: http.client.HTTPConnection | None = None
-    try:
-        conn = http.client.HTTPConnection(LOOPBACK, app.port, timeout=APP_BACKEND_TIMEOUT_SECONDS)
-        conn.request(method, target, body=encoded_body, headers=headers)
-        response = conn.getresponse()
-        raw = response.read(MAX_REQUEST_BODY_BYTES + 1)
-    except OSError as exc:
-        raise ApiError(HTTPStatus.BAD_GATEWAY, f"app backend unavailable: {app.id}") from exc
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-    if len(raw) > MAX_REQUEST_BODY_BYTES:
-        raise ApiError(HTTPStatus.BAD_GATEWAY, "app backend response too large")
-    try:
-        data = json.loads(raw.decode() or "{}")
-    except json.JSONDecodeError as exc:
-        raise ApiError(HTTPStatus.BAD_GATEWAY, "app backend returned invalid JSON") from exc
-    if response.status >= 400:
-        message = data.get("error", {}).get("message") if isinstance(data, dict) else None
-        raise ApiError(HTTPStatus(response.status), message or "app backend request failed")
-    return data
 
 def resolve_pending_push(push_id: str, action: str) -> dict[str, Any]:
     try:
@@ -965,6 +798,52 @@ def prune_idempotency(entries: dict[str, Any], *, now: float, preserve_key: str 
         del entries[old_key]
 
 
+def mutate_idempotently(method: str, path: str, key: str, *, caller_id: str, execute: Any) -> Any:
+    """Run a mutating request with process-local idempotency semantics."""
+    if not IDEMPOTENCY_RE.fullmatch(key):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "missing or invalid Idempotency-Key")
+    with IDEMPOTENCY_LOCK:
+        now = time.time()
+        prune_idempotency(IDEMPOTENCY_ENTRIES, now=now)
+        stored = IDEMPOTENCY_ENTRIES.get(key)
+        if stored is not None:
+            if stored["method"] != method or stored["path"] != path:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "Idempotency-Key was already used for a different request")
+            if stored.get("caller_id") != caller_id:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "Idempotency-Key was already used by a different caller")
+            if stored.get("in_flight"):
+                raise ApiError(HTTPStatus.CONFLICT, "a request with this Idempotency-Key is already in progress")
+            if now - stored["stored_at"] <= IDEMPOTENCY_RETENTION_SECONDS:
+                return stored["response"]
+        IDEMPOTENCY_ENTRIES[key] = {
+            "method": method,
+            "path": path,
+            "caller_id": caller_id,
+            "in_flight": True,
+            "stored_at": now,
+        }
+        prune_idempotency(IDEMPOTENCY_ENTRIES, now=now, preserve_key=key)
+    try:
+        response = execute()
+    except BaseException:
+        with IDEMPOTENCY_LOCK:
+            entry = IDEMPOTENCY_ENTRIES.get(key)
+            if entry is not None and entry.get("in_flight"):
+                del IDEMPOTENCY_ENTRIES[key]
+        raise
+    with IDEMPOTENCY_LOCK:
+        now = time.time()
+        IDEMPOTENCY_ENTRIES[key] = {
+            "method": method,
+            "path": path,
+            "caller_id": caller_id,
+            "response": response,
+            "stored_at": now,
+        }
+        prune_idempotency(IDEMPOTENCY_ENTRIES, now=now, preserve_key=key)
+    return response
+
+
 def prune_state() -> None:
     """Bound admin-state growth: keep all active tasks plus the most recent
     finished ones, cap the thread->session maps and the event log, and drop
@@ -1309,6 +1188,7 @@ def _public_metadata_scalar(value: Any) -> Any:
 def create_task(body: Any) -> dict[str, Any]:
     input_message = _message(body, "input_message")
     thread_id = _thread_id(body)
+    _validate_thread_id_not_reserved_by_app(thread_id)
     agent_runtime = _agent_runtime(body)
     with state.mutation() as cur:
         existing_runtime = state.thread_task_runtime(cur, thread_id) or state.thread_session_runtime(cur, thread_id)
@@ -1583,6 +1463,24 @@ def public_task(task: dict[str, Any], queue_position: int | None = None) -> dict
     return value
 
 
+def app_id_from_internal_thread_id(thread_id: str) -> str | None:
+    app_id, separator, _visible_thread_id = thread_id.partition(APP_SCOPED_ID_SEPARATOR)
+    if not separator or not app_id:
+        return None
+    return app_id if app_platform.app_by_id(app_id) is not None else None
+
+
+def _validate_thread_id_not_reserved_by_app(thread_id: str) -> None:
+    app_id = app_id_from_internal_thread_id(thread_id)
+    if app_id is None:
+        return
+    if getattr(REQUEST_CONTEXT, "app_backend_id", None) == app_id:
+        return
+    raise ApiError(
+        HTTPStatus.BAD_REQUEST,
+        f"thread_id prefix {app_id}{APP_SCOPED_ID_SEPARATOR} is reserved for app backend tasks",
+    )
+
 def _queue_order(tasks: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any]]]:
     running = [task for task in tasks if task["status"] == RUNNING]
     queued = [task for task in tasks if task["status"] == QUEUED]
@@ -1736,8 +1634,10 @@ def main() -> int:
     # so the bind is the single-instance gate. A second instance must fail here
     # rather than fail the live instance's running task and drop its in-flight
     # idempotency reservations first.
+    from host.runtime import app_backend_admin_api
+
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
-    app_backend_httpd = create_app_backend_admin_server()
+    app_backend_httpd = app_backend_admin_api.create_app_backend_admin_server()
     initialize_state()
     orchestrator.start_workers()
     threading.Thread(target=maintenance_loop, daemon=True).start()
@@ -1746,10 +1646,7 @@ def main() -> int:
         httpd.serve_forever()
     finally:
         app_backend_httpd.server_close()
-        try:
-            APP_BACKEND_ADMIN_SOCKET.unlink()
-        except FileNotFoundError:
-            pass
+        app_backend_admin_api.unlink_app_backend_admin_socket()
     return 0
 
 
