@@ -9,14 +9,20 @@ gated push touches ``.github/``. The operator then approves or rejects it here:
 - **reject** invokes the same root helper in cleanup mode to drop the pending
   refs, then marks the row rejected.
 
-Replay failures are recorded on the row (``failed``) after one best-effort
-cleanup attempt. Cleanup failures are terminal too: the row detail records the
-cleanup error for later maintenance instead of sending the operator through a
-retry loop.
+Replay failures are recorded on the row (``failed``); the operator's recovery
+is to have the agent push again, which starts a fresh gate round. Pending-ref
+cleanup is best-effort housekeeping of the proxy-private quarantine mirror —
+it never changes a resolution outcome, and refs a failed cleanup leaves behind
+are inert (never pushed anywhere). Resolutions serialize on RESOLVE_LOCK: the
+admin service is the single resolver by construction (only its role has UPDATE
+on pending_pushes, and the port bind keeps it single-instance), so an
+in-process lock is the whole story. A crash mid-resolve leaves the row
+``pending`` and the operator simply approves or rejects again.
 """
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from host.runtime import state
@@ -24,7 +30,11 @@ from host.runtime.github_credential import HelperError, _run_helper_json
 
 APPROVE_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/approve-github-push"]
 APPROVE_HELPER_TIMEOUT_SECONDS = 150
-HELPER_CLEANUP_AFTER_PUSH_CODE = "cleanup_after_push"
+# Serializes resolutions across admin threads. Bounded wait: a second
+# operator action during a slow helper run gets a crisp conflict error
+# instead of queueing behind a 150s replay.
+RESOLVE_LOCK = threading.Lock()
+RESOLVE_LOCK_TIMEOUT_SECONDS = 5
 
 
 class PendingPushError(Exception):
@@ -33,37 +43,53 @@ class PendingPushError(Exception):
 
 
 def approve(push_id: str) -> dict[str, Any]:
-    row = _claim_pending(push_id)
-    token = state.read_proxy_github_token()
-    if not token:
-        detail = "no working GitHub token is available to replay the push"
-        detail = _append_cleanup_detail(detail, _cleanup_pending_refs(row, push_id))
-        state.resolve_pending_push(push_id, "failed", detail[:500])
-        raise PendingPushError(detail) from None
-    payload = _helper_payload(row, push_id, "approve", token=token)
+    if not RESOLVE_LOCK.acquire(timeout=RESOLVE_LOCK_TIMEOUT_SECONDS):
+        raise PendingPushError("another pending push is being resolved")
     try:
-        _run_helper_json(APPROVE_COMMAND, payload, timeout=APPROVE_HELPER_TIMEOUT_SECONDS)
-    except HelperError as exc:
-        if exc.code == HELPER_CLEANUP_AFTER_PUSH_CODE:
-            state.resolve_pending_push(push_id, "approved", f"pending-ref cleanup failed: {exc}"[:500])
-            return _require(push_id)
-        detail = _append_cleanup_detail(f"replay to GitHub failed: {exc}", _cleanup_pending_refs(row, push_id))
-        state.resolve_pending_push(push_id, "failed", detail[:500])
-        raise PendingPushError(detail) from exc
-    state.resolve_pending_push(push_id, "approved")
-    return _require(push_id)
+        row = _require_pending(push_id)
+        token = state.read_proxy_github_token()
+        if not token:
+            # An approval resolves the row exactly once. With no working token
+            # the replay cannot run, so the push fails terminally like any other
+            # replay failure; recovery is the agent pushing again once the
+            # credential is fixed, which starts a fresh gate round.
+            detail = "no working GitHub token is available to replay the push"
+            _cleanup_pending_refs(row, push_id)
+            state.resolve_pending_push(push_id, "failed", detail)
+            raise PendingPushError(detail)
+        payload = _helper_payload(row, push_id, "approve", token=token)
+        try:
+            _run_helper_json(APPROVE_COMMAND, payload, timeout=APPROVE_HELPER_TIMEOUT_SECONDS)
+        except HelperError as exc:
+            detail = f"replay to GitHub failed: {exc}"
+            _cleanup_pending_refs(row, push_id)
+            state.resolve_pending_push(push_id, "failed", detail[:500])
+            raise PendingPushError(detail) from exc
+        return state.resolve_pending_push(push_id, "approved")
+    finally:
+        RESOLVE_LOCK.release()
 
 
 def reject(push_id: str) -> dict[str, Any]:
-    row = _claim_pending(push_id)
-    payload = _helper_payload(row, push_id, "cleanup")
+    if not RESOLVE_LOCK.acquire(timeout=RESOLVE_LOCK_TIMEOUT_SECONDS):
+        raise PendingPushError("another pending push is being resolved")
     try:
-        _run_helper_json(APPROVE_COMMAND, payload, timeout=APPROVE_HELPER_TIMEOUT_SECONDS)
-    except HelperError as exc:
-        state.resolve_pending_push(push_id, "failed", f"pending-ref cleanup failed: {exc}"[:500])
-        raise PendingPushError(f"pending-ref cleanup failed: {exc}") from exc
-    state.resolve_pending_push(push_id, "rejected")
-    return _require(push_id)
+        row = _require_pending(push_id)
+        # Rejecting means the push never leaves the box, so the row is rejected
+        # no matter how the ref cleanup fares.
+        _cleanup_pending_refs(row, push_id)
+        return state.resolve_pending_push(push_id, "rejected")
+    finally:
+        RESOLVE_LOCK.release()
+
+
+def _require_pending(push_id: str) -> dict[str, Any]:
+    row = state.get_pending_push(push_id)
+    if row is None:
+        raise PendingPushError("pending push not found")
+    if row["status"] != "pending":
+        raise PendingPushError(f"pending push is already {row['status']}")
+    return row
 
 
 def _helper_payload(row: dict[str, Any], push_id: str, action: str, *, token: str | None = None) -> dict[str, Any]:
@@ -72,40 +98,17 @@ def _helper_payload(row: dict[str, Any], push_id: str, action: str, *, token: st
         "repo": row["repo"],
         "push_id": push_id,
         "action": action,
-        "ref_updates": row["ref_updates"],
     }
-    if token is not None:
-        payload["token"] = token
+    if action == "approve":
+        payload["ref_updates"] = row["ref_updates"]
+        if token is not None:
+            payload["token"] = token
     return payload
 
 
-def _cleanup_pending_refs(row: dict[str, Any], push_id: str) -> str | None:
+def _cleanup_pending_refs(row: dict[str, Any], push_id: str) -> None:
     payload = _helper_payload(row, push_id, "cleanup")
     try:
         _run_helper_json(APPROVE_COMMAND, payload, timeout=APPROVE_HELPER_TIMEOUT_SECONDS)
-    except HelperError as exc:
-        return str(exc)[:300]
-    return None
-
-
-def _append_cleanup_detail(detail: str, cleanup_detail: str | None) -> str:
-    if cleanup_detail:
-        return f"{detail}; cleanup failed: {cleanup_detail}"
-    return detail
-
-
-def _claim_pending(push_id: str) -> dict[str, Any]:
-    row = state.claim_pending_push(push_id)
-    if row is not None:
-        return row
-    existing = state.get_pending_push(push_id)
-    if existing is None:
-        raise PendingPushError("pending push not found")
-    raise PendingPushError(f"pending push is already {existing['status']}")
-
-
-def _require(push_id: str) -> dict[str, Any]:
-    row = state.get_pending_push(push_id)
-    if row is None:
-        raise PendingPushError("pending push not found")
-    return row
+    except HelperError:
+        pass  # leftover refs in the quarantine mirror are inert

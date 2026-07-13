@@ -6,23 +6,27 @@ the agent behind an explicit, auditable network policy.
 
 The host runs on an AWS EC2 instance and exposes an admin UI/API through one or
 more operator access endpoints: SSH tunneling, Cloudflare Access, or both. The
-admin process, network proxy, optional Cloudflare Tunnel connector, and agent
-runtime run as separate Linux users with separate storage and secrets so the
-agent can work autonomously without getting direct network access or broad
-access to host state.
+admin API, network proxy, tools service, installed app backends, optional
+Cloudflare Tunnel connector, database, and agent runtime run as separate Linux
+users. Filesystem ownership, peer-authenticated local sockets, scoped database
+roles, and uid-based firewall rules keep the agent from getting direct network
+access or broad access to host state.
 
 ## Why Use TrustyClaw
 
 - **Runs in the cloud by default:** keep long-running agents active without
   keeping your laptop open.
 - **No permission prompts:** the agent runs autonomously in auto-approve mode
-  inside a secure sandbox, while network controls prevent unapproved data leaks
-  and unexpected internet actions.
-- **Coming soon: controlled tools:** connect to third-party services like Gmail
-  through deterministic data paths, with approvals for sensitive actions such
-  as sending email or making payments.
-- **Coming soon: workflow apps:** install purpose-built apps with richer UX than
-  a terminal chat loop.
+  as an unprivileged Linux user, while filesystem and network controls prevent
+  broad host-state access, unapproved data leaks, and unexpected internet
+  actions.
+- **Controlled tools:** bundled tool packages (Gmail, Google Calendar, Brave
+  Search) connect agents to third-party services through deterministic data
+  paths, with operator approval required for sensitive actions such as sending
+  email ([tools architecture](docs/architecture/tools/README.md)).
+- **Workflow apps:** the bundled Agent Chat app provides an isolated,
+  purpose-built UI backed by app-owned state and host-scoped task access
+  ([apps architecture](docs/architecture/apps.md)).
 
 These choices follow from a broader set of beliefs about running AI agents.
 See [PHILOSOPHY.md](./PHILOSOPHY.md).
@@ -121,7 +125,9 @@ You will create five things in Cloudflare: an account, an active domain, a
 tunnel, a published hostname on that tunnel, and an Access application that
 guards the hostname. The walkthrough below starts from nothing. Cloudflare
 moves dashboard menus around occasionally; if a label differs, look for the
-same concept.
+same concept in Cloudflare's current [tunnel setup](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/get-started/create-remote-tunnel/)
+and [self-hosted application](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/)
+instructions.
 
 **1. Create a Cloudflare account and add a domain.**
 
@@ -137,66 +143,62 @@ same concept.
 **2. Complete Zero Trust onboarding.**
 
 - In the Cloudflare dashboard sidebar, open **Zero Trust**. The first visit
-  walks you through onboarding: pick a team name (any unique name; it becomes
-  `<team-name>.cloudflareaccess.com`, the URL your Access login page lives
-  under) and select the **Free** plan.
+  walks you through onboarding: pick a unique team name (the internal
+  identifier for the Zero Trust organization and its App Launcher) and select
+  the **Free** plan.
 - The Free plan costs `$0` but Cloudflare still requires a payment method
   (card or PayPal) on file to finish onboarding. This is expected; you are not
   charged.
 
-**3. Create a tunnel and copy its token.**
+**3. Guard the intended hostname with an Access application.**
 
-- Go to **Zero Trust > Networks > Tunnels > Create a tunnel**, choose the
-  **Cloudflared** connector type, and name the tunnel, for example
-  `trustyclaw`.
+Choose the final hostname now, for example `trustyclaw.example.com`. Creating
+the Access application before publishing the tunnel route keeps the hostname
+deny-by-default throughout setup.
+
+- Go to **Zero Trust > Access controls > Applications > Create new
+  application**, choose **Self-hosted and private**, then select **Add public
+  hostname**.
+- Name the application and add the intended hostname exactly (subdomain
+  `trustyclaw`, your domain, no path).
+- Under **Access policies**, create or attach an **Allow** policy that matches
+  only you. The simplest rule is **Emails** with your own email address.
+- Select the default Cloudflare identity provider for the application. New
+  Zero Trust organizations let account members sign in with their existing
+  Cloudflare account credentials. One-time PIN is optional and must now be
+  added separately under **Zero Trust > Integrations > Identity providers**.
+- Accept the remaining defaults and create the application. Access
+  applications deny users who do not match an Allow policy.
+
+**4. Create a tunnel and copy its token.**
+
+- Go to **Networking > Tunnels > Create a tunnel** and name the tunnel, for
+  example `trustyclaw`.
 - The next screen shows connector install commands for various operating
-  systems. Do not run any of them — TrustyClaw installs the connector on the
+  systems. Do not run any of them. TrustyClaw installs the connector on the
   host during deploy. You only need the tunnel token: the long string starting
   with `eyJ` at the end of any install command. Use the copy button, extract
   the token, and keep it somewhere private for step 6.
 - The tunnel stays **Inactive**/**Down** until your first TrustyClaw deploy
   connects it. That is expected; continue anyway.
 
-**4. Publish a hostname that routes to the admin UI.**
+**5. Publish the hostname so it routes to the admin UI.**
 
-- Open the tunnel you created and add a published application route (on
-  current dashboards a **Routes**/**Published application routes** tab with an
-  **Add a public hostname** or **Add route > Published application** button).
-- Set subdomain `trustyclaw` (or any name you like) on your domain, so the
-  full hostname is for example `trustyclaw.example.com`.
-- Set the service **Type** to `HTTP` and the **URL** to `localhost:7443`. The
-  hop from the connector to the admin process stays on the host's loopback,
-  so plain HTTP here is correct; browsers still reach the hostname over
-  HTTPS.
+- Go to **Networking > Tunnels**, open the tunnel, select **Routes > Add
+  route > Published application**, and enter the same hostname used by the
+  Access application.
+- Set **Service URL** to `http://localhost:7443`. The hop from the connector to
+  the admin process stays on the host's loopback, so plain HTTP here is
+  correct; browsers still reach the hostname over HTTPS.
 - Saving the route creates the DNS record for the hostname automatically. Do
   not create one yourself.
-
-**5. Guard the hostname with an Access application.**
-
-Without this step the admin UI login would be reachable by the whole
-internet, protected only by the admin password. Do not skip it.
-
-- Go to **Zero Trust > Access controls > Applications > Create new
-  application** (older dashboards: **Access > Applications > Add an
-  application**) and choose **Self-hosted**.
-- Name it, and add the public hostname from step 4 exactly (subdomain
-  `trustyclaw`, your domain, no path).
-- Create the Access policy: action **Allow**, with an include rule matching
-  only you — the simplest is **Emails** with your own email address. On
-  current dashboards policies are created under **Access controls >
-  Policies** and attached to the application; older dashboards create the
-  policy inline.
-- Leave the login methods at their defaults. New Zero Trust accounts get a
-  working email login out of the box (one-time PIN or Cloudflare account
-  login), so you do not need to configure an identity provider.
-- Accept the defaults for everything else and save.
 
 **6. Export the tunnel token for deploy.**
 
 Deploy reads the token from the environment variable your config names:
 
 ```bash
-export TRUSTYCLAW_CLOUDFLARE_TUNNEL_TOKEN=...   # the eyJ... string from step 3
+export TRUSTYCLAW_CLOUDFLARE_TUNNEL_TOKEN=...   # the eyJ... string from step 4
 ```
 
 If you lost the token, open the tunnel's **Overview** tab and copy it from
@@ -260,12 +262,17 @@ resource shape or version tag is incompatible with the command. Bootstrap then
 checks the preserved admin disk version as the authoritative source before
 writing any upgraded state.
 
+The admin toolbar quietly shows version status after checking the `VERSION` on
+the public repository's `main` branch. A small upgrade icon shows the available
+version and reminds you to use the operator plane; a small checkmark confirms
+the host is at the latest version. The icons themselves perform no action.
+
 The host uses three EBS volumes:
 
 | Volume | Lifecycle | Contents |
 | --- | --- | --- |
 | Root | Recreated on redeploy and deleted on instance termination | Ubuntu 22.04, system packages, Node.js, Python, Codex CLI, Claude Code CLI, nftables, OpenSSL, curl, jq, CA certificates, and swap. |
-| Admin | Preserved on redeploy and marked not to delete on instance termination | Admin API state, tasks, agent events, network events, network policy, provider account pins, and proxy CA state. |
+| Admin | Preserved on redeploy and marked not to delete on instance termination | Postgres state for the admin API, apps, tools, tasks, audit logs, network policy, credentials, and provider pins; proxy CA/certificate and queued-push state. |
 | Agent | Preserved on redeploy and marked not to delete on instance termination | Agent home directory, provider auth/session files, CLI caches, and workspace data. |
 
 Every AWS resource deploy creates is tagged so it can be found and cleaned up:
@@ -327,10 +334,10 @@ As a rough us-east-1 estimate for a host running all month:
 
 | Item | Estimate |
 | --- | ---: |
-| EC2 `t3.small` Linux instance | about `$15/month` |
-| 40 GiB total gp3 EBS storage | about `$3.50/month` |
-| One public IPv4 address | about `$4/month` |
-| **AWS infrastructure subtotal** | **about `$22.50/month`** |
+| EC2 `t3.small` Linux instance | about `$15.20/month` |
+| 40 GiB total gp3 EBS storage | about `$3.20/month` |
+| One public IPv4 address | about `$3.65/month` |
+| **AWS infrastructure subtotal** | **about `$22.05/month`** |
 
 Actual AWS cost varies by region, month length, free-tier credits, taxes, data
 transfer, snapshots, and any T3 burst CPU credit charges. The root EBS volume is
@@ -338,8 +345,9 @@ deleted when its EC2 instance is terminated. The durable admin and agent EBS
 volumes are explicitly marked not to delete on instance termination and continue
 to cost money until deleted, even if the EC2 instance is replaced. Check the
 current [EC2 On-Demand pricing](https://aws.amazon.com/ec2/pricing/on-demand/),
-[EBS pricing](https://aws.amazon.com/ebs/pricing/), [VPC public IPv4 pricing](https://aws.amazon.com/vpc/pricing/),
-or the [AWS Pricing Calculator](https://calculator.aws/) for your region.
+[EBS pricing](https://aws.amazon.com/ebs/pricing/),
+[VPC public IPv4 pricing](https://aws.amazon.com/vpc/pricing/), or the
+[AWS Pricing Calculator](https://calculator.aws/) for your region.
 
 AI provider costs are separate. Codex/OpenAI and Claude/Anthropic usage is billed
 by those providers on top of the AWS infrastructure cost.
@@ -348,6 +356,8 @@ by those providers on top of the AWS infrastructure cost.
 
 For deeper architecture and contribution notes, read:
 
+- [`docs/architecture/diagram.md`](docs/architecture/diagram.md), for a
+  one-page host capability map
 - [`docs/architecture/index.md`](docs/architecture/index.md)
 - [`docs/development/index.md`](docs/development/index.md)
 - [`docs/api/index.md`](docs/api/index.md)

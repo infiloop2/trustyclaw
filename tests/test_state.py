@@ -18,7 +18,8 @@ from unittest.mock import patch
 
 import pg_harness
 
-from host.runtime import db, secretbox, state
+from host.runtime import db, pgclient, secretbox, state
+from state_seed import read_agent_events, read_network_events
 from host.runtime.state import (
     load_config,
     network_proxy_cert_files,
@@ -26,9 +27,8 @@ from host.runtime.state import (
     read_openai_account,
     read_proxy_claude_account,
     read_proxy_openai_account_id,
-    read_agent_events,
-    save_claude_account,
     save_config,
+    save_claude_account,
     save_openai_account,
     save_proxy_claude_account,
     save_proxy_openai_account_id,
@@ -40,12 +40,27 @@ def make_task(number: int, status: str = "queued", thread_id: str = "t1") -> dic
         "task_id": f"task_{number}",
         "status": status,
         "agent_runtime": "codex",
+        "model": "gpt-5.6-terra",
+        "effort": "high",
         "thread_id": thread_id,
         "input_message": f"task {number}",
         "steer_messages": [],
         "created_at": "2026-06-08T00:00:00Z",
         "updated_at": f"2026-06-08T00:00:{number % 60:02d}Z",
     }
+
+
+def insert_task(cur: Any, task: dict[str, object]) -> None:
+    state.save_thread_session(
+        cur,
+        str(task["agent_runtime"]),
+        str(task["thread_id"]),
+        None,
+        str(task["updated_at"]),
+        str(task["model"]),
+        str(task["effort"]),
+    )
+    state.insert_task(cur, task)
 
 
 class StateStorageTests(unittest.TestCase):
@@ -59,7 +74,7 @@ class StateStorageTests(unittest.TestCase):
 
     def test_mutation_persists_on_normal_exit_and_rolls_back_on_exception(self) -> None:
         with state.mutation() as cur:
-            state.insert_task(cur, make_task(1))
+            insert_task(cur, make_task(1))
         with self.assertRaises(RuntimeError):
             with state.mutation() as cur:
                 task = state.get_task("task_1", cur)
@@ -78,13 +93,41 @@ class StateStorageTests(unittest.TestCase):
         with state.mutation() as cur:
             task = make_task(1)
             task["steer_messages"] = ["steer me"]
-            state.insert_task(cur, task)
+            insert_task(cur, task)
         loaded = state.get_task("task_1")
         assert loaded is not None
         self.assertEqual(loaded["input_message"], "task 1")
         self.assertEqual(loaded["steer_messages"], ["steer me"])
         self.assertIsNone(loaded["output_message"])
         self.assertEqual([t["task_id"] for t in state.active_tasks()], ["task_1"])
+
+    def test_thread_session_configuration_is_immutable(self) -> None:
+        with state.mutation() as cur:
+            state.save_thread_session(
+                cur,
+                "codex",
+                "fixed-thread",
+                None,
+                "2026-06-08T00:00:00Z",
+                "gpt-5.6-terra",
+                "high",
+            )
+
+        with self.assertRaises(ValueError), state.mutation() as cur:
+            state.save_thread_session(
+                cur,
+                "codex",
+                "fixed-thread",
+                None,
+                "2026-06-08T00:00:01Z",
+                "gpt-5.6-sol",
+                "high",
+            )
+
+        with state.mutation() as cur:
+            config = state.thread_session_config(cur, "fixed-thread")
+        assert config is not None
+        self.assertEqual((config["model"], config["effort"]), ("gpt-5.6-terra", "high"))
 
     def test_task_number_allocation_is_dense_and_rolls_back(self) -> None:
         with state.mutation() as cur:
@@ -191,22 +234,30 @@ class StateStorageTests(unittest.TestCase):
             for index in range(8):
                 state.append_agent_event(cur, "task.message", "task_1" if index % 2 else None, {"message": f"m{index}", "source": "user"})
         page = state.page_agent_events_before(None, limit=5)
-        self.assertEqual(len(page.items), 5)
-        seqs = [event["seq"] for event in page.items]
+        self.assertEqual(len(page), 5)
+        seqs = [event["seq"] for event in page]
         self.assertEqual(seqs, sorted(seqs, reverse=True))
         older = state.page_agent_events_before(seqs[-1], limit=5)
-        self.assertTrue(older.items)
-        self.assertTrue(all(event["seq"] < seqs[-1] for event in older.items))
+        self.assertTrue(older)
+        self.assertTrue(all(event["seq"] < seqs[-1] for event in older))
         task_page = state.page_task_events("task_1", None)
-        self.assertTrue(all(event["task_id"] == "task_1" for event in task_page.items))
+        self.assertTrue(all(event["task_id"] == "task_1" for event in task_page))
 
     def test_prune_keeps_the_newest_finished_tasks_and_sessions(self) -> None:
         with state.mutation() as cur:
             for number in range(1, 8):
-                state.insert_task(cur, make_task(number, status="completed", thread_id=f"t{number}"))
-            state.insert_task(cur, make_task(8, status="queued", thread_id="t8"))
+                insert_task(cur, make_task(number, status="completed", thread_id=f"t{number}"))
+            insert_task(cur, make_task(8, status="queued", thread_id="t8"))
             for number in range(1, 8):
-                state.save_thread_session(cur, "codex", f"t{number}", f"ct_{number}", f"2026-06-08T00:00:{number:02d}Z")
+                state.save_thread_session(
+                    cur,
+                    "codex",
+                    f"t{number}",
+                    f"ct_{number}",
+                    f"2026-06-08T00:00:{number:02d}Z",
+                    "gpt-5.6-terra",
+                    "high",
+                )
         with state.mutation() as cur:
             state.prune_finished_tasks(cur, 3)
             state.prune_thread_sessions(cur, "codex", 3)
@@ -226,17 +277,17 @@ class StateStorageTests(unittest.TestCase):
         with state.mutation() as cur:
             for index in range(8):
                 state.append_agent_event(cur, "task.message", None, {"message": f"m{index}", "source": "user"})
-        with patch.object(state, "MAX_EVENTS", 5):
-            state.prune_agent_events()
+        with patch.object(state, "MAX_EVENTS", 5), state.mutation() as cur:
+            state.prune_agent_events(cur)
         seqs = [event["seq"] for event in read_agent_events()]
         self.assertEqual(len(seqs), 5)
         self.assertEqual(seqs, sorted(seqs))
 
         for index in range(8):
             state.append_network_event("https", "GET", "example.com", 443, f"/p{index}", "", True)
-        with patch.object(state, "MAX_NETWORK_EVENTS", 5):
-            state.prune_network_events()
-        network_seqs = [event["seq"] for event in state.read_network_events()]
+        with patch.object(state, "MAX_EVENTS", 5), state.mutation() as cur:
+            state.prune_network_events(cur)
+        network_seqs = [event["seq"] for event in read_network_events()]
         self.assertEqual(len(network_seqs), 5)
         self.assertEqual(network_seqs, sorted(network_seqs))
 
@@ -246,7 +297,7 @@ class StateStorageTests(unittest.TestCase):
         state.append_network_event(
             "https", "GET", "h" * 600, 443, "/" + "p" * 5000, "q" * 5000, False, reason="r" * 900
         )
-        event = state.read_network_events()[-1]
+        event = read_network_events()[-1]
         self.assertEqual(len(event["host"]), 512)
         self.assertEqual(len(event["path"]), 2048)
         self.assertEqual(len(event["query"]), 2048)
@@ -274,6 +325,41 @@ class StateStorageTests(unittest.TestCase):
         record = state.network_policy_record()
         assert record is not None
         self.assertEqual(record["updated_at"], "2026-06-08T00:00:00Z")
+
+    def test_provider_account_anchor_is_immutable_in_the_database(self) -> None:
+        # The anchor guard trigger: an anchored row accepts metadata rewrites
+        # for the same account and the reset that clears it, and nothing else.
+        anchored = {
+            "account_id": "acct-1",
+            "identity_attestation": "anthropic_oauth_profile",
+            "email": "op@example.com",
+        }
+        save_claude_account(anchored)
+        save_claude_account(anchored | {"claude_usage": {"weekly_used_percent": 3}})
+        self.assertEqual(read_claude_account()["claude_usage"], {"weekly_used_percent": 3})
+        with self.assertRaises(pgclient.Error):
+            save_claude_account(anchored | {"account_id": "acct-2"})
+        with self.assertRaises(pgclient.Error):
+            # Stripping the approval marker would demote the row so a second
+            # write could re-anchor it; the guard refuses the demotion.
+            save_claude_account({"account_id": "acct-1", "email": "op@example.com"})
+        with self.assertRaises(pgclient.Error):
+            with state.mutation() as cur:
+                cur.execute("DELETE FROM provider_accounts WHERE provider = %s", ("claude",))
+        self.assertEqual(read_claude_account()["account_id"], "acct-1")
+        save_claude_account(None)  # the operator reset clears the anchor
+        save_claude_account({"account_id": "acct-2", "identity_attestation": "anthropic_oauth_profile"})
+        self.assertEqual(read_claude_account()["account_id"], "acct-2")
+
+    def test_provider_account_rows_without_an_anchor_are_unrestricted(self) -> None:
+        # Legacy or unapproved rows carry no approval marker: they are not
+        # anchors, and the first-capture flow may overwrite them freely.
+        save_openai_account({"account_id": "legacy"})
+        save_openai_account({"account_id": "other"})
+        save_openai_account({"account_id": "acct-1", "operator_approval": "codex_device_login"})
+        with self.assertRaises(pgclient.Error):
+            save_openai_account({"account_id": "acct-2", "operator_approval": "codex_device_login"})
+        self.assertEqual(read_openai_account()["account_id"], "acct-1")
 
     def test_network_policy_round_trips_integrations_and_github_repos(self) -> None:
         controls = {
@@ -340,45 +426,19 @@ class StateStorageTests(unittest.TestCase):
             [{"old": "0" * 40, "new": "1" * 40, "ref": "refs/heads/main"}],
             [".github/workflows/ci.yml"],
         )
-        pending = state.read_pending_pushes("pending")
+        pending = state.read_pending_pushes()
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["id"], "abc123")
         self.assertEqual(pending[0]["changed_paths"], [".github/workflows/ci.yml"])
         self.assertEqual(pending[0]["status"], "pending")
         self.assertEqual(state.get_pending_push("abc123")["ref_updates"][0]["ref"], "refs/heads/main")
-        claimed = state.claim_pending_push("abc123")
-        self.assertIsNotNone(claimed)
-        assert claimed is not None
-        self.assertEqual(claimed["status"], "resolving")
-        with state.db.transaction() as cur:
-            cur.execute("SELECT claimed_at FROM pending_pushes WHERE id = %s", ("abc123",))
-            first_claimed_at = cur.fetchone()[0]
-        self.assertIsNotNone(first_claimed_at)
-        self.assertEqual(state.read_pending_pushes("pending"), [])
-        resolving = state.read_pending_pushes("resolving")
-        self.assertEqual(len(resolving), 1)
-        self.assertEqual(resolving[0]["status"], "resolving")
-        self.assertIsNone(state.claim_pending_push("abc123"))
-        with state.mutation() as cur:
-            cur.execute("UPDATE pending_pushes SET claimed_at = %s WHERE id = %s", ("1970-01-01T00:00:00Z", "abc123"))
-        stale_resolving = state.read_pending_pushes("resolving")
-        self.assertEqual(len(stale_resolving), 1)
-        self.assertEqual(stale_resolving[0]["status"], "resolving")
-        reclaimed = state.claim_pending_push("abc123")
-        self.assertIsNotNone(reclaimed)
-        assert reclaimed is not None
-        self.assertEqual(reclaimed["status"], "resolving")
-        state.resolve_pending_push("abc123", "approved")
-        approved = state.get_pending_push("abc123")
-        self.assertIsNotNone(approved)
-        assert approved is not None
+        approved = state.resolve_pending_push("abc123", "approved")
         self.assertEqual(approved["status"], "approved")
-        with state.db.transaction() as cur:
-            cur.execute("SELECT claimed_at FROM pending_pushes WHERE id = %s", ("abc123",))
-            self.assertIsNone(cur.fetchone()[0])
-        self.assertEqual(state.read_pending_pushes("pending"), [])
-        # Resolving again is a no-op (already resolved).
-        state.resolve_pending_push("abc123", "rejected")
+        self.assertEqual(state.get_pending_push("abc123")["status"], "approved")
+        # Resolving a row that is no longer pending is a programming error
+        # (the caller checks under RESOLVE_LOCK) and fails loudly.
+        with self.assertRaises(RuntimeError):
+            state.resolve_pending_push("abc123", "rejected")
         self.assertEqual(state.get_pending_push("abc123")["status"], "approved")
 
     def test_encrypt_secret_refuses_non_string_values(self) -> None:
@@ -459,7 +519,7 @@ class StateStorageTests(unittest.TestCase):
         with db.transaction() as cur:
             cur.execute("SELECT token FROM proxy_github_token")
             (stored,) = cur.fetchone()
-        self.assertTrue(secretbox.is_encrypted(stored))
+        self.assertTrue(stored.startswith(secretbox.PREFIX))
         self.assertNotIn("ghs_working", stored)
         # A replaced row can never serve a cached stale token.
         state.save_proxy_github_token("ghs_replaced")
@@ -479,11 +539,6 @@ class StateStorageTests(unittest.TestCase):
             github_credential_headers("github.com", [("Authorization", "token smuggled")]),
             [("Authorization", f"Basic {basic}")],
         )
-        # The plain-HTTP proxy path strips but never injects: the credential
-        # must not travel an unencrypted socket.
-        self.assertEqual(
-            github_credential_headers("github.com", [("Authorization", "token smuggled")], secure=False), []
-        )
         # Signed-URL domains are strip-only: an Authorization header breaks
         # the presigned download, and the signed URL is the access control.
         self.assertEqual(
@@ -502,14 +557,14 @@ class StateStorageTests(unittest.TestCase):
         state.save_github_repo_audit(
             "infiloop2",
             "trustyclaw",
-            {"visibility": "public", "has_pages": False, "pages_public": False},
+            {"visibility": "public", "pages_public": False},
             None,
         )
         state.save_github_repo_audit("infiloop2", "infibot", {}, "audit fetch failed: 403")
         audits = state.read_github_repo_audits()
         self.assertEqual(
             audits[("infiloop2", "trustyclaw")]["facts"],
-            {"visibility": "public", "has_pages": False, "pages_public": False},
+            {"visibility": "public", "pages_public": False},
         )
         self.assertNotIn("error", audits[("infiloop2", "trustyclaw")])
         self.assertEqual(audits[("infiloop2", "infibot")]["error"], "audit fetch failed: 403")
@@ -517,12 +572,12 @@ class StateStorageTests(unittest.TestCase):
         state.save_github_repo_audit(
             "infiloop2",
             "trustyclaw",
-            {"visibility": "private", "has_pages": True, "pages_public": None},
+            {"visibility": "private", "pages_public": None},
             None,
         )
         self.assertEqual(
             state.read_github_repo_audits()[("infiloop2", "trustyclaw")]["facts"],
-            {"visibility": "private", "has_pages": True, "pages_public": None},
+            {"visibility": "private", "pages_public": None},
         )
         # An errored row is never fresh: the poller retries it on the next
         # pass instead of waiting out the TTL.
@@ -531,13 +586,6 @@ class StateStorageTests(unittest.TestCase):
         audits = state.read_github_repo_audits()
         self.assertTrue(github_repo_audit._stale(audits[("infiloop2", "infibot")]))
         self.assertFalse(github_repo_audit._stale(audits[("infiloop2", "trustyclaw")]))
-        # A row from before the Pages facts existed re-audits immediately.
-        self.assertTrue(github_repo_audit._stale({"fetched_at": state.utc_now(), "facts": {"visibility": "private"}}))
-        self.assertTrue(
-            github_repo_audit._stale(
-                {"fetched_at": state.utc_now(), "facts": {"visibility": "private", "pages_public": None}}
-            )
-        )
         # Pruning drops repositories no longer in the policy.
         state.prune_github_repo_audits({("infiloop2", "trustyclaw")})
         self.assertEqual(list(state.read_github_repo_audits()), [("infiloop2", "trustyclaw")])
@@ -571,13 +619,15 @@ class StateStorageTests(unittest.TestCase):
     def test_host_runtime_has_no_third_party_imports(self) -> None:
         # The runtime is standard library only — the admin-state database is
         # spoken to by the in-repo protocol client, not a driver. This walks
-        # every host/ module and rejects any import outside the stdlib and the
-        # host package itself, so a dependency cannot sneak back in.
+        # every host/ module and rejects any import outside the stdlib, the
+        # host package itself, and the in-repo tools package (which is
+        # likewise pinned to the stdlib by test_tools), so a dependency
+        # cannot sneak back in.
         import ast
         import sys
 
         repo_root = Path(__file__).resolve().parents[1]
-        allowed_roots = set(sys.stdlib_module_names) | {"host"}
+        allowed_roots = set(sys.stdlib_module_names) | {"host", "tools"}
         offenders: list[str] = []
         for path in sorted((repo_root / "host").rglob("*.py")):
             tree = ast.parse(path.read_text(), filename=str(path))

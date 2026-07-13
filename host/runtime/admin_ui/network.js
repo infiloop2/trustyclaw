@@ -4,7 +4,7 @@
 
 import { api } from "./api.js";
 import { $, badge, esc, objectValue, setHtml } from "./helpers.js";
-import { providerAccounts, refreshHealth, refreshProviderAccounts, renderRuntimeGuidance } from "./health.js";
+import { providerAccounts, refreshHealth, refreshProviderAccounts, runtimeRecords } from "./health.js";
 
 const GITHUB_REPO_INPUT_RE = /^([a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?)\/([a-z0-9._-]{1,100})$/;
 const MANAGED_INTEGRATIONS = {
@@ -17,11 +17,11 @@ const MANAGED_INTEGRATIONS = {
 const INTEGRATION_INFO = {
   openai: {
     heading: "OpenAI",
-    summary: "Lets the Codex runtime reach OpenAI. Requests must authenticate as the pinned operator account, and live web search stays disabled.",
+    summary: "Lets the Codex runtime reach OpenAI. Requests must authenticate as the pinned operator account, cache-only web search is allowed, and remote MCP is blocked.",
     rows: [
-      ["api.openai.com", "POST; account guard; live web search disabled"],
+      ["api.openai.com", "POST; account guard; external URL request guard"],
       ["auth.openai.com", "GET, POST"],
-      ["chatgpt.com", "GET, POST; account guard; live web search disabled"],
+      ["chatgpt.com", "GET, POST; account guard; external URL request guard"],
     ],
   },
   claude: {
@@ -75,8 +75,10 @@ export function activePolicy() {
   return activeNetworkPolicy;
 }
 
-function policyMessage(message) {
-  $("policy-message").textContent = message || "";
+function policyMessage(message, isError) {
+  const node = $("policy-message");
+  node.textContent = message || "";
+  node.classList.toggle("error", isError === true);
 }
 
 export function closeIntegrationInfo() {
@@ -92,21 +94,29 @@ export function closeIntegrationInfo() {
   }
 }
 
-export function toggleIntegrationInfo(name, anchor) {
+// One floating popover serves every info button on the tab: managed
+// integrations pass their curated INTEGRATION_INFO html, tool rows pass
+// html built from the tool manifest (tools.js). The key identifies the open
+// popover so a second click on the same button closes it.
+export function toggleInfoPopover(key, anchor, html) {
   const panel = $("preset-info-popover");
-  if (!INTEGRATION_INFO[name]) return;
-  if (!panel.hidden && panel.dataset.integration === name) {
+  if (!panel.hidden && panel.dataset.integration === key) {
     closeIntegrationInfo();
     return;
   }
-  panel.dataset.integration = name;
-  panel.innerHTML = renderIntegrationInfo(INTEGRATION_INFO[name]);
+  panel.dataset.integration = key;
+  panel.innerHTML = html;
   panel.hidden = false;
   infoPopoverAnchor = anchor;
   positionIntegrationInfo();
   for (const button of document.querySelectorAll(".info-button")) {
-    button.setAttribute("aria-expanded", String(button.dataset.info === name));
+    button.setAttribute("aria-expanded", String(button.dataset.info === key));
   }
+}
+
+export function toggleIntegrationInfo(name, anchor) {
+  if (!INTEGRATION_INFO[name]) return;
+  toggleInfoPopover(name, anchor, renderIntegrationInfo(INTEGRATION_INFO[name]));
 }
 
 export function positionIntegrationInfo() {
@@ -174,7 +184,6 @@ function renderNetworkControls() {
   renderManagedIntegrations();
   renderGithubRepos();
   renderDomainRules();
-  renderRuntimeGuidance();
 }
 
 // Every edit control mutates a clone of the live policy and publishes it
@@ -193,7 +202,7 @@ async function publishPolicy(mutate, message) {
     // Runtime states change with the policy; reflect that now, not at the next poll.
     refreshHealth().catch(() => {});
     refreshProviderAccounts().catch(() => {});
-  } catch (error) { policyMessage(error.message); }
+  } catch (error) { policyMessage(error.message, true); }
 }
 
 function renderManagedIntegrations() {
@@ -214,14 +223,21 @@ function renderManagedIntegrations() {
           <button class="ghost sm icon-button integration-chevron" data-action="toggle-integration-expansion" data-integration="${esc(name)}" aria-label="Toggle ${esc(meta.label)} details" aria-expanded="${expanded}">
             <svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><path d="m7.5 4.5 5 5.5-5 5.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
-          <div class="preset-with-info integration-title">
-            <h2>${esc(meta.label)}</h2>
-            <button class="info-button" data-action="toggle-integration-info" data-info="${esc(meta.info)}" aria-label="${esc(meta.label)} internet access details" aria-haspopup="dialog" aria-expanded="false">i</button>
+          <div class="integration-title">
+            <div class="preset-with-info">
+              <h2>${esc(meta.label)}</h2>
+              <button class="info-button" data-action="toggle-integration-info" data-info="${esc(meta.info)}" aria-label="${esc(meta.label)} internet access details" aria-haspopup="dialog" aria-expanded="false">i</button>
+            </div>
           </div>
-          ${badge(enabled ? "enabled" : "disabled")}
+          <span class="status-chips">
+            ${badge(enabled ? "enabled" : "disabled")}
+            ${name === "openai" || name === "claude" ? `<span data-provider-status="${esc(name)}"></span>` : ""}
+          </span>
           <span class="integration-actions">
-            <button class="sm" data-action="enable-integration" data-integration="${esc(name)}"${enabled ? " disabled" : ""}>Enable</button>
-            <button class="ghost sm" data-action="disable-integration" data-integration="${esc(name)}"${enabled ? "" : " disabled"}>Disable</button>
+            <span class="seg">
+              <button data-action="enable-integration" data-integration="${esc(name)}"${enabled ? " disabled" : ""}>Enable</button>
+              <button data-action="disable-integration" data-integration="${esc(name)}"${enabled ? "" : " disabled"}>Disable</button>
+            </span>
           </span>
         </div>
         <div class="integration-details" data-integration-details="${esc(name)}"${expanded ? "" : " hidden"}>
@@ -240,7 +256,12 @@ function renderManagedIntegrations() {
 
 function integrationDetailsHtml(name, enabled) {
   if (name === "openai" || name === "claude") {
-    return `<div class="integration-account" data-provider="${esc(name)}"></div>`;
+    return `
+      <div class="detail-card">
+        <div class="detail-card-head"><h3>Account</h3></div>
+        <div class="integration-account" data-provider="${esc(name)}"></div>
+        <div class="provider-oauth" data-provider-oauth="${esc(name)}"></div>
+      </div>`;
   }
   if (name === "github") {
     return `
@@ -251,34 +272,74 @@ function integrationDetailsHtml(name, enabled) {
 }
 
 // Filled in place on every accounts poll so the enclosing integration row
-// (its buttons and open info popover) is never re-rendered by the poll.
+// (its buttons and open info popover) is never re-rendered by the poll. Only
+// nodes carrying data-provider belong to the OpenAI/Claude rows; the tool
+// rows reuse the .integration-account layout for their own connection line
+// and must not be overwritten here.
 export function renderIntegrationAccounts() {
-  for (const node of document.querySelectorAll(".integration-account")) {
+  for (const node of document.querySelectorAll("[data-provider-status]")) {
+    const provider = node.dataset.providerStatus;
+    const enabled = objectValue(objectValue(activeNetworkPolicy.managed_network_integrations)[provider]).enabled === true;
+    if (!enabled) {
+      setHtml(node, "");
+      continue;
+    }
+    const account = providerAccounts().find(entry => entry.provider === provider) || {};
+    const runtime = provider === "claude" ? "claude_code" : "codex";
+    const record = runtimeRecords().find(entry => entry.type === runtime) || { status: account.status || "loading" };
+    const identity = account.email || account.account_id;
+    setHtml(node, record.status === "active" && identity
+      ? `<span class="status active">connected: <span class="chip-label">${esc(identity)}</span></span>`
+      : record.status === "awaiting_login"
+        ? `<span class="status awaiting_login">login required</span>`
+        : badge(record.status || "not-connected"));
+  }
+  for (const node of document.querySelectorAll(".integration-account[data-provider]")) {
     const provider = node.dataset.provider;
     const account = providerAccounts().find(entry => entry.provider === provider) || {};
+    const runtime = provider === "claude" ? "claude_code" : "codex";
+    const runtimeLabel = runtime === "claude_code" ? "Claude Code" : "Codex";
+    const record = runtimeRecords().find(entry => entry.type === runtime) || { status: account.status || "loading" };
+    const enabled = objectValue(objectValue(activeNetworkPolicy.managed_network_integrations)[provider]).enabled === true;
     const identity = account.email || account.account_id;
-    const summary = identity
-      ? `Linked account: <b>${esc(identity)}</b> <span class="muted">&middot; only this account is allowed through the proxy.</span>`
-      : `<span class="muted">No account linked yet. The first login links the account it signs in to, and only that account is then allowed through the proxy.</span>`;
+    const summary = !enabled && !identity
+      ? ""
+      : record.status === "active" && identity
+        ? `Connected account: <span class="connection-identity">${esc(identity)}</span> &middot; only this account is allowed through the proxy.`
+        : identity
+          ? `Linked account: <span class="connection-identity">${esc(identity)}</span> &middot; sign in again to reconnect it.`
+          : "No account linked yet. The first login links the account it signs in to, and only that account is then allowed through the proxy.";
+    const guidance = record.status === "error"
+      ? `<p class="provider-error">${esc(record.error_message || "The last runtime check failed.")}</p>`
+      : !enabled
+        ? `<p class="muted">Enable ${esc(MANAGED_INTEGRATIONS[provider].label)} access before starting a login.</p>`
+        : "";
+    const canLogin = enabled && (record.status === "awaiting_login" || record.status === "error");
     setHtml(node, `
-      <p>${summary}</p>
-      <button class="ghost sm" data-action="reset-linked-account" data-provider="${esc(provider)}">Reset linked account</button>`);
+      ${summary ? `<p class="connection-summary">${summary}</p>` : ""}
+      ${guidance}
+      <span class="provider-account-actions">
+        ${canLogin ? `<button class="primary sm" data-action="start-login" data-runtime="${esc(runtime)}">Start ${esc(runtimeLabel)} login</button>` : ""}
+        ${identity ? `<button class="ghost sm" data-action="reset-linked-account" data-provider="${esc(provider)}">Disconnect</button>` : ""}
+      </span>`);
+    const oauth = document.querySelector(`[data-provider-oauth="${provider}"]`);
+    if (oauth && record.status === "active") setHtml(oauth, "");
   }
 }
 
 export async function resetLinkedAccount(provider) {
   const label = MANAGED_INTEGRATIONS[provider] ? MANAGED_INTEGRATIONS[provider].label : provider;
-  const message = `Reset the linked ${label} account? `
+  const message = `Disconnect the linked ${label} account? `
     + `This clears local ${label} auth and fails running tasks that use it. `
     + `The agent cannot reach ${label} until a new login links an account.`;
   if (!confirm(message)) return;
   const runtime = provider === "claude" ? "claude_code" : "codex";
   try {
     await api("POST", "/v1/agent-runtime/reset-linked-account", { "agent_runtime": runtime });
-    policyMessage(`${label} linked account reset.`);
+    policyMessage(`${label} account disconnected.`);
     await refreshProviderAccounts();
     await refreshHealth();
-  } catch (error) { policyMessage(error.message); }
+  } catch (error) { policyMessage(error.message, true); }
 }
 
 export function toggleIntegrationExpansion(name) {
@@ -288,6 +349,12 @@ export function toggleIntegrationExpansion(name) {
   } else {
     expandedIntegrations.add(name);
   }
+  renderManagedIntegrations();
+}
+
+export function openProvider(name) {
+  if (!MANAGED_INTEGRATIONS[name]) return;
+  expandedIntegrations.add(name);
   renderManagedIntegrations();
 }
 
@@ -398,12 +465,12 @@ export function toggleGithubRepoAudit(key) {
 export async function addGithubRepo() {
   const managed = objectValue(activeNetworkPolicy.managed_network_integrations);
   if (objectValue(managed.github).enabled !== true) {
-    policyMessage("Enable the GitHub integration before adding write repositories.");
+    policyMessage("Enable the GitHub integration before adding write repositories.", true);
     return;
   }
   const input = $("github-repo").value.trim().toLowerCase().replace(/\.git$/, "");
   const match = GITHUB_REPO_INPUT_RE.exec(input);
-  if (!match) { policyMessage("Enter a GitHub repository as owner/repo."); return; }
+  if (!match) { policyMessage("Enter a GitHub repository as owner/repo.", true); return; }
   const entry = {"owner": match[1], "repo": match[2]};
   await publishPolicy(policy => {
     const managed = policy.managed_network_integrations;
@@ -449,7 +516,7 @@ function renderGithubApproval() {
 export async function setGithubRequireApproval(requireApproval) {
   const managed = objectValue(activeNetworkPolicy.managed_network_integrations);
   if (objectValue(managed.github).enabled !== true) {
-    policyMessage("Enable the GitHub integration before changing .github push approval.");
+    policyMessage("Enable the GitHub integration before changing .github push approval.", true);
     return;
   }
   await publishPolicy(policy => {
@@ -467,7 +534,7 @@ async function renderPendingPushes() {
     setHtml($("github-pending-pushes"), "");
     return;
   }
-  const pending = pushes.filter(push => push.status === "pending" || push.status === "resolving");
+  const pending = pushes.filter(push => push.status === "pending");
   if (!pending.length) {
     setHtml($("github-pending-pushes"), "");
     return;
@@ -475,13 +542,17 @@ async function renderPendingPushes() {
   setHtml($("github-pending-pushes"), `
     <div class="field-label"><code>.github</code> pushes awaiting approval</div>
     ${pending.map(push => `
-      <div class="manual-domain">
-        <div class="mono">${esc(push.owner)}/${esc(push.repo)} — push-${esc(push.id)} (${esc(push.status)})</div>
-        <div class="muted">${(push.ref_updates || []).map(update => esc(update.ref)).join(", ")}</div>
-        <ul>${(push.changed_paths || []).map(path => `<li class="mono">${esc(path)}</li>`).join("")}</ul>
+      <div class="pending-push">
+        <div class="pending-push-head">
+          <span class="mono">${esc(push.owner)}/${esc(push.repo)}</span>
+          <span class="muted mono">push-${esc(push.id)}</span>
+          ${badge(push.status)}
+          <span class="muted mono">${(push.ref_updates || []).map(update => esc(update.ref)).join(", ")}</span>
+        </div>
+        <ul class="pending-push-paths">${(push.changed_paths || []).map(path => `<li class="mono">${esc(path)}</li>`).join("")}</ul>
         <div class="actions">
           <button class="sm" data-action="approve-github-push" data-id="${esc(push.id)}">Approve &amp; push</button>
-          <button class="danger sm" data-action="reject-github-push" data-id="${esc(push.id)}">Reject</button>
+          <button class="danger ghost sm" data-action="reject-github-push" data-id="${esc(push.id)}">Reject</button>
         </div>
       </div>`).join("")}`);
 }
@@ -496,7 +567,7 @@ export async function approveGithubPush(id) {
     await api("POST", `/v1/network-tools/github-pending-pushes/${id}/approve`, {});
     policyMessage(`push-${id} approved and pushed.`);
   } catch (error) {
-    policyMessage(`Approve failed: ${error.message}`);
+    policyMessage(`Approve failed: ${error.message}`, true);
   }
   renderPendingPushes();
 }
@@ -507,7 +578,7 @@ export async function rejectGithubPush(id) {
     await api("POST", `/v1/network-tools/github-pending-pushes/${id}/reject`, {});
     policyMessage(`push-${id} rejected.`);
   } catch (error) {
-    policyMessage(`Reject failed: ${error.message}`);
+    policyMessage(`Reject failed: ${error.message}`, true);
   }
   renderPendingPushes();
 }
@@ -551,7 +622,7 @@ export async function recheckGithubAudit() {
     const metadata = await api("POST", "/v1/network-tools/github-audit", {});
     renderGithubAudit(metadata.repository_audits);
     policyMessage("Repository audits refreshed.");
-  } catch (error) { policyMessage(error.message); }
+  } catch (error) { policyMessage(error.message, true); }
 }
 
 export async function setGithubCredential() {
@@ -562,13 +633,13 @@ export async function setGithubCredential() {
     const installationId = $("github-app-installation-id").value.trim();
     const privateKey = $("github-app-private-key").value.trim();
     if (!appId || !installationId || !privateKey) {
-      policyMessage("App id, installation id, and private key are all required for app mode.");
+      policyMessage("App id, installation id, and private key are all required for app mode.", true);
       return;
     }
     body = {"mode": "app", "app_id": appId, "installation_id": installationId, "private_key_pem": privateKey};
   } else {
     const token = $("github-token").value.trim();
-    if (!token) { policyMessage("Enter a GitHub token first."); return; }
+    if (!token) { policyMessage("Enter a GitHub token first.", true); return; }
     body = {"mode": "pat", "token": token};
   }
   try {
@@ -576,7 +647,7 @@ export async function setGithubCredential() {
     $("github-token").value = "";
     $("github-app-private-key").value = "";
     policyMessage("GitHub credential stored.");
-  } catch (error) { policyMessage(error.message); }
+  } catch (error) { policyMessage(error.message, true); }
   await loadGithubCredential();
 }
 
@@ -584,7 +655,7 @@ export async function deleteGithubCredential() {
   try {
     await api("DELETE", "/v1/network-tools/github-credential");
     policyMessage("GitHub credential cleared.");
-  } catch (error) { policyMessage(error.message); }
+  } catch (error) { policyMessage(error.message, true); }
   await loadGithubCredential();
 }
 
@@ -621,7 +692,7 @@ export async function addDomainRule() {
   const domain = $("policy-domain").value.trim().toLowerCase();
   const methods = $("policy-methods").value.split(",").map(value => value.trim().toUpperCase()).filter(Boolean);
   const pathGuards = $("policy-path-guards").value.split("\n").map(value => value.trim()).filter(Boolean);
-  if (!domain || !methods.length) { policyMessage("Domain and at least one HTTP method are required."); return; }
+  if (!domain || !methods.length) { policyMessage("Domain and at least one HTTP method are required.", true); return; }
   const rule = {"allow_http_methods": methods};
   if (pathGuards.length) rule.path_guards = pathGuards;
   await publishPolicy(policy => {

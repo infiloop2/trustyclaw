@@ -11,12 +11,6 @@ VERSION_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 REPO_VERSION_PATH = Path(__file__).resolve().parents[1] / "VERSION"
 ROOT_VERSION_PATH = Path(os.environ.get("TRUSTYCLAW_ROOT_VERSION_PATH", "/opt/trustyclaw-host/VERSION"))
 STATE_VERSION_FILENAME = "version.json"
-# Admin state moved from JSON files into Postgres in 0.5.0, deliberately
-# without a data migration; older preserved state cannot be upgraded in place.
-# Enforced twice: in CLI preflight from the EC2 version tag hint (before the
-# existing instance is terminated) and authoritatively by bootstrap from the
-# admin disk's version.json (before preserved state is modified).
-MIN_STATE_VERSION = "0.5.0"
 
 
 def parse_version(version: str) -> tuple[int, int, int]:

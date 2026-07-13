@@ -153,17 +153,32 @@ def desktop_smoke(page, url: str) -> None:
 
     log_in(page, url)
     expect(page.locator("body")).to_contain_text("trustyclaw-mock")
-    asset_urls = page.evaluate(
-        "() => ["
-        "document.querySelector('link[rel=\"stylesheet\"]').href,"
-        "document.querySelector('link[rel=\"icon\"]').href,"
-        "document.querySelector('link[rel=\"alternate icon\"]').href,"
-        "document.querySelector('script[src]').src"
-        "]"
+    expect(page.locator("#agent-name")).to_have_text("Host: trustyclaw-mock")
+    expect(page.locator("#mobile-nav-toggle")).to_be_hidden()
+    expect(page.locator("#upgrade-notice")).to_be_visible()
+    expect(page.locator("#upgrade-notice")).to_have_attribute(
+        "aria-label", "Upgrade available: version 99.0.0. Use your operator plane to upgrade."
     )
-    if not all(f"v={VERSION}" in asset_url for asset_url in asset_urls):
-        raise AssertionError(f"admin UI assets were not versioned: {asset_urls}")
-    expect(page.locator("#agent-name")).to_have_text("Agent: trustyclaw-mock")
+    expect(page.locator("#upgrade-popover")).to_be_hidden()
+    page.locator("#upgrade-notice").hover()
+    expect(page.locator("#upgrade-popover")).to_be_visible()
+    expect(page.locator("#upgrade-popover")).to_contain_text("Upgrade available: version 99.0.0")
+    expect(page.locator("#upgrade-popover")).to_contain_text("Use your operator plane to upgrade.")
+
+    page.locator("#upgrade-notice").click()
+    expect(page.locator("#upgrade-notice")).to_have_attribute(
+        "aria-label", "Your TrustyClaw is at the latest version."
+    )
+    expect(page.locator("#upgrade-notice")).to_be_visible()
+    expect(page.locator("#upgrade-notice")).to_have_class(re.compile(r"upgrade-current"))
+    expect(page.locator("#upgrade-notice .upgrade-check")).to_be_visible()
+    expect(page.locator("#upgrade-notice .upgrade-arrow")).to_be_hidden()
+    page.locator("#upgrade-notice").hover()
+    expect(page.locator("#upgrade-popover")).to_have_text("Your TrustyClaw is at the latest version.")
+    page.locator("#upgrade-notice").click()
+    expect(page.locator("#upgrade-notice")).to_have_attribute(
+        "aria-label", "Upgrade available: version 99.0.0. Use your operator plane to upgrade."
+    )
     expect(page.locator("#panel-home")).to_be_visible()
     expect(page.locator("#health")).to_contain_text("ok")
     expect(page.locator("#health")).to_contain_text(f"runtime {VERSION}")
@@ -172,16 +187,26 @@ def desktop_smoke(page, url: str) -> None:
     expect(page.locator("#health")).to_contain_text("Admin volume")
     expect(page.locator("#health")).to_contain_text("Agent volume")
     expect(page.locator("#panel-home").get_by_role("button", name="Reboot host")).to_be_visible()
-    expect(page.locator("#runtime")).to_contain_text("codex")
-    expect(page.locator("#runtime-guidance")).to_contain_text(
-        "OpenAI provider access is disabled in the active network policy"
-    )
-    expect(page.locator("#runtime-guidance")).to_contain_text("Open Internet Access and Tools")
-    expect(page.locator("#runtime-guidance")).to_contain_text(
-        "Claude provider access is disabled in the active network policy"
-    )
+    expect(page.locator("#runtime-overview")).to_contain_text("Codex")
+    expect(page.locator("#runtime-overview")).to_contain_text("Claude Code")
+    expect(page.locator("#runtime-overview")).to_contain_text("deactivated")
+    expect(page.locator("#runtime-overview").get_by_label("Refresh provider status and usage")).to_be_visible()
+    expect(page.locator(".topbar-actions").get_by_label("Refresh provider status and usage")).to_have_count(0)
+    # Before any login there is no usage: all four rings (5h and weekly for
+    # each runtime) render the unavailable "--" form rather than 0%.
+    expect(page.locator("#runtime-overview .usage-ring.unavailable")).to_have_count(4)
+    expect(page.locator("#runtime-overview")).to_contain_text("--")
+    expect(page.locator("#panel-home").get_by_text("Agent runtimes")).to_have_count(0)
+    expect(page.locator("#panel-home").get_by_text("Provider usage")).to_have_count(0)
     expect(page.get_by_role("button", name="Start Codex login")).to_have_count(0)
     expect(page.get_by_role("button", name="Start Claude login")).to_have_count(0)
+    page.locator("#runtime-overview .runtime-summary", has_text="Codex").click()
+    expect(page.locator("#panel-network")).to_be_visible()
+    disabled_openai_row = page.locator(".integration-row", has_text="OpenAI")
+    expect(disabled_openai_row.locator(".integration-details")).to_be_visible()
+    expect(disabled_openai_row).not_to_contain_text("No account linked yet")
+    expect(disabled_openai_row).not_to_contain_text("deactivated")
+    page.get_by_role("button", name="Home").click()
 
     page.get_by_role("button", name="Agent session log", exact=True).click()
     expect(page.locator("#panel-agent")).to_be_visible()
@@ -310,6 +335,9 @@ def desktop_smoke(page, url: str) -> None:
         expect(row).to_contain_text("disabled")
         expect(row.get_by_role("button", name="Enable", exact=True)).to_be_enabled()
         expect(row.get_by_role("button", name="Disable", exact=True)).to_be_disabled()
+        expect(row.locator(".icon-tile")).to_have_count(0)
+    expect(page.locator(".integration-row", has_text="OpenAI")).not_to_contain_text("deactivated")
+    expect(page.locator(".integration-row", has_text="Claude")).not_to_contain_text("deactivated")
     github_row = page.locator(".integration-row", has_text="GitHub")
     expect(github_row.locator(".preset-with-info h2")).to_have_text("GitHub")
     expect(github_row.locator(".preset-with-info h2")).not_to_contain_text("all reads")
@@ -358,10 +386,7 @@ def desktop_smoke(page, url: str) -> None:
     page.locator(".integration-row", has_text="Claude").get_by_label("Toggle Claude details").click()
     expect(openai_row).to_contain_text("No account linked yet")
     expect(page.locator(".integration-row", has_text="Claude")).to_contain_text("No account linked yet")
-    page.once("dialog", lambda dialog: dialog.accept())
-    openai_row.get_by_role("button", name="Reset linked account").click()
-    expect(page.locator("#policy-message")).to_contain_text("OpenAI linked account reset")
-    expect(openai_row).to_contain_text("No account linked yet")
+    expect(openai_row.get_by_role("button", name="Disconnect")).to_have_count(0)
     github_row.get_by_role("button", name="Enable", exact=True).click()
     expect(page.locator("#policy-message")).to_contain_text("GitHub enabled")
     # Enabling expands the row with the repository controls.
@@ -383,6 +408,28 @@ def desktop_smoke(page, url: str) -> None:
     expect(page.locator("#github-expansion")).to_be_hidden()
     page.get_by_label("Toggle GitHub details").click()
     expect(page.locator("#github-expansion")).to_be_visible()
+    # A rejected repository input reports an error-styled message and keeps
+    # the confirmation styling for ordinary feedback.
+    page.locator("#github-repo").fill("not a repo")
+    page.get_by_role("button", name="Add write repository", exact=True).click()
+    expect(page.locator("#policy-message")).to_have_class("inline-message error")
+    expect(page.locator("#policy-message")).to_contain_text("owner/repo")
+    # The .github approval gate: enabling it holds a push (the mock simulates
+    # the agent pushing while the gate is on) for the operator to decide on.
+    page.locator("[data-action='enable-github-require-approval']").click()
+    expect(page.locator("#policy-message")).to_have_class("inline-message")
+    expect(page.locator("#policy-message")).to_contain_text(".github push approval enabled")
+    expect(page.locator("#github-require-approval-status")).to_contain_text("held for approval")
+    pending_push = page.locator("#github-pending-pushes .pending-push")
+    expect(pending_push).to_contain_text("infiloop2/trustyclaw")
+    expect(pending_push).to_contain_text(".github/workflows/deploy.yml")
+    expect(pending_push).to_contain_text("pending")
+    page.once("dialog", lambda dialog: dialog.accept())
+    pending_push.get_by_role("button", name="Approve & push").click()
+    expect(page.locator("#policy-message")).to_contain_text("approved and pushed")
+    expect(page.locator("#github-pending-pushes")).to_have_text("")
+    page.locator("[data-action='disable-github-require-approval']").click()
+    expect(page.locator("#policy-message")).to_contain_text(".github push approval disabled")
     # Disabling asks for confirmation and applies immediately.
     page.locator(".integration-row", has_text="npm packages").get_by_role("button", name="Enable", exact=True).click()
     expect(page.locator("#policy-message")).to_contain_text("npm packages enabled")
@@ -448,14 +495,18 @@ def desktop_smoke(page, url: str) -> None:
     page.get_by_role("button", name="Clear credential").click()
     expect(page.locator("#github-credential-status")).to_contain_text("No credential configured")
 
-    page.get_by_role("button", name="Home").click()
-    expect(page.locator("#panel-home")).to_be_visible()
-    expect(page.get_by_role("button", name="Start Codex login")).to_be_visible()
-    expect(page.get_by_role("button", name="Start Codex login")).to_be_enabled()
-    expect(page.get_by_role("button", name="Start Claude login")).to_be_visible()
-    expect(page.get_by_role("button", name="Start Claude login")).to_be_enabled()
+    tools_smoke(page)
+
+    # The tool OAuth callback reloads the page, so provider rows are collapsed
+    # again; reopen each account card before exercising provider login.
+    openai_row.get_by_label("Toggle OpenAI details").click()
+    expect(openai_row.get_by_role("button", name="Start Codex login")).to_be_visible()
+    expect(openai_row.get_by_role("button", name="Start Codex login")).to_be_enabled()
+    claude_row = page.locator(".integration-row", has_text="Claude")
+    claude_row.get_by_label("Toggle Claude details").click()
+    expect(claude_row.get_by_role("button", name="Start Claude Code login")).to_be_visible()
     page.get_by_role("button", name="Start Codex login").click()
-    expect(page.locator("#oauth")).to_contain_text("MOCK-CODEX")
+    expect(openai_row.locator(".provider-oauth")).to_contain_text("MOCK-CODEX")
     # The dashboard refreshes on its own 5-second poll; wait for the next one
     # rather than reaching into module internals (there is no test-only hook).
     with page.expect_response(
@@ -463,20 +514,27 @@ def desktop_smoke(page, url: str) -> None:
         timeout=8000,
     ):
         pass
-    expect(page.get_by_role("button", name="Start Codex login")).to_have_count(0)
-    expect(page.locator("#provider-accounts")).to_contain_text("acct_mock_openai")
-    expect(page.locator("#provider-accounts")).to_contain_text("akshay@infiloop.io")
-    expect(page.locator("#provider-accounts")).to_contain_text("pro")
-    expect(page.locator("#provider-accounts")).to_contain_text("5 hour: 60%")
-    expect(page.locator("#provider-accounts")).to_contain_text("weekly: 20%")
-    expect(page.locator("#provider-accounts")).to_contain_text("credits: none")
-    expect(page.locator("#provider-accounts")).to_contain_text("checked")
-
-    # The linked account surfaces in the provider's network-controls row.
-    page.get_by_role("button", name="Internet Access and Tools").click()
-    expect(page.locator(".integration-row", has_text="OpenAI")).to_contain_text("Linked account")
-    expect(page.locator(".integration-row", has_text="OpenAI")).to_contain_text("akshay@infiloop.io")
-    page.get_by_role("button", name="Home").click()
+    expect(openai_row.get_by_role("button", name="Start Codex login")).to_have_count(0)
+    expect(openai_row).to_contain_text("connected: akshay@infiloop.io")
+    expect(openai_row).to_contain_text("Connected account")
+    expect(openai_row.locator(".connection-summary")).to_be_visible()
+    expect(openai_row.locator(".connection-summary b")).to_have_count(0)
+    expect(openai_row.get_by_role("button", name="Disconnect")).to_be_visible()
+    codex_summary = page.locator("#runtime-overview .runtime-summary", has_text="Codex")
+    expect(codex_summary).to_contain_text("active")
+    expect(codex_summary).to_contain_text("8%")
+    expect(codex_summary).to_contain_text("84%")
+    # A healthy 5h window (no threshold class) beside a near-full weekly window
+    # (warning), so the mock exercises both ring states at once.
+    expect(codex_summary.locator(".usage-ring").nth(0)).not_to_have_class(re.compile(r"usage-(warning|critical)"))
+    expect(codex_summary.locator(".usage-ring").nth(1)).to_have_class(re.compile(r"usage-warning"))
+    # The reset countdown shares the single window-label line, so a summary
+    # with countdowns is exactly as tall as one without.
+    expect(codex_summary.locator(".usage-window")).to_have_text(["5h · 40m", "wk · 6d"])
+    # An active runtime is informational: the chip is a static element, not a
+    # navigating button.
+    expect(codex_summary).to_have_class(re.compile(r"is-static"))
+    expect(codex_summary).not_to_have_attribute("data-action", "open-provider")
 
     with page.expect_response(lambda response: "/v1/agent-processes" in response.url):
         page.get_by_role("button", name="Agent processes").click()
@@ -485,12 +543,19 @@ def desktop_smoke(page, url: str) -> None:
     expect(page.locator("#processes")).to_contain_text("app-server")
     expect(page.locator("#processes")).not_to_contain_text("scope")
     expect(page.locator("#processes")).not_to_contain_text("run-mock-")
-    page.get_by_role("button", name="Home").click()
+    page.get_by_role("button", name="Internet Access and Tools").click()
 
-    expect(page.get_by_role("button", name="Start Claude login")).to_be_visible()
-    expect(page.get_by_role("button", name="Start Claude login")).to_be_enabled()
-    page.get_by_role("button", name="Start Claude login").click()
-    expect(page.locator("#oauth")).to_contain_text("Claude Code login")
+    expect(claude_row.get_by_role("button", name="Start Claude Code login")).to_be_visible()
+    expect(claude_row.get_by_role("button", name="Start Claude Code login")).to_be_enabled()
+    claude_row.get_by_role("button", name="Start Claude Code login").click()
+    expect(claude_row.locator(".provider-oauth")).to_contain_text("Claude Code login")
+    # A reload must not lose the pending login: the next health poll re-shows
+    # the login card inside the expanded provider card without starting a new
+    # login.
+    page.reload()
+    page.get_by_role("button", name="Internet Access and Tools").click()
+    claude_row.get_by_label("Toggle Claude details").click()
+    expect(claude_row.locator(".provider-oauth")).to_contain_text("Claude Code login", timeout=12000)
     page.once("dialog", lambda dialog: dialog.accept("mock-code"))
     page.get_by_role("button", name="Submit code").click()
     with page.expect_response(
@@ -498,18 +563,164 @@ def desktop_smoke(page, url: str) -> None:
         timeout=8000,
     ):
         pass
-    expect(page.get_by_role("button", name="Start Claude login")).to_have_count(0)
-    expect(page.locator("#provider-accounts")).to_contain_text("acct_mock_claude")
-    expect(page.locator("#provider-accounts")).to_contain_text("claude@example.invalid")
-    expect(page.locator("#provider-accounts")).to_contain_text("max")
-    expect(page.locator("#provider-accounts")).to_contain_text("current session: 14%")
-    expect(page.locator("#provider-accounts")).to_contain_text("weekly: 31%")
-    expect(page.locator("#provider-accounts")).to_contain_text("resets Jul 7, 3:59pm (UTC)")
-    expect(page.locator("#provider-accounts")).to_contain_text("checked")
+    expect(claude_row.get_by_role("button", name="Start Claude Code login")).to_have_count(0)
+    expect(claude_row).to_contain_text("connected: claude@example.invalid")
+    expect(claude_row).to_contain_text("Connected account")
+    expect(claude_row.locator(".connection-summary b")).to_have_count(0)
+    expect(claude_row.get_by_role("button", name="Disconnect")).to_be_visible()
+    claude_summary = page.locator("#runtime-overview .runtime-summary", has_text="Claude Code")
+    expect(claude_summary).to_contain_text("97%")
+    expect(claude_summary).to_contain_text("46%")
+    # The Fable weekly window rides along as a third ring labeled "fable".
+    expect(claude_summary).to_contain_text("88%")
+    # Critical (session), healthy (weekly), and warning (Fable week) side by
+    # side: all three ring thresholds in one chip.
+    expect(claude_summary.locator(".usage-ring").nth(0)).to_have_class(re.compile(r"usage-critical"))
+    expect(claude_summary.locator(".usage-ring").nth(1)).not_to_have_class(re.compile(r"usage-(warning|critical)"))
+    expect(claude_summary.locator(".usage-ring").nth(2)).to_have_class(re.compile(r"usage-warning"))
+    expect(claude_summary.locator(".usage-window")).to_have_text(["5h · 2h", "wk · 5d", "fable · 5d"])
+    expect(claude_summary).to_have_class(re.compile(r"is-static"))
     with page.expect_response(lambda response: "/v1/agent-runtime/refresh" in response.url):
-        page.get_by_label("Refresh provider usage").click()
-    expect(page.locator("#provider-accounts")).to_contain_text("current session: 14%")
-    expect(page.locator("#provider-accounts")).to_contain_text("checked")
+        page.locator("#runtime-overview").get_by_label("Refresh provider status and usage").click()
+    expect(claude_summary).to_contain_text("97%")
+
+
+def tools_smoke(page) -> None:
+    """Tool rows on the Internet Access and Tools tab: seeded state, rows
+    collapsed by default in the managed-integration format, config set/clear,
+    enablement not gated on config, the mock OAuth connect round trip, the
+    shared info popover, approval decisions, and the Tool audit log tab."""
+    from playwright.sync_api import expect
+
+    tools = page.locator("#tools")
+    expect(tools).to_contain_text("Gmail")
+    expect(tools).to_contain_text("Google Calendar")
+    expect(tools).to_contain_text("Brave Search")
+
+    # Each tool is its own integration row, collapsed by default: the summary
+    # shows the status chips, the chevron opens connection, config, and
+    # approvals — the same format as the GitHub and OpenAI rows above.
+    gmail_row = page.locator("#tools .integration-row[data-tool-row='gmail']")
+    expect(gmail_row).to_contain_text("connected: akshay@infiloop.io")
+    expect(page.locator("#tools .icon-tile")).to_have_count(0)
+    expect(gmail_row.locator("[data-tool-details='gmail']")).to_be_hidden()
+    gmail_row.get_by_role("button", name="Toggle Gmail details").click()
+    expect(gmail_row.locator("[data-tool-details='gmail']")).to_be_visible()
+    expect(gmail_row).to_contain_text("GOOGLE_OAUTH_CLIENT_ID")
+    # The dropdown is structured like the GitHub expansion: one card per
+    # concern with a sentence-case header.
+    gmail_details = gmail_row.locator("[data-tool-details='gmail']")
+    for concern in ("Connection", "Configuration", "Approvals"):
+        expect(gmail_details.locator(".detail-card-head", has_text=concern)).to_be_visible()
+    expect(gmail_details.locator(".connection-summary")).to_be_visible()
+    expect(gmail_details.locator(".connection-summary b")).to_have_count(0)
+
+    # Per-action data policy and action details live behind the same floating
+    # info popover the managed integrations use.
+    page.get_by_label("Gmail details", exact=True).click()
+    expect(page.locator("#preset-info-popover")).to_contain_text("send_email")
+    expect(page.locator("#preset-info-popover")).to_contain_text("Queue approval")
+    # Each action shows its own data policy next to its description.
+    expect(page.locator("#preset-info-popover")).to_contain_text("reaches Google only after you approve")
+    page.get_by_label("Gmail details", exact=True).click()
+    expect(page.locator("#preset-info-popover")).to_be_hidden()
+
+    # Enablement is not gated on config: Brave Search enables even before its
+    # API key is set (its config status is visible in the expanded row).
+    brave_row = page.locator("#tools .integration-row[data-tool-row='brave_search']")
+    brave_row.get_by_role("button", name="Toggle Brave Search details").click()
+    expect(brave_row).to_contain_text("not set")
+    # An unused tool shows a plain empty state, not an empty table skeleton.
+    expect(brave_row).to_contain_text("No approvals for this tool yet.")
+    expect(brave_row.locator(".tool-approvals-table th")).to_have_count(0)
+    brave_row.get_by_role("button", name="Enable").click()
+    expect(brave_row).to_contain_text("enabled")
+    expect(brave_row).to_contain_text("not set")
+    # Setting the key afterwards flips its status; the tool stays enabled.
+    page.locator("#tool-config-brave_search-BRAVE_SEARCH_API_KEY").fill("mock-brave-key")
+    brave_row.get_by_role("button", name="Save").click()
+    expect(brave_row).to_contain_text("set")
+
+    # The OAuth connect round trip against the mock provider: disconnect, then
+    # reconnect through /oauth/callback and land back on this tab connected.
+    page.once("dialog", lambda dialog: dialog.accept())
+    gmail_row.get_by_role("button", name="Disconnect").click()
+    expect(gmail_row).to_contain_text("not connected")
+    gmail_row.get_by_role("button", name="Disable", exact=True).click()
+    expect(gmail_row).to_contain_text("disabled")
+    expect(gmail_row).not_to_contain_text("not connected")
+    expect(gmail_row.locator(".detail-card-head", has_text="Connection")).to_have_count(0)
+    gmail_row.get_by_role("button", name="Enable", exact=True).click()
+    expect(gmail_row).to_contain_text("not connected")
+    gmail_row.get_by_role("button", name="Connect").click()
+    expect(page.locator("#panel-network")).to_be_visible()
+    expect(page.locator("#notice")).to_contain_text("Connected gmail as operator@example.com")
+    expect(gmail_row).to_contain_text("connected: operator@example.com")
+
+    # The callback navigation reloaded the page, so rows are collapsed again.
+    # Approvals are per tool, an always-visible section of the expanded row:
+    # expand Gmail's, approve its pending send, and see it flip to executed.
+    expect(gmail_row.locator("[data-tool-details='gmail']")).to_be_hidden()
+    gmail_row.get_by_role("button", name="Toggle Gmail details").click()
+    gmail_approvals = gmail_row.locator(".tool-approvals")
+    expect(gmail_approvals).to_contain_text("Invoice follow-up")
+    pending_row = gmail_approvals.locator("tr", has_text="Invoice follow-up")
+    pending_row.get_by_text("exact payload").click()
+    expect(pending_row).to_contain_text("billing@acme.dev")
+    page.once("dialog", lambda dialog: dialog.accept())
+    pending_row.get_by_role("button", name="Approve").click()
+    expect(page.locator("#notice")).to_contain_text("Approved and executed")
+    expect(gmail_approvals.locator("tr", has_text="Invoice follow-up")).to_contain_text("executed")
+    expect(gmail_approvals.get_by_role("button", name="Approve")).to_have_count(0)
+
+    # Another tool's approvals live under its own row: Calendar shows only its
+    # own decisions (executed and pending), never Gmail's.
+    calendar_row = page.locator("#tools .integration-row[data-tool-row='google_calendar']")
+    calendar_row.get_by_role("button", name="Toggle Google Calendar details").click()
+    calendar_approvals = calendar_row.locator(".tool-approvals")
+    expect(calendar_approvals).to_contain_text("Team retro")
+    expect(calendar_approvals).to_contain_text("executed")
+    expect(calendar_approvals).not_to_contain_text("Invoice follow-up")
+
+    # Denial is the other terminal decision: deny the pending calendar delete
+    # and see it flip to denied with no further decision buttons.
+    deny_row = calendar_approvals.locator("tr", has_text="Quarterly planning")
+    deny_row.get_by_role("button", name="Deny").click()
+    expect(page.locator("#notice")).to_contain_text("Denied")
+    expect(calendar_approvals.locator("tr", has_text="Quarterly planning")).to_contain_text("denied")
+    expect(calendar_approvals.get_by_role("button", name="Deny")).to_have_count(0)
+
+    # The info popover also carries the operator setup guide.
+    page.get_by_label("Brave Search details", exact=True).click()
+    expect(page.locator("#preset-info-popover")).to_contain_text("Setup")
+    expect(page.locator("#preset-info-popover")).to_contain_text("api-dashboard.search.brave.com")
+    page.get_by_label("Brave Search details", exact=True).click()
+
+    # Clearing a config value: saving an empty input clears the key, and the
+    # tool stays enabled (credential state is orthogonal to enablement).
+    brave_row.get_by_role("button", name="Toggle Brave Search details").click()
+    page.locator("#tool-config-brave_search-BRAVE_SEARCH_API_KEY").fill("")
+    brave_row.get_by_role("button", name="Save").click()
+    expect(brave_row).to_contain_text("not set")
+    expect(brave_row).to_contain_text("enabled")
+
+    # Disable flips the row back to the enable state without expanding it.
+    brave_row.get_by_role("button", name="Disable").click()
+    expect(brave_row.get_by_role("button", name="Enable")).to_be_enabled()
+    expect(brave_row).to_contain_text("disabled")
+
+    # Tool events live on their own audit-log tab now, next to the network
+    # audit log, with the same paged table format.
+    with page.expect_response(lambda response: "/v1/tools/events" in response.url):
+        page.get_by_role("button", name="Tool audit log").click()
+    expect(page.locator("#panel-tool-log")).to_be_visible()
+    expect(page.locator("#panel-network")).to_be_hidden()
+    expect(page.locator("#tool-events")).to_contain_text("brave_search")
+    expect(page.locator("#tool-events")).to_contain_text("oauth_connect")
+    expect(page.locator("#tool-events")).to_contain_text("Brave Search API rejected the configured API key.")
+    expect(page.locator("#tool-page-summary")).to_contain_text("Page 1")
+    page.get_by_role("button", name="Internet Access and Tools").click()
+    expect(page.locator("#panel-network")).to_be_visible()
 
 
 def mobile_smoke(page, url: str) -> None:
@@ -519,37 +730,98 @@ def mobile_smoke(page, url: str) -> None:
     log_in(page, url)
     expect(page.locator("#panel-home")).to_be_visible()
     expect(page.locator("#health")).to_contain_text("ok")
+    expect(page.locator("#agent-name")).to_be_visible()
+    expect(page.locator("#agent-name")).to_have_text("Host: trustyclaw-mock")
+    expect(page.locator("#mobile-nav-toggle")).to_be_visible()
+    expect(page.locator("#mobile-nav-toggle")).to_have_attribute("aria-expanded", "false")
+    expect(page.locator("#upgrade-notice")).to_be_visible()
+    page.locator("#upgrade-notice").focus()
+    expect(page.locator("#upgrade-popover")).to_be_visible()
+    expect(page.locator("#nav-backdrop")).to_be_hidden()
+    # Both runtimes are active by now (the desktop pass logged them in);
+    # Claude Code carries the extra model-week ring.
+    for runtime, rings in (("Codex", 2), ("Claude Code", 3)):
+        summary = page.locator("#runtime-overview .runtime-summary", has_text=runtime)
+        expect(summary).to_be_visible()
+        expect(summary.locator(".usage-ring")).to_have_count(rings)
+        for index in range(rings):
+            expect(summary.locator(".usage-ring").nth(index)).to_be_visible()
     assert_no_horizontal_overflow(page, "home")
 
-    page.get_by_role("button", name="Agent session log", exact=True).click()
+    # The drawer closes on backdrop click, Escape, and destination selection.
+    open_mobile_navigation(page)
+    page.locator("#nav-backdrop").click(position={"x": 380, "y": 400})
+    expect(page.locator("#nav-backdrop")).to_be_hidden()
+    open_mobile_navigation(page)
+    page.keyboard.press("Escape")
+    expect(page.locator("#nav-backdrop")).to_be_hidden()
+
+    mobile_go_to(page, "Agent session log", exact=True)
     expect(page.locator("#panel-agent")).to_be_visible()
     expect(page.locator("#threads")).to_contain_text("website-redesign")
     page.locator("#threads .thread-item", has_text="website-redesign").click()
     expect(page.locator("#thread-detail")).to_contain_text("denied by policy")
     assert_no_horizontal_overflow(page, "agent")
 
-    page.get_by_role("button", name="Agent audit log").click()
+    mobile_go_to(page, "Agent audit log")
     expect(page.locator("#events")).to_contain_text("task.created")
     assert_no_horizontal_overflow(page, "agent event log")
 
-    page.get_by_role("button", name="Agent processes").click()
+    mobile_go_to(page, "Agent processes")
     expect(page.locator("#panel-processes")).to_be_visible()
     assert_no_horizontal_overflow(page, "agent processes")
 
-    page.get_by_role("button", name="Agent workspace", exact=True).click()
+    mobile_go_to(page, "Agent workspace", exact=True)
     expect(page.locator("#file-list")).to_contain_text("workspace")
     assert_no_horizontal_overflow(page, "agent workspace")
 
-    page.get_by_role("button", name="Internet Access and Tools").click()
+    mobile_go_to(page, "Internet Access and Tools")
     expect(page.locator("#panel-network")).to_be_visible()
     assert_no_horizontal_overflow(page, "internet access")
+    # Wide status chips (a connected account) must not crush the row name:
+    # the title keeps a readable width on a phone.
+    calendar_title = page.locator(".integration-row[data-tool-row='google_calendar'] h2")
+    title_box = calendar_title.bounding_box()
+    if not title_box or title_box["width"] < 60:
+        raise AssertionError(f"tool row title is crushed on a phone viewport: {title_box}")
 
-    page.get_by_role("button", name="Network audit log").click()
+    mobile_go_to(page, "Network audit log")
     expect(page.locator("#net-events")).to_contain_text("deploy.acme.dev")
     expect(page.locator("#net-events")).to_contain_text("Host is not in the allowed network policy")
     expect(page.locator("#net-event-pager")).to_contain_text("1")
     expect(page.locator("#net-event-pager")).to_contain_text("Next")
     assert_no_horizontal_overflow(page, "network audit log")
+
+    mobile_go_to(page, "Tool audit log")
+    expect(page.locator("#tool-events")).to_contain_text("oauth_connect")
+    assert_no_horizontal_overflow(page, "tool audit log")
+
+
+def open_mobile_navigation(page) -> None:
+    from playwright.sync_api import expect
+
+    page.locator("#mobile-nav-toggle").click()
+    expect(page.locator("#mobile-nav-toggle")).to_have_attribute("aria-expanded", "true")
+    expect(page.locator("#sidebar")).to_have_class(re.compile(r"mobile-open"))
+    expect(page.locator("#nav-backdrop")).to_be_visible()
+    expect(page.locator("#mobile-nav-close")).to_be_focused()
+    if page.locator(".topbar").evaluate("element => element.inert") is not True:
+        raise AssertionError("the top bar must be inert behind the open navigation drawer")
+    if page.locator("main").evaluate("element => element.inert") is not True:
+        raise AssertionError("the active page must be inert behind the open navigation drawer")
+
+
+def mobile_go_to(page, name: str, *, exact: bool = False) -> None:
+    from playwright.sync_api import expect
+
+    open_mobile_navigation(page)
+    page.locator("#sidebar").get_by_role("button", name=name, exact=exact).click()
+    expect(page.locator("#nav-backdrop")).to_be_hidden()
+    expect(page.locator("#mobile-nav-toggle")).to_have_attribute("aria-expanded", "false")
+    if page.locator(".topbar").evaluate("element => element.inert") is not False:
+        raise AssertionError("the top bar must leave inert state after the drawer closes")
+    if page.locator("main").evaluate("element => element.inert") is not False:
+        raise AssertionError("the active page must leave inert state after the drawer closes")
 
 
 def assert_no_horizontal_overflow(page, panel: str) -> None:

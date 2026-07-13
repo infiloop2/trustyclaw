@@ -18,19 +18,26 @@ import {
   refreshFiles,
 } from "./files.js";
 import { refreshAgentProcesses } from "./processes.js";
-import { agentLog, netLog, toggleNetDeniedFilter } from "./logs.js";
+import { agentLog, netLog, toolLog, toggleNetDeniedFilter } from "./logs.js";
 import {
   addDomainRule, addGithubRepo, approveGithubPush, closeIntegrationInfo, deleteGithubCredential,
-  loadPolicy, recheckGithubAudit, rejectGithubPush, removeDomainRule,
+  loadPolicy, openProvider, recheckGithubAudit, rejectGithubPush, removeDomainRule,
   removeGithubRepo, resetLinkedAccount, setGithubCredential, setGithubRequireApproval,
   setIntegrationEnabled, positionIntegrationInfo, refreshPendingGithubPushes, toggleGithubCredentialMode, toggleIntegrationExpansion,
   toggleCustomDomainAccess, toggleGithubRepoAudit, toggleIntegrationInfo,
 } from "./network.js";
+import {
+  completeToolConnect, connectTool, decideToolApproval, disconnectTool,
+  refreshExpandedToolApprovals, refreshTools, saveToolConfig, setToolEnabled,
+  toggleToolExpansion, toggleToolInfo,
+} from "./tools.js";
 
 let activeTab = "home";
 let installedApps = [];
 const appFrames = new Map();
-const staticTabs = ["home", "agent", "processes", "agent-log", "files", "network", "net-log"];
+const staticTabs = ["home", "agent", "processes", "agent-log", "files", "network", "net-log", "tool-log"];
+const MOBILE_NAV_QUERY = "(max-width: 860px)";
+let mobileNavOpen = false;
 
 function adminCookieAttributes(maxAge) {
   return `; path=/; max-age=${maxAge}; samesite=strict${location.protocol === "https:" ? "; secure" : ""}`;
@@ -49,14 +56,43 @@ function logout() {
   location.reload();
 }
 
+function setMobileNavOpen(open, restoreFocus = false) {
+  const mobile = window.matchMedia(MOBILE_NAV_QUERY).matches;
+  mobileNavOpen = mobile && open;
+  const sidebar = $("sidebar");
+  const toggle = $("mobile-nav-toggle");
+  sidebar.classList.toggle("mobile-open", mobileNavOpen);
+  sidebar.inert = mobile && !mobileNavOpen;
+  document.querySelector(".topbar").inert = mobileNavOpen;
+  document.querySelector("main").inert = mobileNavOpen;
+  $("nav-backdrop").hidden = !mobileNavOpen;
+  toggle.setAttribute("aria-expanded", String(mobileNavOpen));
+  toggle.setAttribute("aria-label", mobileNavOpen ? "Close navigation" : "Open navigation");
+  document.body.classList.toggle("nav-open", mobileNavOpen);
+  if (mobileNavOpen) {
+    $("mobile-nav-close").focus();
+  } else if (restoreFocus && mobile) {
+    toggle.focus();
+  }
+}
+
+function toggleMobileNav() {
+  setMobileNavOpen(!mobileNavOpen, mobileNavOpen);
+}
+
 function showLogin() {
+  setMobileNavOpen(false);
   $("login").hidden = false;
   $("app").hidden = true;
   $("logout-button").hidden = true;
   $("agent-name").hidden = true;
+  $("runtime-overview").hidden = true;
+  $("upgrade-notice").hidden = true;
+  $("mobile-nav-toggle").hidden = true;
 }
 
 function showTab(name) {
+  const closeDrawer = mobileNavOpen;
   activeTab = name;
   for (const tabName of staticTabs) {
     $(`tab-${tabName}`).classList.toggle("active-tab", tabName === name);
@@ -68,6 +104,7 @@ function showTab(name) {
     const panel = $(`panel-app-${app.id}`);
     if (panel) panel.hidden = !selected;
   }
+  setMobileNavOpen(false, closeDrawer);
   refreshVisibleTab(name).catch(() => {});
 }
 
@@ -76,10 +113,19 @@ async function refreshVisibleTab(name) {
     await agentLog.showFirstPage();
   } else if (name === "net-log") {
     await netLog.showFirstPage();
+  } else if (name === "tool-log") {
+    await toolLog.showFirstPage();
   } else if (name === "processes") {
     await refreshAgentProcesses();
   } else if (name === "files") {
     await ensureFilesLoaded();
+  } else if (name === "network") {
+    // Tool rows hold config inputs, so they refresh on tab entry and after
+    // actions only, never on the 5-second tick (that would wipe half-typed
+    // values). Expanded approvals carry no inputs and also refresh on the
+    // tick below.
+    await refreshTools();
+    await refreshExpandedToolApprovals();
   }
 }
 
@@ -93,6 +139,8 @@ async function tick() {
   if (activeTab === "network") await refreshOrSkip(refreshPendingGithubPushes);
   if (activeTab === "processes") await refreshOrSkip(refreshAgentProcesses);
   if (activeTab === "files") await refreshOrSkip(refreshFiles);
+  if (activeTab === "network") await refreshOrSkip(refreshExpandedToolApprovals);
+  if (activeTab === "tool-log" && toolLog.page === 1) await refreshOrSkip(() => toolLog.showFirstPage());
 }
 
 async function refreshOrSkip(work) {
@@ -109,9 +157,18 @@ function start() {
   $("login").hidden = true;
   $("app").hidden = false;
   $("logout-button").hidden = false;
-  loadApps().catch(error => notice(error.message));
+  $("mobile-nav-toggle").hidden = false;
+  $("runtime-overview").hidden = false;
+  setMobileNavOpen(false);
+  loadApps().catch(error => notice(error.message, "error"));
   renderThreadHistory();
   loadPolicy().catch(() => {});
+  // The provider redirects a tool OAuth connect back to /oauth/callback; land
+  // on the network tab and finish the token exchange the operator started.
+  if (location.pathname === "/oauth/callback") {
+    showTab("network");
+    completeToolConnect().catch(error => notice(error.message, "error"));
+  }
   tick();
   setInterval(tick, 5000);
 }
@@ -152,7 +209,7 @@ function renderAppTabs() {
     iframe.className = "app-frame";
     iframe.title = app.title || app.id;
     iframe.src = app.ui.iframe_src;
-    iframe.setAttribute("sandbox", (app.ui.sandbox || ["allow-scripts", "allow-forms"]).join(" "));
+    iframe.setAttribute("sandbox", app.ui.sandbox.join(" "));
     section.appendChild(iframe);
     panel.appendChild(section);
     main.appendChild(panel);
@@ -180,37 +237,24 @@ window.addEventListener("message", event => {
 });
 
 async function handleAppApiMessage(app, source, message) {
-  if (!["GET", "POST", "PUT", "DELETE"].includes(message.method) || typeof message.path !== "string" || !message.path.startsWith("/v1/")) {
-    throw new Error("invalid app API request");
-  }
-  const canonical = canonicalAppBridgePath(message.path);
-  if (!canonical || !isAppBridgeAllowed(app, canonical.pathname)) {
+  // Friendly pre-check only: the admin API enforces the bridge scope
+  // server-side (a bridge-tagged request outside the app's own API is 403).
+  const route = app && app.backend && app.backend.api_route;
+  if (
+    !["GET", "POST", "PUT", "DELETE"].includes(message.method) ||
+    typeof message.path !== "string" ||
+    typeof route !== "string" ||
+    !message.path.startsWith(route)
+  ) {
     throw new Error("app API route is not allowed");
   }
-  const body = await api(message.method, canonical.requestPath, message.body, { "X-TrustyClaw-App-Bridge": app.id });
+  const body = await api(message.method, message.path, message.body, { "X-TrustyClaw-App-Bridge": app.id });
   source.postMessage({
     type: "trustyclaw-app-api-result",
     request_id: String(message.request_id || ""),
     ok: true,
     body,
   }, "*");
-}
-
-function canonicalAppBridgePath(path) {
-  if (path.includes("\\")) return null;
-  let url;
-  try {
-    url = new URL(path, window.location.origin);
-  } catch (_error) {
-    return null;
-  }
-  if (url.origin !== window.location.origin || !url.pathname.startsWith("/v1/")) return null;
-  return { pathname: url.pathname, requestPath: url.pathname + url.search };
-}
-
-function isAppBridgeAllowed(app, path) {
-  const route = app && app.backend && app.backend.api_route;
-  return typeof route === "string" && path.startsWith(route);
 }
 
 document.addEventListener("click", event => {
@@ -228,7 +272,10 @@ document.addEventListener("click", event => {
   const actions = {
     "login": () => login(),
     "logout": () => logout(),
+    "toggle-mobile-nav": () => toggleMobileNav(),
+    "close-mobile-nav": () => setMobileNavOpen(false, true),
     "show-tab": () => showTab(button.dataset.tab),
+    "open-provider": () => { showTab("network"); openProvider(button.dataset.provider); },
     "start-login": () => startLogin(runtime),
     "reset-linked-account": () => resetLinkedAccount(button.dataset.provider),
     "complete-claude-login": () => completeClaudeLogin(),
@@ -259,16 +306,32 @@ document.addEventListener("click", event => {
     "toggle-net-denied": () => toggleNetDeniedFilter(),
     "net-page": () => netLog.showPage(button.dataset.page).catch(() => {}),
     "agent-page": () => agentLog.showPage(button.dataset.page).catch(() => {}),
+    "tool-page": () => toolLog.showPage(button.dataset.page).catch(() => {}),
     "approve-github-push": () => approveGithubPush(button.dataset.id),
     "reject-github-push": () => rejectGithubPush(button.dataset.id),
+    "enable-tool": () => setToolEnabled(button.dataset.tool, true),
+    "disable-tool": () => setToolEnabled(button.dataset.tool, false),
+    "save-tool-config": () => saveToolConfig(button.dataset.tool, button.dataset.key),
+    "connect-tool": () => connectTool(button.dataset.tool),
+    "disconnect-tool": () => disconnectTool(button.dataset.tool),
+    "toggle-tool-info": () => toggleToolInfo(button.dataset.tool, button),
+    "toggle-tool-expansion": () => toggleToolExpansion(button.dataset.tool),
+    "decide-approval": () => decideToolApproval(button.dataset.tool, button.dataset.approvalId, button.dataset.decision),
   };
   const handler = actions[action];
   if (handler) handler();
 });
 
 setUnauthorizedHandler(showLogin);
-document.addEventListener("keydown", event => { if (event.key === "Escape") closeIntegrationInfo(); });
-window.addEventListener("resize", positionIntegrationInfo);
+document.addEventListener("keydown", event => {
+  if (event.key !== "Escape") return;
+  closeIntegrationInfo();
+  if (mobileNavOpen) setMobileNavOpen(false, true);
+});
+window.addEventListener("resize", () => {
+  positionIntegrationInfo();
+  setMobileNavOpen(mobileNavOpen);
+});
 document.addEventListener("scroll", positionIntegrationInfo, true);
 $("github-credential-mode").addEventListener("change", toggleGithubCredentialMode);
 $("password").addEventListener("keydown", event => { if (event.key === "Enter") login(); });

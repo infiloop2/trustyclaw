@@ -192,6 +192,8 @@ def _write_runtime_code_archive(code_path: Path) -> None:
         return tarinfo
 
     with tarfile.open(code_path, "w:gz") as tar:
+        # host/ includes the bundled tool framework and packages under
+        # host/tools; the admin service imports them at startup.
         tar.add(root / "host", arcname="host", filter=runtime_only)
 
 
@@ -214,10 +216,6 @@ def _render_bootstrap(config: InputConfig) -> str:
 
 def _render_app_bootstrap(template: str) -> str:
     apps = app_platform.installed_apps()
-    registry = app_platform.app_registry()
-    missing_allocations = [app.id for app in apps if app.id not in registry]
-    if missing_allocations:
-        raise ConfigError(f"missing app registry allocation for: {', '.join(missing_allocations)}")
 
     def env_prefix(app_id: str) -> str:
         return app_id.upper()
@@ -226,13 +224,11 @@ def _render_app_bootstrap(template: str) -> str:
         return f"APP_{env_prefix(app_id)}_PORT"
 
     uid_lines = [
-        "# Installed app service users use the reserved static range 48000-48099.",
-        "# Add new apps to host/apps/registry.json; keep existing UID/GID values",
-        "# unchanged across upgrades and update the deploy invariant test.",
+        "# App package host_slot values generate stable UID/GID assignments in",
+        "# the reserved 48000-48099 range. Existing slots must not change.",
     ]
     port_lines = [
-        "# App ports are host-owned static assignments from host/apps/registry.json.",
-        "# Add new apps there so bootstrap provisioning and /v1/apps stay aligned.",
+        "# App ports are generated from the same package-local host_slot values.",
     ]
     ensure_group_lines: list[str] = []
     ensure_user_lines: list[str] = []
@@ -246,7 +242,7 @@ def _render_app_bootstrap(template: str) -> str:
     enable_start_lines: list[str] = []
 
     for app in apps:
-        allocation = registry[app.id]
+        allocation = app.allocation
         env = env_prefix(app.id)
         backend_entrypoint = app.backend_entrypoint.relative_to(app.package_dir)
         port = port_name(app.id)

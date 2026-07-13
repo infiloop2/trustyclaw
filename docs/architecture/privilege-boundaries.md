@@ -2,22 +2,24 @@
 
 | User | Purpose | Privileges |
 | --- | --- | --- |
-| `trustyclaw-operator` | Human SSH login. | Full passwordless sudo. |
-| `trustyclaw-admin` | Runs the admin API; owns admin state (the `trustyclaw_admin` database role). | sudo for exactly nine root helpers (below). |
-| `trustyclaw-proxy` | Runs the policy proxy; owns proxy policy/log/CA files. | No sudo, no database role. Only nftables-approved DNS and TCP 80/443 egress. |
+| `trustyclaw-operator` | Human SSH login. | Full passwordless sudo, and therefore intentionally equivalent to root once logged in. |
+| `trustyclaw-admin` | Runs the admin API; owns admin state (the `trustyclaw_admin` database role, full access). | sudo for exactly eleven root helpers (below). No internet egress at all. |
+| `trustyclaw-tools` | Runs the bundled tool packages in the dedicated tools service; owns the agent-facing tools socket. | No sudo. Postgres role scoped to the five tool tables plus read access to `secret_keys`. DNS and outbound HTTPS (443) for tool third-party APIs. |
+| `trustyclaw-proxy` | Runs the policy proxy; owns proxy TLS and Git quarantine files. | No sudo. A narrow Postgres role reads enforcement inputs and the working token/key, inserts network and pending-push records, and prunes network events. Only nftables-approved DNS and TCP 80/443 egress. |
 | `trustyclaw-agent` | Runs Codex and Claude Code runtime processes. | None. No sudo, no direct network, no database role. |
-| `trustyclaw-app-<app_id>` | Runs one installed app backend and owns that app's derived Postgres schema, `app_<app_id>`. | No sudo and no host database role. May answer established admin API reverse-proxy connections on its assigned loopback app port; host admin and Postgres calls use peer-authenticated Unix sockets. Cannot initiate arbitrary TCP loopback or external network connections. |
+| `trustyclaw-app-<app_id>` | Runs one installed app backend and owns that app's derived Postgres schema, `app_<app_id>`. | No sudo. Its matching Postgres role is confined to the app schema and has no host-table grants. It may answer established admin reverse-proxy connections on its assigned loopback port and call allowlisted host routes over the peer-authenticated app socket, but cannot initiate arbitrary TCP loopback or external connections. |
 | `cloudflared` | Runs the optional Cloudflare Tunnel connector. | No sudo, no database role. Only nftables-approved DNS, TCP 443, and TCP/UDP 7844 egress. |
 | `postgres` | Runs the admin-state Postgres. | Database superuser over the local socket; no sudo, no network egress. |
 
 The service accounts use fixed numeric IDs: `trustyclaw-admin` is
 `47741`, `trustyclaw-proxy` is `47742`, `trustyclaw-agent` is `47743`,
-`cloudflared` is `47744`, and `postgres` is `47745` (created by bootstrap
-before the PostgreSQL packages would assign a dynamic id). Installed app service
+`cloudflared` is `47744`, `postgres` is `47745` (created by bootstrap
+before the PostgreSQL packages would assign a dynamic id), and
+`trustyclaw-tools` is `47746`. Installed app service
 users use the reserved UID/GID range `48000-48099`, matching the 100-app
-registry cap. The app manifest does not choose numeric IDs. The root-owned
-`host/apps/registry.json` allocation maps each app id to a stable UID/GID in
-that range, and bootstrap creates `trustyclaw-app-<app_id>` from that registry.
+cap. Each app package declares one stable `host_slot`; the host generates the
+UID and GID as `48000 + host_slot` and creates
+`trustyclaw-app-<app_id>` from the validated package list.
 Stable IDs keep durable EBS ownership — including the preserved Postgres data
 directory and app-owned schemas/files — valid when the root volume and
 `/etc/passwd` are replaced.
@@ -39,7 +41,7 @@ guards. If a helper or sudoers entry were writable by a service user, that user
 could turn the sudo rule into arbitrary root execution, so these files stay on
 the root volume as root-owned code.
 
-`trustyclaw-admin`'s sudoers entry allows only nine fixed helpers in
+`trustyclaw-admin`'s sudoers entry allows only eleven fixed helpers in
 `/usr/local/lib/trustyclaw-host/`:
 
 - `reboot-host` — runs `systemctl reboot`.
@@ -58,10 +60,13 @@ the root volume as root-owned code.
 - `read-agent-file` — demotes to `trustyclaw-agent`, confines paths to
   `agent-home`, rejects symlinks, bounds directory scan work, and lists
   directories or returns bounded text previews.
+- `check-for-upgrade` — fetches only the public
+  `infiloop2/trustyclaw` main-branch `VERSION` file over HTTPS, with strict
+  connection, transfer-time, and response-size limits. It accepts no input.
 - `mint-github-app-token` — mints a short-lived, installation-wide GitHub App
   token from an App id, installation id, and private key piped on stdin. It
-  runs as root because only root (besides the proxy) has outbound network
-  access; the key only ever moves through pipes (admin stdin in, openssl
+  runs as root because the admin service has no outbound network access; the
+  key only ever moves through pipes (admin stdin in, openssl
   stdin on) and nothing is persisted.
 - `audit-github-repo` — fetches the per-repository facts behind the operator
   warnings with a token piped on stdin, the same shape as the mint helper:
@@ -73,8 +78,9 @@ the root volume as root-owned code.
 
 Network policy, provider account pins, and network events need no helpers:
 they are database tables the admin service (schema owner) writes after
-validation and the proxy's narrow database role can only read (plus insert on
-its own event table). The GitHub credential is also a database table — admin-owned
+validation. The proxy's narrow database role reads enforcement inputs,
+inserts and prunes its own events, and inserts held-push records. The GitHub
+credential is also an admin-owned database table
 with no proxy grant; the admin service publishes only the short-lived working
 token to the proxy-readable `proxy_github_token` row, and the proxy injects
 it into policy-approved GitHub requests. The agent never holds the credential
@@ -82,11 +88,27 @@ it into policy-approved GitHub requests. The agent never holds the credential
 audit, and approved push replay cross privilege boundaries through the helpers
 above.
 
+The tools socket (`/run/trustyclaw-tools/tools.sock`) is the deliberate crossing
+from the agent to the tools service: the harnesses spawn the MCP shim as
+`trustyclaw-agent`, and the `trustyclaw-tools`-owned socket service accepts only
+the `trustyclaw-agent` and `trustyclaw-admin` uids by kernel peer credentials
+(`SO_PEERCRED`). The agent gets exactly the enabled tools' actions; the admin
+service uses the same socket (admin uid, `/operator/...` routes) to delegate the
+operator operations that need the tools service's egress. Tool secrets and
+approval decisions stay in Postgres, reachable by the scoped `trustyclaw-tools`
+role and the admin role but not the agent, and approval-gated actions still
+require the operator's decision in the admin UI.
+
 Admin state adds one more boundary with the same shape: the database accepts
-Unix-socket connections only, authenticated by OS identity (`peer`), with roles
-for exactly `trustyclaw-admin` and `postgres` and an explicit reject for
-everyone else — so the agent and proxy users cannot read or write admin state
-even though the socket path is technically reachable. Operators inspect it with
+Unix-socket connections only, authenticated by OS identity (`peer`), with a role
+for `trustyclaw-admin` (full admin state), narrowly scoped roles for
+`trustyclaw-proxy` (enforcement inputs, working events/pushes, and its token)
+and `trustyclaw-tools` (the five tool tables plus the shared encryption key),
+per-app roles confined to their schemas, `postgres` for operators, and an
+explicit reject for everyone else, so
+the agent user cannot read or write admin state, and a compromised tools or proxy
+service reaches only its granted tables, even though the socket path is
+technically reachable. Operators inspect it with
 `sudo -u postgres psql trustyclaw_admin`.
 
 `trustyclaw-agent` has no sudo, no login shell, and is in no privileged group,
@@ -103,5 +125,6 @@ When Cloudflare Access operator access is configured, `cloudflared` is a
 separate unprivileged service user with no sudo and no access to admin, proxy,
 or agent durable state. Its only TrustyClaw secret is the root-volume tunnel
 token file `/etc/trustyclaw/cloudflared.token`, owned `root:cloudflared` and
-mode `0640`; this lets the connector read the token without exposing it to the
-admin API, proxy, agent, or SSH operator users.
+mode `0640`; this lets the connector read the token without exposing it
+directly to the admin API, proxy, or agent. The SSH operator can read it only
+by deliberately using its unrestricted sudo authority.

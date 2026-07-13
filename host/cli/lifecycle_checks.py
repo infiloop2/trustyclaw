@@ -7,7 +7,7 @@ from host.cli import lifecycle_aws
 from host.cli.lifecycle_constants import VERSION_TAG_KEY
 from host.cli.lifecycle_logging import _log
 from host.cli.lifecycle_types import LifecycleCommand
-from host.version import MIN_STATE_VERSION, compare_versions
+from host.version import compare_versions
 
 
 def _validate_command_preflight(
@@ -92,16 +92,6 @@ def _version_hint_error(
     target_version: str,
     comparison: int,
 ) -> str | None:
-    try:
-        if compare_versions(version, MIN_STATE_VERSION) < 0:
-            # Refusing here keeps the running host untouched; bootstrap's own
-            # floor check would only fire after the instance was replaced.
-            return (
-                f"its admin state predates the Postgres storage introduced in {MIN_STATE_VERSION} "
-                "and cannot be upgraded in place; deploy a fresh host for this version"
-            )
-    except ValueError:
-        pass  # invalid tags are rejected by the caller with their own message
     if command.mode == "upgrade":
         if comparison >= 0:
             return (

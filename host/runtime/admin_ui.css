@@ -21,6 +21,15 @@
   --warn-soft: rgba(232, 194, 104, 0.12);
   --ok: #5fd6a2;
   --ok-soft: rgba(95, 214, 162, 0.13);
+  /* Muted usage-ring palette: desaturated so the small top-bar rings sit
+     quietly in the dark UI while keeping ok/warning/critical distinct. */
+  --usage-ok: #5aa89d;
+  --usage-warn: #c2a566;
+  --usage-critical: #cc8494;
+  /* Muted azure for the running-tasks badge, drawn from the logo's blue
+     (#3f9df8 / #46b4ff) so it reads blue, not purple; desaturated to sit
+     quietly with the muted rings. */
+  --running-badge: #5286b0;
   --radius: 14px;
   --radius-sm: 9px;
   --font-ui: "Inter", "SF Pro Text", -apple-system, "Segoe UI", system-ui, sans-serif;
@@ -45,7 +54,7 @@ body {
   line-height: 1.55;
   margin: 0;
   min-height: 100vh;
-  padding-top: 3.5rem;
+  padding-top: 3.4rem;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -72,11 +81,12 @@ body {
   backdrop-filter: blur(12px);
   background: rgba(10, 13, 19, 0.75);
   border-bottom: 1px solid var(--border);
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  gap: 0.65rem;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   left: 0;
-  min-height: 3.5rem;
-  padding: 0.55rem clamp(1rem, 3vw, 2rem);
+  min-height: 3.4rem;
+  padding: 0.28rem clamp(1rem, 3vw, 2rem);
   position: fixed;
   right: 0;
   top: 0;
@@ -117,6 +127,213 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.runtime-overview {
+  align-items: center;
+  display: flex;
+  gap: 0.45rem;
+  justify-content: center;
+  min-width: 0;
+}
+
+.runtime-refresh { flex: 0 0 auto; }
+
+.runtime-summary {
+  align-items: center;
+  background: rgba(16, 21, 29, 0.85);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  color: var(--text);
+  display: flex;
+  gap: 0.55rem;
+  justify-content: space-between;
+  min-width: 10.8rem;
+  padding: 0.16rem 0.42rem 0.16rem 0.55rem;
+  position: relative;
+}
+
+button.runtime-summary:hover {
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+}
+
+/* An active or logging-in runtime is informational only; it does not act as a
+   link, so it gets no pointer affordance. */
+.runtime-summary.is-static { cursor: default; }
+
+/* Count of in-flight tasks, pinned to the chip's top-left corner (over the
+   provider name, clear of the usage rings on the right). */
+.runtime-running-badge {
+  align-items: center;
+  background: var(--running-badge);
+  border: 1px solid var(--surface-1);
+  border-radius: 999px;
+  color: #f2f5fb;
+  display: flex;
+  font-family: var(--font-mono);
+  font-size: 0.5rem;
+  font-weight: 700;
+  justify-content: center;
+  left: -7px;
+  letter-spacing: 0.02em;
+  line-height: 1;
+  padding: 0.12rem 0.36rem;
+  position: absolute;
+  top: -7px;
+}
+
+.runtime-summary-name {
+  align-items: center;
+  display: flex;
+  gap: 0.42rem;
+  min-width: 0;
+}
+
+.runtime-summary-copy { display: grid; font-size: 0.76rem; font-weight: 650; line-height: 1.15; min-width: 0; text-align: left; }
+
+.runtime-state {
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 0.58rem;
+  font-weight: 500;
+  max-width: 7rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-transform: lowercase;
+  white-space: nowrap;
+}
+
+.runtime-status-dot {
+  background: var(--text-dim);
+  border: 0;
+  border-radius: 999px;
+  box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.08);
+  flex: 0 0 auto;
+  height: 7px;
+  width: 7px;
+}
+
+.runtime-status-dot.active { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+.runtime-status-dot.awaiting_login { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
+.runtime-status-dot.error { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
+
+/* Labels are wider than the rings, so the gap keeps neighboring window
+   labels from reading as one line. */
+.runtime-usage { align-items: center; display: flex; flex: 0 0 auto; gap: 0.7rem; }
+
+.usage-ring { align-items: center; color: var(--text-dim); display: grid; font-family: var(--font-mono); font-size: 0.55rem; justify-items: center; line-height: 1; }
+
+.usage-ring svg { height: 25px; overflow: visible; width: 25px; }
+
+.usage-ring circle { fill: none; stroke-width: 3; transform: rotate(-90deg); transform-origin: center; }
+
+.usage-ring-track { stroke: var(--surface-3); }
+.usage-ring-value { stroke: var(--usage-ok); stroke-linecap: round; }
+.usage-ring.usage-warning { color: var(--usage-warn); }
+.usage-ring.usage-warning .usage-ring-value { stroke: var(--usage-warn); }
+.usage-ring.usage-critical { color: var(--usage-critical); }
+.usage-ring.usage-critical .usage-ring-value { stroke: var(--usage-critical); }
+.usage-ring.unavailable .usage-ring-value { stroke: transparent; }
+
+.usage-ring text {
+  dominant-baseline: central;
+  fill: var(--text);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  text-anchor: middle;
+}
+
+.usage-ring.usage-warning text { fill: var(--usage-warn); }
+.usage-ring.usage-critical text { fill: var(--usage-critical); }
+/* Exactly one label line per ring (window plus optional reset countdown), so
+   the ring block height never changes with the data. */
+.usage-window { font-size: 0.5rem; margin-top: 0.1rem; white-space: nowrap; }
+
+.topbar-actions { align-items: center; display: flex; gap: 0.35rem; justify-content: flex-end; }
+
+.upgrade-notice {
+  align-items: center;
+  background: var(--ok-soft);
+  border: 1px solid rgba(95, 214, 162, 0.34);
+  border-radius: 999px;
+  color: var(--ok);
+  display: inline-flex;
+  height: 1.65rem;
+  justify-content: center;
+  position: relative;
+  transition: background 0.15s ease, border-color 0.15s ease;
+  width: 1.65rem;
+}
+
+.upgrade-notice.upgrade-available .upgrade-check { display: none; }
+.upgrade-notice.upgrade-current .upgrade-arrow { display: none; }
+.upgrade-notice:hover { background: rgba(95, 214, 162, 0.2); border-color: rgba(95, 214, 162, 0.55); }
+.upgrade-notice:focus-visible { outline: 2px solid var(--ok); outline-offset: 1px; }
+.upgrade-notice svg { display: block; flex: 0 0 auto; }
+
+.upgrade-popover {
+  background: var(--surface-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  color: var(--text);
+  display: grid;
+  font-size: 0.78rem;
+  gap: 0.18rem;
+  line-height: 1.35;
+  opacity: 0;
+  padding: 0.58rem 0.68rem;
+  pointer-events: none;
+  position: absolute;
+  right: 0;
+  top: calc(100% + 0.48rem);
+  transform: translateY(-0.2rem);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  visibility: hidden;
+  white-space: nowrap;
+  z-index: 130;
+}
+
+.upgrade-popover > span { color: var(--text-dim); }
+.upgrade-notice:hover .upgrade-popover, .upgrade-notice:focus .upgrade-popover { opacity: 1; transform: translateY(0); visibility: visible; }
+button.mobile-nav-toggle.icon-button, .sidebar-mobile-head, .nav-backdrop { display: none; }
+
+/* ---------- Notice toast ---------- */
+
+/* One floating line for confirmations and failures; sits above the topbar
+   border so it never shifts page content. */
+#notice {
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  box-shadow: var(--shadow);
+  color: var(--text);
+  font-size: 0.86rem;
+  left: 50%;
+  max-width: min(44rem, calc(100vw - 2rem));
+  padding: 0.5rem 1rem 0.5rem 0.85rem;
+  position: fixed;
+  top: 4.1rem;
+  transform: translateX(-50%);
+  z-index: 120;
+}
+
+#notice::before {
+  background: var(--accent);
+  border-radius: 999px;
+  content: "";
+  display: inline-block;
+  height: 7px;
+  margin-right: 0.5rem;
+  vertical-align: 1px;
+  width: 7px;
+}
+
+#notice:empty { display: none; }
+
+#notice.error { border-color: rgba(240, 112, 138, 0.45); color: var(--danger); }
+
+#notice.error::before { background: var(--danger); }
 
 /* ---------- Login ---------- */
 
@@ -180,7 +397,7 @@ main { min-width: 0; }
   flex-direction: column;
   gap: 0.15rem;
   position: sticky;
-  top: 4rem;
+  top: 4.85rem;
 }
 
 .tab-button {
@@ -407,33 +624,6 @@ h2 {
 .meter.hot::-webkit-progress-value { background: linear-gradient(90deg, var(--warn), var(--danger)); }
 .meter.hot::-moz-progress-bar { background: linear-gradient(90deg, var(--warn), var(--danger)); }
 
-/* ---------- Runtime cards ---------- */
-
-.runtime-grid {
-  display: grid;
-  gap: 0.7rem;
-  grid-template-columns: repeat(auto-fill, minmax(min(15rem, 100%), 1fr));
-}
-
-.runtime-card {
-  align-items: center;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  display: flex;
-  gap: 0.8rem;
-  justify-content: space-between;
-  padding: 0.8rem 0.95rem;
-}
-
-.runtime-card .name { font-weight: 600; }
-
-.runtime-card .sub {
-  color: var(--text-dim);
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
-}
-
 .task-events-inline {
   border-top: 1px solid var(--border);
   margin-top: 0.8rem;
@@ -564,9 +754,71 @@ button.danger:hover { background: var(--danger-soft); border-color: var(--danger
 
 button.danger.ghost { background: transparent; }
 
+/* Enable/Disable render as one joined pair of actions: the applicable action
+   is a live button, the inapplicable one is inert. The neighbouring status
+   chip is what states enabled/disabled, so neither side reads as a state. */
+.seg {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  overflow: hidden;
+  padding: 2px;
+}
+
+.seg button {
+  background: transparent;
+  border: 0;
+  border-radius: calc(var(--radius-sm) - 3px);
+  color: var(--text);
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.26rem 0.7rem;
+}
+
+.seg button + button { margin-left: 2px; }
+
+.seg button:hover { background: var(--surface-3); color: var(--accent); }
+
+.seg button:active { transform: none; }
+
+.seg button:disabled {
+  background: transparent;
+  color: var(--text-dim);
+  opacity: 0.55;
+}
+
+/* ---------- Integration & tool rows ---------- */
+
 .preset-with-info { align-items: center; display: inline-flex; gap: 0.3rem; }
 
-.integration-title h2 { margin: 0; }
+/* Row names are entity names, not section labels. */
+.integration-title { display: grid; gap: 0.1rem; min-width: 0; }
+
+.integration-title h2 {
+  color: var(--text);
+  font-size: 0.95rem;
+  font-weight: 650;
+  letter-spacing: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-transform: none;
+  white-space: nowrap;
+}
+
+.integration-subtitle {
+  color: var(--text-dim);
+  font-size: 0.78rem;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The expanded dropdown opens with the full description, so the trimmed
+   summary line bows out instead of duplicating it. */
+.integration-row.expanded .integration-subtitle { display: none; }
 
 #managed-integrations {
   display: grid;
@@ -576,14 +828,27 @@ button.danger.ghost { background: transparent; }
 .integration-row {
   display: grid;
   gap: 0.65rem;
+  padding: 0.75rem 0.95rem;
+  transition: border-color 0.15s ease;
 }
+
+.integration-row:hover { border-color: var(--border-strong); }
 
 .integration-summary {
   align-items: center;
   display: grid;
   gap: 0.55rem;
+  grid-template-areas: "chevron title chips actions";
   grid-template-columns: auto minmax(0, 1fr) auto auto;
 }
+
+.integration-summary .integration-chevron { grid-area: chevron; }
+
+.integration-summary .integration-title { grid-area: title; }
+
+.integration-summary .status-chips { grid-area: chips; }
+
+.integration-summary .integration-actions { grid-area: actions; }
 
 .integration-row .preset-with-info { min-width: 0; }
 
@@ -592,20 +857,64 @@ button.integration-chevron {
   min-width: 34px;
 }
 
-.integration-chevron svg { transform: rotate(0deg); }
+.integration-chevron svg { transform: rotate(0deg); transition: transform 0.15s ease; }
 
 .integration-chevron[aria-expanded="true"] svg { transform: rotate(90deg); }
 
 .integration-actions { display: inline-flex; flex-wrap: wrap; gap: 0.4rem; justify-content: flex-end; }
 
+/* The enabled/connected chips share one summary-grid cell. */
+.status-chips {
+  align-items: center;
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  justify-content: flex-end;
+}
+
 .integration-details {
   border-top: 1px solid var(--border);
   display: grid;
-  gap: 0.55rem;
-  padding: 0.7rem 0 0.1rem 2.55rem;
+  gap: 0.65rem;
+  padding: 0.75rem 0 0.1rem 5.05rem;
 }
 
 .integration-details[hidden] { display: none; }
+
+.integration-details > p { margin: 0; }
+
+/* Every concern inside a dropdown is one card with a sentence-case header:
+   the same pattern for the GitHub expansion and for every tool row. */
+.detail-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.75rem 0.85rem;
+}
+
+.detail-card-head {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.75rem;
+  justify-content: space-between;
+  min-height: 1.6rem;
+}
+
+.detail-card-head h3 {
+  color: var(--text);
+  font-size: 0.84rem;
+  font-weight: 650;
+  margin: 0;
+}
+
+.detail-card-head h3 code { color: var(--text-dim); font-size: 0.9em; }
+
+.detail-card > p { margin: 0; }
+
+.detail-card .muted { font-size: 0.82rem; }
 
 /* The provider's linked-account line lives inside that provider's dropdown. */
 .integration-account {
@@ -617,32 +926,34 @@ button.integration-chevron {
 
 .integration-account p { flex: 1 1 16rem; margin: 0; }
 
-/* The GitHub dropdown's expansion: two cards (write repositories with per-repo
-   audit warnings, and the credential) attached under the integration card. */
-.integration-expansion {
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-left: 2px solid var(--accent);
-  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
-  display: grid;
-  gap: 0.6rem;
-  margin: 0;
-  padding: 0.7rem 0.85rem;
+.connection-summary {
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  font-weight: 450;
 }
 
-.expansion-card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+.connection-identity { color: var(--text-dim); font-family: var(--font-mono); font-weight: 550; }
+
+.provider-account-actions { align-items: center; display: inline-flex; flex-wrap: wrap; gap: 0.45rem; }
+
+.provider-error { color: var(--danger); font-size: 0.82rem; }
+
+.provider-oauth:empty { display: none; }
+
+/* The GitHub dropdown's expansion: sibling cards (credential, .github push
+   approval, write repositories) below the integration description. */
+.integration-expansion {
   display: grid;
-  gap: 0.5rem;
-  padding: 0.7rem 0.85rem;
+  gap: 0.65rem;
+  margin: 0;
+  padding: 0;
 }
 
 #github-repo-controls { display: grid; gap: 0.5rem; }
-.repo-add-row { display: flex; gap: 0.5rem; }
-.repo-add-row input { flex: 1; }
-.approval-controls { align-items: center; display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.repo-add-row { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.repo-add-row input { flex: 1 1 12rem; }
+
+#github-repos { display: grid; }
 
 .repo-entry {
   border-top: 1px solid var(--border);
@@ -651,29 +962,62 @@ button.integration-chevron {
   padding: 0.5rem 0;
 }
 .repo-entry:first-child { border-top: none; padding-top: 0; }
-.repo-head { align-items: center; display: flex; gap: 0.6rem; }
-.repo-head .repo-remove { margin-left: auto; }
-.repo-audit-details { margin-left: 2.55rem; }
+.repo-head {
+  align-items: center;
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+}
+.repo-head .mono { min-width: 0; overflow-wrap: anywhere; }
+.repo-audit-details { display: grid; gap: 0.35rem; margin-left: 2.7rem; }
 .repo-entry .audit-banner { margin: 0; }
 .audit-banner.muted { color: var(--text-dim); }
 
+/* Held .github pushes awaiting the operator's decision. */
+.pending-push {
+  background: var(--surface-2);
+  border: 1px solid rgba(232, 194, 104, 0.3);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.6rem 0.75rem;
+}
+
+.pending-push-head {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.6rem;
+}
+
+.pending-push-paths {
+  display: grid;
+  gap: 0.15rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.pending-push-paths li { font-size: 0.8rem; }
+
 .credential-current {
   align-items: center;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
   display: flex;
-  gap: 0.6rem;
-  justify-content: space-between;
-  padding: 0.5rem 0.7rem;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.8rem;
 }
+
+.credential-current > span { flex: 1 1 16rem; }
+
 .credential-set {
   border-top: 1px dashed var(--border);
   display: grid;
   gap: 0.5rem;
   margin-top: 0.2rem;
-  padding-top: 0.6rem;
+  padding-top: 0.65rem;
 }
+
+#github-app-fields { display: grid; gap: 0.5rem; }
 
 .audit-banner {
   border: 1px solid var(--border);
@@ -692,6 +1036,7 @@ button.integration-chevron {
 button.info-button {
   border-radius: 999px;
   color: var(--text-dim);
+  flex: 0 0 auto;
   font-family: var(--font-mono);
   font-size: 0.72rem;
   height: 1.55rem;
@@ -715,16 +1060,23 @@ button.info-button[aria-expanded="true"] {
   max-height: min(70vh, 34rem);
   max-width: calc(100vw - 1.5rem);
   overflow: auto;
-  padding: 0.7rem 0.8rem;
+  overscroll-behavior: contain;
+  padding: 0.85rem 0.95rem;
   position: fixed;
   z-index: 60;
 }
 
-.info-popover h3 { font-size: 0.85rem; margin: 0 0 0.45rem; }
+.info-popover h3 { font-size: 0.84rem; margin: 0 0 0.45rem; }
+
+.info-popover h3 + p { margin-top: 0; }
+
+.info-popover > :last-child { margin-bottom: 0; }
 
 .info-popover table { margin: 0; }
 
-.info-popover td { font-size: 0.78rem; padding: 0.25rem 0.4rem; }
+.info-popover td { font-size: 0.78rem; padding: 0.3rem 0.4rem; }
+
+.info-popover .setup-guide { font-size: 0.8rem; margin: 0 0 0.8rem; }
 
 /* ---------- Forms ---------- */
 
@@ -896,30 +1248,7 @@ button.thread-item.selected {
   font-size: 0.82rem;
 }
 
-/* ---------- Runtime guidance & oauth ---------- */
-
-.runtime-guidance-list { display: grid; gap: 0.55rem; margin: 0.85rem 0 0; }
-
-/* Quiet advisory line, not an alert box: this state is routine on a fresh host. */
-.runtime-guidance {
-  align-items: center;
-  border-left: 2px solid var(--warn);
-  color: var(--text-dim);
-  display: flex;
-  flex-wrap: wrap;
-  font-size: 0.8rem;
-  gap: 0.25rem 0.8rem;
-  justify-content: space-between;
-  padding: 0.1rem 0 0.1rem 0.8rem;
-}
-
-.runtime-guidance p { flex: 1 1 18rem; margin: 0; }
-
-.runtime-guidance .actions { margin: 0; }
-
-#oauth { margin-top: 0.85rem; }
-
-#oauth:empty { margin-top: 0; }
+/* ---------- Provider OAuth ---------- */
 
 .oauth-card {
   align-items: center;
@@ -933,16 +1262,6 @@ button.thread-item.selected {
 }
 
 .oauth-card b { font-family: var(--font-mono); }
-
-.manual-domain {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  display: grid;
-  gap: 0.5rem;
-  margin-top: 1.1rem;
-  padding: 0.85rem;
-}
 
 .custom-domain-card { margin-top: 0; }
 
@@ -1017,6 +1336,7 @@ button.file-entry:hover { color: var(--accent); }
   font-family: var(--font-mono);
   font-size: 0.72rem;
   line-height: 1.5;
+  max-width: 100%;
   padding: 0.08rem 0.6rem;
   white-space: nowrap;
 }
@@ -1025,11 +1345,22 @@ button.file-entry:hover { color: var(--accent); }
   background: currentColor;
   border-radius: 999px;
   content: "";
+  flex: 0 0 auto;
   height: 6px;
   width: 6px;
 }
 
-.ok, .active, .completed, .allowed, .enabled {
+/* Long chip values (a connected account, a repository) trim instead of
+   pushing the summary grid wider than the row. */
+.chip-label {
+  max-width: min(14rem, 38vw);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ok, .active, .completed, .allowed, .enabled, .executed, .connected, .status.set {
   background: var(--ok-soft);
   border-color: rgba(95, 214, 162, 0.35);
   color: var(--ok);
@@ -1041,7 +1372,7 @@ button.file-entry:hover { color: var(--accent); }
   color: var(--text-dim);
 }
 
-.degraded, .awaiting_login, .queued, .running, .mismatch, .warning {
+.degraded, .awaiting_login, .queued, .running, .mismatch, .warning, .pending, .pending_approval, .resolving {
   background: var(--warn-soft);
   border-color: rgba(232, 194, 104, 0.35);
   color: var(--warn);
@@ -1053,13 +1384,13 @@ button.file-entry:hover { color: var(--accent); }
   50% { opacity: 0.25; }
 }
 
-.error, .failed, .denied, .critical {
+.error, .failed, .denied, .critical, .rejected {
   background: var(--danger-soft);
   border-color: rgba(240, 112, 138, 0.35);
   color: var(--danger);
 }
 
-.loading, .cancelled, .deactivated, .unknown {
+.loading, .cancelled, .deactivated, .unknown, .disconnected, .status.cleared, .expired {
   background: rgba(148, 163, 184, 0.1);
   border-color: rgba(148, 163, 184, 0.3);
   color: var(--text-dim);
@@ -1073,7 +1404,23 @@ td.time { font-size: 0.78rem; white-space: nowrap; }
 
 .mono { font-family: var(--font-mono); overflow-wrap: anywhere; }
 
-.inline-message { color: var(--danger); font-size: 0.85rem; min-height: 1.2em; }
+/* Inline feedback: confirmations by default, failures with .error. */
+.inline-message { color: var(--text-dim); font-size: 0.85rem; min-height: 1.2em; }
+
+.inline-message::before {
+  background: var(--accent);
+  border-radius: 999px;
+  content: "";
+  display: inline-block;
+  height: 6px;
+  margin-right: 0.45rem;
+  vertical-align: 1px;
+  width: 6px;
+}
+
+.inline-message.error { color: var(--danger); }
+
+.inline-message.error::before { background: var(--danger); }
 
 .inline-message:empty { display: none; }
 
@@ -1085,7 +1432,15 @@ pre {
   white-space: pre-wrap;
 }
 
-pre.metadata { font-size: 0.75rem; margin: 0; max-width: 32rem; }
+pre.metadata {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  margin: 0.35rem 0 0;
+  max-width: 32rem;
+  padding: 0.5rem 0.6rem;
+}
 
 .empty-state {
   color: var(--text-dim);
@@ -1101,6 +1456,8 @@ pre.metadata { font-size: 0.75rem; margin: 0; max-width: 32rem; }
   gap: 0.5rem;
   margin-top: 0.7rem;
 }
+
+.detail-card .actions { margin-top: 0.1rem; }
 
 .audit-toolbar, .pager {
   align-items: center;
@@ -1130,16 +1487,6 @@ button.active-page {
   color: var(--text);
 }
 
-#notice {
-  color: var(--danger);
-  font-size: 0.88rem;
-  margin: 0 auto;
-  max-width: 90rem;
-  padding: 0 clamp(1rem, 3vw, 2rem);
-}
-
-#notice:not(:empty) { padding-top: 0.7rem; }
-
 a { color: var(--accent); text-decoration: none; }
 
 a:hover { text-decoration: underline; }
@@ -1147,7 +1494,27 @@ a:hover { text-decoration: underline; }
 /* ---------- Mobile ---------- */
 
 @media (max-width: 860px) {
-  body { font-size: 14px; }
+  body { font-size: 14px; padding-top: 0; }
+
+  body.nav-open { overflow: hidden; }
+  body.nav-open #app { z-index: 140; }
+
+  .topbar {
+    grid-template-areas:
+      "brand actions"
+      "runtimes runtimes";
+    grid-template-columns: minmax(0, 1fr) auto;
+    padding: 0.42rem 0.65rem 0.5rem;
+    position: sticky;
+  }
+
+  .brand { grid-area: brand; }
+  button.mobile-nav-toggle.icon-button { display: inline-flex; flex: 0 0 auto; }
+  .agent-chip { display: inline-flex; max-width: min(40vw, 15rem); }
+  .runtime-overview { display: grid; grid-area: runtimes; grid-template-columns: repeat(2, minmax(0, 1fr)) auto; width: 100%; }
+  .topbar-actions { grid-area: actions; }
+
+  .runtime-summary { min-width: 0; width: 100%; }
 
   .shell {
     gap: 0.9rem;
@@ -1155,32 +1522,72 @@ a:hover { text-decoration: underline; }
     padding: 0.8rem 0.8rem 3rem;
   }
 
-  .sidebar {
-    backdrop-filter: blur(12px);
-    background: rgba(10, 13, 19, 0.8);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    flex-direction: row;
-    gap: 0.15rem;
-    overflow-x: auto;
-    padding: 0.3rem;
-    top: 3.6rem;
-    z-index: 15;
+  button.nav-backdrop {
+    backdrop-filter: blur(2px);
+    background: rgba(3, 5, 9, 0.62);
+    border: 0;
+    border-radius: 0;
+    display: block;
+    inset: 0;
+    padding: 0;
+    position: fixed;
+    z-index: 150;
   }
 
-  .tab-button {
-    flex: 1 1 auto;
-    grid-template-columns: 1fr;
-    font-size: 0.66rem;
+  .sidebar {
+    align-self: stretch;
+    backdrop-filter: blur(18px);
+    background: rgba(12, 16, 23, 0.97);
+    border-right: 1px solid var(--border-strong);
+    bottom: 0;
+    box-shadow: 24px 0 60px rgba(0, 0, 0, 0.45);
     gap: 0.25rem;
-    justify-items: center;
-    justify-content: center;
-    line-height: 1.25;
-    min-width: 4.2rem;
-    padding: 0.45rem 0.3rem;
-    text-align: center;
-    width: auto;
+    left: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    padding: 0.8rem;
+    position: fixed;
+    top: 0;
+    transform: translateX(-105%);
+    transition: transform 180ms ease;
+    width: min(20rem, 86vw);
+    z-index: 160;
   }
+
+  .sidebar.mobile-open { transform: translateX(0); }
+
+  .sidebar-mobile-head {
+    align-items: center;
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 0.7rem;
+    padding: 0.15rem 0.15rem 0.65rem 0.35rem;
+  }
+
+  .sidebar-mobile-brand { align-items: center; display: flex; gap: 0.65rem; }
+  .sidebar-mobile-brand img { display: block; }
+  .sidebar-mobile-brand > span { display: grid; line-height: 1.15; }
+  .sidebar-mobile-brand strong { font-size: 0.92rem; }
+  .sidebar-mobile-brand small { color: var(--text-dim); font-size: 0.66rem; letter-spacing: 0.08em; text-transform: uppercase; }
+
+  .tab-button {
+    border-radius: 11px;
+    font-size: 0.88rem;
+    min-height: 2.65rem;
+    padding: 0.58rem 0.7rem;
+    width: 100%;
+  }
+
+  .tab-button svg { height: 18px; width: 18px; }
+
+  .sidebar-divider {
+    border-left: 0;
+    border-top: 1px solid var(--border-strong);
+    margin: 0.65rem 0 0.55rem;
+  }
+
+  .sidebar-section, .sidebar-section > div { display: grid; gap: 0.25rem; }
+  .sidebar-section-title { display: block; margin-bottom: 0.15rem; }
 
   .agent-layout { grid-template-columns: 1fr; }
 
@@ -1196,18 +1603,39 @@ a:hover { text-decoration: underline; }
 
   section { padding: 0.95rem 0.9rem 1rem; }
 
+  .integration-row { padding: 0.75rem 0.8rem; }
+
+  /* Title keeps the whole first line; chips and actions share the second.
+     The title spans into the actions column so a wide chip set can never
+     squeeze the name to nothing. */
   .integration-summary {
+    grid-template-areas:
+      "chevron title title"
+      "chips chips actions";
     grid-template-columns: auto minmax(0, 1fr) auto;
   }
 
-  .integration-actions {
-    grid-column: 2 / -1;
-    justify-content: flex-start;
-  }
+  .integration-summary .status-chips { justify-content: flex-start; }
+
+  .integration-subtitle { display: none; }
+
+  .chip-label { max-width: 42vw; }
 
   .integration-details {
     padding-left: 0;
   }
+
+  .repo-audit-details { margin-left: 0; }
+
+  /* Repository name owns the first line; its audit badge and Remove drop
+     below instead of crushing the mono name into fragments. */
+  .repo-head { grid-template-columns: auto minmax(0, 1fr) auto; }
+
+  .repo-head .mono { grid-column: 2 / -1; }
+
+  .repo-head .status { grid-column: 2; grid-row: 2; justify-self: start; }
+
+  .repo-head .repo-remove { grid-column: 3; grid-row: 2; }
 
   .stat-statuses { grid-template-columns: 1fr 1fr; }
 
@@ -1219,11 +1647,83 @@ a:hover { text-decoration: underline; }
 
   .file-list-pane { max-height: 18rem; }
 
-  .topbar { padding: 0.6rem 0.8rem; }
+  #notice { top: 0.75rem; }
 
   td, th { padding: 0.45rem 0.5rem; }
 }
 
+@media (max-width: 430px) {
+  .brand-name { display: none; }
+  .agent-chip { max-width: 43vw; }
+  .runtime-overview { grid-template-columns: minmax(0, 1fr) auto; }
+  .runtime-overview > .runtime-summary { grid-column: 1; }
+  .runtime-overview > .runtime-summary:nth-child(1) { grid-row: 1; }
+  .runtime-overview > .runtime-summary:nth-child(2) { grid-row: 2; }
+  .runtime-refresh { align-self: center; grid-column: 2; grid-row: 1 / span 2; }
+  .runtime-summary { gap: 0.25rem; padding-left: 0.4rem; padding-right: 0.3rem; }
+  .runtime-summary-copy { font-size: 0.7rem; }
+  .runtime-state { max-width: 8rem; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+/* -- tools ---------------------------------------------------------------- */
+
+/* Tool rows are integration-row sections, matching #managed-integrations. */
+#tools { display: grid; gap: 0.8rem; }
+
+.tool-config { display: grid; gap: 0.6rem; }
+
+.tool-config-row {
+  align-items: center;
+  display: grid;
+  gap: 0.35rem 0.8rem;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+/* The key name reads as a value, not a heading: quiet mono, no uppercase,
+   so it cannot be confused with the Configuration card title above it. */
+.config-key {
+  align-items: center;
+  display: inline-flex;
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  gap: 0.4rem;
+}
+
+/* Config key descriptions are subtext under the key name. */
+.config-note { font-size: 0.78rem; }
+
+.config-input-row { display: flex; gap: 0.5rem; }
+
+.config-input-row input { flex: 1 1 auto; min-width: 0; }
+
+/* Compact value input, height-matched to the small Save button beside it. */
+.tool-config-row input { font-size: 0.85rem; padding: 0.38rem 0.6rem; }
+
+/* Only a populated approvals table claims scroll width; the empty state fits
+   any viewport without a pointless horizontal scrollbar. */
+.tool-approvals-table.has-rows { min-width: 34rem; }
+
+.tool-approvals-table pre.metadata { max-width: 480px; overflow-x: auto; }
+
+.tool-approvals-table details summary { color: var(--text-dim); cursor: pointer; font-size: 0.78rem; }
+
+.tool-approvals-table details summary:hover { color: var(--text); }
+
+/* Approve/Deny sit on one line; the decision column hugs its content so the
+   proposed-action column does not crowd it into wrapping. */
+.approval-decisions { display: inline-flex; gap: 0.4rem; white-space: nowrap; }
+
+.tool-approvals-table td:last-child { width: 1%; }
+
+@media (max-width: 860px) {
+  .tool-config-row { align-items: stretch; grid-template-columns: 1fr; }
+
+  .tool-config-row .config-key { flex-wrap: wrap; }
+
+  .tool-config-row input { min-width: 0; }
 }

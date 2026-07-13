@@ -314,13 +314,13 @@ class ConfigTests(unittest.TestCase):
         rules = policy["allowed_network_access"]
         self.assertEqual(rules["api.openai.com"]["allow_http_methods"], ["POST"])
         self.assertTrue(rules["api.openai.com"]["openai_account_guard"])
-        self.assertTrue(rules["api.openai.com"]["openai_disable_live_web_search"])
+        self.assertTrue(rules["api.openai.com"]["openai_external_url_request_guard"])
         self.assertEqual(rules["auth.openai.com"]["allow_http_methods"], ["GET", "POST"])
         self.assertNotIn("openai_account_guard", rules["auth.openai.com"])
-        self.assertNotIn("openai_disable_live_web_search", rules["auth.openai.com"])
+        self.assertNotIn("openai_external_url_request_guard", rules["auth.openai.com"])
         self.assertEqual(rules["chatgpt.com"]["allow_http_methods"], ["GET", "POST"])
         self.assertTrue(rules["chatgpt.com"]["openai_account_guard"])
-        self.assertTrue(rules["chatgpt.com"]["openai_disable_live_web_search"])
+        self.assertTrue(rules["chatgpt.com"]["openai_external_url_request_guard"])
 
     def test_openai_domains_are_reserved_for_managed_integration(self) -> None:
         for domain in ("api.openai.com", "auth.openai.com", "chatgpt.com", "*.chatgpt.com"):
@@ -332,7 +332,7 @@ class ConfigTests(unittest.TestCase):
                     }
                 )
 
-        for field in ("openai_disable_live_web_search", "openai_account_guard"):
+        for field in ("openai_external_url_request_guard", "openai_account_guard"):
             with self.subTest(field=field), self.assertRaisesRegex(ConfigError, "unsupported fields"):
                 parse_network_controls(
                     {
@@ -858,8 +858,6 @@ class PolicyTests(unittest.TestCase):
                 )
 
     def test_require_dot_github_approval_rides_into_guard(self) -> None:
-        from host.runtime import github_push_gate
-
         controls = parse_network_controls(
             {
                 "managed_network_integrations": {
@@ -876,17 +874,41 @@ class PolicyTests(unittest.TestCase):
         policy = expand_network_controls(controls)
         guard = policy["allowed_network_access"]["github.com"]["github_repo_guard"]
         self.assertTrue(guard["require_dot_github_approval"])
-        # should_inspect selects only receive-pack POSTs to a write repo.
-        self.assertEqual(
-            github_push_gate.should_inspect(guard, "github.com", "POST", "/infiversehq/trustyclaw-tools.git/git-receive-pack"),
-            ("infiversehq", "trustyclaw-tools"),
-        )
-        self.assertIsNone(
-            github_push_gate.should_inspect(guard, "github.com", "POST", "/other/repo.git/git-receive-pack")
-        )
-        self.assertIsNone(
-            github_push_gate.should_inspect(guard, "github.com", "GET", "/infiversehq/trustyclaw-tools.git/info/refs")
-        )
+        # The gate triggers only on receive-pack POSTs (it runs after the
+        # write guard allowed the push, so the repo is a write repo by
+        # construction); a read probe never reaches inspect().
+        clean = type("R", (), {"touches_github": False})()
+        with (
+            patch("host.runtime.network_policy.read_proxy_github_token", return_value="ghs_test"),
+            patch("host.runtime.network_policy.github_push_gate.inspect", return_value=clean) as inspect_fn,
+        ):
+            response, reason = github_push_gate_response(
+                policy, "POST", "github.com", "/infiversehq/trustyclaw-tools.git/git-receive-pack", b"body"
+            )
+            self.assertEqual((response, reason), (None, None))
+            inspect_fn.assert_called_once()
+            self.assertEqual(inspect_fn.call_args.args[:2], ("infiversehq", "trustyclaw-tools"))
+        # The inspected owner/repo come from the same normalized path the
+        # trigger (and the write guard before it) matched: dot segments and
+        # percent-encoding cannot smuggle a different identity into the gate.
+        with (
+            patch("host.runtime.network_policy.read_proxy_github_token", return_value="ghs_test"),
+            patch("host.runtime.network_policy.github_push_gate.inspect", return_value=clean) as inspect_fn,
+        ):
+            response, reason = github_push_gate_response(
+                policy, "POST", "github.com", "/x/../infiversehq/trustyclaw-tools.git/git-receive-pack", b"body"
+            )
+            self.assertEqual((response, reason), (None, None))
+            inspect_fn.assert_called_once()
+            self.assertEqual(inspect_fn.call_args.args[:2], ("infiversehq", "trustyclaw-tools"))
+        with patch("host.runtime.network_policy.github_push_gate.inspect") as inspect_fn:
+            self.assertEqual(
+                github_push_gate_response(
+                    policy, "GET", "github.com", "/infiversehq/trustyclaw-tools.git/info/refs", b""
+                ),
+                (None, None),
+            )
+            inspect_fn.assert_not_called()
         # Off by default: no require_dot_github_approval means no gating.
         off = expand_network_controls(
             parse_network_controls(
@@ -900,9 +922,14 @@ class PolicyTests(unittest.TestCase):
         )
         off_guard = off["allowed_network_access"]["github.com"]["github_repo_guard"]
         self.assertNotIn("require_dot_github_approval", off_guard)
-        self.assertIsNone(
-            github_push_gate.should_inspect(off_guard, "github.com", "POST", "/infiversehq/trustyclaw-tools.git/git-receive-pack")
-        )
+        with patch("host.runtime.network_policy.github_push_gate.inspect") as inspect_fn:
+            self.assertEqual(
+                github_push_gate_response(
+                    off, "POST", "github.com", "/infiversehq/trustyclaw-tools.git/git-receive-pack", b"body"
+                ),
+                (None, None),
+            )
+            inspect_fn.assert_not_called()
 
         # Approval mode also closes REST content-write bypasses that can create
         # .github-changing commits without entering git-receive-pack.
@@ -1079,14 +1106,14 @@ class PolicyTests(unittest.TestCase):
                     "github_graphql_denied",
                 )
 
-    def test_openai_guard_pins_account_and_blocks_live_web_search(self) -> None:
+    def test_openai_guard_pins_account_and_blocks_external_url_requests(self) -> None:
         pg_harness.reset_database()
         policy = {
             "allowed_network_access": {
                 "chatgpt.com": {
                     "allow_http_methods": ["POST"],
                     "openai_account_guard": True,
-                    "openai_disable_live_web_search": True,
+                    "openai_external_url_request_guard": True,
                 }
             }
         }
@@ -1110,7 +1137,7 @@ class PolicyTests(unittest.TestCase):
             self.assertIsNone(openai_request_denied({"allowed_network_access": {}}, "github.com", [], b"{}"))
             unpinned_policy = {
                 "allowed_network_access": {
-                    "chatgpt.com": {"allow_http_methods": ["POST"], "openai_disable_live_web_search": True}
+                    "chatgpt.com": {"allow_http_methods": ["POST"], "openai_external_url_request_guard": True}
                 }
             }
             self.assertIsNone(openai_request_denied(unpinned_policy, host, [], b'{"input": "hello"}'))
@@ -1123,19 +1150,114 @@ class PolicyTests(unittest.TestCase):
             self.assertIsNotNone(openai_request_denied(policy, host, json_header, unset))
             self.assertIsNone(openai_request_denied(policy, host, json_header, cached))
 
-            # The legacy preview tool is always denied; so is a bare marker with no tool.
+            # The legacy preview tool and dated variants are always denied: they
+            # ignore external_web_access and always browse live.
             self.assertIsNotNone(openai_request_denied(policy, host, json_header, b'{"tools": [{"type": "web_search_preview"}]}'))
-            self.assertIsNotNone(openai_request_denied(policy, host, json_header, b'{"note": "web_search"}'))
+            self.assertIsNotNone(
+                openai_request_denied(policy, host, json_header, b'{"tools": [{"type": "web_search_preview_2025_03_11"}]}')
+            )
+            self.assertIsNotNone(
+                openai_request_denied(
+                    policy, host, json_header, b'{"tools": [{"type": "web_search_2025_08_26", "external_web_access": false}]}'
+                )
+            )
+            # Prompt text mentioning a search tool carries no capability: the
+            # upstream only enables search from a parsed tool object.
+            self.assertIsNone(openai_request_denied(policy, host, json_header, b'{"note": "web_search"}'))
+            self.assertIsNone(
+                openai_request_denied(policy, host, json_header, b'{"instructions": "never use web_search_preview"}')
+            )
+            # A web_search_call history item replays an earlier cached search and
+            # is not a tool declaration.
+            self.assertIsNone(
+                openai_request_denied(
+                    policy,
+                    host,
+                    json_header,
+                    b'{"input": [{"type": "web_search_call", "action": {"type": "search", "query": "x"}}],'
+                    b' "tools": [{"type": "web_search", "external_web_access": false}]}',
+                )
+            )
 
-            # Evasion: a non-JSON content-type (or a leading non-brace byte) must not
-            # skip inspection — the markers are still caught.
+            # Remote MCP tools make the upstream call an external server with
+            # request data: denied by tool type (server_url or hosted
+            # connector_id form) and by a server_url key anywhere.
+            self.assertIsNotNone(
+                openai_request_denied(
+                    policy, host, json_header,
+                    b'{"tools": [{"type": "mcp", "server_label": "evil", "server_url": "https://evil.example/mcp"}]}',
+                )
+            )
+            self.assertIsNotNone(
+                openai_request_denied(
+                    policy, host, json_header, b'{"tools": [{"type": "mcp", "connector_id": "connector_gmail"}]}'
+                )
+            )
+            self.assertIsNotNone(
+                openai_request_denied(
+                    policy, host, json_header, b'{"input": "hi", "extra": {"server_url": "https://evil.example"}}'
+                )
+            )
+            # Text mentioning MCP carries no capability.
+            self.assertIsNone(
+                openai_request_denied(
+                    policy, host, json_header, b'{"input": "declare type mcp with a server_url to call out"}'
+                )
+            )
+
+            # Chat Completions search has no cached form: both the options field
+            # and search models are denied outright.
+            self.assertIsNotNone(
+                openai_request_denied(policy, host, json_header, b'{"model": "gpt-5.5", "web_search_options": {}}')
+            )
+            self.assertIsNotNone(
+                openai_request_denied(policy, host, json_header, b'{"model": "gpt-4o-search-preview", "messages": []}')
+            )
+
+            # Standalone search endpoints must opt into cached retrieval; the
+            # server default is live, so a missing setting fails closed.
+            search_path = "/backend-api/codex/alpha/search"
+            self.assertIsNone(
+                openai_request_denied(
+                    policy,
+                    host,
+                    json_header,
+                    b'{"commands": {"search_query": [{"q": "x"}]}, "settings": {"external_web_access": false}}',
+                    path=search_path,
+                )
+            )
+            for search_body in (
+                b'{"commands": {"search_query": [{"q": "x"}]}}',
+                b'{"commands": {"search_query": [{"q": "x"}]}, "settings": {"external_web_access": true}}',
+                b'{"commands": {"search_query": [{"q": "x"}]}, "settings": {"external_web_access": "indexed"}}',
+            ):
+                self.assertIsNotNone(openai_request_denied(policy, host, json_header, search_body, path=search_path))
+            # The endpoint match survives percent-encoding and dot-segment
+            # disguises, which the upstream would serve as the search route.
+            for disguised_path in (
+                "/backend-api/codex/alpha/%73earch",
+                "/backend-api/codex/extra/../alpha/search",
+                "/backend-api/codex/alpha/search/",
+            ):
+                self.assertIsNotNone(
+                    openai_request_denied(
+                        policy, host, json_header,
+                        b'{"commands": {"search_query": [{"q": "x"}]}}',
+                        path=disguised_path,
+                    )
+                )
+
+            # A body the upstream cannot parse as JSON cannot declare tools, so a
+            # mislabeled body with a junk prefix is not a search vector; a
+            # JSON-looking body that fails to parse still fails closed.
             text_header = [("Content-Type", "text/plain"), ("ChatGPT-Account-Id", "acct_good")]
-            self.assertIsNotNone(openai_request_denied(policy, host, text_header, b'x' + live))
+            self.assertIsNone(openai_request_denied(policy, host, text_header, b'x' + live))
+            self.assertIsNotNone(openai_request_denied(policy, host, json_header, b'{"tools": [{"type": "web_search"'))
             self.assertIsNotNone(
                 openai_request_denied(policy, host, text_header, b'{"tools": [{"type": "web_search_preview"}]}')
             )
 
-            # A request with no web search and no marker is fine.
+            # A request with no web search is fine.
             self.assertIsNone(openai_request_denied(policy, host, json_header, b'{"input": "hello"}'))
 
             # gzip-encoded live request is decoded and still denied (no evasion).
@@ -1150,7 +1272,7 @@ class PolicyTests(unittest.TestCase):
             # The guard only applies where the flag is set.
             self.assertIsNone(openai_request_denied({"allowed_network_access": {}}, "github.com", json_header, live))
 
-    def test_web_search_guard_caps_gzip_and_deflate_decoded_size(self) -> None:
+    def test_external_url_guard_caps_gzip_and_deflate_decoded_size(self) -> None:
         pg_harness.reset_database()
         import gzip
         import zlib
@@ -1162,7 +1284,7 @@ class PolicyTests(unittest.TestCase):
                 "chatgpt.com": {
                     "allow_http_methods": ["POST"],
                     "openai_account_guard": True,
-                    "openai_disable_live_web_search": True,
+                    "openai_external_url_request_guard": True,
                 }
             }
         }
@@ -1184,45 +1306,32 @@ class PolicyTests(unittest.TestCase):
                 with self.subTest(encoding=encoding):
                     self.assertIsNotNone(openai_request_denied(policy, "chatgpt.com", headers, compressed))
 
-    def test_web_search_guard_decodes_zstd_and_brotli_bodies(self) -> None:
+    def test_external_url_guard_denies_stdlib_undecodable_encodings(self) -> None:
         pg_harness.reset_database()
-        # Codex compresses request bodies (and the proxy must not be evadable
-        # through an encoding): zstd and brotli go through the system binaries.
-        import shutil
-        import subprocess
-
-        from host.runtime import network_policy
-
+        # Only stdlib-decodable encodings are inspected; zstd and brotli fail
+        # closed (clients essentially never compress request bodies, and a
+        # live denial is the signal to add an encoding, not a fallback path).
         policy = {
             "allowed_network_access": {
                 "chatgpt.com": {
                     "allow_http_methods": ["POST"],
                     "openai_account_guard": True,
-                    "openai_disable_live_web_search": True,
+                    "openai_external_url_request_guard": True,
                 }
             }
         }
-        live = b'{"tools": [{"type": "web_search", "external_web_access": true}]}'
-        cached = b'{"tools": [{"type": "web_search", "external_web_access": false}]}'
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TRUSTYCLAW_STATE_DIR": tmp}):
             save_proxy_openai_account_id("acct_good")
-            for encoding, binary in (("zstd", network_policy.ZSTD_BIN), ("br", network_policy.BROTLI_BIN)):
+            for encoding in ("zstd", "br"):
                 with self.subTest(encoding=encoding):
-                    tool = shutil.which(binary) or shutil.which(Path(binary).name)
-                    if tool is None:
-                        self.skipTest(f"{binary} is not installed")
                     headers = [
                         ("Content-Type", "application/json"),
                         ("Content-Encoding", encoding),
                         ("ChatGPT-Account-Id", "acct_good"),
                     ]
-                    with patch.object(network_policy, {"zstd": "ZSTD_BIN", "br": "BROTLI_BIN"}[encoding], tool):
-                        compress = subprocess.run([tool, "-c"], input=live, stdout=subprocess.PIPE, check=True)
-                        self.assertIsNotNone(openai_request_denied(policy, "chatgpt.com", headers, compress.stdout))
-                        compress = subprocess.run([tool, "-c"], input=cached, stdout=subprocess.PIPE, check=True)
-                        self.assertIsNone(openai_request_denied(policy, "chatgpt.com", headers, compress.stdout))
-                        # A corrupt stream fails closed.
-                        self.assertIsNotNone(openai_request_denied(policy, "chatgpt.com", headers, b"not compressed"))
+                    self.assertIsNotNone(
+                        openai_request_denied(policy, "chatgpt.com", headers, b'{"input": "hello"}')
+                    )
 
     def test_unsupported_content_encoding_fails_closed(self) -> None:
         pg_harness.reset_database()
@@ -1231,7 +1340,7 @@ class PolicyTests(unittest.TestCase):
                 "chatgpt.com": {
                     "allow_http_methods": ["POST"],
                     "openai_account_guard": True,
-                    "openai_disable_live_web_search": True,
+                    "openai_external_url_request_guard": True,
                 }
             }
         }

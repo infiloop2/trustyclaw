@@ -18,11 +18,6 @@ COMPLETED = "completed"
 FAILED = "failed"
 CANCELLED = "cancelled"
 
-#: Statuses where the task is still in the queue's view.
-ACTIVE = frozenset({QUEUED, RUNNING})
-#: Statuses a task never leaves.
-TERMINAL = frozenset({COMPLETED, FAILED, CANCELLED})
-
 #: from-status -> the statuses it may move to.
 TRANSITIONS: dict[str, frozenset[str]] = {
     QUEUED: frozenset({RUNNING, CANCELLED}),
@@ -31,14 +26,6 @@ TRANSITIONS: dict[str, frozenset[str]] = {
     FAILED: frozenset(),
     CANCELLED: frozenset(),
 }
-
-
-def is_active(task: dict[str, Any]) -> bool:
-    return task["status"] in ACTIVE
-
-
-def is_terminal(task: dict[str, Any]) -> bool:
-    return task["status"] in TERMINAL
 
 
 def set_status(task: dict[str, Any], to_status: str, *, now: str) -> None:

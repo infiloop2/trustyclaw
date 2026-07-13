@@ -79,6 +79,9 @@ routes the UI uses with in-memory data. It is for UI wiring and interaction
 checks only; it does not validate the real admin API, host state, sudo helpers,
 agent runtimes, or network proxy.
 
+In the local mock only, click the green version-status badge in the toolbar to
+toggle between the upgrade-available and latest-version states.
+
 To run type checks or the automated browser smoke locally, install the
 development-only test dependencies once. If no cached Chromium is available,
 install the browser too:
@@ -94,9 +97,10 @@ Then run:
 python3 tests/smoke-ui/admin_ui_smoke.py --port 3100
 ```
 
-The smoke starts the mock server, opens Chromium, logs in with `dev`, creates a
-task, opens the thread and task event views, edits network policy through the
-GitHub managed integration controls, and checks the Codex login panel. CI installs Playwright and
+The smoke starts the mock server, opens Chromium, and exercises the core
+operator flows across task/session views, network and GitHub controls, files,
+processes, bundled tools and approvals, audit logs, and installed app surfaces
+at desktop and mobile dimensions. CI installs Playwright and
 Chromium during the Docker image build, then runs this smoke through
 `.github/ci/run-in-sandbox.sh` with `--network none`. On development boxes with
 a preinstalled Playwright browser cache, the smoke reuses the newest cached

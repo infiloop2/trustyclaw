@@ -1,12 +1,13 @@
 """Agent Chat app backend.
 
-The app owns the Agent Chat thread index, task references, archive state, and
-presentation preferences. Host task contents and execution remain host-owned and
-are accessed through the host admin API by this backend.
+The app owns the Agent Chat thread index, task references, and archive state.
+Host task contents and execution remain host-owned and are accessed through the
+host admin API by this backend.
 """
 
 from __future__ import annotations
 
+import http.client
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -15,10 +16,10 @@ import socket
 import time
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
-import uuid
 
-from host.constants import LOOPBACK
+from host.constants import LOOPBACK, MAX_REQUEST_BODY_BYTES as ADMIN_MAX_REQUEST_BODY_BYTES
 from host.runtime import db
+from host.session_options import public_session_options, session_config_error
 
 
 HOST = os.environ.get("TRUSTYCLAW_APP_HOST", LOOPBACK)
@@ -26,10 +27,11 @@ PORT = int(os.environ.get("TRUSTYCLAW_APP_PORT", "7450"))
 DB_SCHEMA = os.environ.get("TRUSTYCLAW_APP_DB_SCHEMA", "app_agent_chat")
 ADMIN_API_SOCKET = os.environ.get("TRUSTYCLAW_APP_ADMIN_API_SOCKET", "/run/trustyclaw-admin-api/app-backend.sock")
 MAX_REQUEST_BODY_BYTES = 128 * 1024
+# Admin API responses (a thread's full task history) can exceed the inbound
+# request-body cap; size the response cap to the admin API's own body limit.
+MAX_ADMIN_RESPONSE_BYTES = ADMIN_MAX_REQUEST_BODY_BYTES
 APP_ID = "agent_chat"
 RUNTIME_OPTIONS = {"codex", "claude_code"}
-DENSITY_OPTIONS = {"compact", "comfortable", "spacious"}
-DEFAULT_PREFERENCES = {"density": "comfortable", "show_completed": True}
 
 
 class AppError(Exception):
@@ -60,12 +62,8 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_body()
             response: dict[str, Any]
             path = urlparse(self.path).path
-            if method == "GET" and path == "/health":
-                response = {"status": "ok", "app": "agent_chat"}
-            elif method == "GET" and path == "/preferences":
-                response = {"preferences": read_preferences()}
-            elif method == "PUT" and path == "/preferences":
-                response = {"preferences": write_preferences(body)}
+            if method == "GET" and path == "/session-options":
+                response = {"session_options": public_session_options()}
             elif method == "GET" and path == "/threads":
                 response = list_app_threads()
             elif method == "GET" and path.startswith("/threads/") and path.endswith("/tasks"):
@@ -132,64 +130,28 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-def read_preferences() -> dict[str, Any]:
-    with db.transaction() as cur:
-        _set_search_path(cur)
-        cur.execute("SELECT density, show_completed FROM preferences WHERE singleton = TRUE")
-        row = cur.fetchone()
-    if not row:
-        return dict(DEFAULT_PREFERENCES)
-    return {"density": row[0], "show_completed": row[1]}
-
-
-def write_preferences(body: Any) -> dict[str, Any]:
-    if not isinstance(body, dict):
-        raise AppError(HTTPStatus.BAD_REQUEST, "preferences request must be an object")
-    preferences = body.get("preferences")
-    if not isinstance(preferences, dict):
-        raise AppError(HTTPStatus.BAD_REQUEST, "preferences must be an object")
-    extra = sorted(set(preferences) - {"density", "show_completed"})
-    if extra:
-        raise AppError(HTTPStatus.BAD_REQUEST, f"unsupported preference field: {extra[0]}")
-    current = read_preferences()
-    density = preferences.get("density", current["density"])
-    show_completed = preferences.get("show_completed", current["show_completed"])
-    if density not in DENSITY_OPTIONS:
-        raise AppError(HTTPStatus.BAD_REQUEST, "density must be compact, comfortable, or spacious")
-    if not isinstance(show_completed, bool):
-        raise AppError(HTTPStatus.BAD_REQUEST, "show_completed must be a boolean")
-    with db.transaction() as cur:
-        _set_search_path(cur)
-        cur.execute(
-            """
-            INSERT INTO preferences (singleton, density, show_completed, updated_at)
-            VALUES (TRUE, %s, %s, %s)
-            ON CONFLICT (singleton) DO UPDATE SET
-                density = EXCLUDED.density,
-                show_completed = EXCLUDED.show_completed,
-                updated_at = EXCLUDED.updated_at
-            """,
-            (density, show_completed, _utc_now()),
-        )
-    return {"density": density, "show_completed": show_completed}
-
-
 def list_app_threads() -> dict[str, Any]:
     with db.transaction() as cur:
         _set_search_path(cur)
         cur.execute(
             """
-            SELECT thread_id, agent_runtime, updated_at
+            SELECT thread_id
             FROM threads
             WHERE archived = FALSE
-            ORDER BY updated_at DESC, thread_id ASC
+            ORDER BY thread_id ASC
             """
         )
         rows = cur.fetchall()
     app_threads: list[dict[str, Any]] = []
-    for thread_id, runtime, updated_at in rows:
+    for (thread_id,) in rows:
         task_response = list_app_thread_tasks(thread_id)
         tasks = task_response["tasks"]
+        if not tasks:
+            continue
+        configs = {_host_task_session_config(task) for task in tasks}
+        if len(configs) != 1:
+            raise AppError(HTTPStatus.BAD_GATEWAY, "host admin returned inconsistent thread configuration")
+        runtime, model, effort = configs.pop()
         timestamps = [
             str(task.get("updated_at") or task.get("created_at"))
             for task in tasks
@@ -199,14 +161,15 @@ def list_app_threads() -> dict[str, Any]:
             {
                 "thread_id": thread_id,
                 "agent_runtime": runtime,
-                "last_used_at": max(timestamps, default=updated_at),
+                "model": model,
+                "effort": effort,
+                "last_used_at": max(timestamps, default=""),
                 "task_count": len(tasks),
                 "active_tasks": [
                     {"task_id": task["task_id"], "status": task["status"]}
                     for task in tasks
                     if task.get("status") in {"queued", "running"} and isinstance(task.get("task_id"), str)
                 ],
-                "app_archived": False,
             }
         )
     app_threads.sort(key=lambda item: str(item.get("last_used_at") or ""), reverse=True)
@@ -214,7 +177,7 @@ def list_app_threads() -> dict[str, Any]:
 
 
 def list_app_thread_tasks(thread_id: str) -> dict[str, Any]:
-    _require_app_thread(thread_id, include_archived=False)
+    _require_app_thread(thread_id)
     known_task_ids = _app_task_ids_for_thread(thread_id)
     response = call_admin_api("GET", f"/v1/threads/{quote(thread_id, safe='')}/tasks")
     host_tasks = response.get("tasks", [])
@@ -227,18 +190,17 @@ def create_app_task(body: Any) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise AppError(HTTPStatus.BAD_REQUEST, "task request must be an object")
     thread_id = _required_text(body.get("thread_id"), "thread_id")
-    agent_runtime = _required_text(body.get("agent_runtime", "codex"), "agent_runtime")
-    if agent_runtime not in RUNTIME_OPTIONS:
-        raise AppError(HTTPStatus.BAD_REQUEST, "agent_runtime must be codex or claude_code")
-    _validate_app_thread_runtime(thread_id, agent_runtime)
+    requested_config = _requested_session_config(body)
     response = call_admin_api("POST", "/v1/tasks", body)
-    task_id = _required_text(response.get("task_id"), "task_id")
-    response_thread_id = _required_text(response.get("thread_id"), "thread_id")
-    response_runtime = _required_text(response.get("agent_runtime"), "agent_runtime")
-    if response_thread_id != thread_id or response_runtime != agent_runtime:
-        raise AppError(HTTPStatus.BAD_GATEWAY, "host admin returned mismatched task reference")
+    task_id = _required_response_text(response.get("task_id"), "task_id")
     try:
-        _record_app_task(thread_id, agent_runtime, task_id)
+        response_thread_id = _required_response_text(response.get("thread_id"), "thread_id")
+        response_config = _host_task_session_config(response)
+        if response_thread_id != thread_id or (
+            requested_config is not None and response_config != requested_config
+        ):
+            raise AppError(HTTPStatus.BAD_GATEWAY, "host admin returned mismatched task reference")
+        _record_app_task(thread_id, task_id)
     except Exception:
         _cancel_orphaned_host_task(task_id)
         raise
@@ -246,75 +208,94 @@ def create_app_task(body: Any) -> dict[str, Any]:
 
 
 def _cancel_orphaned_host_task(task_id: str) -> None:
-    try:
-        call_admin_api("POST", f"/v1/tasks/{quote(task_id, safe='')}/cancel", {})
-    except Exception:
-        pass
+    # Cancel covers a still-queued task; kill covers one a worker claimed in
+    # the create-to-conflict window, so the orphan never keeps executing. A
+    # task that already finished cannot be revoked — the app request still
+    # got its conflict error either way.
+    for action in ("cancel", "kill"):
+        try:
+            call_admin_api("POST", f"/v1/tasks/{quote(task_id, safe='')}/{action}", {})
+            return
+        except Exception:
+            continue
 
 
 def archive_app_thread(thread_id: str) -> dict[str, Any]:
-    _require_app_thread(thread_id, include_archived=True)
-    now = _utc_now()
     with db.transaction() as cur:
         _set_search_path(cur)
         cur.execute(
-            "UPDATE threads SET archived = TRUE, updated_at = %s WHERE thread_id = %s",
-            (now, thread_id),
+            "UPDATE threads SET archived = TRUE WHERE thread_id = %s"
+            " RETURNING thread_id, archived",
+            (thread_id,),
         )
-        cur.execute("SELECT thread_id, agent_runtime, archived, updated_at FROM threads WHERE thread_id = %s", (thread_id,))
         row = cur.fetchone()
     if not row:
         raise AppError(HTTPStatus.NOT_FOUND, "thread not found")
-    return {"thread_id": row[0], "agent_runtime": row[1], "archived": row[2], "updated_at": row[3]}
+    return {
+        "thread_id": row[0],
+        "archived": row[1],
+    }
 
 
-def _record_app_task(thread_id: str, agent_runtime: str, task_id: str) -> None:
-    now = _utc_now()
+def _record_app_task(thread_id: str, task_id: str) -> None:
     with db.transaction() as cur:
         _set_search_path(cur)
-        cur.execute("SELECT agent_runtime FROM threads WHERE thread_id = %s", (thread_id,))
-        row = cur.fetchone()
-        if row and row[0] != agent_runtime:
-            raise AppError(HTTPStatus.CONFLICT, "thread already belongs to another agent runtime")
         cur.execute(
             """
-            INSERT INTO threads (thread_id, agent_runtime, archived, created_at, updated_at)
-            VALUES (%s, %s, FALSE, %s, %s)
+            INSERT INTO threads (thread_id, archived)
+            VALUES (%s, FALSE)
             ON CONFLICT (thread_id) DO UPDATE SET
-                archived = FALSE,
-                updated_at = EXCLUDED.updated_at
+                archived = FALSE
             """,
-            (thread_id, agent_runtime, now, now),
+            (thread_id,),
         )
         cur.execute(
             """
-            INSERT INTO thread_tasks (task_id, thread_id, created_at)
-            VALUES (%s, %s, %s)
+            INSERT INTO thread_tasks (task_id, thread_id)
+            VALUES (%s, %s)
             ON CONFLICT (task_id) DO NOTHING
             """,
-            (task_id, thread_id, now),
+            (task_id, thread_id),
         )
 
 
-def _require_app_thread(thread_id: str, *, include_archived: bool) -> None:
+def _require_app_thread(thread_id: str) -> None:
     with db.transaction() as cur:
         _set_search_path(cur)
-        if include_archived:
-            cur.execute("SELECT 1 FROM threads WHERE thread_id = %s", (thread_id,))
-        else:
-            cur.execute("SELECT 1 FROM threads WHERE thread_id = %s AND archived = FALSE", (thread_id,))
+        cur.execute("SELECT 1 FROM threads WHERE thread_id = %s AND archived = FALSE", (thread_id,))
         row = cur.fetchone()
     if not row:
         raise AppError(HTTPStatus.NOT_FOUND, "thread not found")
 
 
-def _validate_app_thread_runtime(thread_id: str, agent_runtime: str) -> None:
-    with db.transaction() as cur:
-        _set_search_path(cur)
-        cur.execute("SELECT agent_runtime FROM threads WHERE thread_id = %s", (thread_id,))
-        row = cur.fetchone()
-    if row and row[0] != agent_runtime:
-        raise AppError(HTTPStatus.CONFLICT, "thread already belongs to another agent runtime")
+def _requested_session_config(body: dict[str, Any]) -> tuple[str, str, str] | None:
+    fields = ("agent_runtime", "model", "effort")
+    supplied = [field for field in fields if field in body]
+    if not supplied:
+        return None
+    if len(supplied) != len(fields):
+        raise AppError(
+            HTTPStatus.BAD_REQUEST,
+            "agent_runtime, model, and effort must be provided together",
+        )
+
+    agent_runtime = _required_text(body.get("agent_runtime"), "agent_runtime")
+    model = body.get("model")
+    effort = body.get("effort")
+    error = session_config_error(agent_runtime, model, effort)
+    if error is not None:
+        raise AppError(HTTPStatus.BAD_REQUEST, error)
+    assert isinstance(model, str) and isinstance(effort, str)
+    return agent_runtime, model, effort
+
+
+def _host_task_session_config(task: dict[str, Any]) -> tuple[str, str, str]:
+    runtime = _required_response_text(task.get("agent_runtime"), "agent_runtime")
+    model = _required_response_text(task.get("model"), "model")
+    effort = _required_response_text(task.get("effort"), "effort")
+    if session_config_error(runtime, model, effort) is not None:
+        raise AppError(HTTPStatus.BAD_GATEWAY, "host admin returned invalid session configuration")
+    return runtime, model, effort
 
 
 def _app_task_ids_for_thread(thread_id: str) -> set[str]:
@@ -336,65 +317,58 @@ def _require_app_task(task_id: str) -> None:
 
 def _required_text(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        status = HTTPStatus.BAD_GATEWAY if label == "task_id" else HTTPStatus.BAD_REQUEST
-        raise AppError(status, f"{label} must be a non-empty string")
+        raise AppError(HTTPStatus.BAD_REQUEST, f"{label} must be a non-empty string")
     return value.strip()
+
+
+def _required_response_text(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise AppError(HTTPStatus.BAD_GATEWAY, f"host admin returned invalid {label}")
+    return value.strip()
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    """http.client over the admin API's Unix socket: the standard client with
+    only connect() replaced."""
+
+    def __init__(self, socket_path: str, timeout: float) -> None:
+        super().__init__("trustyclaw-admin-api", timeout=timeout)
+        self._socket_path = socket_path
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self._socket_path)
+        self.sock = sock
 
 
 def call_admin_api(method: str, path: str, body: Any = None) -> dict[str, Any]:
     encoded_body = None if body is None else json.dumps(body, sort_keys=True).encode()
-    headers = {
-        "Host": "trustyclaw-admin-api",
-        "X-TrustyClaw-App-Backend": APP_ID,
-    }
-    if method != "GET":
-        headers["Idempotency-Key"] = f"app-{uuid.uuid4()}"
+    headers = {"X-TrustyClaw-App-Backend": APP_ID}
     if encoded_body is not None:
         headers["Content-Type"] = "application/json"
-        headers["Content-Length"] = str(len(encoded_body))
-    else:
-        headers["Content-Length"] = "0"
-    request = [f"{method} {path} HTTP/1.1", *(f"{name}: {value}" for name, value in headers.items()), "", ""]
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(10)
-        sock.connect(ADMIN_API_SOCKET)
-        sock.sendall("\r\n".join(request).encode() + (encoded_body or b""))
-        raw = _read_http_response(sock)
-    status, payload = _parse_http_response(raw)
+    conn = _UnixHTTPConnection(ADMIN_API_SOCKET, timeout=10)
+    try:
+        conn.request(method, path, body=encoded_body, headers=headers)
+        response = conn.getresponse()
+        status = response.status
+        raw = response.read(MAX_ADMIN_RESPONSE_BYTES + 1)
+    except (OSError, http.client.HTTPException) as exc:
+        raise AppError(HTTPStatus.BAD_GATEWAY, f"host admin request failed: {exc}") from exc
+    finally:
+        conn.close()
+    if len(raw) > MAX_ADMIN_RESPONSE_BYTES:
+        raise AppError(HTTPStatus.BAD_GATEWAY, "host admin response too large")
+    try:
+        payload = json.loads(raw.decode() or "{}")
+    except json.JSONDecodeError as exc:
+        raise AppError(HTTPStatus.BAD_GATEWAY, "host admin returned invalid JSON") from exc
     if status >= 400:
         message = payload.get("error", {}).get("message") if isinstance(payload, dict) else None
         raise AppError(HTTPStatus(status), message or "host admin request failed")
     if not isinstance(payload, dict):
         raise AppError(HTTPStatus.BAD_GATEWAY, "host admin returned invalid response")
     return payload
-
-
-def _read_http_response(sock: socket.socket) -> bytes:
-    chunks: list[bytes] = []
-    while True:
-        chunk = sock.recv(65536)
-        if not chunk:
-            break
-        chunks.append(chunk)
-        if sum(len(item) for item in chunks) > MAX_REQUEST_BODY_BYTES + 4096:
-            raise AppError(HTTPStatus.BAD_GATEWAY, "host admin response too large")
-    return b"".join(chunks)
-
-
-def _parse_http_response(raw: bytes) -> tuple[int, Any]:
-    head, separator, body = raw.partition(b"\r\n\r\n")
-    if not separator:
-        raise AppError(HTTPStatus.BAD_GATEWAY, "host admin returned malformed response")
-    lines = head.decode("iso-8859-1").split("\r\n")
-    try:
-        status = int(lines[0].split()[1])
-    except (IndexError, ValueError) as exc:
-        raise AppError(HTTPStatus.BAD_GATEWAY, "host admin returned malformed status") from exc
-    try:
-        payload = json.loads(body.decode() or "{}")
-    except json.JSONDecodeError as exc:
-        raise AppError(HTTPStatus.BAD_GATEWAY, "host admin returned invalid JSON") from exc
-    return status, payload
 
 
 def _set_search_path(cur: Any) -> None:

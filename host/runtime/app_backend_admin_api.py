@@ -22,6 +22,7 @@ import struct
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+from host.constants import MAX_REQUEST_BODY_BYTES
 from host.runtime import admin_api, app_platform, state
 
 
@@ -29,7 +30,6 @@ APP_BACKEND_ADMIN_SOCKET = Path(
     os.environ.get("TRUSTYCLAW_APP_BACKEND_ADMIN_SOCKET", "/run/trustyclaw-admin-api/app-backend.sock")
 )
 APP_BACKEND_AUTH_HEADER = "X-TrustyClaw-App-Backend"
-APP_BACKEND_THREAD_SEPARATOR = admin_api.APP_SCOPED_ID_SEPARATOR
 APP_BACKEND_ALLOWED_ADMIN_ROUTES = (
     ("POST", "/v1/tasks"),
     ("GET", "/v1/tasks/:task_id"),
@@ -67,7 +67,6 @@ class Handler(BaseHTTPRequestHandler):
                 path.path,
                 parse_qs(path.query),
                 body,
-                self.headers.get("Idempotency-Key", ""),
             )
             self._send_json(HTTPStatus.OK, response)
         except admin_api.ApiError as exc:
@@ -93,7 +92,7 @@ class Handler(BaseHTTPRequestHandler):
             raise admin_api.ApiError(HTTPStatus.BAD_REQUEST, "malformed Content-Length") from exc
         if length < 0:
             raise admin_api.ApiError(HTTPStatus.BAD_REQUEST, "malformed Content-Length")
-        if length > admin_api.MAX_REQUEST_BODY_BYTES:
+        if length > MAX_REQUEST_BODY_BYTES:
             raise admin_api.ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request body too large")
         if length == 0:
             return None
@@ -153,30 +152,14 @@ def route_app_backend_request(
     path: str,
     query: dict[str, list[str]],
     body: Any,
-    idempotency_key: str,
 ) -> Any:
     _require_app_backend_route(method, path)
 
-    def execute() -> Any:
-        internal_path = _internal_path(app_id, method, path)
-        internal_body = _internal_body(app_id, method, path, body)
-        _require_app_task_scope(app_id, method, path)
-        admin_api.REQUEST_CONTEXT.app_backend_id = app_id
-        try:
-            response = admin_api.route(method, internal_path, query, internal_body)
-        finally:
-            admin_api.REQUEST_CONTEXT.app_backend_id = None
-        return _visible_response(app_id, response)
-
-    if method in {"POST", "PUT", "DELETE"}:
-        return admin_api.mutate_idempotently(
-            method,
-            path,
-            idempotency_key,
-            caller_id=f"app:{app_id}",
-            execute=execute,
-        )
-    return execute()
+    internal_path = _internal_path(app_id, method, path)
+    internal_body = _internal_body(app_id, method, path, body)
+    _require_app_task_scope(app_id, method, path)
+    response = admin_api.route(method, internal_path, query, internal_body, app_backend_id=app_id)
+    return _visible_response(app_id, response)
 
 
 def _peer_uid(conn: socket.socket) -> int:
@@ -235,7 +218,7 @@ def _require_app_task_scope(app_id: str, method: str, path: str) -> None:
 
 
 def _thread_prefix(app_id: str) -> str:
-    return f"{app_id}{APP_BACKEND_THREAD_SEPARATOR}"
+    return f"{app_id}{admin_api.APP_SCOPED_ID_SEPARATOR}"
 
 
 def _internal_thread_id(app_id: str, thread_id: str) -> str:

@@ -262,13 +262,17 @@ button.thread-item.selected::before {
 
 .composer-controls {
   align-items: end;
-  display: grid;
+  display: flex;
+  flex-wrap: wrap;
   gap: 0.6rem;
-  grid-template-columns: minmax(9rem, 1fr) minmax(8rem, 12rem) auto;
 }
 
+.composer-controls .field { flex: 1 1 9rem; }
+#thread-field,
+#model-field { flex-basis: 12rem; }
+.composer-controls button { flex: 0 0 auto; }
+
 .composer:not(.new-thread) .composer-controls {
-  grid-template-columns: auto;
   justify-content: end;
 }
 
@@ -365,9 +369,12 @@ button.ghost:hover {
 
   .composer-controls,
   .composer:not(.new-thread) .composer-controls {
-    grid-template-columns: 1fr;
+    align-items: stretch;
+    flex-direction: column;
     justify-content: stretch;
   }
+
+  .composer-controls .field { flex-basis: auto; }
 
   .composer-controls button { width: 100%; }
 }

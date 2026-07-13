@@ -3,16 +3,18 @@
 All agent traffic is forced here: nftables drops direct outbound traffic for
 non-root users, and the agent runs with HTTP(S)_PROXY pointing at this proxy.
 
-Plain HTTP/WS requests are proxied directly. HTTPS/WSS arrive as CONNECT and
-are inspected by terminating client TLS with a certificate signed by the
-TrustyClaw proxy CA, then opening a separate TLS connection upstream.
+The proxy is HTTPS/WSS-only: traffic arrives as CONNECT and is inspected by
+terminating client TLS with a certificate signed by the TrustyClaw proxy CA,
+then opening a separate TLS connection upstream. Plain HTTP is denied with a
+logged 403 — no allowed destination speaks it, and the GitHub credential must
+never travel an unencrypted socket.
 
 Policy checks happen before any upstream DNS resolution or connection, so a
 denied host name is never resolved (host names are otherwise a data
 exfiltration channel). Every decision is recorded in the network_events table.
 Requests are denied whenever the persisted policy cannot be parsed.
 
-On domains whose rule requires message inspection (the live web search
+On domains whose rule requires message inspection (the external URL request
 guard), WebSocket connections are not opaque tunnels: each client→upstream
 message is parsed out of its frames and policy-checked before forwarding, and
 a violation closes the connection with a 1008 close frame.
@@ -22,7 +24,6 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
-import json
 import select
 import socket
 import ssl
@@ -104,16 +105,15 @@ def connect_public(host: str, port: int, timeout: float) -> socket.socket:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
         raise OSError(f"could not resolve {host}") from exc
+    ips: list[str] = []
     for info in infos:
         ip = info[4][0]
         if not isinstance(ip, str):
             raise OSError(f"resolved non-string address {ip!r} for {host}")
         if not _is_public_ip(ip):
             raise OSError(f"refusing to connect to non-public address {ip} for {host}")
-    connect_ip = infos[0][4][0]
-    if not isinstance(connect_ip, str):
-        raise OSError(f"resolved non-string address {connect_ip!r} for {host}")
-    return socket.create_connection((connect_ip, port), timeout=timeout)
+        ips.append(ip)
+    return socket.create_connection((ips[0], port), timeout=timeout)
 
 
 def request_denial_reason(
@@ -131,7 +131,7 @@ def request_denial_reason(
     if not decide_http_request(policy, protocol, method, host, path, query):
         return "network policy denied request"
     return (
-        openai_request_denied(policy, host, headers, body)
+        openai_request_denied(policy, host, headers, body, path=path)
         or anthropic_request_denied(policy, method, host, path, headers)
         or github_request_denied(policy, method, host, path, query, body)
     )
@@ -173,7 +173,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         else:
             reason = None
         if reason is not None:
-            record_network_event("https", "CONNECT", host, port, "", "", False, reason)
+            append_network_event("https", "CONNECT", host, port, "", "", False, reason)
             self.send_error(403, reason)
             return
         try:
@@ -196,89 +196,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return
 
-    def _proxy_http(self) -> None:
+    def _deny_plain_http(self) -> None:
+        """Plain HTTP (and WS) is not supported: every allowed destination
+        speaks HTTPS/WSS via CONNECT, so an http:// request can only be a
+        misconfiguration or a downgrade. Denied before any body read, DNS
+        resolution, or upstream connection, and logged like any other
+        denial."""
         self.close_connection = True
+        host, port, path, query = "", 80, "/", ""
         try:
             parsed = urllib.parse.urlsplit(self.path)
-            request_host = parsed.hostname
-            request_port = parsed.port
+            host = parsed.hostname or ""
+            port = parsed.port or 80
+            path = parsed.path or "/"
+            query = parsed.query
         except ValueError:
-            # urlsplit/.port raise on a malformed authority (bad IPv6 bracket,
-            # non-numeric or out-of-range port). Answer 400 instead of letting
-            # the exception kill the handler thread.
-            self.send_error(400, "request target is invalid")
-            return
-        path = parsed.path or "/"
-        query = parsed.query
-        headers = list(self.headers.items())
-        host_error = None
-        if request_host is not None:
-            host = request_host
-            port = request_port or 80
-        else:
-            host_values = [value for key, value in headers if key.lower() == "host"]
-            if not host_values:
-                host, port = "", 80
-                host_error = "Host header is required"
-            elif len(host_values) != 1:
-                host, port = "", 80
-                host_error = "exactly one Host header is required"
-            else:
-                try:
-                    host, port = _split_host_port(host_values[0], 80)
-                except ValueError:
-                    host, port = "", 80
-                    host_error = "Host header port is invalid"
-        is_websocket = self.headers.get("Upgrade", "").lower() == "websocket"
-        protocol = "ws" if is_websocket else "http"
-        body, error = self._read_plain_body()
-        if error:
-            status, body_error_reason = error
-            record_network_event(protocol, self.command, host, port, path, query, False, body_error_reason)
-            self.send_error(status, body_error_reason)
-            return
-        policy, policy_error = _policy_load_denial()
-        reason: str | None
-        if host_error is not None:
-            reason = host_error
-        elif port != 80:
-            reason = "only port 80 is allowed for plain HTTP"
-        elif (host_reason := host_header_denial(headers, host, port)) is not None:
-            reason = host_reason
-        elif policy_error is not None:
-            reason = policy_error
-        else:
-            reason = request_denial_reason(policy, protocol, self.command, host, path, query, headers, body)
-        record_network_event(protocol, self.command, host, port, path, query, reason is None, reason)
-        if reason is not None:
-            self.send_error(403, reason)
-            return
-        # After the allow decision: on GitHub domains agent-supplied
-        # Authorization is stripped here too, but the token is never injected
-        # on this plain-HTTP path — the credential must not travel an
-        # unencrypted socket.
-        headers = github_credential_headers(host, headers, secure=False)
-        try:
-            upstream = connect_public(host, port, timeout=15)
-            upstream.settimeout(IDLE_TIMEOUT)
-            request_path = urllib.parse.urlunsplit(("", "", path, query, ""))
-            send_http_request(upstream, self.command, request_path, headers, body, websocket=is_websocket)
-            if is_websocket:
-                tunnel_websocket(self.connection, upstream, policy, protocol, host, port, path)
-            else:
-                forward_until_close(upstream, self.connection)
-        except OSError as exc:
-            self.send_error(502, str(exc))
+            pass  # malformed authority: log the denial with the defaults
+        reason = "plain HTTP is not supported; use HTTPS"
+        append_network_event("http", self.command, host, port, path, query, False, reason)
+        self.send_error(403, reason)
 
-    # Every plain (non-CONNECT) method goes through the same policy path.
-    do_GET = do_HEAD = do_POST = do_PUT = do_PATCH = do_DELETE = _proxy_http
-
-    def _read_plain_body(self) -> tuple[bytes, tuple[int, str] | None]:
-        body, deny_reason = read_body(self.rfile, list(self.headers.items()))
-        if deny_reason:
-            status = 400 if deny_reason.startswith("malformed") else 413
-            return b"", (status, deny_reason)
-        return body, None
+    # Every plain (non-CONNECT) method is denied the same way.
+    do_GET = do_HEAD = do_POST = do_PUT = do_PATCH = do_DELETE = _deny_plain_http
 
     def _serve_tls_request(self, host: str, port: int, client_tls: ssl.SSLSocket) -> None:
         """Read one decrypted request from the client, decide, then connect
@@ -289,30 +228,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
             client_tls.settimeout(IDLE_TIMEOUT)
             reader = SocketReader(client_tls)
             method, target, headers = read_request_head(reader)
+            # Origin-form only: every real client sends origin-form inside a
+            # CONNECT tunnel, and a leading "/" cannot carry a scheme or
+            # authority, so nothing needs re-vetting against the tunnel host.
+            # Anything else (absolute-form, authority-form, garbage) is denied
+            # outright — fail closed, one reason.
             path, query = "/", ""
             target_denial = None
-            upstream_target = target
-            try:
+            if target.startswith("/"):
                 parsed = urllib.parse.urlsplit(target)
                 path = parsed.path or "/"
                 query = parsed.query
-                target_host = parsed.hostname
-                target_port = parsed.port
-            except ValueError:
-                # Malformed authority (bad IPv6 bracket, non-numeric port):
-                # deny and log rather than let the exception kill the handler.
-                target_denial = "request target is invalid"
             else:
-                if target_host is not None:
-                    target_port = target_port or port
-                    if parsed.scheme and parsed.scheme.lower() not in {"https", "wss"}:
-                        target_denial = "request target scheme does not match the TLS tunnel"
-                    elif target_host.lower() != host.lower() or target_port != port:
-                        target_denial = "request target does not match the vetted upstream host"
-                    else:
-                        upstream_target = urllib.parse.urlunsplit(("", "", path, query, ""))
-                elif parsed.netloc:
-                    target_denial = "request target authority is invalid"
+                target_denial = "request target must be origin-form"
             is_websocket = any(key.lower() == "upgrade" and value.lower() == "websocket" for key, value in headers)
             protocol = "wss" if is_websocket else "https"
             body, body_deny = read_body(reader, headers)
@@ -332,7 +260,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 gate_response, gate_reason = github_push_gate_response(policy, method, host, path, body)
                 if gate_reason is not None:
                     reason = gate_reason
-            record_network_event(protocol, method, host, port, path, query, reason is None, reason)
+            append_network_event(protocol, method, host, port, path, query, reason is None, reason)
             if gate_response is not None:
                 client_tls.sendall(gate_response)
                 return
@@ -352,7 +280,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             upstream_raw = connect_public(host, port, timeout=15)
             upstream_tls = ssl.create_default_context().wrap_socket(upstream_raw, server_hostname=host)
             upstream_tls.settimeout(IDLE_TIMEOUT)
-            send_http_request(upstream_tls, method, upstream_target, headers, body, websocket=is_websocket)
+            send_http_request(upstream_tls, method, target, headers, body, websocket=is_websocket)
             if is_websocket:
                 # reader.drain(): frames the client pipelined behind the handshake.
                 tunnel_websocket(
@@ -367,13 +295,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if upstream_tls is not None:
                 upstream_tls.close()
             client_tls.close()
-
-
-def record_network_event(
-    protocol: str, method: str, host: str, port: int, path: str, query: str,
-    allowed: bool, reason: str | None = None,
-) -> None:
-    append_network_event(protocol, method, host, port, path, query, allowed, reason)
 
 
 def _split_host_port(authority: str, default_port: int) -> tuple[str, int]:
@@ -575,9 +496,7 @@ class WebSocketClientGuard:
     oversized is denied rather than blindly forwarded — the same fail-closed
     posture as the HTTP body guard."""
 
-    def __init__(self, policy: dict[str, Any], host: str) -> None:
-        self._policy = policy
-        self._host = host
+    def __init__(self) -> None:
         self._buffer = bytearray()
         self._message = bytearray()
         self._frames: list[bytes] = []  # raw frames of the in-progress message
@@ -608,7 +527,7 @@ class WebSocketClientGuard:
             self._frames.append(raw)
             self._fragmented = not fin
             if fin:
-                reason = openai_ws_message_denied(self._policy, self._host, bytes(self._message))
+                reason = openai_ws_message_denied(bytes(self._message))
                 if reason is not None:
                     raise WebSocketDenied(reason)
                 cleared += b"".join(self._frames)
@@ -664,21 +583,19 @@ def tunnel_websocket(
     initial_client_bytes: bytes = b"",
 ) -> None:
     """Relay a WebSocket connection. When the domain rule requires message
-    inspection (live web search guard), each client→upstream message is
+    inspection (external URL request guard), each client→upstream message is
     policy-checked before forwarding; a violation is logged, answered with a
     1008 close frame, and ends the connection. Upstream→client frames pass
     through untouched. Domains with no message-dependent rule keep the plain
     opaque tunnel."""
-    if not websocket_inspection_required(policy, host):
-        if initial_client_bytes:
-            upstream.sendall(initial_client_bytes)
-        tunnel_sockets(client, upstream)
-        return
-    guard = WebSocketClientGuard(policy, host)
+    # One relay loop for both modes: with no message-dependent rule the guard
+    # is None and the tunnel stays byte-opaque (feed() can then never raise).
+    guard = WebSocketClientGuard() if websocket_inspection_required(policy, host) else None
     try:
-        cleared = guard.feed(initial_client_bytes) if initial_client_bytes else b""
-        if cleared:
-            upstream.sendall(cleared)
+        if initial_client_bytes:
+            cleared = guard.feed(initial_client_bytes) if guard else initial_client_bytes
+            if cleared:
+                upstream.sendall(cleared)
         sockets = [client, upstream]
         while True:
             readable, _, errors = select.select(sockets, [], sockets, IDLE_TIMEOUT)
@@ -689,13 +606,13 @@ def tunnel_websocket(
                 if not data:
                     return
                 if source is client:
-                    cleared = guard.feed(data)
+                    cleared = guard.feed(data) if guard else data
                     if cleared:
                         upstream.sendall(cleared)
                 else:
                     client.sendall(data)
     except WebSocketDenied as denied:
-        record_network_event(protocol, "MESSAGE", host, port, path, "", False, denied.reason)
+        append_network_event(protocol, "MESSAGE", host, port, path, "", False, denied.reason)
         try:
             client.sendall(_websocket_close_frame(1008, denied.reason))
         except OSError:
@@ -703,24 +620,6 @@ def tunnel_websocket(
     finally:
         upstream.close()
         client.close()
-
-
-def tunnel_sockets(left: socket.socket, right: socket.socket) -> None:
-    sockets = [left, right]
-    try:
-        while True:
-            readable, _, errors = select.select(sockets, [], sockets, IDLE_TIMEOUT)
-            if errors or not readable:
-                break
-            for source in readable:
-                data = source.recv(BUFFER_SIZE)
-                if not data:
-                    return
-                target = right if source is left else left
-                target.sendall(data)
-    finally:
-        right.close()
-        left.close()
 
 
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):

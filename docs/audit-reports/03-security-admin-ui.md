@@ -26,7 +26,7 @@ code or act with the operator's credentials.
 - **Trust boundaries:** the browser origin of the admin UI; the cookie/bearer
   scheme; the loopback/SSH-forward or Cloudflare Access transport in front
   of `127.0.0.1:7443`.
-- **In scope:** `host/runtime/admin_ui.html`, `admin_ui.js`, `admin_ui.css`
+- **In scope:** `host/runtime/admin_ui.html`, `admin_ui/*.js`, `admin_ui.css`
   and how `admin_api.py` serves them — every sink where dynamic data enters
   the DOM (`innerHTML` vs text nodes), external references of any kind
   (scripts, styles, fonts, images, prefetch, `fetch` targets), cookie
@@ -46,7 +46,7 @@ your coverage section, and report anything else within scope even if no item
 below names it.
 
 1. Grep-level sweep: every `innerHTML`/`insertAdjacentHTML`/template
-   construction in `admin_ui.js`, and every URL the page can request.
+   construction in `admin_ui/*.js`, and every URL the page can request.
 2. XSS via each agent-controlled string: task output, thread names, file
    names and contents, network event fields, provider metadata JSON.
 3. Cookie: flags (`Secure`, `HttpOnly` feasibility, `SameSite`), scope, what
@@ -60,7 +60,7 @@ below names it.
 ## Key code and docs
 
 - `docs/architecture/admin-api.md`
-- `host/runtime/admin_ui.html`, `host/runtime/admin_ui.js`,
+- `host/runtime/admin_ui.html`, `host/runtime/admin_ui/*.js`,
   `host/runtime/admin_ui.css`
 - `host/runtime/admin_api.py` (static serving, auth, headers)
 

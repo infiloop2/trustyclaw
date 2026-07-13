@@ -30,8 +30,10 @@ workflow passes the generated stage SSH key path through `--ssh-key-env
 TRUSTYCLAW_STAGE_SSH_KEY`.
 
 The stage test takes a `--suite` argument selecting which checks run: `claude`,
-`codex`, or `github` run that provider's checks plus the shared preamble, and
-`all` (the default) additionally runs the cross-runtime checks. Whichever suite
+`codex`, or `github` run that provider's checks plus the shared preamble,
+`brave`, `gmail`, and `gcal` each run that one bundled tool's live check, and
+`all` (the default) additionally runs the cross-runtime checks and every
+configured tool's check. Whichever suite
 is selected, the run first performs a configuration preflight that verifies the
 one-time operator setup the suite needs is present, failing fast and listing
 every missing item at once before any long-running check. The preflight is
@@ -59,9 +61,39 @@ The `all` suite covers the runtime checks omitted from fresh smoke: Codex
 account guards and real web-search task traffic, Claude bearer-token guards and
 real task traffic, mixed Codex/Claude concurrency, steering, kill and thread
 survival, persisted thread recall, runtime deactivation behavior, host reboot
-recovery, the network event prune race, and the GitHub write end-to-end. A
-single-provider suite runs only that provider's guard, task, steering, and kill
-checks; `github` runs only the GitHub write end-to-end.
+recovery, the network event prune race, the live bundled-tool checks against
+real third-party APIs (see below), and the GitHub write
+end-to-end. A single-provider suite runs only that provider's guard, task,
+steering, and kill checks; `github` runs only the GitHub write end-to-end; and
+`brave`, `gmail`, and `gcal` each run only that one bundled tool's live check.
+
+## Tool credentials for stage
+
+The bundled-tool checks run under the `brave`, `gmail`, and `gcal` suites (and
+`all`), one tool per suite. There is no separate per-tool opt-in switch. A
+dedicated `brave`/`gmail`/`gcal` suite requires its credential configured on the
+stage host and fails its preflight if it is not, the same way a provider suite
+requires that runtime logged in. The `all` suite instead self-skips whichever
+tools are unconfigured, so it stays useful mid-setup and exercises what is
+actually configured.
+
+- **Brave Search** runs when the `TRUSTYCLAW_STAGE_BRAVE_API_KEY` repository
+  secret (a free Brave Search API subscription key) is set; the test configures
+  and enables the tool itself and asserts a real search returns results.
+  Otherwise it is skipped.
+- **Gmail** and **Google Calendar** run when the stage Google account is
+  connected (the tool shows connected in `/v1/tools`), and are skipped
+  otherwise. Connecting uses the same one-time pattern as the provider OAuth
+  logins: create a Google Cloud OAuth
+  client (web application) for a dedicated stage Google account and add
+  `http://127.0.0.1:7443/oauth/callback` as an authorized redirect URI. Set
+  `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` by hand in the
+  admin UI's Tools tab, enable the tools, then connect the stage account once.
+  The OAuth sign-in cannot be automated, and tokens persist on the admin volume
+  across stage runs. The tests exercise live reads and full single-use approval
+  round trips: they create and, after a second approval, delete a Gmail draft
+  and a calendar event on the connected stage account, so do not connect a
+  personal account.
 
 ## One-time AWS and GitHub setup for stage
 
@@ -101,9 +133,9 @@ Generate a stable admin password and keep it in your password manager:
 openssl rand -base64 32
 ```
 
-Add these repository secrets:
+Add these repository secrets and variables:
 
-| Secret | Value |
+| Name | Value |
 | --- | --- |
 | `TRUSTYCLAW_STAGE_AWS_ACCESS_KEY_ID` | Access key id for the stage IAM user. |
 | `TRUSTYCLAW_STAGE_AWS_SECRET_ACCESS_KEY` | Secret access key for the stage IAM user. |
@@ -113,6 +145,7 @@ Add these repository secrets:
 | `TRUSTYCLAW_STAGE_GITHUB_APP_ID` | Numeric GitHub App id whose installation can push to the sandbox repo. |
 | `TRUSTYCLAW_STAGE_GITHUB_APP_INSTALLATION_ID` | Numeric installation id of that App on the sandbox repo. |
 | `TRUSTYCLAW_STAGE_GITHUB_APP_PRIVATE_KEY` | The GitHub App PEM private key. |
+| `TRUSTYCLAW_STAGE_BRAVE_API_KEY` | Optional: Brave Search API key. When set, the `brave`/`all` suite runs the live Brave check; when unset, that check self-skips. |
 
 The four `TRUSTYCLAW_STAGE_GITHUB_*` secrets are optional: set all four to have a
 `github` or `all` run auto-configure GitHub, or none to configure a credential
@@ -129,12 +162,13 @@ comments, pull request branches, or temporary feature branches: stage is a
 persistent environment, so upgrades must use the stable mainline version and
 mainline migration path.
 
-The `workflow_dispatch` form takes a **suite** input (`all`, `claude`, `codex`,
-or `github`; default `all`) that maps to the test's `--suite` argument. Use a
-single-provider suite to exercise or debug just that integration, for example
-`github` once the GitHub credential and sandbox write repo are configured, or
-`codex`/`claude` while GitHub is still being set up. Each suite still runs its
-scoped configuration preflight first.
+The `workflow_dispatch` form takes a **suite** input (`all`, `brave`, `gmail`,
+`gcal`, `claude`, `codex`, or `github`; default `all`) that maps to the test's
+`--suite` argument. Use a single-provider suite to exercise or debug just that
+integration, for example `github` once the GitHub credential and sandbox write
+repo are configured, `brave` once the Brave key secret is set, or `codex`/`claude`
+while GitHub is still being set up. Each suite still runs its scoped
+configuration preflight first.
 
 The workflow first runs an `authorize` job that checks out trusted workflow
 actions from `main`, verifies the triggering actor is a repository admin,

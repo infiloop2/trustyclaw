@@ -8,8 +8,10 @@ const FILE_LIST_ENTRY_LIMIT = 1000;
 let currentFilePath = "/";
 let fileEntries = [];
 
-function fileMessage(message) {
-  $("file-message").textContent = message || "";
+function fileMessage(message, isError) {
+  const node = $("file-message");
+  node.textContent = message || "";
+  node.classList.toggle("error", isError === true);
 }
 
 function parentPath(path) {
@@ -28,7 +30,7 @@ export async function loadAgentFiles(path = currentFilePath) {
     $("file-path").value = currentFilePath;
     renderFileList(response);
   } catch (error) {
-    fileMessage(error.message);
+    fileMessage(error.message, true);
   }
 }
 
@@ -50,7 +52,7 @@ async function readAgentFile(path) {
     const response = await api("GET", `/v1/agent-files/read?path=${encodeURIComponent(path)}`);
     renderFileContent(response);
   } catch (error) {
-    fileMessage(error.message);
+    fileMessage(error.message, true);
   }
 }
 

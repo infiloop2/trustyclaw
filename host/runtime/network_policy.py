@@ -15,12 +15,11 @@ import io
 import json
 import posixpath
 import re
-import subprocess
-import threading
 import zlib
 from typing import Any
 from urllib.parse import parse_qs, unquote
 
+from host.config import parse_network_controls
 from host.runtime import github_push_gate
 from host.runtime.state import (
     enqueue_pending_push,
@@ -28,10 +27,12 @@ from host.runtime.state import (
     read_proxy_claude_account,
     read_proxy_github_token,
     read_proxy_openai_account_id,
-    save_network_policy,
 )
 
-WEB_SEARCH_TOOL_TYPES = {"web_search", "web_search_preview"}
+# Codex standalone web search endpoints (code-mode models search here instead
+# of declaring a Responses web_search tool). The request must opt into cached
+# retrieval via settings.external_web_access; the server default is live.
+OPENAI_SEARCH_PATHS = {"/backend-api/codex/alpha/search", "/v1/alpha/search"}
 ANTHROPIC_PRE_PIN_BOOTSTRAP_GET_PATHS = {
     "/api/oauth/profile",
     "/api/oauth/claude_cli/roles",
@@ -39,12 +40,6 @@ ANTHROPIC_PRE_PIN_BOOTSTRAP_GET_PATHS = {
     "/api/claude_code/policy_limits",
     "/api/claude_code/settings",
 }
-# zstd and brotli have no stdlib decoder, so those bodies go through the
-# system binaries (installed by bootstrap), called with argument lists at
-# absolute paths — the same posture as the rest of the host's shell-outs.
-ZSTD_BIN = "/usr/bin/zstd"
-BROTLI_BIN = "/usr/bin/brotli"
-DECOMPRESS_TIMEOUT_SECONDS = 30
 # Matches the proxy's MAX_BODY_BYTES: decompressed output is capped so a
 # decompression bomb cannot exhaust the proxy's memory.
 MAX_DECODED_BODY_BYTES = 128 * 1024 * 1024
@@ -58,13 +53,43 @@ def load_policy() -> dict[str, Any]:
     return controls if isinstance(controls, dict) else {}
 
 
-def load_policy_updated_at() -> str | None:
+def managed_integration(name: str, policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    """One managed integration's stored dict ({} when absent) — the single
+    reader every consumer derives from instead of re-parsing the policy."""
+    if policy is None:
+        policy = load_policy()
+    integrations = policy.get("managed_network_integrations")
+    if not isinstance(integrations, dict):
+        return {}
+    integration = integrations.get(name)
+    return integration if isinstance(integration, dict) else {}
+
+
+def network_policy_response() -> dict[str, Any]:
+    """The operator-facing policy view: stored controls plus updated_at."""
     record = network_policy_record()
-    return record["updated_at"] if record else None
+    if record is None:
+        return {
+            "network_controls": {"managed_network_integrations": {}, "allowed_network_access": {}},
+            "updated_at": None,
+        }
+    controls = record["controls"]
+    return {
+        "network_controls": controls if isinstance(controls, dict) else {},
+        "updated_at": record["updated_at"],
+    }
 
 
-def save_policy(policy: dict[str, Any], updated_at: str) -> None:
-    save_network_policy(policy, updated_at)
+def network_status() -> str:
+    """Whether the stored policy is enforceable. Any failure — an unreadable
+    or unavailable policy table, malformed controls — is the degraded status:
+    /v1/health must report it, not 500 (the same any-failure-denies posture
+    as the proxy's own policy load)."""
+    try:
+        parse_network_controls(load_policy())
+    except Exception:
+        return "error"
+    return "active"
 
 
 def domain_matches(pattern: str, host: str) -> bool:
@@ -104,8 +129,6 @@ def decide_http_request(
     path: str,
     query: str,
 ) -> bool:
-    if protocol not in {"http", "https", "ws", "wss"}:
-        return False
     rule = find_domain_rule(policy, host)
     if rule is None:
         return False
@@ -137,6 +160,7 @@ def openai_request_denied(
     host: str,
     headers: list[tuple[str, str]],
     body: bytes,
+    path: str | None = None,
 ) -> str | None:
     """Apply the OpenAI-specific domain controls. Returns a denial reason, or
     None when the request passes (including for non-OpenAI domains)."""
@@ -153,8 +177,8 @@ def openai_request_denied(
             return "OpenAI account id header is required for this domain"
         if any(value != account_id for value in presented):
             return f"OpenAI account {presented[0]!r} is not the configured account"
-    if rule.get("openai_disable_live_web_search"):
-        return _live_web_search_denial(headers, body)
+    if rule.get("openai_external_url_request_guard"):
+        return _external_url_request_denial(headers, body, path)
     return None
 
 
@@ -213,9 +237,7 @@ GITHUB_STRIP_ONLY_DOMAINS = {
 }
 
 
-def github_credential_headers(
-    host: str, headers: list[tuple[str, str]], *, secure: bool = True
-) -> list[tuple[str, str]]:
+def github_credential_headers(host: str, headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """Credential injection: on GitHub domains, strip whatever
     ``Authorization`` the agent sent and inject the active working token
     (``proxy_github_token`` row) instead. The agent never holds the
@@ -225,14 +247,12 @@ def github_credential_headers(
     for these domains are rejected at validation, so every allowed request
     here came through the managed integration. Without a working token the
     request goes upstream unauthenticated (public reads work, private access
-    gets GitHub's plain 401). ``secure=False`` (the plain-HTTP proxy path)
-    still strips but never injects: the credential must not travel an
-    unencrypted socket, whatever the policy allows."""
+    gets GitHub's plain 401)."""
     lowered = host.lower()
     if lowered not in GITHUB_BEARER_DOMAINS and lowered not in GITHUB_BASIC_DOMAINS and lowered not in GITHUB_STRIP_ONLY_DOMAINS:
         return headers
     headers = [(key, value) for key, value in headers if key.lower() != "authorization"]
-    if lowered in GITHUB_STRIP_ONLY_DOMAINS or not secure:
+    if lowered in GITHUB_STRIP_ONLY_DOMAINS:
         return headers
     token = read_proxy_github_token()
     if not token:
@@ -263,7 +283,11 @@ def github_request_denied(
     guard = rule.get("github_repo_guard")
     if not isinstance(guard, dict):
         return None
-    write_repos = _github_write_repositories(guard)
+    # The guard is only ever produced by config expansion from validated
+    # typed GitHubRepository entries (raw rules on GitHub domains are rejected
+    # at validation), so the shape is trusted; a malformed guard raises and
+    # the proxy's fail-closed handling denies the request.
+    write_repos = {(item["owner"], item["repo"]) for item in guard.get("write_repositories") or []}
     require_approval = guard.get("require_dot_github_approval") is True
     method = method.upper()
     host = host.lower()
@@ -291,12 +315,16 @@ def github_push_gate_response(
     """
     rule = find_domain_rule(policy, host) or {}
     guard = rule.get("github_repo_guard")
-    if not isinstance(guard, dict):
+    if not isinstance(guard, dict) or guard.get("require_dot_github_approval") is not True:
         return None, None
-    target = github_push_gate.should_inspect(guard, host, method.upper(), _normalized_path(path))
-    if target is None:
+    # Trigger: a receive-pack POST to github.com. The write guard has already
+    # run (the proxy calls this only after request_denial_reason returned
+    # None), so the target is a configured write repository by construction —
+    # no re-matching here.
+    parts = [part for part in _normalized_path(path).split("/") if part]
+    if host.lower() != "github.com" or method.upper() != "POST" or len(parts) != 3 or parts[2] != "git-receive-pack":
         return None, None
-    owner, repo = target
+    owner, repo = parts[0].lower(), parts[1].removesuffix(".git").lower()
     try:
         result = github_push_gate.inspect(owner, repo, body, read_proxy_github_token())
     except github_push_gate.GateError:
@@ -314,21 +342,6 @@ def github_push_gate_response(
             pass
         return None, "github_push_gate_unavailable"
     return response, "github_push_queued_for_approval"
-
-
-def _github_write_repositories(guard: dict[str, Any]) -> set[tuple[str, str]]:
-    repositories: set[tuple[str, str]] = set()
-    raw = guard.get("write_repositories", [])
-    if not isinstance(raw, list):
-        return repositories
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        owner = item.get("owner")
-        repo = item.get("repo")
-        if isinstance(owner, str) and isinstance(repo, str):
-            repositories.add((owner.lower(), repo.removesuffix(".git").lower()))
-    return repositories
 
 
 def _github_repo_writable(write_repos: set[tuple[str, str]], owner: str, repo: str) -> bool:
@@ -545,28 +558,34 @@ def _bearer_token(value: str) -> str | None:
 
 
 def websocket_inspection_required(policy: dict[str, Any], host: str) -> bool:
-    """Whether WebSocket messages to ``host`` must be inspected. Only the live
-    web search guard depends on message bodies; the other controls (methods,
-    paths, account pin) are fully decided at the handshake."""
+    """Whether WebSocket messages to ``host`` must be inspected. Only the
+    external URL request guard depends on message bodies; the other controls
+    (methods, paths, account pin) are fully decided at the handshake."""
     rule = find_domain_rule(policy, host) or {}
-    return bool(rule.get("openai_disable_live_web_search"))
+    return bool(rule.get("openai_external_url_request_guard"))
 
 
-def openai_ws_message_denied(policy: dict[str, Any], host: str, payload: bytes) -> str | None:
-    """Apply the live web search guard to one complete WebSocket message,
+def openai_ws_message_denied(payload: bytes) -> str | None:
+    """Apply the external URL request guard to one complete WebSocket message,
     mirroring the HTTP body check. WS payloads carry no Content-Encoding or
-    Content-Type, so the message is inspected as-is."""
-    if not websocket_inspection_required(policy, host):
-        return None
-    return _live_web_search_denial([], payload)
+    Content-Type, so the message is inspected as-is. Only called for guarded
+    hosts: the proxy gates on websocket_inspection_required at the handshake
+    and tunnels everything else opaquely."""
+    return _external_url_request_denial([], payload)
 
 
-def _live_web_search_denial(headers: list[tuple[str, str]], body: bytes) -> str | None:
-    """Block live web search while allowing the cached tool, matching the OpenAI
-    request guard: the legacy ``web_search_preview`` tool is always denied, and a
-    ``web_search`` tool is allowed only with ``external_web_access: false``
-    (cached). A bare ``web_search`` marker with no parseable tool is denied as an
-    anti-evasion measure."""
+def _external_url_request_denial(
+    headers: list[tuple[str, str]],
+    body: bytes,
+    path: str | None = None,
+) -> str | None:
+    """Block requests that would make the upstream reach an external URL with
+    request data, while allowing cache-backed search. The upstream enables
+    search and remote MCP only from parsed request fields, so prompt text that
+    merely mentions a tool name carries no capability and enforcement is
+    structural: see _external_url_request_violation for the rule, plus the
+    standalone search endpoints, which must opt into cached retrieval because
+    the server default there is live."""
     if not body:
         return None
     header_map = {key.lower(): value for key, value in headers}
@@ -574,45 +593,83 @@ def _live_web_search_denial(headers: list[tuple[str, str]], body: bytes) -> str 
     if decoded is None:
         return "request body could not be decoded for web search inspection"
     body = decoded
-    # Anti-evasion first, before any content-type/shape gate: the legacy marker
-    # is disallowed wherever it appears and whatever the declared content-type,
-    # so the agent cannot skip inspection by mislabeling the body or prefixing a
-    # non-JSON byte (OpenAI would still parse such a body).
-    if b"web_search_preview" in body:
-        return "web_search_preview is disabled for this domain"
     content_type = header_map.get("content-type", "").split(";", 1)[0].strip().lower()
     looks_json = content_type == "application/json" or body.lstrip().startswith((b"{", b"["))
     if not looks_json:
-        # Genuinely non-JSON body; allow unless it still smuggles a web_search.
-        if b"web_search" in body:
-            return "web_search requested without a parseable tool"
+        # The upstream parses requests as JSON; a body it cannot parse cannot
+        # declare tools, whatever its content-type label.
         return None
     try:
         payload = json.loads(body)
     except (UnicodeDecodeError, json.JSONDecodeError):
         return "request body is not valid JSON"
-    tools = _iter_tool_objects(payload)
-    if any(tool.get("type") == "web_search_preview" for tool in tools):
-        return "web_search_preview is disabled for this domain"
-    web_search_tools = [tool for tool in tools if tool.get("type") == "web_search"]
-    if not web_search_tools:
-        if b"web_search" in body:
-            return "web_search requested without a parseable tool"
-        return None
-    for tool in web_search_tools:
-        if tool.get("external_web_access") is not False:
+
+    reason = _external_url_request_violation(payload)
+    if reason is not None:
+        return reason
+
+    if path is not None and _normalized_path(path).rstrip("/") in OPENAI_SEARCH_PATHS:
+        settings = payload.get("settings") if isinstance(payload, dict) else None
+        external_web_access = settings.get("external_web_access") if isinstance(settings, dict) else None
+        if external_web_access is not False:
             return "live web search is disabled for this domain (external_web_access must be false)"
     return None
 
 
+def _external_url_request_violation(payload: Any) -> str | None:
+    """The upstream must never reach an external URL with request data. Web
+    content may be retrieved cache-backed only: a web-search-family tool must be
+    exactly ``web_search`` with ``external_web_access`` exactly false; preview
+    and dated variants ignore that setting and always browse live, so they
+    always fail the rule. Chat Completions search (``web_search_options``,
+    ``*-search*`` models) has no cached form and is denied outright. Remote MCP
+    tools (``type: mcp``, by ``server_url`` or hosted ``connector_id``) make the
+    upstream call an external server and are denied outright."""
+    for tool in _iter_tool_objects(payload):
+        tool_type = tool.get("type")
+        if tool_type == "mcp":
+            return "remote MCP tools are disabled for this domain"
+        if tool_type != "web_search":
+            return "web_search_preview is disabled for this domain"
+        if tool.get("external_web_access") is not False:
+            return "live web search is disabled for this domain (external_web_access must be false)"
+    if _contains_key(payload, "server_url"):
+        return "remote MCP tools are disabled for this domain"
+    if _contains_key(payload, "web_search_options"):
+        return "web_search_options is disabled for this domain"
+    model = payload.get("model") if isinstance(payload, dict) else None
+    if isinstance(model, str) and "-search" in model:
+        return "web search models are disabled for this domain"
+    return None
+
+
+def _contains_key(payload: Any, key: str) -> bool:
+    if isinstance(payload, dict):
+        if key in payload:
+            return True
+        return any(_contains_key(value, key) for value in payload.values())
+    if isinstance(payload, list):
+        return any(_contains_key(item, key) for item in payload)
+    return False
+
+
 def _iter_tool_objects(payload: Any) -> list[dict[str, Any]]:
-    """Collect every tool object (``type`` in WEB_SEARCH_TOOL_TYPES) anywhere in
-    the request, so a tool nested under any key is still inspected."""
+    """Collect every web-search-family and remote-MCP tool object anywhere in
+    the request, so a tool nested under any key is still inspected. The prefix
+    match covers dated variants such as web_search_preview_2025_03_11.
+    web_search_call is excluded: it is a history item replaying an earlier
+    search, not a tool declaration, and appears in legitimate cached-search
+    requests; mcp_call and mcp_list_tools history item types do not match
+    either."""
     matches: list[dict[str, Any]] = []
 
     def walk(node: Any) -> None:
         if isinstance(node, dict):
-            if node.get("type") in WEB_SEARCH_TOOL_TYPES:
+            type_value = node.get("type")
+            if isinstance(type_value, str) and (
+                type_value == "mcp"
+                or (type_value.startswith("web_search") and type_value != "web_search_call")
+            ):
                 matches.append(node)
             for value in node.values():
                 walk(value)
@@ -626,8 +683,11 @@ def _iter_tool_objects(payload: Any) -> list[dict[str, Any]]:
 
 def _decode_body(body: bytes, content_encoding: str) -> bytes | None:
     """Decode a Content-Encoding so the guard inspects real JSON, not a
-    compressed blob. Returns None when the body cannot be decoded (corrupt or an
-    encoding we cannot read), which the caller treats as fail-closed."""
+    compressed blob. Only the stdlib-decodable encodings are supported;
+    anything else (zstd, br, corrupt streams) returns None, which the caller
+    treats as fail-closed. Clients essentially never compress request bodies
+    and the agent CLIs are version-pinned, so a live denial is the signal to
+    add an encoding, not a fallback decoder."""
     encoding = content_encoding.strip().lower()
     if encoding in ("", "identity"):
         return body
@@ -635,10 +695,6 @@ def _decode_body(body: bytes, content_encoding: str) -> bytes | None:
         return _bounded_gzip_decompress(body)
     if encoding in ("deflate", "zlib"):
         return _bounded_zlib_decompress(body)
-    if encoding == "zstd":
-        return _run_decompressor([ZSTD_BIN, "-dc"], body)
-    if encoding == "br":
-        return _run_decompressor([BROTLI_BIN, "-dc"], body)
     return None
 
 
@@ -684,55 +740,3 @@ def _read_decoded_limited(handle: Any) -> bytes | None:
         decoded.extend(chunk)
         if len(decoded) > MAX_DECODED_BODY_BYTES:
             return None
-
-
-def _run_decompressor(argv: list[str], body: bytes) -> bytes | None:
-    """Decompress through a system binary (stdin -> stdout) with the output
-    size capped, so a decompression bomb cannot exhaust the proxy's memory.
-    Returns None — fail closed — when the binary is missing, the stream is
-    corrupt, or the output exceeds the cap."""
-    try:
-        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    except OSError:
-        return None
-    assert proc.stdin is not None and proc.stdout is not None
-    stdin = proc.stdin
-
-    def feed() -> None:
-        # A separate writer avoids the classic pipe deadlock: the child can
-        # block writing output while we would block writing its input.
-        try:
-            stdin.write(body)
-        except OSError:
-            pass  # the child died; wait() below surfaces it
-        finally:
-            try:
-                stdin.close()
-            except OSError:
-                pass
-
-    writer = threading.Thread(target=feed, daemon=True)
-    writer.start()
-    # This read can only block while the child is alive and silent. The child
-    # has its complete input (stdin is closed after the write), so a real
-    # decompressor either produces output or exits with an error; the wait()
-    # timeout below covers one that lingers after closing its stdout.
-    decoded = bytearray()
-    overflow = False
-    while chunk := proc.stdout.read(64 * 1024):
-        decoded.extend(chunk)
-        if len(decoded) > MAX_DECODED_BODY_BYTES:
-            overflow = True
-            proc.kill()
-            break
-    proc.stdout.close()
-    try:
-        returncode = proc.wait(timeout=DECOMPRESS_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        return None
-    writer.join(timeout=5)
-    if overflow or returncode != 0:
-        return None
-    return bytes(decoded)

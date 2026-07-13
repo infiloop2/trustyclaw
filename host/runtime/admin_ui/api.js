@@ -16,7 +16,6 @@ export function getPassword() {
 export async function api(method, path, body, extraHeaders) {
   const headers = { "Authorization": "Bearer " + getPassword() };
   for (const [name, value] of Object.entries(extraHeaders || {})) headers[name] = value;
-  if (method !== "GET") headers["Idempotency-Key"] = crypto.randomUUID();
   if (body !== undefined) headers["Content-Type"] = "application/json";
   const response = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   const data = await response.json();

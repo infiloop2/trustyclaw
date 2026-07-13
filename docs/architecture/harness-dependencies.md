@@ -10,8 +10,8 @@ break when a harness package is upgraded.
 
 | Harness | Package | Pinned version | Runtime id | Adapter |
 | --- | --- | --- | --- | --- |
-| Codex | `@openai/codex` | `0.140.0` | `codex` | `host/runtime/codex_app_server.py` |
-| Claude Code | `@anthropic-ai/claude-code` | `2.1.177` | `claude_code` | `host/runtime/claude_code.py` |
+| Codex | `@openai/codex` | `0.144.0` | `codex` | `host/runtime/codex_app_server.py` |
+| Claude Code | `@anthropic-ai/claude-code` | `2.1.206` | `claude_code` | `host/runtime/claude_code.py` |
 
 Bootstrap installs these packages globally with npm and verifies the exact CLI
 version strings before completing. A version bump should be treated as an
@@ -60,13 +60,18 @@ Expected methods:
 
 | Method | Expected behavior |
 | --- | --- |
-| `account/read` | Accepts `{"refreshToken": false}` and returns a JSON object with an `account` field. A ChatGPT account contains `email` and `planType`; any provider-specific account type is intentionally ignored. A falsey `account` means login is still required. |
+| `account/read` | Accepts a `refreshToken` boolean and returns a JSON object with an `account` field. Normal status reads pass `false`; if the live usage probe fails for a pinned account, TrustyClaw retries with `true` so Codex validates or refreshes its credential before the UI reports connected. A ChatGPT account contains `email` and `planType`; any provider-specific account type is intentionally ignored. A falsey account means login is still required. |
 | `account/rateLimits/read` | Returns Codex usage-limit snapshots. TrustyClaw exposes only the default `rateLimits` snapshot in admin API responses; per-limit `rateLimitsByLimitId` entries and duplicated snapshot identity fields are intentionally not returned. Rate-limit windows contain `usedPercent`, `windowDurationMins`, and `resetsAt`; the default snapshot may contain `credits`. |
 | `account/login/start` | Accepts `{"type": "chatgptDeviceCode"}` and returns `type`, `loginId`, `verificationUrl`, and `userCode`. |
-| `thread/start` | Accepts `cwd`, `approvalPolicy`, `sandbox`, and developer instructions. Returns `thread.id`. |
-| `thread/resume` | Accepts `threadId` and `cwd`. Returns a resumed `thread.id`, or fails when the thread cannot be resumed. |
-| `turn/start` | Accepts `threadId` and text input. Returns `turn.id`. It may emit notifications before the response. |
+| `thread/start` | Accepts `cwd`, `approvalPolicy`, `sandbox`, developer instructions, and the selected `model`. Returns `thread.id`. |
+| `thread/resume` | Accepts `threadId`, `cwd`, and the selected `model`. Returns a resumed `thread.id`, or fails when the thread cannot be resumed. |
+| `turn/start` | Accepts `threadId`, text input, and the selected `model` and `effort`. Returns `turn.id`. It may emit notifications before the response. |
 | `turn/steer` | Accepts `threadId`, `expectedTurnId`, and text input. A `no active turn` error is treated as transient during startup. |
+
+The pinned Codex catalog must advertise `gpt-5.6-terra` and `gpt-5.6-sol`
+with `high`, `max`, and `ultra`, plus `gpt-5.6-luna` with `high` and `max`.
+TrustyClaw intentionally exposes only that small subset; the API rejects
+unsupported pairs before a task is queued.
 
 Expected notifications:
 
@@ -102,7 +107,7 @@ between the CLI writing `~/.codex/auth.json` and that read matches the Claude
 first-capture path, and the linked account is shown to the operator once pinned.
 The resulting OpenAI provider account row is tagged with
 `operator_approval: "codex_device_login"`; rows without that marker are
-legacy/unapproved state and cannot seed the proxy pin.
+legacy/unapproved state and never publish a proxy pin.
 
 `account/read` is not assumed to expose the ChatGPT account id. TrustyClaw reads
 the account id through `read-codex-account-id`, which parses a small part of
@@ -128,11 +133,21 @@ OpenAI data-plane traffic to the logged-in account. TrustyClaw stores only the
 operator-approved account id in admin and proxy state, not the tokens needed to
 recreate Codex auth files.
 
-TrustyClaw keeps the observed `account/read` identity fields (`email` and
-`planType`) in admin state. The Admin API exposes the Codex plan as the
-common `plan_type` field. It reads Codex usage limits from
+TrustyClaw keeps the observed `account/read` identity fields (`email`, and
+`planType` stored as the common `plan_type` field) in admin state; the Admin
+API exposes stored account metadata as is, so sanitization happens once, at
+capture. It reads Codex usage limits from
 `account/rateLimits/read`, not from `account/read`, and exposes only the default
 snapshot's `primary`, `secondary`, and `credits` fields under `codex_usage`.
+For a pinned account, failure of that live read triggers one forced
+Codex-owned credential refresh; an authentication failure becomes
+`awaiting_login`, while a successful refresh may remain active without usage
+metadata. An account that is not pinned yet cannot reach the guarded usage
+endpoint at all, so its usage-read failure is routine: it stays a readable
+account awaiting operator approval and its refresh token is never rotated.
+The refresh verdict is remembered: an authentication failure stands, with no
+further provider traffic, until an operator login or reset replaces the
+credential, and any other failure is retried on the next scheduled recheck.
 The proxy still receives only the account id needed for account pinning.
 
 ### Network request shape
@@ -143,19 +158,26 @@ request shapes:
 - `auth.openai.com` is the only managed OpenAI auth domain. It is allowed for
   `GET` and `POST` and is not account-pinned.
 - `api.openai.com` is a managed OpenAI data-plane domain. It is allowed only for
-  `POST`, requires `ChatGPT-Account-Id`, and applies the live-web-search guard.
+  `POST`, requires `ChatGPT-Account-Id`, and applies the external URL request
+  guard.
 - `chatgpt.com` is a managed ChatGPT/Codex data-plane domain. It is allowed for
   `GET` and `POST`, requires `ChatGPT-Account-Id`, and applies the
-  live-web-search guard.
+  external URL request guard.
 - Codex must not require additional OpenAI, ChatGPT, or wildcard ChatGPT
   domains without updating the managed provider policy.
 - ChatGPT/Codex data-plane requests carry `ChatGPT-Account-Id` matching the
   account id inferred from local auth files.
 - Data-plane request bodies expose OpenAI tool declarations in parseable JSON
   when web search is requested.
-- Cached web search uses `{"type": "web_search", "external_web_access": false}`.
-- Live web search either uses `web_search_preview` or `web_search` with
-  external access enabled or omitted, so the proxy can deny it.
+- Cached web search uses `{"type": "web_search", "external_web_access": false}`,
+  or on the standalone Codex search endpoints a body with
+  `settings.external_web_access: false`.
+- Live web search uses `web_search_preview` (including dated variants),
+  `web_search` with external access enabled or omitted, Chat Completions
+  `web_search_options`/search models, or a standalone search request without
+  the cached setting, so the proxy can deny it.
+- Remote MCP tools are declared as parseable `type: mcp` tool objects (with a
+  `server_url` or hosted `connector_id`), so the proxy can deny them.
 
 Bootstrap also installs `/etc/codex/requirements.toml` to pin Codex web search
 behavior to cached search and disable Codex app/plugin connector surfaces, plus
@@ -164,7 +186,11 @@ behavior to cached search and disable Codex app/plugin connector surfaces, plus
 `approval_policy = "never"`, `sandbox_mode = "danger-full-access"`, and trust
 `/mnt/trustyclaw-agent/agent-home`. Bootstrap installs it root-owned, readable,
 and immutable so the agent cannot edit or delete the active policy file. The
-proxy guard is still required as the web-search enforcement layer.
+proxy guard is still required as the web-search enforcement layer. The root-owned
+managed config layer `/etc/codex/managed_config.toml` also registers the bundled
+tools MCP server (`mcp_servers.trustyclaw` spawning `host.runtime.tools_mcp_shim`),
+so Codex must keep reading both root-owned `/etc/codex` layers and spawning
+configured stdio MCP servers as the runtime user.
 
 ## Claude Code harness expectations
 
@@ -174,8 +200,16 @@ TrustyClaw starts one Claude Code process per task turn through:
 
 ```text
 claude -p --input-format stream-json --output-format stream-json --verbose \
-  --setting-sources user --strict-mcp-config
+  --model <model> --effort <effort> \
+  --setting-sources user --strict-mcp-config \
+  --mcp-config <inline JSON for the bundled tools MCP shim>
 ```
+
+TrustyClaw passes the session selection on every new and resumed process.
+Claude Code `2.1.206` accepts the exposed model aliases `opus`, `fable`, and
+`sonnet`; it also accepts `high`, `max`, and the session-only `ultracode`
+effort. `ultracode` combines xhigh effort with dynamic workflow orchestration,
+so an older CLI that silently ignores that value is not compatible.
 
 Bootstrap also installs `/mnt/trustyclaw-agent/agent-home/.claude/settings.json`
 from `host/bootstrap/agent-home/.claude/settings.json`. That file must set
@@ -184,6 +218,15 @@ from `host/bootstrap/agent-home/.claude/settings.json`. That file must set
 readable, and immutable; `--setting-sources user` keeps stale local or project
 settings out of the task harness while still allowing `CLAUDE.md` instructions
 to load.
+
+`--strict-mcp-config` plus the inline `--mcp-config` make the bundled tools
+shim (`host.runtime.tools_mcp_shim`, spawned as `trustyclaw-agent`) the only
+MCP server; with no tools enabled it lists nothing. The invocation
+deliberately does not pass `--safe-mode`: the pinned CLI drops every non-SDK
+MCP server in safe mode, which would disable the bundled tools entirely. The
+agent's isolation comes from the OS boundaries (dedicated user, nftables,
+policy proxy), not from harness flags, and `--strict-mcp-config` already
+ignores any MCP configuration outside the host-supplied one.
 
 Bootstrap installs the same `host/bootstrap/agent-home/agents_claude.md`
 contents to `/mnt/trustyclaw-agent/agent-home/AGENTS.md` and
@@ -234,6 +277,36 @@ Expected status fields:
 | `authMethod` | Must be `claude.ai`; any other value is an error. |
 | `email`, `orgId` | Used as optional metadata when helper-read auth files do not already expose equivalent values. |
 | `accountId`, `account_id`, `userId`, `userID`, `user_id` | Optional provisional account-id sources within a single status probe. The identity that gets anchored and displayed always comes from token attestation (below), never from these agent-writable fields. Legacy stored Claude rows without `identity_attestation: "anthropic_oauth_profile"` are treated as no anchor (like an unapproved OpenAI row), so a plain operator re-login re-captures them through the first-capture attestation gate; no separate reset is required. |
+
+`loggedIn` is only Claude Code's local credential state, so it is not enough to
+publish an active runtime. Once a token is pinned, every steady-state status
+refresh also runs:
+
+```text
+claude -p /usage --output-format json
+```
+
+This live probe makes Claude Code authenticate and gives the CLI ownership of
+refreshing an expired access token. TrustyClaw reads the credential hash again
+after the probe. If refresh rotated it, the old proxy pin can safely deny that
+probe's first retry; the orchestrator notices the new hash, attests it through
+the profile endpoint below, and atomically replaces the pin. First capture and
+a rotation already visible at the start of a check use that same live profile
+attestation directly; the refresh then reads usage once, right after the new
+pin is published, so usage metadata is available immediately after login. A
+steady-token authentication failure becomes `awaiting_login`; another steady
+probe failure becomes `error`.
+
+The probe's verdict is memoized per token hash. Active runtimes are rechecked
+every five minutes and immediately before each Claude task, but only a
+recheck whose memo has expired runs the probe, so the pre-task check is
+normally memory-only. An `awaiting_login` verdict never expires: that token
+is rejected, no background retry can fix it, and the only recovery is an
+operator login (which mints a new token) or an account reset. An `error`
+verdict expires with the memo, so infrastructure failures recover on the next
+scheduled recheck. Attestation results are memoized per token hash the same
+way: a token's attested identity never changes, so one successful profile
+fetch answers every later recheck of that token.
 
 Login starts with:
 
@@ -321,18 +394,27 @@ Claude usage is read with:
 claude -p "/usage" --output-format json
 ```
 
-On observed Claude Code `2.1.195`, the command returns a JSON object whose
+On pinned Claude Code `2.1.206`, the command returns a JSON object whose
 `result` string contains lines like:
 
 ```text
-Current session: 0% used
+Current session: 0% used · resets Jul 11, 1am (UTC)
 Current week (all models): 0% used · resets Jul 3, 3:59pm (UTC)
+Current week (Fable): 0% used · resets Jul 3, 3:59pm (UTC)
 ```
 
-TrustyClaw parses only that observed text shape into
-`claude_usage.current_session_used_percent`, `claude_usage.weekly_used_percent`,
-and `claude_usage.weekly_resets_at_text`. If the CLI response changes shape or
-the command fails, TrustyClaw omits `claude_usage` instead of guessing.
+TrustyClaw parses each window line independently: `Current session` into
+`claude_usage.current_session_*`, `Current week (all models)` into
+`claude_usage.weekly_*`, and `Current week (Fable)` into
+`claude_usage.fable_weekly_*`; other model-specific week lines are ignored.
+Each window carries `used_percent` and,
+when its reset time parses, `resets_at`. Reset times are Unix timestamps;
+TrustyClaw converts the provider's UTC text while capturing the snapshot; a
+reset in any other timezone label drops only that window's `resets_at`. A line
+that does not match contributes nothing, and the snapshot keeps whatever did
+parse. When a refresh yields no fresh usage at all, TrustyClaw keeps the
+previously captured `claude_usage` snapshot (and its `last_checked_at`)
+instead of guessing or blanking known limits.
 
 TrustyClaw therefore cannot recreate Claude Code auth files from admin state.
 Doing that would require storing refresh/access tokens or equivalent provider

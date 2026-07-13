@@ -1,9 +1,9 @@
-"""Installed app registry and host-derived integration metadata.
+"""Installed app packages and host-derived integration metadata.
 
-Apps provide manifests and files under ``host/apps/<app_id>/``. The host
-derives service users, database namespaces, routes, and ports from the app id
-so app packages cannot collide with host objects by choosing those names
-themselves.
+Apps provide manifests and files under ``host/apps/<app_id>/``. The package
+directory is the app's identity. The host derives service users, database
+namespaces, routes, and ports from that id plus the package's stable host slot,
+so there is no second registry that can drift from the packages on disk.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import mimetypes
 import re
 from typing import Any
 
-from host.constants import APP_PORT_BASE, LOOPBACK
+from host.constants import APP_PORT_BASE
 
 
 APP_ROOT = Path(__file__).resolve().parents[1] / "apps"
@@ -49,7 +49,7 @@ class AppManifest:
     migrations_dir: Path
     ui_dir: Path
     port: int
-    allocation: AppAllocation | None = None
+    allocation: AppAllocation
 
     @property
     def linux_user(self) -> str:
@@ -76,18 +76,13 @@ class AppManifest:
         return f"/v1/apps/{self.id}/ui/"
 
     def public(self) -> dict[str, Any]:
+        # Only what the admin shell reads: the service unit, DB schema/role,
+        # and localhost base URL are fixed derivations documented in
+        # docs/architecture/apps.md and never leave the host.
         return {
             "id": self.id,
             "title": self.title,
-            "backend": {
-                "api_route": self.api_route,
-                "localhost_base_url": f"http://{LOOPBACK}:{self.port}",
-                "service": self.service_name,
-            },
-            "database": {
-                "schema": self.db_schema,
-                "role": self.db_role,
-            },
+            "backend": {"api_route": self.api_route},
             "ui": {
                 "iframe_src": f"{self.ui_route}index.html",
                 "sandbox": ["allow-scripts", "allow-forms", "allow-modals"],
@@ -99,22 +94,13 @@ def installed_apps(root: Path | None = None) -> list[AppManifest]:
     root = APP_ROOT if root is None else root
     if not root.exists():
         return []
-    manifest_paths = sorted(root.glob("*/manifest.json"))
-    if len(manifest_paths) > MAX_INSTALLED_APPS:
+    package_dirs = _app_package_dirs(root)
+    if len(package_dirs) > MAX_INSTALLED_APPS:
         raise AppError(f"too many installed apps: maximum is {MAX_INSTALLED_APPS}")
     apps: list[AppManifest] = []
-    seen_ids: set[str] = set()
     seen_generated: set[tuple[str, str]] = set()
-    registry = app_registry(root)
-    for manifest_path in manifest_paths:
-        app = _load_manifest(
-            manifest_path,
-            allocation=registry.get(manifest_path.parent.name),
-            port=_port_for_app_id(manifest_path.parent.name, registry=registry),
-        )
-        if app.id in seen_ids:
-            raise AppError(f"duplicate app id: {app.id}")
-        seen_ids.add(app.id)
+    for package_dir in package_dirs:
+        app = _load_manifest(package_dir / "manifest.json")
         for kind, value in (
             ("linux_user", app.linux_user),
             ("db_schema", app.db_schema),
@@ -127,53 +113,7 @@ def installed_apps(root: Path | None = None) -> list[AppManifest]:
                 raise AppError(f"duplicate generated app {kind}: {value}")
             seen_generated.add(key)
         apps.append(app)
-    missing = sorted(set(registry) - seen_ids)
-    if missing:
-        raise AppError(f"app registry references missing app packages: {', '.join(missing)}")
     return apps
-
-
-def app_registry(root: Path | None = None) -> dict[str, AppAllocation]:
-    root = APP_ROOT if root is None else root
-    path = root / "registry.json"
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text())
-    except json.JSONDecodeError as exc:
-        raise AppError(f"{path}: invalid JSON: {exc}") from exc
-    if not isinstance(data, dict):
-        raise AppError(f"{path}: registry must be an object")
-    registry: dict[str, AppAllocation] = {}
-    seen_uids: set[int] = set()
-    seen_gids: set[int] = set()
-    seen_offsets: set[int] = set()
-    for app_id, raw in data.items():
-        if not isinstance(app_id, str) or not APP_ID_RE.fullmatch(app_id):
-            raise AppError(f"{path}: registry app id must match {APP_ID_RE.pattern}")
-        if not isinstance(raw, dict):
-            raise AppError(f"{path}: registry entry for {app_id} must be an object")
-        allocation = AppAllocation(
-            uid=_required_int(raw, "uid", path),
-            gid=_required_int(raw, "gid", path),
-            port_offset=_required_int(raw, "port_offset", path),
-        )
-        if not APP_UID_BASE <= allocation.uid <= APP_UID_MAX:
-            raise AppError(f"{path}: {app_id} uid must be in {APP_UID_BASE}-{APP_UID_MAX}")
-        if not APP_UID_BASE <= allocation.gid <= APP_UID_MAX:
-            raise AppError(f"{path}: {app_id} gid must be in {APP_UID_BASE}-{APP_UID_MAX}")
-        if not APP_PORT_OFFSET_MIN <= allocation.port_offset <= APP_PORT_OFFSET_MAX:
-            raise AppError(
-                f"{path}: {app_id} port_offset must be in "
-                f"{APP_PORT_OFFSET_MIN}-{APP_PORT_OFFSET_MAX}"
-            )
-        if allocation.uid in seen_uids or allocation.gid in seen_gids or allocation.port_offset in seen_offsets:
-            raise AppError(f"{path}: duplicate uid, gid, or port offset in app registry")
-        seen_uids.add(allocation.uid)
-        seen_gids.add(allocation.gid)
-        seen_offsets.add(allocation.port_offset)
-        registry[app_id] = allocation
-    return registry
 
 
 def app_by_id(app_id: str, root: Path | None = None) -> AppManifest | None:
@@ -207,7 +147,25 @@ def ui_asset(path: str, root: Path | None = None) -> tuple[AppManifest, Path, st
     return app, asset, content_type
 
 
-def _load_manifest(path: Path, *, allocation: AppAllocation | None, port: int) -> AppManifest:
+def _app_package_dirs(root: Path) -> list[Path]:
+    packages: list[Path] = []
+    for child in sorted(root.iterdir(), key=lambda path: path.name):
+        if child.name == "__pycache__":
+            continue
+        if child.is_symlink():
+            raise AppError(f"{child}: app package directory must not be a symlink")
+        if not child.is_dir():
+            raise AppError(f"{child}: every entry under host/apps must be an app package directory")
+        if not APP_ID_RE.fullmatch(child.name):
+            raise AppError(f"{child}: app package directory must match {APP_ID_RE.pattern}")
+        manifest_path = child / "manifest.json"
+        if not manifest_path.is_file() or manifest_path.is_symlink():
+            raise AppError(f"{child}: app package must contain a regular manifest.json file")
+        packages.append(child)
+    return packages
+
+
+def _load_manifest(path: Path) -> AppManifest:
     try:
         data = json.loads(path.read_text())
     except json.JSONDecodeError as exc:
@@ -215,17 +173,27 @@ def _load_manifest(path: Path, *, allocation: AppAllocation | None, port: int) -
     if not isinstance(data, dict):
         raise AppError(f"{path}: manifest must be an object")
     package_dir = path.parent
-    app_id = _required_string(data, "id", path)
-    if not APP_ID_RE.fullmatch(app_id):
-        raise AppError(f"{path}: id must match {APP_ID_RE.pattern}")
-    if package_dir.name != app_id:
-        raise AppError(f"{path}: manifest id must match package directory name")
+    _require_exact_keys(data, {"host_slot", "title", "backend", "database", "ui"}, path, "manifest")
+    app_id = package_dir.name
+    host_slot = _required_int(data, "host_slot", path)
+    if not APP_PORT_OFFSET_MIN <= host_slot <= APP_PORT_OFFSET_MAX:
+        raise AppError(
+            f"{path}: host_slot must be in {APP_PORT_OFFSET_MIN}-{APP_PORT_OFFSET_MAX}"
+        )
+    allocation = AppAllocation(
+        uid=APP_UID_BASE + host_slot,
+        gid=APP_UID_BASE + host_slot,
+        port_offset=host_slot,
+    )
     title = _required_string(data, "title", path)
     if "\n" in title or "\r" in title:
         raise AppError(f"{path}: title must be a single line")
     backend = _required_object(data, "backend", path)
     database = _required_object(data, "database", path)
     ui = _required_object(data, "ui", path)
+    _require_exact_keys(backend, {"entrypoint"}, path, "backend")
+    _require_exact_keys(database, {"migrations"}, path, "database")
+    _require_exact_keys(ui, {"path"}, path, "ui")
     backend_entrypoint = _required_child(package_dir, backend, "entrypoint", path)
     migrations_dir = _required_child(package_dir, database, "migrations", path)
     ui_dir = _required_child(package_dir, ui, "path", path)
@@ -242,7 +210,7 @@ def _load_manifest(path: Path, *, allocation: AppAllocation | None, port: int) -
         backend_entrypoint=backend_entrypoint,
         migrations_dir=migrations_dir,
         ui_dir=ui_dir,
-        port=port,
+        port=APP_PORT_BASE + allocation.port_offset,
         allocation=allocation,
     )
     _validate_postgres_identifier(app.db_schema, "database schema", path)
@@ -250,21 +218,9 @@ def _load_manifest(path: Path, *, allocation: AppAllocation | None, port: int) -
     return app
 
 
-def _port_for_app_id(app_id: str, *, registry: dict[str, AppAllocation]) -> int:
-    allocation = registry.get(app_id)
-    if allocation is None:
-        # Temp test roots may omit registry.json. Keep those fallback ports
-        # independent of manifest scan order; deployed app ports come from the
-        # root-owned registry and lifecycle bootstrap requires allocations.
-        offset = 100 + sum((index + 1) * ord(char) for index, char in enumerate(app_id)) % 900
-    else:
-        offset = allocation.port_offset
-    return APP_PORT_BASE + offset
-
-
 def _required_int(data: dict[str, Any], key: str, path: Path) -> int:
     value = data.get(key)
-    if not isinstance(value, int):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise AppError(f"{path}: {key} must be an integer")
     return value
 
@@ -281,6 +237,20 @@ def _required_object(data: dict[str, Any], key: str, path: Path) -> dict[str, An
     if not isinstance(value, dict):
         raise AppError(f"{path}: {key} must be an object")
     return value
+
+
+def _require_exact_keys(data: dict[str, Any], expected: set[str], path: Path, label: str) -> None:
+    keys = set(data)
+    if keys == expected:
+        return
+    missing = sorted(expected - keys)
+    extra = sorted(keys - expected)
+    details: list[str] = []
+    if missing:
+        details.append(f"missing {', '.join(missing)}")
+    if extra:
+        details.append(f"unsupported {', '.join(extra)}")
+    raise AppError(f"{path}: {label} fields are invalid: {'; '.join(details)}")
 
 
 def _required_child(base: Path, data: dict[str, Any], key: str, path: Path) -> Path:

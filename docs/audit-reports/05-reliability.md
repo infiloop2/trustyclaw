@@ -38,7 +38,7 @@ explicitly (or state that it was skipped):
   `MemoryMax`, `MemorySwapMax`, `TasksMax`) and what they do *not* cover
   (disk, file descriptors, I/O); volume layout separating agent storage from
   service storage; admin API threading (state lock discipline, six workers /
-  three-per-runtime claim caps, idempotency-record memory), Postgres via the
+  three-per-runtime claim caps), Postgres via the
   in-repo `pgclient.py` (timeouts, reconnects, transaction hygiene); systemd
   unit ordering, restart policies, and watchdogs; the maintenance thread's
   pruning of the 1,000,000-row event caps; boot-time nftables ordering.
@@ -97,8 +97,8 @@ a live host.
   network-proxy/admin-api/postgres units and restart policies, the volume
   layout, `postgresql.conf` (`max_connections=50`), and `pg_hba.conf`.
 - `host/runtime/admin_api.py` locks (mutation lock usage, `NETWORK_POLICY_LOCK`,
-  `OAUTH_LOGIN_LOCK`, `IDEMPOTENCY_LOCK`), helper timeouts, the maintenance
-  loop, and the queue/steer caps.
+  `OAUTH_LOGIN_LOCK`), helper timeouts, the maintenance loop, and the
+  queue/steer caps.
 - `host/runtime/state.py` (`mutation()` RLock, event caps + amortized prune,
   task/thread-session pruning), `host/runtime/db.py` (pool, `MAX_ACTIVE_CONNECTIONS`,
   checkout timeout), `host/runtime/pgclient.py` (socket handling),

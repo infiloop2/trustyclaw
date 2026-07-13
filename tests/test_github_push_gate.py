@@ -120,13 +120,21 @@ class ChangeDetectionTests(unittest.TestCase):
         self.assertIn(".github/workflows/ci.yml", paths)
         self.assertTrue(gate.touches_github(paths))
 
-    def test_valid_ref_name_matches_git_rules(self) -> None:
-        self.assertTrue(gate.valid_ref_name("refs/heads/main"))
-        for ref in ("refs/heads/bad?ref", "refs/heads/foo..bar", "refs/heads/foo.lock", "refs/heads/@{x}"):
+    def test_valid_ref_name_pins_the_regex_contract(self) -> None:
+        # Parsing fails closed on anything but a plain refs/heads or refs/tags
+        # name without whitespace or git metacharacters; git-invalid spellings
+        # the regex admits (foo..bar, x.lock) are rejected downstream by the
+        # root helper's own `git push`, the actual privilege boundary.
+        for ref in ("refs/heads/main", "refs/tags/v1.0", "refs/heads/feature/x"):
+            with self.subTest(ref=ref):
+                self.assertTrue(gate.valid_ref_name(ref))
+        for ref in ("refs/heads/bad?ref", "refs/heads/a b", "refs/heads/x[y]",
+                    "refs/heads/c:d", "refs/heads/t~1", "refs/heads/h^2",
+                    "refs/notes/x", "HEAD", "refs/heads/"):
             with self.subTest(ref=ref):
                 self.assertFalse(gate.valid_ref_name(ref))
 
-    def test_clean_push_does_not_touch_github(self) -> None:
+    def test_clean_push_diffs_clean_and_is_forwarded(self) -> None:
         (self.work / "src.py").write_text("print(1)\n")
         _git(self.work, "add", "src.py")
         _git(self.work, "commit", "--quiet", "-m", "B: code only")
@@ -135,12 +143,6 @@ class ChangeDetectionTests(unittest.TestCase):
         paths = gate.changed_paths(self.mirror, [(self.old, new, "refs/heads/main")], pack)
         self.assertEqual(paths, set())
         self.assertFalse(gate.touches_github(paths))
-        missing = subprocess.run(
-            ["git", "-C", str(self.mirror), "cat-file", "-e", f"{new}^{{commit}}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        self.assertNotEqual(missing.returncode, 0)
 
     def test_new_branch_flags_github_added_since_the_branch_point(self) -> None:
         # A brand-new branch (old = zeros) is diffed against its remote branch
@@ -365,7 +367,9 @@ class ChangeDetectionTests(unittest.TestCase):
         for argv in git_argvs:
             self.assertIn(f"safe.directory={mirror}", argv)
 
-    def test_cleanup_drops_pending_refs_even_if_original_ref_is_invalid(self) -> None:
+    def test_cleanup_needs_no_ref_updates(self) -> None:
+        # Cleanup lists the pending refs from the mirror itself, so the
+        # payload carries no ref_updates at all.
         root = self.root / "quarantine"
         mirror = root / "infiversehq" / "trustyclaw.git"
         _git(self.root, "clone", "--bare", "--quiet", str(self.mirror), str(mirror))
@@ -375,7 +379,6 @@ class ChangeDetectionTests(unittest.TestCase):
             "owner": "infiversehq",
             "repo": "trustyclaw",
             "push_id": "abc123",
-            "ref_updates": [{"old": gate.ZERO_OID, "new": self.old, "ref": "refs/heads/bad?ref"}],
         }
 
         with (
@@ -392,48 +395,13 @@ class ChangeDetectionTests(unittest.TestCase):
         )
         self.assertNotEqual(missing.returncode, 0)
 
-    def test_cleanup_reports_failed_pending_ref_delete(self) -> None:
+    def test_failed_pending_ref_delete_is_best_effort(self) -> None:
+        # Ref deletion is housekeeping of the proxy-private mirror: a failed
+        # delete must not fail a cleanup (reject) or an approval whose push
+        # already landed. The leftover ref is inert.
         root = self.root / "quarantine"
         mirror = root / "infiversehq" / "trustyclaw.git"
         _git(self.root, "clone", "--bare", "--quiet", str(self.mirror), str(mirror))
-        gate.quarantine_pending(mirror, [(gate.ZERO_OID, self.old, "refs/heads/main")], "abc123")
-        payload = {
-            "action": "cleanup",
-            "owner": "infiversehq",
-            "repo": "trustyclaw",
-            "push_id": "abc123",
-            "ref_updates": [{"old": gate.ZERO_OID, "new": self.old, "ref": "refs/heads/main"}],
-        }
-        original_run = approve_github_push._run
-
-        def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-            if "update-ref" in argv:
-                return subprocess.CompletedProcess(argv, 1, b"", b"stale lock")
-            return original_run(argv, **kwargs)  # type: ignore[arg-type]
-
-        with (
-            patch.object(gate, "QUARANTINE_ROOT", root),
-            patch.object(approve_github_push, "_run", side_effect=fake_run),
-            patch.object(sys, "stdin", io.StringIO(json.dumps(payload))),
-            patch.object(sys, "stdout", io.StringIO()),
-            self.assertRaises(SystemExit) as raised,
-        ):
-            approve_github_push.main()
-        self.assertEqual(raised.exception.code, 2)
-
-    def test_approve_cleanup_failure_reports_landed_push_code(self) -> None:
-        root = self.root / "quarantine"
-        mirror = root / "infiversehq" / "trustyclaw.git"
-        _git(self.root, "clone", "--bare", "--quiet", str(self.mirror), str(mirror))
-        gate.quarantine_pending(mirror, [(gate.ZERO_OID, self.old, "refs/heads/main")], "abc123")
-        payload = {
-            "action": "approve",
-            "owner": "infiversehq",
-            "repo": "trustyclaw",
-            "push_id": "abc123",
-            "token": "ghs_secret",
-            "ref_updates": [{"old": gate.ZERO_OID, "new": self.old, "ref": "refs/heads/main"}],
-        }
         original_run = approve_github_push._run
 
         def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
@@ -443,21 +411,32 @@ class ChangeDetectionTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 1, b"", b"stale lock")
             return original_run(argv, **kwargs)  # type: ignore[arg-type]
 
-        stdout = io.StringIO()
-        with (
-            patch.object(gate, "QUARANTINE_ROOT", root),
-            patch.object(approve_github_push, "_run", side_effect=fake_run),
-            patch.object(sys, "stdin", io.StringIO(json.dumps(payload))),
-            patch.object(sys, "stdout", stdout),
-            self.assertRaises(SystemExit) as raised,
-        ):
-            approve_github_push.main()
-        self.assertEqual(raised.exception.code, 2)
-        error = json.loads(stdout.getvalue())["error"]
-        self.assertEqual(error["code"], "cleanup_after_push")
-        self.assertIn("stale lock", error["message"])
+        base_payload = {
+            "owner": "infiversehq",
+            "repo": "trustyclaw",
+            "push_id": "abc123",
+            "ref_updates": [{"old": gate.ZERO_OID, "new": self.old, "ref": "refs/heads/main"}],
+        }
+        for action in ("cleanup", "approve"):
+            with self.subTest(action=action):
+                gate.quarantine_pending(mirror, [(gate.ZERO_OID, self.old, "refs/heads/main")], "abc123")
+                payload = dict(base_payload, action=action)
+                if action == "approve":
+                    payload["token"] = "ghs_secret"
+                stdout = io.StringIO()
+                with (
+                    patch.object(gate, "QUARANTINE_ROOT", root),
+                    patch.object(approve_github_push, "_run", side_effect=fake_run),
+                    patch.object(sys, "stdin", io.StringIO(json.dumps(payload))),
+                    patch.object(sys, "stdout", stdout),
+                ):
+                    approve_github_push.main()
+                self.assertEqual(json.loads(stdout.getvalue()), {"ok": True})
 
-    def test_approve_recovers_when_pending_refs_were_already_cleaned_after_landing(self) -> None:
+    def test_approve_fails_when_quarantined_refs_are_gone(self) -> None:
+        # No pending refs (for example a crash after an earlier partial
+        # cleanup): the approval fails plainly instead of reconciling against
+        # the remote; the agent re-pushes to start a fresh gate round.
         root = self.root / "quarantine"
         mirror = root / "infiversehq" / "trustyclaw.git"
         _git(self.root, "clone", "--bare", "--quiet", str(self.mirror), str(mirror))
@@ -469,34 +448,19 @@ class ChangeDetectionTests(unittest.TestCase):
             "token": "ghs_secret",
             "ref_updates": [{"old": gate.ZERO_OID, "new": self.old, "ref": "refs/heads/main"}],
         }
-        original_run = approve_github_push._run
-        calls: list[tuple[list[str], dict[str, str] | None]] = []
-
-        def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-            calls.append((argv, kwargs.get("env") if isinstance(kwargs.get("env"), dict) else None))
-            if "push" in argv:
-                raise AssertionError("already-landed retry should not push again")
-            if "ls-remote" in argv:
-                return subprocess.CompletedProcess(argv, 0, f"{self.old}\trefs/heads/main\n".encode(), b"")
-            return original_run(argv, **kwargs)  # type: ignore[arg-type]
-
         stdout = io.StringIO()
         with (
             patch.object(gate, "QUARANTINE_ROOT", root),
-            patch.object(approve_github_push, "_run", side_effect=fake_run),
             patch.object(sys, "stdin", io.StringIO(json.dumps(payload))),
             patch.object(sys, "stdout", stdout),
+            self.assertRaises(SystemExit) as raised,
         ):
             approve_github_push.main()
-        self.assertEqual(json.loads(stdout.getvalue()), {"ok": True, "already_landed": True})
-        ls_remote = [call for call in calls if "ls-remote" in call[0]]
-        self.assertEqual(len(ls_remote), 1)
-        self.assertNotIn("ghs_secret", " ".join(ls_remote[0][0]))
-        self.assertIsNotNone(ls_remote[0][1])
-        assert ls_remote[0][1] is not None
-        self.assertIn("GIT_ASKPASS", ls_remote[0][1])
+        self.assertEqual(raised.exception.code, 2)
+        error = json.loads(stdout.getvalue())["error"]
+        self.assertIn("does not match the approved commit", error["message"])
 
-    def test_approve_recovers_when_retry_push_is_rejected_but_remote_matches(self) -> None:
+    def test_approve_fails_plainly_when_push_is_rejected(self) -> None:
         root = self.root / "quarantine"
         mirror = root / "infiversehq" / "trustyclaw.git"
         _git(self.root, "clone", "--bare", "--quiet", str(self.mirror), str(mirror))
@@ -514,8 +478,6 @@ class ChangeDetectionTests(unittest.TestCase):
         def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
             if "push" in argv:
                 return subprocess.CompletedProcess(argv, 1, b"", b"lease rejected")
-            if "ls-remote" in argv:
-                return subprocess.CompletedProcess(argv, 0, f"{self.old}\trefs/heads/main\n".encode(), b"")
             return original_run(argv, **kwargs)  # type: ignore[arg-type]
 
         stdout = io.StringIO()
@@ -524,19 +486,17 @@ class ChangeDetectionTests(unittest.TestCase):
             patch.object(approve_github_push, "_run", side_effect=fake_run),
             patch.object(sys, "stdin", io.StringIO(json.dumps(payload))),
             patch.object(sys, "stdout", stdout),
+            self.assertRaises(SystemExit) as raised,
         ):
             approve_github_push.main()
-        self.assertEqual(json.loads(stdout.getvalue()), {"ok": True, "already_landed": True})
-        missing = subprocess.run(
-            ["git", "-C", str(mirror), "rev-parse", "--verify", "--quiet", "refs/pending/abc123/0"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        self.assertNotEqual(missing.returncode, 0)
+        self.assertEqual(raised.exception.code, 2)
+        error = json.loads(stdout.getvalue())["error"]
+        self.assertIn("git push was rejected", error["message"])
+        self.assertIn("lease rejected", error["message"])
 
     def test_gate_result_cleanup_drops_pending_refs(self) -> None:
         new = self.old
-        result = gate.GateResult(self.mirror, [(gate.ZERO_OID, new, "refs/heads/main")], False, {".github/x"}, b"")
+        result = gate.GateResult(self.mirror, [(gate.ZERO_OID, new, "refs/heads/main")], False, {".github/x"})
         result.hold_for_approval("abc123")
         self.assertEqual(_git(self.mirror, "rev-parse", "refs/pending/abc123/0").decode().strip(), new)
         result.cleanup_pending("abc123")
@@ -557,7 +517,6 @@ class ChangeDetectionTests(unittest.TestCase):
             ],
             False,
             {".github/x"},
-            b"",
         )
         original_run = gate._run_git
         created = 0

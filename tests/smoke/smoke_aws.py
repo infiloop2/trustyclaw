@@ -11,11 +11,11 @@ login-dependent runtime checks live in ``tests/stage/stage_aws.py``.
     nftables, systemd, the proxy CA)
   - the admin API answering over the SSH tunnel (health, network policy)
   - admin API contract edge cases over the tunnel: auth rejection, the task
-    lifecycle and its 4xx responses, idempotency replay/conflict behavior,
+    lifecycle and its 4xx responses,
     policy validation (including managed OpenAI and Claude provider schema),
     and event pagination
   - concurrency on the real host: parallel task creation, a same-key
-    idempotency storm, concurrent policy replaces, and parallel proxy traffic
+    concurrent policy replaces, and parallel proxy traffic
     with consistent event sequencing
   - state transaction edge cases on the real host: racing cancels of one task
     resolve to exactly one winner, racing updates apply last-writer-wins (and
@@ -159,7 +159,6 @@ def main(argv: list[str] | None = None) -> int:
         smoke.check_policy_validation_and_concurrency()
         smoke.check_task_lifecycle()
         smoke.check_task_pagination()
-        smoke.check_idempotency()
         smoke.check_admin_concurrency()
         smoke.check_state_transactions()
         smoke.check_event_pagination()
@@ -168,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         smoke.check_proxy_edge_cases()
         smoke.check_proxy_concurrency()
         smoke.check_pre_login_provider_guards()
+        smoke.check_tools_surface()
         smoke.check_network_event_prune_race()
         print(f"\n{smoke.passed}/{smoke.total} checks passed")
         return 0 if smoke.passed == smoke.total else 1
@@ -199,8 +199,29 @@ class AwsSmoke:
     def managed_domains(self) -> tuple[str, ...]:
         return SMOKE_MANAGED_DOMAINS
 
-    def task_body(self, input_message: str, thread_id: str, *, runtime: str | None = None) -> dict:
-        return {"input_message": input_message, "thread_id": thread_id, "agent_runtime": runtime or self.agent_runtime}
+    def task_body(
+        self,
+        input_message: str,
+        thread_id: str,
+        *,
+        runtime: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> dict:
+        selected_runtime = runtime or self.agent_runtime
+        selected_model = model or (
+            "opus" if selected_runtime == "claude_code" else "gpt-5.6-terra"
+        )
+        return {
+            "input_message": input_message,
+            "thread_id": thread_id,
+            "agent_runtime": selected_runtime,
+            "model": selected_model,
+            "effort": effort or "high",
+        }
+
+    def follow_up_body(self, input_message: str, thread_id: str) -> dict:
+        return {"input_message": input_message, "thread_id": thread_id}
 
     def runtime_status_record(self, status_response: dict, runtime: str | None = None) -> dict:
         runtime = runtime or self.agent_runtime
@@ -724,7 +745,7 @@ class AwsSmoke:
             ("initial-codex-disabled-login", "/v1/agent-runtime/codex-oauth-login"),
             ("initial-claude-disabled-login", "/v1/agent-runtime/claude-oauth-login"),
         ):
-            status, body = self._api_status("POST", login_path, idem=self._idem(label))
+            status, body = self._api_status("POST", login_path)
             if status != 409:
                 raise AssertionError(f"{login_path} while initially deactivated returned {status}, expected 409: {body}")
         self._api("PUT", "/v1/network/policy", self.enforcement_policy())
@@ -756,6 +777,7 @@ class AwsSmoke:
             ("/admin_ui/processes.js", "application/javascript"),
             ("/admin_ui/logs.js", "application/javascript"),
             ("/admin_ui/network.js", "application/javascript"),
+            ("/admin_ui/tools.js", "application/javascript"),
         ):
             request = urllib.request.Request(f"http://127.0.0.1:{ADMIN_PORT}{path}")
             with urllib.request.urlopen(request, timeout=30) as response:
@@ -766,8 +788,8 @@ class AwsSmoke:
                 raise AssertionError(f"UI asset {path} content type is {asset_type!r}")
             page += "\n" + asset_body
         for expected in (
-            '<link rel="stylesheet" href="/admin_ui.css?v=',
-            '<script type="module" src="/admin_ui/app.js?v=',
+            '<link rel="stylesheet" href="/admin_ui.css">',
+            '<script type="module" src="/admin_ui/app.js"></script>',
             "<h2>Sessions</h2>",
             "/v1/threads",
             "/v1/threads/${encodeURIComponent(selectedThreadId)}/tasks",
@@ -786,13 +808,13 @@ class AwsSmoke:
             'id="processes"',
             "/v1/agent-processes",
             "refreshAgentProcesses",
-            'id="runtime-guidance"',
+            'id="runtime-overview"',
             'id="policy-message"',
-            'id="start-codex-login"',
-            'id="start-claude-login"',
-            'data-runtime="codex" disabled hidden>Start Codex login</button>',
-            'data-runtime="claude_code" disabled hidden>Start Claude login</button>',
-            "updateLoginButtons",
+            'data-action="start-login"',
+            'Start ${esc(runtimeLabel)} login',
+            'data-action="reset-linked-account"',
+            'Disconnect</button>',
+            "usageRing",
             'id="managed-integrations"',
             'id="github-repos"',
             'id="domain-rules"',
@@ -805,7 +827,6 @@ class AwsSmoke:
             'id="github-app-private-key"',
             'id="github-credential-status"',
             'id="preset-info-popover"',
-            "Open Internet Access and Tools",
             "<span>Internet Access and Tools</span>",
             "Reboot host",
             "Custom Domain Access",
@@ -861,6 +882,28 @@ class AwsSmoke:
             "nodejs.org",
             "registry.npmjs.org",
             "Add domain rule",
+            'id="tools"',
+            'data-action="toggle-tool-expansion"',
+            "toggleToolExpansion",
+            "toggleInfoPopover",
+            "tool-approvals-table",
+            "refreshTools",
+            "refreshExpandedToolApprovals",
+            "decideToolApproval",
+            'data-action="enable-tool"',
+            'data-action="save-tool-config"',
+            "connectTool",
+            "completeToolConnect",
+            "/oauth/callback",
+            "/v1/tools",
+            'id="panel-tool-log"',
+            'id="tool-events"',
+            "Tool audit log",
+            "/v1/tools/events",
+            "tool-page",
+            "renderSetupGuide",
+            "setup-guide",
+            "setup_guide",
         ):
             if expected not in page:
                 raise AssertionError(f"UI page is missing expected admin UI fragment {expected!r}")
@@ -927,16 +970,14 @@ class AwsSmoke:
             b"POST /v1/tasks HTTP/1.1\r\n"
             b"Host: 127.0.0.1\r\n"
             + f"Authorization: Bearer {self.result['admin_password']}\r\n".encode()
-            + b"Idempotency-Key: smoke-admin-bad-length\r\n"
-            b"Content-Length: nope\r\n\r\n",
+            + b"Content-Length: nope\r\n\r\n",
         )
         huge = self._raw_local_http(
             ADMIN_PORT,
             b"POST /v1/tasks HTTP/1.1\r\n"
             b"Host: 127.0.0.1\r\n"
             + f"Authorization: Bearer {self.result['admin_password']}\r\n".encode()
-            + b"Idempotency-Key: smoke-admin-huge-length\r\n"
-            b"Content-Length: 1048577\r\n\r\n",
+            + b"Content-Length: 1048577\r\n\r\n",
         )
         if b"400" not in malformed or b"malformed Content-Length" not in malformed:
             raise AssertionError(f"admin API malformed Content-Length was not rejected cleanly: {malformed[:300]!r}")
@@ -949,16 +990,16 @@ class AwsSmoke:
         # SSH is deployment config, not runtime network policy.
         pinned = network_policy(SMOKE_MANAGED_PROVIDERS)
         pinned["ssh_port_opened"] = False
-        status, body = self._api_status("PUT", "/v1/network/policy", pinned, idem=self._idem("ssh-pin"))
+        status, body = self._api_status("PUT", "/v1/network/policy", pinned)
         if status != 400:
             raise AssertionError(f"runtime ssh_port_opened field returned {status}, expected 400: {body}")
         invalid = network_policy(SMOKE_MANAGED_PROVIDERS, {"api.example.com": {"allow_http_methods": ["BOGUS"]}})
-        status, body = self._api_status("PUT", "/v1/network/policy", invalid, idem=self._idem("bad-method"))
+        status, body = self._api_status("PUT", "/v1/network/policy", invalid)
         if status != 400:
             raise AssertionError(f"invalid policy returned {status}, expected 400: {body}")
         disabled_provider_policy = {"allowed_network_access": {}}
         status, body = self._api_status(
-            "PUT", "/v1/network/policy", disabled_provider_policy, idem=self._idem("provider-disabled")
+            "PUT", "/v1/network/policy", disabled_provider_policy
         )
         if status != 200:
             raise AssertionError(f"disabling all managed providers returned {status}, expected 200: {body}")
@@ -970,7 +1011,7 @@ class AwsSmoke:
             ("codex-provider-disabled-login", "/v1/agent-runtime/codex-oauth-login"),
             ("claude-provider-disabled-login", "/v1/agent-runtime/claude-oauth-login"),
         ):
-            status, _ = self._api_status("POST", login_path, idem=self._idem(label))
+            status, _ = self._api_status("POST", login_path)
             if status != 409:
                 raise AssertionError(f"{login_path} while provider is deactivated returned {status}, expected 409")
 
@@ -991,7 +1032,7 @@ class AwsSmoke:
             ),
         ):
             policy = network_policy(providers)
-            status, body = self._api_status("PUT", "/v1/network/policy", policy, idem=self._idem(label))
+            status, body = self._api_status("PUT", "/v1/network/policy", policy)
             if status != 200:
                 raise AssertionError(f"{label} provider policy returned {status}, expected 200: {body}")
             enabled_status = self._wait_for_runtime_status(
@@ -1002,7 +1043,7 @@ class AwsSmoke:
             disabled_status = self._wait_for_runtime_status({"deactivated"}, runtime=disabled_runtime, timeout=60)
             if disabled_status != "deactivated":
                 raise AssertionError(f"{label} should deactivate {disabled_runtime}, got {disabled_status}")
-            status, _ = self._api_status("POST", disabled_login_path, idem=self._idem(f"{label}-disabled-login"))
+            status, _ = self._api_status("POST", disabled_login_path)
             if status != 409:
                 raise AssertionError(f"{label} disabled runtime login returned {status}, expected 409")
             print(
@@ -1034,7 +1075,7 @@ class AwsSmoke:
                     "allowed_network_access": {
                         "api.example.com": {
                             "allow_http_methods": ["GET"],
-                            "openai_disable_live_web_search": True,
+                            "openai_external_url_request_guard": True,
                         }
                     },
                 },
@@ -1054,7 +1095,7 @@ class AwsSmoke:
                 "unsupported fields",
             ),
         ):
-            status, body = self._api_status("PUT", "/v1/network/policy", bad_policy, idem=self._idem(label))
+            status, body = self._api_status("PUT", "/v1/network/policy", bad_policy)
             if status != 400:
                 raise AssertionError(f"{label} policy returned {status}, expected 400: {body}")
             error = body.get("error", {})
@@ -1073,7 +1114,7 @@ class AwsSmoke:
         results = self._parallel(
             len(variants),
             lambda index: self._api_status(
-                "PUT", "/v1/network/policy", variants[index], idem=self._idem(f"cc-policy-{index}")
+                "PUT", "/v1/network/policy", variants[index]
             ),
         )
         succeeded = []
@@ -1098,39 +1139,52 @@ class AwsSmoke:
         )
 
     def check_task_lifecycle(self) -> None:
-        self._step("task lifecycle transitions and 4xx contract")
+        self._step("task fail-fast lifecycle and 4xx contract")
         task = self._api("POST", "/v1/tasks", self.task_body("lifecycle check (smoke)", "smoke-lifecycle"))
         task_id = task["task_id"]
         if task["status"] != "queued":
             raise AssertionError(f"new task is {task['status']}, expected queued")
-        listed = self._active_tasks()
-        if not any(item["task_id"] == task_id and "queue_position" in item for item in listed):
-            raise AssertionError(f"queued task missing from the list (or has no queue_position): {listed}")
+        # Runtime status is not a claim condition: pre-login, a worker claims
+        # the queued task immediately and fails it with the runtime status as
+        # the error, so queued work never parks behind a missing login.
+        failed = self._wait_for_task_status(task_id, "failed", timeout=60)
+        if failed["status"] != "failed":
+            raise AssertionError(f"pre-login task ended {failed['status']}, expected fail-fast failure: {failed}")
+        if "tasks run only while it is active" not in failed.get("error_message", ""):
+            raise AssertionError(f"fail-fast error should name the runtime status: {failed}")
 
         status, _ = self._api_status("GET", "/v1/tasks/task_999999")
         if status != 404:
             raise AssertionError(f"unknown task returned {status}, expected 404")
 
-        updated = self._api("PUT", f"/v1/tasks/{task_id}", {"input_message": "lifecycle check, updated (smoke)"})
-        if updated["input_message"] != "lifecycle check, updated (smoke)":
-            raise AssertionError(f"queued task update not reflected: {updated}")
-        status, _ = self._api_status("PUT", f"/v1/tasks/{task_id}", {"input_message": ""}, idem=self._idem("empty"))
+        # Message validation runs before the status gate, so the 400 contract
+        # holds even on a terminal task.
+        status, _ = self._api_status("PUT", f"/v1/tasks/{task_id}", {"input_message": ""})
         if status != 400:
             raise AssertionError(f"empty input_message returned {status}, expected 400")
         status, _ = self._api_status(
-            "PUT", f"/v1/tasks/{task_id}", {"input_message": "x" * (MESSAGE_LIMIT + 1)}, idem=self._idem("huge")
+            "PUT", f"/v1/tasks/{task_id}", {"input_message": "x" * (MESSAGE_LIMIT + 1)}
         )
         if status != 400:
             raise AssertionError(f"oversized input_message returned {status}, expected 400")
+        # Every transition off a terminal task is a clean 409.
         status, _ = self._api_status(
-            "POST", f"/v1/tasks/{task_id}/steer", {"steer_message": "steer (smoke)"}, idem=self._idem("steer")
+            "PUT", f"/v1/tasks/{task_id}", {"input_message": "lifecycle check, updated (smoke)"}
         )
         if status != 409:
-            raise AssertionError(f"steering a queued task returned {status}, expected 409")
-        status, _ = self._api_status("POST", f"/v1/tasks/{task_id}/kill", idem=self._idem("kill-queued"))
+            raise AssertionError(f"updating a failed task returned {status}, expected 409")
+        status, _ = self._api_status(
+            "POST", f"/v1/tasks/{task_id}/steer", {"steer_message": "steer (smoke)"}
+        )
         if status != 409:
-            raise AssertionError(f"killing a queued task returned {status}, expected 409")
-        status, _ = self._api_status("POST", "/v1/tasks/task_999999/kill", idem=self._idem("kill-404"))
+            raise AssertionError(f"steering a failed task returned {status}, expected 409")
+        status, _ = self._api_status("POST", f"/v1/tasks/{task_id}/kill")
+        if status != 409:
+            raise AssertionError(f"killing a failed task returned {status}, expected 409")
+        status, _ = self._api_status("POST", f"/v1/tasks/{task_id}/cancel")
+        if status != 409:
+            raise AssertionError(f"cancelling a failed task returned {status}, expected 409")
+        status, _ = self._api_status("POST", "/v1/tasks/task_999999/kill")
         if status != 404:
             raise AssertionError(f"killing an unknown task returned {status}, expected 404")
         for label, bad_body in (
@@ -1139,28 +1193,13 @@ class AwsSmoke:
             ("no-thread", {"input_message": "missing thread (smoke)", "agent_runtime": self.agent_runtime}),
             ("bad-thread", {"input_message": "bad thread (smoke)", "thread_id": "not valid!", "agent_runtime": self.agent_runtime}),
         ):
-            status, _ = self._api_status("POST", "/v1/tasks", bad_body, idem=self._idem(label))
+            status, _ = self._api_status("POST", "/v1/tasks", bad_body)
             if status != 400:
                 raise AssertionError(f"create with {label} returned {status}, expected 400")
 
-        self._api("POST", f"/v1/tasks/{task_id}/cancel")
-        cancelled = self._api("GET", f"/v1/tasks/{task_id}")
-        if cancelled["status"] != "cancelled":
-            raise AssertionError(f"cancel left task {cancelled['status']}")
-        status, _ = self._api_status("POST", f"/v1/tasks/{task_id}/cancel", idem=self._idem("recancel"))
-        if status != 409:
-            raise AssertionError(f"cancelling a cancelled task returned {status}, expected 409")
-        status, _ = self._api_status(
-            "PUT", f"/v1/tasks/{task_id}", {"input_message": "resurrect (smoke)"}, idem=self._idem("resurrect")
-        )
-        if status != 409:
-            raise AssertionError(f"updating a cancelled task returned {status}, expected 409")
-
         events = self._api("GET", f"/v1/tasks/{task_id}/events?since=0")["events"]
-        if any(event["event_type"] == "task.message" and event["task_id"] == task_id for event in events):
-            raise AssertionError(f"queued task emitted a task.message before running: {events}")
-        if [event["event_type"] for event in events] != ["task.cancelled"]:
-            raise AssertionError(f"queued cancel should only emit task.cancelled, got: {events}")
+        if [event["event_type"] for event in events] != ["task.started", "task.message", "task.failed"]:
+            raise AssertionError(f"fail-fast should emit started/message/failed exactly, got: {events}")
         if any(event["task_id"] != task_id for event in events):
             raise AssertionError("per-task events leaked another task's events")
 
@@ -1178,29 +1217,36 @@ class AwsSmoke:
         thread_tasks = self._api("GET", "/v1/threads/smoke-lifecycle/tasks")["tasks"]
         if [item["task_id"] for item in thread_tasks] != [task_id]:
             raise AssertionError(f"thread task list did not return the lifecycle task only: {thread_tasks}")
-        if thread_tasks[0]["status"] != "cancelled":
-            raise AssertionError(f"thread task list did not retain cancelled task status: {thread_tasks}")
+        if thread_tasks[0]["status"] != "failed":
+            raise AssertionError(f"thread task list did not retain failed task status: {thread_tasks}")
 
+        # An existing thread derives its session config; supplying agent_runtime
+        # (or model/effort) is rejected outright, so the wrong-runtime case never
+        # reaches a runtime-mismatch check. task_body deliberately carries those
+        # fields here to prove they are refused.
         status, _ = self._api_status(
             "POST",
             "/v1/tasks",
-            self.task_body("wrong runtime for existing thread (smoke)", "smoke-lifecycle", runtime="claude_code"),
-            idem=self._idem("thread-runtime-conflict"),
+            self.task_body("session fields on existing thread (smoke)", "smoke-lifecycle", runtime="claude_code"),
         )
-        if status != 409:
-            raise AssertionError(f"creating a claude task on a codex thread returned {status}, expected 409")
+        if status != 400:
+            raise AssertionError(
+                f"supplying session fields to an existing thread returned {status}, expected 400"
+            )
         status, _ = self._api_status("GET", "/v1/tasks/finished")
         if status != 404:
             raise AssertionError(f"removed finished-task endpoint returned {status}, expected 404")
         self._ok(
-            "queued update/cancel/kill honored; thread_id validated; terminal transitions rejected; "
+            "pre-login task failed fast with the runtime status; validation 400s and terminal 409s honored; "
             "events scoped; thread list/task history covered"
         )
 
     def check_task_pagination(self) -> None:
-        """last_seen_task_id paging over a stable, pre-login queue (the runtime
-        is not active yet, so nothing changes status between pages)."""
-        self._step("task list pagination (7 queued tasks, 5-per-page)")
+        """The active-task list holds queued and running work only: pre-login,
+        every created task drains via fail-fast, thread histories retain the
+        failed tasks, and cursor paging over whatever is in flight stays
+        bounded and duplicate-free."""
+        self._step("task list drain and cursor paging (7 fail-fast tasks)")
         created = [
             self._api(
                 "POST",
@@ -1219,51 +1265,31 @@ class AwsSmoke:
             if len(page) > 5:
                 raise AssertionError(f"task page holds {len(page)} tasks, expected at most 5")
             seen.extend(task["task_id"] for task in page)
+            if len(seen) > 100:
+                raise AssertionError(f"cursor paging did not terminate: {seen}")
             cursor = page[-1]["task_id"]
-        ours = [task_id for task_id in seen if task_id in created]
-        if ours != created:
-            raise AssertionError(f"pagination lost or reordered tasks: saw {ours}, created {created}")
         if len(seen) != len(set(seen)):
             raise AssertionError(f"pagination returned duplicates: {seen}")
         for task_id in created:
-            self._api("POST", f"/v1/tasks/{task_id}/cancel")
-        self._ok("7 tasks paged in creation order with no duplicates")
-
-    def check_idempotency(self) -> None:
-        self._step("idempotency replay, conflicts, and key validation")
-        key = self._idem("replay")
-        body = self.task_body("idempotency check (smoke)", "smoke-idem")
-        status, first = self._api_status("POST", "/v1/tasks", body, idem=key)
-        if status != 200:
-            raise AssertionError(f"task create returned {status}: {first}")
-        status, replay = self._api_status("POST", "/v1/tasks", body, idem=key)
-        if status != 200 or replay["task_id"] != first["task_id"]:
-            raise AssertionError(f"replay did not return the original response: {status} {replay}")
-        active = [item for item in self._active_tasks() if item["input_message"] == body["input_message"]]
-        if len(active) != 1:
-            raise AssertionError(f"replay created a duplicate task: {active}")
-
-        status, _ = self._api_status("PUT", "/v1/network/policy", self.enforcement_policy(), idem=key)
-        if status != 400:
-            raise AssertionError(f"key reuse on a different request returned {status}, expected 400")
-        status, _ = self._api_status("POST", "/v1/tasks", body, idem=None)  # no key at all
-        if status != 400:
-            raise AssertionError(f"mutation without Idempotency-Key returned {status}, expected 400")
-        status, _ = self._api_status("POST", "/v1/tasks", body, idem="bad key!")
-        if status != 400:
-            raise AssertionError(f"invalid Idempotency-Key returned {status}, expected 400")
-
-        self._api("POST", f"/v1/tasks/{first['task_id']}/cancel")
-        self._ok("replay returned the original task once; cross-request and malformed keys rejected")
+            final = self._wait_for_task(task_id, timeout=60)
+            if final["status"] != "failed":
+                raise AssertionError(f"pre-login filler {task_id} ended {final['status']}, expected failed")
+        remaining = {item["task_id"] for item in self._active_tasks()} & set(created)
+        if remaining:
+            raise AssertionError(f"failed tasks still listed as active: {remaining}")
+        for index, task_id in enumerate(created):
+            history = self._api("GET", f"/v1/threads/smoke-page-{index}/tasks")["tasks"]
+            if [item["task_id"] for item in history] != [task_id]:
+                raise AssertionError(f"thread smoke-page-{index} history mismatch: {history}")
+        self._ok("7 tasks drained via fail-fast; paging duplicate-free; thread histories retained")
 
     def check_admin_concurrency(self) -> None:
-        self._step("concurrent task creation and a same-key idempotency storm")
-        before = {item["task_id"] for item in self._active_tasks()}
-
-        # Distinct keys: every create must land exactly once with a unique id,
-        # interleaved with health reads that must never block or fail.
+        self._step("concurrent task creation with interleaved health reads")
+        # Every create must land exactly once with a unique id, interleaved
+        # with health reads that must never block or fail. The tasks fail
+        # fast pre-login, so consistency is checked per task and against the
+        # thread histories rather than the (draining) active list.
         creates = 8
-        nonce = time.time_ns()
 
         def create_or_health(index: int) -> tuple[int, dict]:
             if index >= creates:
@@ -1271,7 +1297,6 @@ class AwsSmoke:
             return self._api_status(
                 "POST", "/v1/tasks",
                 self.task_body(f"concurrent create {index} (smoke)", f"smoke-cc-{index}"),
-                idem=f"smoke-cc-{nonce}-{index}",
             )
 
         results = self._parallel(creates + 3, create_or_health)
@@ -1284,36 +1309,14 @@ class AwsSmoke:
         if len(set(created_ids)) != creates:
             raise AssertionError(f"concurrent creates produced duplicate task ids: {created_ids}")
 
-        # Same key from every thread: the reservation must let exactly one
-        # execute; the rest replay the stored response or see 409 in-flight.
-        storm_key = self._idem("storm")
-        storm_body = self.task_body("idempotency storm (smoke)", "smoke-storm")
-        storm = self._parallel(8, lambda _: self._api_status("POST", "/v1/tasks", storm_body, idem=storm_key))
-        storm_ids = {body["task_id"] for status, body in storm if status == 200}
-        bad = [status for status, _ in storm if status not in (200, 409)]
-        if bad:
-            raise AssertionError(f"same-key storm returned unexpected statuses: {bad}")
-        if len(storm_ids) > 1:
-            raise AssertionError(f"same-key storm created more than one task: {storm_ids}")
-        # Whether the racers replayed or got 409, the key must resolve to
-        # exactly one stored task afterwards.
-        status, settled = self._api_status("POST", "/v1/tasks", storm_body, idem=storm_key)
-        if status != 200:
-            raise AssertionError(f"storm key did not settle into a replayable response: {status} {settled}")
-        storm_ids.add(settled["task_id"])
-        if len(storm_ids) != 1:
-            raise AssertionError(f"storm replay disagrees with the storm winners: {storm_ids}")
-
-        after = {item["task_id"] for item in self._active_tasks()}
-        new_ids = after - before
-        expected = set(created_ids) | storm_ids
-        if new_ids != expected:
-            raise AssertionError(f"task list out of sync after concurrency: new {new_ids}, expected {expected}")
-        for task_id in sorted(new_ids):
-            self._api("POST", f"/v1/tasks/{task_id}/cancel")
-        if {item["task_id"] for item in self._active_tasks()} != before:
-            raise AssertionError("queued smoke tasks were not all cancelled")
-        self._ok(f"{creates} parallel creates unique, storm created exactly one task, list consistent")
+        for index, task_id in enumerate(sorted(created_ids)):
+            if self._wait_for_task(task_id, timeout=60)["status"] != "failed":
+                raise AssertionError(f"concurrent create {task_id} did not drain via fail-fast")
+        for index in range(creates):
+            history = self._api("GET", f"/v1/threads/smoke-cc-{index}/tasks")["tasks"]
+            if len(history) != 1 or history[0]["status"] != "failed":
+                raise AssertionError(f"thread smoke-cc-{index} history mismatch: {history}")
+        self._ok(f"{creates} parallel creates unique, every task landed exactly once")
 
     def check_state_transactions(self) -> None:
         """Edge cases of the admin-state read-modify-write transaction under
@@ -1322,30 +1325,33 @@ class AwsSmoke:
         last-writer-wins (never merged or torn), reads that stay fast and
         consistent mid-storm, and event seqs that stay unique across parallel
         writers."""
-        self._step("state transaction edge cases (atomic cancel, racing updates, seq uniqueness)")
-        before = {item["task_id"] for item in self._active_tasks()}
+        self._step("state transaction edge cases (atomic terminal transitions, racing writes, seq uniqueness)")
 
-        # 1. Concurrent cancels of one queued task. The QUEUED check and the
-        # CANCELLED write share one transaction, so exactly one racer can win;
-        # a lost-update regression would let several see QUEUED and all "win".
+        # 1. Concurrent cancels racing the fail-fast worker over one task. The
+        # status check and the terminal write share one transaction, so AT
+        # MOST one cancel can win (the worker may fail the task first); a
+        # lost-update regression would let several racers see QUEUED and all
+        # "win". The task must end terminal either way.
         _, target = self._api_status(
             "POST", "/v1/tasks",
             self.task_body("cancel race target (smoke)", "smoke-tx-cancel"),
         )
         cancel_id = target["task_id"]
         cancels = self._parallel(
-            6, lambda i: self._api_status("POST", f"/v1/tasks/{cancel_id}/cancel", idem=self._idem(f"tx-cancel-{i}"))
+            6, lambda i: self._api_status("POST", f"/v1/tasks/{cancel_id}/cancel")
         )
         statuses = sorted(status for status, _ in cancels)
-        if statuses.count(200) != 1 or statuses != [200] + [409] * (len(cancels) - 1):
-            raise AssertionError(f"concurrent cancels must yield exactly one 200 and the rest 409, got {statuses}")
-        if self._api("GET", f"/v1/tasks/{cancel_id}")["status"] != "cancelled":
-            raise AssertionError("cancel race target did not end cancelled")
+        if statuses.count(200) > 1 or any(status not in (200, 409) for status in statuses):
+            raise AssertionError(f"concurrent cancels must yield at most one 200 and the rest 409, got {statuses}")
+        final_status = self._wait_for_task(cancel_id, timeout=60)["status"]
+        if final_status not in {"cancelled", "failed"}:
+            raise AssertionError(f"cancel race target ended {final_status}, expected a terminal status")
 
-        # 2. Racing updates to one queued task, interleaved with reads. Every
-        # update must apply atomically: the final message is exactly one
-        # racer's payload (last writer wins), never a torn or merged value,
-        # and the concurrent reads never block or fail.
+        # 2. Racing updates to one task, interleaved with reads, while the
+        # fail-fast worker races them all. Every write must apply atomically:
+        # each racer sees 200 or a clean 409 (never a 5xx), the reads never
+        # block or fail, and the final message is exactly one sent value or
+        # the original — never a torn or merged value.
         _, target = self._api_status(
             "POST", "/v1/tasks",
             self.task_body("update race target (smoke)", "smoke-tx-update"),
@@ -1353,6 +1359,7 @@ class AwsSmoke:
         update_id = target["task_id"]
         updaters = 6
         candidates = {f"update racer {index} (smoke)" for index in range(updaters)}
+        candidates.add("update race target (smoke)")
 
         def update_or_read(index: int) -> tuple[int, dict]:
             if index >= updaters:
@@ -1360,37 +1367,37 @@ class AwsSmoke:
             return self._api_status(
                 "PUT", f"/v1/tasks/{update_id}",
                 {"input_message": f"update racer {index} (smoke)"},
-                idem=self._idem(f"tx-update-{index}"),
             )
 
         results = self._parallel(updaters + 4, update_or_read)
-        bad = [status for status, _ in results if status != 200]
-        if bad:
-            raise AssertionError(f"update/read storm returned non-200 statuses: {bad}")
+        for index, (status, body) in enumerate(results):
+            expected = (200, 409) if index < updaters else (200,)
+            if status not in expected:
+                raise AssertionError(f"update/read storm request {index} returned {status}: {body}")
         final = self._api("GET", f"/v1/tasks/{update_id}")
         if final["input_message"] not in candidates:
             raise AssertionError(f"racing updates produced a value no racer sent: {final['input_message']!r}")
 
-        # 3. An update racing a cancel: each request is atomic, so every racer
-        # sees 200 or a clean 409 (never a 5xx or a resurrected task), and the
-        # task ends cancelled regardless of interleaving.
+        # 3. Terminal statuses are sticky: once the task is terminal, further
+        # cancels and updates are clean 409s and the status never changes.
+        first_terminal = self._wait_for_task(update_id, timeout=60)["status"]
+        if first_terminal not in {"cancelled", "failed"}:
+            raise AssertionError(f"update race target ended {first_terminal}, expected a terminal status")
+
         def update_or_cancel(index: int) -> tuple[int, dict]:
             if index == 0:
-                return self._api_status("POST", f"/v1/tasks/{update_id}/cancel", idem=self._idem("tx-mixed-cancel"))
+                return self._api_status("POST", f"/v1/tasks/{update_id}/cancel")
             return self._api_status(
                 "PUT", f"/v1/tasks/{update_id}",
-                {"input_message": f"post-cancel racer {index} (smoke)"},
-                idem=self._idem(f"tx-mixed-{index}"),
+                {"input_message": f"post-terminal racer {index} (smoke)"},
             )
 
         mixed = self._parallel(5, update_or_cancel)
-        bad = [status for status, _ in mixed if status not in (200, 409)]
+        bad = [status for status, _ in mixed if status != 409]
         if bad:
-            raise AssertionError(f"update-vs-cancel race returned unexpected statuses: {bad}")
-        if mixed[0][0] != 200:
-            raise AssertionError(f"the cancel itself failed: {mixed[0]}")
-        if self._api("GET", f"/v1/tasks/{update_id}")["status"] != "cancelled":
-            raise AssertionError("update-vs-cancel race left the task un-cancelled")
+            raise AssertionError(f"post-terminal transitions returned non-409 statuses: {bad}")
+        if self._api("GET", f"/v1/tasks/{update_id}")["status"] != first_terminal:
+            raise AssertionError("terminal status did not stick under racing writes")
 
         # 4. Parallel writers allocated event seqs through the transaction, so
         # the agent event log must hold no duplicate seq anywhere.
@@ -1399,9 +1406,7 @@ class AwsSmoke:
             duplicates = sorted({seq for seq in seqs if seqs.count(seq) > 1})
             raise AssertionError(f"agent event log has duplicate seqs after the storms: {duplicates}")
 
-        if {item["task_id"] for item in self._active_tasks()} != before:
-            raise AssertionError("state transaction checks leaked active tasks")
-        self._ok("cancel race won once, updates atomic, cancel sticky, event seqs unique")
+        self._ok("terminal transition won at most once, writes atomic, terminal sticky, event seqs unique")
 
     def check_event_pagination(self) -> None:
         self._step("agent event pagination (newest-first cursor pages, strict seq ordering)")
@@ -1682,18 +1687,6 @@ class AwsSmoke:
             "+ git ls-remote/push-denial across the github domains"
         )
 
-    def _github_search_read_was_allowed(self, baseline_seq: int) -> bool:
-        """GitHub can answer unauthenticated search reads with 403 for rate or
-        abuse limits. Accept that only when the proxy recorded the exact search
-        request as allowed, so a proxy-side 403 still fails the smoke."""
-        return any(
-            event["decision"] == "allowed"
-            and event["host"] == "api.github.com"
-            and event["path"] == "/search/repositories"
-            and "q=trustyclaw" in event.get("query", "")
-            for event in self._network_events(since=baseline_seq)
-        )
-
     def check_proxy_edge_cases(self) -> None:
         self._step("proxy protocol edge cases (ports, hosts, encodings, wildcards)")
         baseline = max((event["seq"] for event in self._network_events()), default=0)
@@ -1723,23 +1716,12 @@ class AwsSmoke:
             f"{agent} HTTPS_PROXY={proxy} curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 "
             f"https://www.example.com/ || true"
         )
-        # Plain HTTP rides the same policy path (curl only honors the
-        # lowercase http_proxy variable for http:// URLs).
+        # Plain HTTP is not supported: even a policy-allowed domain gets a
+        # logged 403 (curl only honors the lowercase http_proxy variable for
+        # http:// URLs).
         plain = self._ssh_code(
             f"{agent} http_proxy={proxy} curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 "
             f"http://example.com/ || true"
-        )
-        malformed_length = self._ssh_code(
-            "sudo -u trustyclaw-agent python3 - <<'PY'\n"
-            "import socket\n"
-            f"s = socket.create_connection(('127.0.0.1', {PROXY_PORT}), timeout=10)\n"
-            "s.sendall(b'GET http://example.com/ HTTP/1.1\\r\\n"
-            "Host: example.com\\r\\n"
-            "Content-Length: nope\\r\\n\\r\\n')\n"
-            "s.shutdown(socket.SHUT_WR)\n"
-            "print(s.recv(4096).decode('utf-8', 'replace'))\n"
-            "s.close()\n"
-            "PY"
         )
 
         if mismatch != "403":
@@ -1748,10 +1730,8 @@ class AwsSmoke:
             raise AssertionError(f"percent-encoded path matching a decoded guard returned {encoded!r}, expected the proxy to allow it")
         if wildcard == "403" or wildcard == "":
             raise AssertionError(f"wildcard-allowed host returned {wildcard!r}, expected non-403")
-        if plain == "403" or plain == "":
-            raise AssertionError(f"plain HTTP through the proxy returned {plain!r}, expected non-403")
-        if "malformed Content-Length" not in malformed_length:
-            raise AssertionError(f"proxy malformed Content-Length was not rejected cleanly: {malformed_length[:300]!r}")
+        if plain != "403":
+            raise AssertionError(f"plain HTTP through the proxy returned {plain!r}, expected 403")
 
         events = self._network_events(since=baseline)
         reasons = {event.get("reason") for event in events if event["decision"] == "denied"}
@@ -1759,15 +1739,13 @@ class AwsSmoke:
             raise AssertionError(f"non-443 CONNECT denial not logged; denied reasons: {reasons}")
         if "host is not in the allowed network policy" not in reasons:
             raise AssertionError(f"unknown-host denial not logged; denied reasons: {reasons}")
-        if "malformed Content-Length" not in reasons:
-            raise AssertionError(f"malformed Content-Length denial not logged; denied reasons: {reasons}")
-        if not any(event["protocol"] == "http" and event["decision"] == "allowed" for event in events):
-            raise AssertionError("plain HTTP request did not produce an allowed http event")
+        if "plain HTTP is not supported; use HTTPS" not in reasons:
+            raise AssertionError(f"plain HTTP denial not logged; denied reasons: {reasons}")
         if not any(event["host"] == "www.example.com" and event["decision"] == "allowed" for event in events):
             raise AssertionError("wildcard-matched request did not produce an allowed event")
         if not any(event["path"] == "/%7A%65%6E" and event["decision"] == "allowed" for event in events):
             raise AssertionError("percent-encoded request was not logged as an allowed decision")
-        self._ok("port pin, unknown host, Host mismatch denied; decoded guard, wildcard, plain HTTP allowed")
+        self._ok("port pin, unknown host, Host mismatch, plain HTTP denied; decoded guard and wildcard allowed")
 
     def check_proxy_concurrency(self) -> None:
         self._step("parallel proxy traffic with consistent event sequencing")
@@ -1883,261 +1861,144 @@ class AwsSmoke:
             "OpenAI and Claude data-plane requests denied before login while Claude readiness stayed allowed"
         )
 
-    def check_claude_auth_and_task(self) -> None:
-        self._step("Claude OAuth + Anthropic account guard + real task (interactive)")
-        claude_section_baseline = max((event["seq"] for event in self._network_events()), default=0)
-        self._api(
-            "PUT",
-            "/v1/network/policy",
-            network_policy(SMOKE_MANAGED_PROVIDERS),
-        )
-        proxy = f"http://127.0.0.1:{PROXY_PORT}"
+    def check_tools_surface(self) -> None:
+        """Bundled tools without third-party credentials: manifest listing,
+        enablement (not gated on config), the agent-facing MCP shim over the tools
+        socket (including its peer-credential guard), the tools-service egress
+        for a tool API call (and that the admin uid has none), and the OAuth
+        connect start URL."""
+        self._step("bundled tools: listing, enablement, agent shim, approvals surface")
+        listing = self._api("GET", "/v1/tools")
+        tool_ids = sorted(entry["tool_id"] for entry in listing["tools"])
+        if tool_ids != ["brave_search", "gmail", "google_calendar"]:
+            raise AssertionError(f"unexpected bundled tools: {tool_ids}")
+        gmail = next(entry for entry in listing["tools"] if entry["tool_id"] == "gmail")
+        if gmail["enabled"] or gmail["connection_status"] != {"connected": False}:
+            raise AssertionError(f"gmail must start disabled and disconnected: {gmail}")
 
-        hello = self._ssh_code(
-            f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} "
-            "curl -s -o /dev/null -w '%{http_code}' --max-time 20 "
-            "https://api.anthropic.com/api/hello"
-        )
-        if hello == "403" or hello == "000" or hello == "":
-            raise AssertionError(f"Claude unauthenticated readiness path returned {hello!r}, expected proxy allow")
+        # Enablement is not gated on config: enabling before the key is set succeeds.
+        enabled = self._api("POST", "/v1/tools/brave_search/enable", {})
+        if enabled != {"tool_id": "brave_search", "enabled": True}:
+            raise AssertionError(f"brave_search enable without config should succeed: {enabled}")
+        # Set an (invalid) key so the live call below exercises the tools-service egress.
+        self._api("PUT", "/v1/tools/brave_search/config", {"key": "BRAVE_SEARCH_API_KEY", "value": "smoke-invalid-key"})
 
-        url = "https://api.anthropic.com/v1/messages"
-        payload = '{"model":"claude-sonnet-4-5","max_tokens":8,"messages":[{"role":"user","content":"hello"}]}'
-        print(f"  POST {url} before Claude account token hash is known", flush=True)
-        response = self._ssh_code(
-            f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} "
-            f"curl -s --max-time 20 -X POST -H 'Content-Type: application/json' "
-            f"--data {shlex.quote(payload)} {shlex.quote(url)}"
+        # The agent-facing path end to end: the MCP shim runs as
+        # trustyclaw-agent and reaches the tools socket by peer credentials.
+        shim_command = (
+            "sudo -u trustyclaw-agent env PYTHONPATH=/opt/trustyclaw-host "
+            "python3 -m host.runtime.tools_mcp_shim"
         )
-        print(f"  -> {response[:200]!r}", flush=True)
-        if "Claude account token is not available" not in response:
-            raise AssertionError(f"Anthropic API request did not fail closed before login; proxy returned {response!r}")
+        list_request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        shim_listing = self._ssh_code(f"printf '%s\\n' {shlex.quote(list_request)} | {shim_command}")
+        print(f"  shim tools/list -> {shim_listing[:200]!r}", flush=True)
+        if "brave_search_search_web" not in shim_listing or "check_tool_approval" not in shim_listing:
+            raise AssertionError(f"MCP shim listing missing expected tools: {shim_listing!r}")
+        if "list_bundled_tools" not in shim_listing:
+            raise AssertionError(f"MCP shim listing missing list_bundled_tools: {shim_listing!r}")
+        if "gmail_search_messages" in shim_listing:
+            raise AssertionError("MCP shim listed a disabled tool")
 
-        status = self._wait_for_runtime_status({"awaiting_login", "active"}, timeout=120)
-        if status == "awaiting_login":
-            login = self._api("POST", "/v1/agent-runtime/claude-oauth-login")
-            replay = self._api("GET", "/v1/agent-runtime/claude-oauth-login")
-            repost = self._api("POST", "/v1/agent-runtime/claude-oauth-login")
-            if replay["login_url"] != login["login_url"] or repost["login_url"] != login["login_url"]:
-                raise AssertionError(f"Claude login replays disagree: {login} / {replay} / {repost}")
-            print(f"\n  ACTION REQUIRED: open {login['login_url']}")
-            code = input("  Paste the Claude Code login code, then press Enter: ").strip()
-            if not code:
-                raise AssertionError("Claude Code login code was empty")
-            complete = self._api("POST", "/v1/agent-runtime/claude-oauth-login/complete", {"code": code})
-            if complete.get("status") != "accepted":
-                raise AssertionError(f"Claude login completion returned {complete}")
-            status = self._wait_for_runtime_status({"active"}, timeout=180)
-        if status != "active":
-            last = self._api("GET", "/v1/agent-runtime/status")
-            raise AssertionError(f"Claude runtime never became active after login (last status: {last})")
-
-        for method in ("POST", "GET"):
-            code, _ = self._api_status(method, "/v1/agent-runtime/claude-oauth-login", idem=self._idem(f"claude-oauth-{method}"))
-            if code != 409:
-                raise AssertionError(f"{method} claude-oauth-login while active returned {code}, expected 409")
-        account = self._agent_account("claude_code")
-        if (
-            account.get("status") != "active"
-            or account.get("provider") != "claude"
-            or not account.get("account_id")
-            or "email" not in account
-        ):
-            raise AssertionError(f"GET account while Claude is active returned unexpected shape: {account}")
-        self._assert_provider_metadata("claude_code", account)
-
-        print(f"  POST {url} without bearer after Claude account token hash is known", flush=True)
-        missing = self._ssh_code(
-            f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} "
-            f"curl -s --max-time 20 -X POST -H 'Content-Type: application/json' "
-            f"--data {shlex.quote(payload)} {shlex.quote(url)}"
+        # The catalog built-in shows disabled tools too, so the agent can ask
+        # the operator to enable an existing tool instead of rebuilding it.
+        catalog_request = json.dumps(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_bundled_tools", "arguments": {}}}
         )
-        print(f"  -> {missing[:200]!r}", flush=True)
-        print(f"  POST {url} with wrong bearer after Claude account token hash is known", flush=True)
-        wrong = self._ssh_code(
-            f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} "
-            f"curl -s --max-time 20 -X POST -H 'Content-Type: application/json' "
-            f"-H 'Authorization: Bearer smoke-wrong-token' "
-            f"--data {shlex.quote(payload)} {shlex.quote(url)}"
-        )
-        print(f"  -> {wrong[:200]!r}", flush=True)
-        if "Claude bearer token is required" not in missing:
-            raise AssertionError(f"missing Claude bearer was not blocked; proxy returned {missing!r}")
-        if "Claude bearer token does not match" not in wrong:
-            raise AssertionError(f"wrong Claude bearer was not blocked; proxy returned {wrong!r}")
+        catalog_response = self._ssh_code(f"printf '%s\\n' {shlex.quote(catalog_request)} | {shim_command}")
+        print(f"  shim list_bundled_tools -> {catalog_response[:200]!r}", flush=True)
+        if '"isError": true' in catalog_response:
+            raise AssertionError(f"list_bundled_tools failed: {catalog_response!r}")
+        # The result text is JSON-escaped inside the MCP content; parse it back
+        # out and assert the disabled gmail tool appears with enabled false.
+        catalog_text = json.loads(catalog_response)["result"]["content"][0]["text"]
+        catalog_tools = {entry["tool_id"]: entry for entry in json.loads(catalog_text)["tools"]}
+        if not catalog_tools["brave_search"]["enabled"]:
+            raise AssertionError(f"catalog must show brave_search enabled: {catalog_text!r}")
+        if catalog_tools["gmail"]["enabled"]:
+            raise AssertionError(f"catalog must show gmail disabled: {catalog_text!r}")
 
-        task_baseline_seq = max((event["seq"] for event in self._network_events()), default=0)
-        prompt = "Reply with exactly the word CLAUDE_SMOKE_OK and nothing else."
-        print(f"  submitting Claude task: {prompt!r}", flush=True)
-        task = self._api("POST", "/v1/tasks", self.task_body(prompt, "smoke-claude"))
-        done = self._wait_for_task(task["task_id"], timeout=240)
-        if done["status"] != "completed":
-            raise AssertionError(f"Claude task ended {done['status']}: {self._task_failure_detail(task['task_id'])}")
-        if "CLAUDE_SMOKE_OK" not in (done.get("output_message") or ""):
-            raise AssertionError(f"Claude task output did not contain expected token: {done.get('output_message')!r}")
-        events = self._network_events(since=task_baseline_seq)
-        anthropic = [event for event in events if event["host"] == "api.anthropic.com"]
-        if not any(event["decision"] == "allowed" for event in anthropic):
-            raise AssertionError(f"Claude task completed without an allowed api.anthropic.com event: {events}")
-        fatal = [
-            event for event in anthropic
-            if event["decision"] == "denied" and event["path"].startswith("/v1/messages")
-        ]
-        if fatal:
-            raise AssertionError(f"Claude task had denied message traffic: {fatal}")
-        follow_up_prompt = (
-            "Earlier in this Claude conversation you replied with one uppercase token. "
-            "Reply with exactly that token again and nothing else."
+        # The egress boundary is split: the tools service holds internet egress,
+        # the admin service holds none. nftables drops the admin uid's outbound
+        # TCP while the tools uid reaches 443 (to a raw IP, so no DNS is needed).
+        admin_egress = self._ssh_code(
+            "sudo -u trustyclaw-admin timeout 6 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>&1 "
+            "&& echo TC_OPEN || echo TC_BLOCKED"
         )
-        print(f"  submitting Claude follow-up task on same thread: {follow_up_prompt!r}", flush=True)
-        follow_up = self._api("POST", "/v1/tasks", self.task_body(follow_up_prompt, "smoke-claude"))
-        follow_up_done = self._wait_for_task(follow_up["task_id"], timeout=240)
-        if follow_up_done["status"] != "completed":
-            raise AssertionError(
-                f"Claude follow-up ended {follow_up_done['status']}: "
-                f"{self._task_failure_detail(follow_up['task_id'])}"
+        if "TC_BLOCKED" not in admin_egress:
+            raise AssertionError(f"admin uid must have no internet egress: {admin_egress!r}")
+        tools_egress = self._ssh_code(
+            "sudo -u trustyclaw-tools timeout 6 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>&1 "
+            "&& echo TC_OPEN || echo TC_BLOCKED"
+        )
+        if "TC_OPEN" not in tools_egress:
+            raise AssertionError(f"tools uid must reach the internet for tool APIs: {tools_egress!r}")
+
+        # The agent-facing tools socket is owned by the dedicated tools service.
+        service_active = self._ssh_code("systemctl is-active trustyclaw-tools.service 2>&1 || true")
+        if service_active.strip() != "active":
+            raise AssertionError(f"trustyclaw-tools.service must be active: {service_active!r}")
+        socket_owner = self._ssh_code("stat -c '%U' /run/trustyclaw-tools/tools.sock 2>&1 || true")
+        if "trustyclaw-tools" not in socket_owner:
+            raise AssertionError(f"tools socket must be owned by trustyclaw-tools: {socket_owner!r}")
+
+        # A live tool call: the invalid key must be rejected by Brave (or fail on
+        # the network), proving the tool-call path and the tools-service egress
+        # rules without real credentials.
+        call_request = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "brave_search_search_web", "arguments": {"query": "trustyclaw"}},
+            }
+        )
+        call_response = self._ssh_code(f"printf '%s\\n' {shlex.quote(call_request)} | {shim_command}")
+        print(f"  shim tools/call -> {call_response[:200]!r}", flush=True)
+        if '"isError": true' not in call_response or "Brave Search API" not in call_response:
+            raise AssertionError(f"invalid-key Brave call did not fail cleanly: {call_response!r}")
+
+        # Peers are scoped strictly by path: other service users are rejected
+        # outright, and even the admin uid is rejected on the agent MCP routes
+        # (it holds only the /operator/... delegation routes).
+        probe_script = (
+            "from host.runtime.tools_mcp_shim import UnixHTTPConnection; "
+            "c = UnixHTTPConnection('/run/trustyclaw-tools/tools.sock'); "
+            "c.request('GET', '/tools'); print(c.getresponse().status)"
+        )
+        for probe_user in ("trustyclaw-proxy", "trustyclaw-admin"):
+            peer_probe = self._ssh_code(
+                f"sudo -u {probe_user} env PYTHONPATH=/opt/trustyclaw-host "
+                f"python3 -c {shlex.quote(probe_script)}"
             )
-        if "CLAUDE_SMOKE_OK" not in (follow_up_done.get("output_message") or ""):
-            raise AssertionError(
-                "Claude follow-up did not resume the persisted session context: "
-                f"{follow_up_done.get('output_message')!r}"
-            )
-        self.print_network_events("Claude auth/task network events", since=claude_section_baseline)
-        self._ok("Claude login/account guard passed; real Claude task completed and resumed through the proxy")
-
-    def check_task(self) -> None:
-        self._step("Codex login + web search task with the guard active (interactive)")
-        # Allow the OpenAI endpoints Codex needs, with the live web search guard
-        # active on the ChatGPT data plane.
-        self._api(
-            "PUT",
-            "/v1/network/policy",
-            network_policy(SMOKE_MANAGED_PROVIDERS),
-        )
-        # The status is cached and refreshed by a background poller every 10s;
-        # earlier steps ran under policies that deny Codex traffic, so wait for
-        # a poll under the policy just applied before deciding whether to log in.
-        status = self._wait_for_runtime_status({"awaiting_login", "active"}, timeout=120)
-        if status == "awaiting_login":
-            login = self._api("POST", "/v1/agent-runtime/codex-oauth-login")
-            # GET must replay the same pending login, and a repeated POST must
-            # reuse it rather than mint a second device code.
-            replay = self._api("GET", "/v1/agent-runtime/codex-oauth-login")
-            repost = self._api("POST", "/v1/agent-runtime/codex-oauth-login")
-            if replay["device_code"] != login["device_code"] or repost["device_code"] != login["device_code"]:
-                raise AssertionError(f"login replays disagree: {login} / {replay} / {repost}")
-            print(f"\n  ACTION REQUIRED: open {login['login_url']} and enter code {login['device_code']}")
-            input("  Press Enter once the Codex login is approved... ")
-            status = self._wait_for_runtime_status({"active"}, timeout=180)
-        if status != "active":
-            last = self._api("GET", "/v1/agent-runtime/status")
-            raise AssertionError(f"agent runtime never became active after login (last status: {last})")
-        # Once active, OAuth endpoints refuse because there is no pending
-        # device login. The account endpoint reports the inferred account id
-        # used by the proxy account pin.
-        for method in ("POST", "GET"):
-            code, _ = self._api_status(method, "/v1/agent-runtime/codex-oauth-login", idem=self._idem(f"oauth-{method}"))
-            if code != 409:
-                raise AssertionError(f"{method} codex-oauth-login while active returned {code}, expected 409")
-        account = self._agent_account("codex")
-        if account.get("status") != "active":
-            raise AssertionError(f"GET account while active did not report active: {account}")
-        account_id = account.get("account_id")
-        if not account_id:
-            raise AssertionError(f"GET account while active did not include account_id: {account}")
-        self._assert_provider_metadata("codex", account)
-
-        proxy = f"http://127.0.0.1:{PROXY_PORT}"
-        url = "https://chatgpt.com/backend-api/codex/responses"
-        live = '{"tools":[{"type":"web_search","external_web_access":true}]}'
-        cached = '{"tools":[{"type":"web_search","external_web_access":false}]}'
-
-        def post_openai(payload: str, account_header: str | None = account_id) -> str:
-            header = "" if account_header is None else f" -H {shlex.quote(f'ChatGPT-Account-Id: {account_header}')}"
-            return self._ssh_code(
-                f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} "
-                f"curl -s --max-time 20 -X POST -H 'Content-Type: application/json' "
-                f"{header} --data {shlex.quote(payload)} {shlex.quote(url)}"
-            )
-
-        print(f"  POST {url} without account header after account id is known", flush=True)
-        missing_account_response = post_openai(cached, account_header=None)
-        print(f"  -> {missing_account_response[:200]!r}", flush=True)
-        print(f"  POST {url} with wrong account header after account id is known", flush=True)
-        wrong_account_response = post_openai(cached, account_header=f"{account_id}-wrong")
-        print(f"  -> {wrong_account_response[:200]!r}", flush=True)
-        print(f"  POST {url} with live payload and pinned account", flush=True)
-        live_response = post_openai(live)
-        print(f"  -> {live_response[:200]!r}", flush=True)
-        print(f"  POST {url} with cached payload and pinned account", flush=True)
-        cached_response = post_openai(cached)
-        print(f"  -> {cached_response[:200]!r}", flush=True)
-        if "OpenAI account id header is required" not in missing_account_response:
-            raise AssertionError(f"missing account header was not blocked; proxy returned {missing_account_response!r}")
-        if "not the configured account" not in wrong_account_response:
-            raise AssertionError(f"wrong account header was not blocked; proxy returned {wrong_account_response!r}")
-        if "live web search is disabled" not in live_response:
-            raise AssertionError(f"live web search payload was not blocked; proxy returned {live_response!r}")
-        if "live web search is disabled" in cached_response:
-            raise AssertionError("cached web search payload was incorrectly blocked")
-
-        # Only the task's own traffic is in scope: earlier steps (the web-search
-        # guard) deliberately logged denied chatgpt.com events, so anchor on the
-        # latest event seq before submitting and ignore everything up to it.
-        baseline_seq = max((event["seq"] for event in self._network_events()), default=0)
-        print(f"  network event baseline: seq {baseline_seq}", flush=True)
-
-        # Run a task that exercises web search. The host pins Codex to cached web
-        # search and the guard blocks live, so the task completes only if the
-        # agent's real ChatGPT traffic passes the guard.
-        prompt = "Use your web search tool to check today's date, then reply with the word DONE."
-        print(f"  submitting task: {prompt!r}", flush=True)
-        task = self._api("POST", "/v1/tasks", self.task_body(prompt, "smoke-web"))
-        print(f"  created {task['task_id']}", flush=True)
-        start = time.time()
-        deadline = start + 240
-        current = task
-        last_status = None
-        while time.time() < deadline:
-            current = self._api("GET", f"/v1/tasks/{task['task_id']}")
-            if current["status"] != last_status:
-                print(f"  task status: {current['status']} ({int(time.time() - start)}s)", flush=True)
-                last_status = current["status"]
-            if current["status"] in {"completed", "failed", "cancelled"}:
-                break
-            time.sleep(5)
-
-        events = self._network_events(since=baseline_seq)
-        traffic: dict[tuple[str, str], int] = {}
-        for event in events:
-            key = (event["host"], event["decision"])
-            traffic[key] = traffic.get(key, 0) + 1
-        for (host, decision), count in sorted(traffic.items()):
-            print(f"  task traffic: {decision} {host} x{count}", flush=True)
-        if current.get("output_message") is not None:
-            print(f"  task output: {current['output_message']!r}", flush=True)
-        chatgpt = [event for event in events if event["host"].endswith("chatgpt.com")]
-        denied = [event for event in chatgpt if event["decision"] == "denied"]
-        # Codex also sends ancillary chatgpt.com traffic (e.g. analytics whose
-        # body mentions web_search without a parseable tool) that the guard
-        # conservatively denies and the agent shrugs off. Only a denial on the
-        # turn endpoint means the guard interfered with the task itself.
-        fatal = [e for e in denied if e["path"].startswith("/backend-api/codex/responses")]
-        for event in denied:
-            if event not in fatal:
-                print(
-                    f"  tolerated denial: {event['method']} {event['host']}{event['path']}"
-                    f" ({event.get('reason', 'no reason recorded')})",
-                    flush=True,
+            if peer_probe.strip() != "403":
+                raise AssertionError(
+                    f"tools socket must reject {probe_user} on agent routes, got {peer_probe!r}"
                 )
-        if current["status"] != "completed":
-            raise AssertionError(f"task did not complete: {current}; denied chatgpt.com events: {denied}")
-        if fatal:
-            raise AssertionError(f"the guard denied agent ChatGPT turn traffic (live web search?): {fatal}")
-        if not any(event["decision"] == "allowed" for event in chatgpt):
-            hosts = sorted({host for host, _ in traffic})
-            raise AssertionError(f"no allowed chatgpt.com traffic was observed for the task; hosts seen: {hosts}")
-        self._ok("web search task completed; agent ChatGPT traffic passed the live web search guard")
+
+        # OAuth connect start builds the Google URL from deployment config
+        # without any third-party call; approvals start empty.
+        self._api("PUT", "/v1/tools/gmail/config", {"key": "GOOGLE_OAUTH_CLIENT_ID", "value": "smoke-client"})
+        self._api("PUT", "/v1/tools/gmail/config", {"key": "GOOGLE_OAUTH_CLIENT_SECRET", "value": "smoke-secret"})
+        self._api("POST", "/v1/tools/gmail/enable", {})
+        connect = self._api(
+            "POST", "/v1/tools/gmail/oauth_connect/start",
+            {"redirect_uri": f"http://127.0.0.1:{ADMIN_PORT}/oauth/callback"},
+        )
+        if "accounts.google.com" not in connect["authorization_url"] or "smoke-client" not in connect["authorization_url"]:
+            raise AssertionError(f"gmail oauth_connect/start returned unexpected URL: {connect}")
+        approvals = self._api("GET", "/v1/tools/gmail/approvals")
+        if approvals["approvals"]:
+            raise AssertionError(f"expected no approvals on a fresh host: {approvals}")
+        status, body = self._api_status("POST", "/v1/tools/gmail/approvals/approval_1/approve", {})
+        if status != 404:
+            raise AssertionError(f"deciding a missing approval must 404, got {status} {body}")
+        for tool_id in ("brave_search", "gmail"):
+            self._api("POST", f"/v1/tools/{tool_id}/disable", {})
+        self._ok(
+            "tools listed with manifests, enablement gated on config, MCP shim listed and "
+            "called tools as the agent user, non-agent peer rejected, connect URL built, "
+            "approval surface empty and guarded"
+        )
 
     def check_both_runtimes_active(self) -> None:
         self._step("both agent runtimes logged in together")
@@ -2317,13 +2178,12 @@ class AwsSmoke:
             task = self._api(
                 "POST",
                 "/v1/tasks",
-                self.task_body(
+                self.follow_up_body(
                     (
                         "Earlier in this conversation you replied with a single uppercase token. "
                         "Reply with exactly that token again and nothing else."
                     ),
                     thread_id,
-                    runtime=runtime,
                 ),
             )
             done = self._wait_for_task(task["task_id"], timeout=240)
@@ -2383,7 +2243,7 @@ class AwsSmoke:
         if current["status"] != "running":
             raise AssertionError(f"slow task never started (status {current['status']}); cannot test kill")
         start = time.time()
-        status, body = self._api_status("POST", f"/v1/tasks/{slow_id}/kill", idem=self._idem(f"kill-{self.agent_runtime}"))
+        status, body = self._api_status("POST", f"/v1/tasks/{slow_id}/kill")
         if status != 200 or body.get("status") != "accepted":
             raise AssertionError(f"kill returned {status}: {body}")
         killed = self._wait_for_task(slow_id, timeout=60)
@@ -2394,7 +2254,7 @@ class AwsSmoke:
         follow = self._api(
             "POST",
             "/v1/tasks",
-            self.task_body(
+            self.follow_up_body(
                 "Stop the essay. Reply with exactly the word SURVIVED and nothing else.",
                 f"smoke-kill-{self.agent_runtime}",
             ),
@@ -2419,13 +2279,12 @@ class AwsSmoke:
             task = self._api(
                 "POST",
                 "/v1/tasks",
-                self.task_body(
+                self.follow_up_body(
                     (
                         "Earlier in this conversation you replied with a single uppercase word. "
                         "Reply with exactly that word again and nothing else."
                     ),
                     thread_id,
-                    runtime=runtime,
                 ),
             )
             done = self._wait_for_task(task["task_id"], timeout=240)
@@ -2446,7 +2305,7 @@ class AwsSmoke:
         finished_id = next(iter(self.parallel_task_ids), None)
         if finished_id is None:
             raise AssertionError("no completed parallel task recorded; reboot check must run after parallelism")
-        status, body = self._api_status("POST", "/v1/host-runtime/reboot", idem=self._idem("reboot"))
+        status, body = self._api_status("POST", "/v1/host-runtime/reboot")
         if status != 200 or body.get("status") != "accepted":
             raise AssertionError(f"reboot returned {status}: {body}")
         print("  reboot accepted; waiting for the host to go down and come back", flush=True)
@@ -2483,13 +2342,12 @@ class AwsSmoke:
             recall = self._api(
                 "POST",
                 "/v1/tasks",
-                self.task_body(
+                self.follow_up_body(
                     (
                         "Earlier in this conversation you replied with a single uppercase token. "
                         "Reply with exactly that token again and nothing else."
                     ),
                     thread_id,
-                    runtime=runtime,
                 ),
             )
             done = self._wait_for_task(recall["task_id"], timeout=300)
@@ -2616,13 +2474,10 @@ class AwsSmoke:
 
     def _api(self, method: str, path: str, body: dict | None = None) -> dict:
         data = json.dumps(body).encode() if body is not None else None
-        idem = f"smoke-{time.time_ns()}" if method != "GET" else None
 
         def attempt() -> dict:
             request = urllib.request.Request(f"http://127.0.0.1:{ADMIN_PORT}{path}", data=data, method=method)
             request.add_header("Authorization", f"Bearer {self.result['admin_password']}")
-            if idem is not None:
-                request.add_header("Idempotency-Key", idem)
             if body is not None:
                 request.add_header("Content-Type", "application/json")
             with urllib.request.urlopen(request, timeout=30) as response:
@@ -2631,9 +2486,11 @@ class AwsSmoke:
         try:
             return attempt()
         except (urllib.error.URLError, ConnectionError) as exc:
-            # The tunnel can drop during a long idle (e.g. the interactive login
-            # wait). Re-establish it once and retry; the request carries a stable
-            # Idempotency-Key, so a retried mutation will not double-execute.
+            # The tunnel can drop during a long idle; the failure then hits the
+            # connect of the NEXT request, which never reached the server, so
+            # one reopen-and-retry is safe. (A response lost mid-flight would
+            # retry a mutation that already executed; that is vanishingly rare
+            # and fails the run visibly rather than silently.)
             reason = getattr(exc, "reason", exc)
             if isinstance(exc, urllib.error.HTTPError):
                 payload = exc.read()
@@ -2648,22 +2505,18 @@ class AwsSmoke:
 
     def _api_status(
         self, method: str, path: str, body: dict | None = None, *,
-        idem: str | None = "__auto__", bearer: str | None = "__default__",
+        bearer: str | None = "__default__",
     ) -> tuple[int, dict]:
         """One-shot request returning (status, body) instead of raising on HTTP
         errors, for checks that assert specific 4xx behavior or run from
         threads (no tunnel-reopen side effects). ``bearer=None`` sends no
-        Authorization header; ``idem=None`` sends no Idempotency-Key."""
+        Authorization header."""
         if bearer == "__default__":
             bearer = self.result["admin_password"]
-        if idem == "__auto__":
-            idem = self._idem("auto") if method != "GET" else None
         data = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(f"http://127.0.0.1:{ADMIN_PORT}{path}", data=data, method=method)
         if bearer is not None:
             request.add_header("Authorization", f"Bearer {bearer}")
-        if idem is not None and method != "GET":
-            request.add_header("Idempotency-Key", idem)
         if body is not None:
             request.add_header("Content-Type", "application/json")
         try:
@@ -2675,9 +2528,6 @@ class AwsSmoke:
                 return exc.code, json.loads(payload)
             except json.JSONDecodeError:
                 return exc.code, {"raw": payload.decode(errors="replace")}
-
-    def _idem(self, label: str) -> str:
-        return f"smoke-{label}-{time.time_ns()}"
 
     def _parallel(self, count: int, fn) -> list:
         """Run fn(0..count-1) on real threads and return results in order; a

@@ -215,6 +215,9 @@ class StageAwsSmokeTests(unittest.TestCase):
         self.assertEqual(StageAwsSmoke.suite_runtimes("codex"), ("codex",))
         self.assertEqual(StageAwsSmoke.suite_runtimes("claude"), ("claude_code",))
         self.assertEqual(StageAwsSmoke.suite_runtimes("github"), ())
+        self.assertEqual(StageAwsSmoke.suite_runtimes("brave"), ())
+        self.assertEqual(StageAwsSmoke.suite_runtimes("gmail"), ())
+        self.assertEqual(StageAwsSmoke.suite_runtimes("gcal"), ())
         self.assertEqual(StageAwsSmoke.suite_runtimes("all"), ("codex", "claude_code"))
 
     def test_github_app_config_from_env_parses_or_requires_all(self) -> None:

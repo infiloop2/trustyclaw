@@ -12,9 +12,11 @@ export function runtimeLabel(runtime) {
   return RUNTIME_PROVIDERS[runtime]?.label || runtime;
 }
 
-export function notice(message) {
-  $("notice").textContent = message || "";
-  if (message) setTimeout(() => { $("notice").textContent = ""; }, 8000);
+export function notice(message, kind) {
+  const node = $("notice");
+  node.textContent = message || "";
+  node.classList.toggle("error", kind === "error");
+  if (message) setTimeout(() => { node.textContent = ""; }, 8000);
 }
 
 export function badge(value) { return `<span class="status ${value}">${value}</span>`; }

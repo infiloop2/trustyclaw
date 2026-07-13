@@ -32,22 +32,7 @@
 | `operator_connections[].mode` | Yes | enum | `ssh` or `cloudflare_access`. |
 | `operator_connections[].ssh_public_key` | Yes when mode is `ssh` | string | SSH public key installed for persistent operator access. This is the key content, not a file path. |
 | `operator_connections[].hostname` | Yes when mode is `cloudflare_access` | string | Exact Cloudflare-protected hostname that routes to the admin UI/API, for example `trustyclaw.example.com`. Wildcards are rejected. |
-| `operator_connections[].tunnel_token_env` | Yes when mode is `cloudflare_access` | string | Name of the local environment variable containing the Cloudflare Tunnel token. The token value is copied into admin state so upgrade, recover, and reconfigure can recreate the tunnel service. |
-
-## Upgrade Config
-
-```json
-{
-  "agent_name": "trustyclaw-dev-agent",
-  "aws_region": "us-east-1",
-  "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
-  "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY"
-}
-```
-
-Upgrade intentionally omits `operator_connections`. It preserves the existing
-operator access endpoints from admin state instead of taking new endpoints from
-the command input.
+| `operator_connections[].tunnel_token_env` | Yes when mode is `cloudflare_access` | string | Name of the local environment variable containing the Cloudflare Tunnel token. The token is encrypted in admin state so upgrade, recover, and reconfigure can recreate the tunnel service. |
 
 ## Upgrade, Recover, and Power Config
 

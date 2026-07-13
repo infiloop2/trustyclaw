@@ -6,8 +6,8 @@ umask 077
 # cwd so runuser children do not inherit an unreadable directory.
 cd /
 NODE_VERSION=22.12.0
-CODEX_CLI_VERSION=0.140.0
-CLAUDE_CODE_VERSION=2.1.177
+CODEX_CLI_VERSION=0.144.0
+CLAUDE_CODE_VERSION=2.1.206
 CLOUDFLARED_VERSION=2026.6.1
 # Ubuntu 22.04 ships PostgreSQL 14. The data directory below is versioned by
 # major so a future base-image bump gets an explicit pg_upgrade step instead
@@ -23,6 +23,8 @@ CLOUDFLARED_UID=47744
 CLOUDFLARED_GID=47744
 POSTGRES_UID=47745
 POSTGRES_GID=47745
+TRUSTYCLAW_TOOLS_UID=47746
+TRUSTYCLAW_TOOLS_GID=47746
 @APP_UID_GID_CONSTANTS@
 PROXY_PORT=@PROXY_PORT@
 @APP_PORT_CONSTANTS@
@@ -151,11 +153,15 @@ ensure_group trustyclaw-admin "$TRUSTYCLAW_ADMIN_GID"
 ensure_group trustyclaw-proxy "$TRUSTYCLAW_PROXY_GID"
 ensure_group trustyclaw-agent "$TRUSTYCLAW_AGENT_GID"
 ensure_group cloudflared "$CLOUDFLARED_GID"
+ensure_group trustyclaw-tools "$TRUSTYCLAW_TOOLS_GID"
 @APP_ENSURE_GROUPS@
 ensure_user trustyclaw-admin "$TRUSTYCLAW_ADMIN_UID" trustyclaw-admin /mnt/trustyclaw-admin/admin-home
 ensure_user trustyclaw-proxy "$TRUSTYCLAW_PROXY_UID" trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state
 ensure_user trustyclaw-agent "$TRUSTYCLAW_AGENT_UID" trustyclaw-agent /mnt/trustyclaw-agent/agent-home
 ensure_user cloudflared "$CLOUDFLARED_UID" cloudflared /nonexistent
+# The tools service holds no durable state of its own (its state lives in the
+# tool tables, reached with a scoped Postgres role), so it needs no home.
+ensure_user trustyclaw-tools "$TRUSTYCLAW_TOOLS_UID" trustyclaw-tools /nonexistent
 @APP_ENSURE_USERS@
 # The postgres account is created here, before the postgresql packages would
 # create it with a dynamic system uid: the preserved cluster files on the
@@ -221,7 +227,7 @@ proxy_state = admin_mount / "proxy-state"
 agent_home = Path("/mnt/trustyclaw-agent/agent-home")
 pgdata = admin_mount / "postgres" / os.environ["PG_MAJOR"] / "main"
 for directory in (
-    # admin-state holds only the deploy-plane version.json now; runtime admin
+    # admin-state holds only the deploy-plane version.json; runtime admin
     # state lives in Postgres. Every component of the data directory path is
     # sanitized: the tree is owned by the postgres service user on a preserved
     # volume, so a compromised previous database process could otherwise plant
@@ -311,19 +317,6 @@ if mode == "deploy":
 elif state_version is None:
     fail(f"{mode} requires existing admin state version file {version_path}")
 
-# Admin state moved from JSON files into Postgres in 0.5.0, deliberately
-# without a data migration. Refuse older preserved state here — before
-# anything is modified — rather than failing midway when the carried-over
-# credentials turn out to live in the legacy config.json.
-MIN_STATE_VERSION = "0.5.0"
-if mode != "deploy" and compare_versions(state_version, MIN_STATE_VERSION) < 0:
-    fail(
-        f"admin state version {state_version} predates the Postgres storage "
-        f"introduced in {MIN_STATE_VERSION} and cannot be upgraded in place; "
-        "deploy a fresh host (the preserved volume is untouched and still "
-        "recoverable with matching older code)"
-    )
-
 if mode == "upgrade":
     comparison = compare_versions(state_version, target_version)
     if comparison >= 0:
@@ -374,7 +367,7 @@ echo "== installing system packages =="
 # npm package pulls in hundreds of node-* dependencies. -qq keeps the output to
 # warnings and errors.
 apt-get update -qq
-apt-get install -y -qq brotli ca-certificates curl gh git jq nftables openssl python3 python3-venv sudo unattended-upgrades xz-utils zstd
+apt-get install -y -qq ca-certificates curl gh git jq nftables openssl python3 python3-venv sudo unattended-upgrades xz-utils
 
 # PostgreSQL for admin state. postgresql-common is installed first so its
 # default-cluster creation can be disabled: the data directory must live on
@@ -404,27 +397,31 @@ fi
 # Managed database config, rewritten on every deploy like the rest of the
 # root-of-trust config. Unix-socket only: there is no TCP listener at all, and
 # peer auth maps OS users to database roles, so access control is the host's
-# user model. Only trustyclaw-admin (owner of the admin database) and the
-# postgres superuser (operators, via sudo) can connect; every other user —
-# including the agent user — matches only the final reject rule.
+# user model. trustyclaw-admin (owner of the admin database), the scoped
+# trustyclaw-proxy and trustyclaw-tools roles, and the postgres superuser
+# (operators, via sudo) can connect; every other user — including the agent
+# user — matches only the final reject rule.
 cat > "$PGDATA_DIR/postgresql.conf" <<PGCONF
 # Managed by TrustyClaw bootstrap; rewritten on every deploy.
 listen_addresses = ''
 unix_socket_directories = '/var/run/postgresql'
 # Each service process bounds its own active sessions client-side
-# (db.MAX_ACTIVE_CONNECTIONS = 18), so admin + proxy stay well below this cap
-# and bursts queue for milliseconds in the services instead of failing at the
-# server; the remainder is operator psql headroom.
-max_connections = 50
+# (db.MAX_ACTIVE_CONNECTIONS = 18). Three long-running services now use this
+# database (admin, proxy, and tools), so their combined worst case is
+# 3 x 18 = 54 sessions. The cap also fits the currently bundled app's pool,
+# operator psql, and the superuser reserve; bursts beyond a process's cap queue
+# client-side instead of immediately failing at the server.
+max_connections = 80
 log_destination = 'stderr'
 PGCONF
 cat > "$PGDATA_DIR/pg_hba.conf" <<'PGHBA'
 # Managed by TrustyClaw bootstrap; rewritten on every deploy.
-# Unix-socket connections only; identity is the OS user (peer auth). The
-# proxy role is granted exactly the network_events table (see the schema
-# migration); the agent user has no role and no rule that admits it.
+# Unix-socket connections only; identity is the OS user (peer auth). Schema
+# migrations give proxy, tools, and app roles only their required tables or
+# schema. The agent user has no role and no rule that admits it.
 local  trustyclaw_admin  trustyclaw-admin  peer
 local  trustyclaw_admin  trustyclaw-proxy  peer
+local  trustyclaw_admin  trustyclaw-tools  peer
 @APP_PG_HBA_LINES@
 local  all               postgres          peer
 local  all               all               reject
@@ -477,6 +474,9 @@ BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'trustyclaw-proxy') THEN
     CREATE ROLE "trustyclaw-proxy" LOGIN;
   END IF;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'trustyclaw-tools') THEN
+    CREATE ROLE "trustyclaw-tools" LOGIN;
+  END IF;
 @APP_ROLE_SQL@
 END
 $$;
@@ -490,14 +490,16 @@ runuser -u postgres -- psql -d trustyclaw_admin -v ON_ERROR_STOP=1 --quiet \
   -c "GRANT CREATE ON SCHEMA public TO \"trustyclaw-admin\";" \
 @APP_POSTGRES_SCHEMA_GRANTS@
   -c "GRANT CONNECT ON DATABASE trustyclaw_admin TO \"trustyclaw-proxy\";" \
+  -c "GRANT CONNECT ON DATABASE trustyclaw_admin TO \"trustyclaw-tools\";" \
 @APP_POSTGRES_CONNECT_GRANTS@
-# The PUBLIC revoke also stripped the proxy role's inherited CONNECT, so it is
-# granted back explicitly; without it the proxy cannot log network decisions
-# and, being fail-closed, would fail every agent request. PostgreSQL 14 ships
-# the public schema creatable by every connecting role, so CREATE is revoked
-# there too and granted back to exactly the schema-owning admin role: a
-# compromised proxy can use only its granted tables, not mint new objects.
-# The owning trustyclaw-admin role keeps its database privileges implicitly.
+# The PUBLIC revoke also stripped the proxy and tools roles' inherited CONNECT,
+# so it is granted back explicitly; without it the proxy cannot log network
+# decisions (and, being fail-closed, would fail every agent request) and the
+# tools service cannot reach any tool state. PostgreSQL 14 ships the public
+# schema creatable by every connecting role, so CREATE is revoked there too and
+# granted back to exactly the schema-owning admin role: a compromised proxy or
+# tools service can use only its granted tables, not mint new objects. The
+# owning trustyclaw-admin role keeps its database privileges implicitly.
 
 # Apply schema migrations, then compute and store the effective host config.
 # Both run as trustyclaw-admin: migrations are owned by the same role the
@@ -507,6 +509,10 @@ runuser -u postgres -- psql -d trustyclaw_admin -v ON_ERROR_STOP=1 --quiet \
 # the effective config, which is staged root-only for the later bootstrap steps
 # (SSH keys, cloudflared) that need it without database access.
 echo "== migrating admin state schema =="
+# The trustyclaw-tools role's table grants live in the schema migration
+# (0007_tool_state.sql), the same pattern as the trustyclaw-proxy grants;
+# bootstrap only provisions the role, its pg_hba line, and database CONNECT
+# above, before migrations run.
 runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.migrate up
 echo "== migrating app schemas =="
 @APP_MIGRATION_COMMANDS@
@@ -623,6 +629,19 @@ tool_suggest = false
 EOF
 chmod 644 /etc/codex/requirements.toml
 
+# Managed Codex config layer: the bundled tools surface. Codex spawns the
+# MCP shim as trustyclaw-agent; the shim forwards to the tools service's
+# socket, which authenticates the caller by kernel peer credentials.
+# managed_config.toml is the documented root-owned system layer Codex loads
+# alongside the agent-home config.
+cat > /etc/codex/managed_config.toml <<'EOF'
+[mcp_servers.trustyclaw]
+command = "/usr/bin/python3"
+args = ["-m", "host.runtime.tools_mcp_shim"]
+env = { PYTHONPATH = "/opt/trustyclaw-host" }
+EOF
+chmod 644 /etc/codex/managed_config.toml
+
 # Reduce the root-daemon attack surface reachable by the agent. snapd ships in
 # the base image but is unused here, and its socket is world-accessible; stop
 # and mask it so the agent has no snapd API to reach for privilege escalation.
@@ -664,6 +683,7 @@ HELPER_NAMES=(
   clear-agent-auth
   read-agent-file
   reboot-host
+  check-for-upgrade
   mint-github-app-token
   audit-github-repo
   approve-github-push
@@ -707,8 +727,7 @@ chown trustyclaw-proxy:trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state/networ
 chmod 600 /mnt/trustyclaw-admin/proxy-state/network_proxy_ca.key
 chmod 644 /mnt/trustyclaw-admin/proxy-state/network_proxy_ca.crt
 # No initial network policy is seeded: a missing policy row is the fail-closed
-# empty default (deny everything), which is exactly what the old seeded empty
-# policy expressed.
+# empty default (deny everything).
 
 # Durable agent runtime config and instructions. The files live in this repo so
 # harness expectations are reviewable, and bootstrap installs them root-owned,
@@ -733,7 +752,7 @@ chattr +i \
   "$AGENT_HOME_PATH/.claude/settings.json"
 
 cat > /etc/sudoers.d/trustyclaw-host <<'SUDOERS'
-trustyclaw-admin ALL=(root) NOPASSWD: /usr/local/lib/trustyclaw-host/reboot-host, /usr/local/lib/trustyclaw-host/run-codex-app-server, /usr/local/lib/trustyclaw-host/read-codex-account-id, /usr/local/lib/trustyclaw-host/run-claude-code, /usr/local/lib/trustyclaw-host/read-claude-account, /usr/local/lib/trustyclaw-host/clear-agent-auth, /usr/local/lib/trustyclaw-host/read-agent-file, /usr/local/lib/trustyclaw-host/mint-github-app-token, /usr/local/lib/trustyclaw-host/audit-github-repo, /usr/local/lib/trustyclaw-host/approve-github-push
+trustyclaw-admin ALL=(root) NOPASSWD: /usr/local/lib/trustyclaw-host/reboot-host, /usr/local/lib/trustyclaw-host/run-codex-app-server, /usr/local/lib/trustyclaw-host/read-codex-account-id, /usr/local/lib/trustyclaw-host/run-claude-code, /usr/local/lib/trustyclaw-host/read-claude-account, /usr/local/lib/trustyclaw-host/clear-agent-auth, /usr/local/lib/trustyclaw-host/read-agent-file, /usr/local/lib/trustyclaw-host/check-for-upgrade, /usr/local/lib/trustyclaw-host/mint-github-app-token, /usr/local/lib/trustyclaw-host/audit-github-repo, /usr/local/lib/trustyclaw-host/approve-github-push
 SUDOERS
 chmod 440 /etc/sudoers.d/trustyclaw-host
 
@@ -756,7 +775,11 @@ fi
 # connector can reach their narrow external dependencies; the agent can only
 # reach the loopback proxy. DNS is denied for every other non-root user because
 # DNS lookups are an exfiltration channel; the proxy may resolve and connect
-# only after policy allows a host.
+# only after policy allows a host. The trustyclaw-tools service gets DNS and
+# HTTPS because the bundled tool packages run inside it and call their
+# third-party APIs directly; the admin service holds no internet egress at all,
+# so a compromised tool package cannot exfiltrate admin state, and the agent's
+# fail-closed proxy path is unaffected.
 python3 - <<'PY'
 import json, pathlib
 config = json.loads(pathlib.Path('/tmp/trustyclaw_effective_config.json').read_text())
@@ -789,6 +812,9 @@ $(cat /tmp/trustyclaw_cloudflare_rules)
     meta skuid "trustyclaw-proxy" udp dport 53 accept
     meta skuid "trustyclaw-proxy" tcp dport 53 accept
     meta skuid "trustyclaw-proxy" tcp dport { 80, 443 } accept
+    meta skuid "trustyclaw-tools" udp dport 53 accept
+    meta skuid "trustyclaw-tools" tcp dport 53 accept
+    meta skuid "trustyclaw-tools" tcp dport 443 accept
     udp dport 53 meta skuid != 0 drop
     tcp dport 53 meta skuid != 0 drop
     oif lo tcp dport @PROXY_PORT@ meta skuid "trustyclaw-agent" accept
@@ -873,16 +899,46 @@ RestartSec=3
 WantedBy=multi-user.target
 UNIT
 
+# The dedicated tools service runs tool code and holds internet egress out of
+# the admin service. It owns the agent-facing tools socket and connects to
+# Postgres as the scoped trustyclaw-tools role. RuntimeDirectory stays
+# world-traversable (0755) so the agent (and admin, for delegated operator
+# operations) can connect; the socket peer-credential check is the authentication.
+cat > /etc/systemd/system/trustyclaw-tools.service <<'UNIT'
+[Unit]
+Description=TrustyClaw Tools Service
+After=network-online.target trustyclaw-postgres.service
+Wants=network-online.target trustyclaw-postgres.service
+StartLimitIntervalSec=0
+
+[Service]
+User=trustyclaw-tools
+UMask=0077
+RuntimeDirectory=trustyclaw-tools
+RuntimeDirectoryMode=0755
+Environment=PYTHONPATH=/opt/trustyclaw-host
+ExecStart=/usr/bin/python3 -m host.runtime.tools_service
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 cat > /etc/systemd/system/trustyclaw-admin-api.service <<'UNIT'
 [Unit]
 Description=TrustyClaw Admin API
-After=network-online.target trustyclaw-network-proxy.service trustyclaw-postgres.service
-Wants=network-online.target trustyclaw-network-proxy.service trustyclaw-postgres.service
+After=network-online.target trustyclaw-network-proxy.service trustyclaw-postgres.service trustyclaw-tools.service
+Wants=network-online.target trustyclaw-network-proxy.service trustyclaw-postgres.service trustyclaw-tools.service
 StartLimitIntervalSec=0
 
 [Service]
 User=trustyclaw-admin
 UMask=0077
+# trustyclaw-admin-api holds the app-backend admin socket; the agent-facing
+# tools socket is owned by trustyclaw-tools.service. The directory stays
+# world-traversable so the app users can connect, and the socket peer
+# credentials authenticate the caller.
 RuntimeDirectory=trustyclaw-admin-api
 RuntimeDirectoryMode=0755
 Environment=PYTHONPATH=/opt/trustyclaw-host
@@ -919,6 +975,7 @@ fi
 
 systemctl daemon-reload
 systemctl enable --now trustyclaw-network-proxy.service
+systemctl enable --now trustyclaw-tools.service
 systemctl enable --now trustyclaw-admin-api.service
 if [ "$cloudflare_connection_count" -gt 0 ]; then
   systemctl enable --now trustyclaw-cloudflared.service

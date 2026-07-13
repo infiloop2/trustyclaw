@@ -27,10 +27,8 @@ from contextlib import contextmanager
 import os
 from pathlib import Path
 import re
-import select
 import subprocess
 import tempfile
-import time
 from typing import Iterator
 import uuid
 
@@ -39,6 +37,10 @@ import uuid
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 ZERO_OID = "0" * 40
 OID_RE = re.compile(r"^[0-9a-f]{40}$")
+# Branch/tag refs only, no whitespace or git metacharacters. Parsing fails
+# closed on anything else; the authoritative check stays at the root helper,
+# whose `git push` rejects any ref name git itself would refuse.
+REF_RE = re.compile(r"^refs/(heads|tags)/[^\s?*:\[\\~^]+$")
 GIT_BIN = "/usr/bin/git"
 GATE_TIMEOUT_SECONDS = 120
 MAX_CHANGED_PATHS = 200
@@ -91,18 +93,7 @@ def parse_receive_pack(body: bytes) -> tuple[list[tuple[str, str, str]], set[str
 
 
 def valid_ref_name(ref: str) -> bool:
-    if not ref.startswith(("refs/heads/", "refs/tags/")):
-        return False
-    try:
-        result = subprocess.run(
-            [GIT_BIN, "check-ref-format", ref],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=GATE_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise GateError(f"git check-ref-format failed: {exc}") from exc
-    return result.returncode == 0
+    return REF_RE.fullmatch(ref) is not None
 
 
 def touches_github(paths: set[str]) -> bool:
@@ -160,72 +151,6 @@ def _run_git(
     if proc.returncode != 0:
         raise GateError(f"git {args[0]} exited {proc.returncode}: {proc.stderr.decode('utf-8', 'replace')[:200]}")
     return proc.stdout
-
-
-def _git_exit_code(mirror: Path, args: list[str], *, env: dict[str, str] | None = None) -> int:
-    try:
-        proc = subprocess.run(
-            [GIT_BIN, "-C", str(mirror), *args],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            timeout=GATE_TIMEOUT_SECONDS,
-            env=env,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise GateError(f"git {args[0]} failed: {exc}") from exc
-    return proc.returncode
-
-
-def _run_git_lines_capped(
-    mirror: Path,
-    args: list[str],
-    *,
-    env: dict[str, str] | None = None,
-    max_lines: int = MAX_CHANGED_PATHS,
-) -> tuple[list[str], bool]:
-    try:
-        proc = subprocess.Popen(
-            [GIT_BIN, "-C", str(mirror), *args],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-        )
-    except OSError as exc:
-        raise GateError(f"git {args[0]} failed: {exc}") from exc
-    assert proc.stdout is not None
-    lines: list[str] = []
-    truncated = False
-    deadline = time.monotonic() + GATE_TIMEOUT_SECONDS
-    try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                proc.kill()
-                proc.communicate()
-                raise GateError(f"git {args[0]} timed out")
-            ready, _, _ = select.select([proc.stdout], [], [], remaining)
-            if not ready:
-                proc.kill()
-                proc.communicate()
-                raise GateError(f"git {args[0]} timed out")
-            raw = proc.stdout.readline()
-            if raw == b"":
-                break
-            line = raw.decode("utf-8", "replace").rstrip("\n")
-            if line:
-                lines.append(line)
-            if len(lines) > max_lines:
-                truncated = True
-                proc.kill()
-                break
-        _stdout, stderr = proc.communicate(timeout=max(0.1, deadline - time.monotonic()))
-    except subprocess.TimeoutExpired as exc:
-        proc.kill()
-        proc.communicate()
-        raise GateError(f"git {args[0]} timed out") from exc
-    if not truncated and proc.returncode != 0:
-        raise GateError(f"git {args[0]} exited {proc.returncode}: {stderr.decode('utf-8', 'replace')[:200]}")
-    return lines[:max_lines], truncated
 
 
 @contextmanager
@@ -296,31 +221,38 @@ def ensure_mirror(owner: str, repo: str, token: str | None, *, root: Path = QUAR
     return mirror
 
 
-def _git_object_env(object_dir: Path, alternates: list[Path]) -> dict[str, str]:
-    env = os.environ.copy()
-    env["GIT_OBJECT_DIRECTORY"] = str(object_dir)
-    if alternates:
-        env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = os.pathsep.join(str(path) for path in alternates)
-    return env
-
-
 def changed_paths(mirror: Path, commands: list[tuple[str, str, str]], pack: bytes) -> set[str]:
-    """Index the pushed pack into the quarantine (resolving the thin pack against
-    the mirror) and return capped ``.github`` paths the ref updates *introduce*
-    relative to what is already on the remote."""
-    if not pack:
-        return _changed_paths_with_env(mirror, commands, None)
-    with tempfile.TemporaryDirectory(prefix="inspect-objects.", dir=mirror.parent) as tmp:
-        object_dir = Path(tmp) / "objects"
-        object_dir.mkdir()
-        env = _git_object_env(object_dir, [mirror / "objects"])
-        _run_git(mirror, ["index-pack", "--stdin", "--fix-thin"], stdin=pack, env=env)
-        return _changed_paths_with_env(mirror, commands, env)
+    """Index the pushed pack into the quarantine mirror (resolving the thin
+    pack) and return capped ``.github`` paths the ref updates *introduce*
+    relative to what is already on the remote. A clean (forwarded) push leaves
+    its objects unreachable in the proxy-private mirror until git's own gc
+    during a later fetch reclaims them — disk-only, on a path no agent can
+    read."""
+    if pack:
+        _run_git(mirror, ["index-pack", "--stdin", "--fix-thin"], stdin=pack)
+    paths: set[str] = set()
+    for old, new, _ref in commands:
+        if new == ZERO_OID:  # branch deletion introduces no content
+            continue
+        bases = _remote_ancestor_bases(mirror, old, new)
+        if bases is None:  # tip is already on the remote; nothing introduced
+            continue
+        # A ref update or a branch off a single remote head has one base, giving
+        # an exact answer. When a new branch merges several remote heads there is
+        # no single authoritative base, so we fail closed: any .github difference
+        # against any base holds the push, rather than guessing which merged
+        # remote state is canonical. Code-only merges still diff clean.
+        for base in bases:
+            paths |= _github_diff(mirror, base, new)
+    if len(paths) > MAX_CHANGED_PATHS:
+        # Every path is under .github/, so the hold decision was made the
+        # moment the set went non-empty; the cap only bounds the operator
+        # display list stored on the pending row.
+        paths = set(sorted(paths)[:MAX_CHANGED_PATHS]) | {CHANGED_PATHS_TRUNCATED}
+    return paths
 
 
-def _remote_ancestor_bases(
-    mirror: Path, old: str, new: str, env: dict[str, str] | None
-) -> list[str] | None:
+def _remote_ancestor_bases(mirror: Path, old: str, new: str) -> list[str] | None:
     """The commits to diff ``new`` against so only the ``.github`` changes this
     push *introduces* are seen -- files already on the remote don't count.
 
@@ -338,7 +270,6 @@ def _remote_ancestor_bases(
     out = _run_git(
         mirror,
         ["rev-list", "--boundary", new, "--not", "--branches", "--tags"],
-        env=env,
     ).decode("utf-8", "replace")
     introduced = False
     bases: list[str] = []
@@ -354,60 +285,15 @@ def _remote_ancestor_bases(
     return bases or [EMPTY_TREE]
 
 
-def _github_diff(
-    mirror: Path, base: str, new: str, env: dict[str, str] | None, max_lines: int
-) -> tuple[set[str], bool]:
-    """The ``.github`` paths that differ between ``base`` and ``new`` (capped),
-    and whether the listing was truncated."""
-    quiet = _git_exit_code(mirror, ["diff-tree", "--quiet", base, new, "--", ".github"], env=env)
-    if quiet == 0:
-        return set(), False
-    if quiet != 1:
-        raise GateError(f"git diff-tree exited {quiet}")
-    output, truncated = _run_git_lines_capped(
+def _github_diff(mirror: Path, base: str, new: str) -> set[str]:
+    """The ``.github`` paths that differ between ``base`` and ``new``. A
+    diff-tree without ``--exit-code`` simply prints nothing when there is no
+    difference, so the one listing call is authoritative."""
+    output = _run_git(
         mirror,
         ["diff-tree", "-r", "--no-commit-id", "--name-only", base, new, "--", ".github"],
-        env=env,
-        max_lines=max_lines,
     )
-    return set(output), truncated
-
-
-def _changed_paths_with_env(
-    mirror: Path, commands: list[tuple[str, str, str]], env: dict[str, str] | None
-) -> set[str]:
-    paths: set[str] = set()
-    for old, new, _ref in commands:
-        if new == ZERO_OID:  # branch deletion introduces no content
-            continue
-        bases = _remote_ancestor_bases(mirror, old, new, env)
-        if bases is None:  # tip is already on the remote; nothing introduced
-            continue
-        remaining = MAX_CHANGED_PATHS - len(paths)
-        if remaining <= 0:
-            paths.add(CHANGED_PATHS_TRUNCATED)
-            break
-        # A ref update or a branch off a single remote head has one base, giving
-        # an exact answer. When a new branch merges several remote heads there is
-        # no single authoritative base, so we fail closed: any .github difference
-        # against any base holds the push, rather than guessing which merged
-        # remote state is canonical. Code-only merges still diff clean.
-        changed, truncated = _github_diff(mirror, bases[0], new, env, remaining)
-        for base in bases[1:]:
-            other, other_truncated = _github_diff(mirror, base, new, env, remaining)
-            changed |= other
-            truncated = truncated or other_truncated
-        if len(changed) > remaining:
-            truncated = True
-            changed = set(sorted(changed)[:remaining])
-        if truncated and not changed:
-            # Capping left the result unreliable; fail toward review.
-            changed = {CHANGED_PATHS_TRUNCATED}
-        paths.update(changed)
-        if truncated:
-            paths.add(CHANGED_PATHS_TRUNCATED)
-            break
-    return paths
+    return {line for line in output.decode("utf-8", "replace").splitlines() if line}
 
 
 def quarantine_pending(mirror: Path, commands: list[tuple[str, str, str]], push_id: str) -> None:
@@ -433,28 +319,6 @@ def side_band_requested(capabilities: set[str]) -> bool:
     return "side-band-64k" in capabilities or "side-band" in capabilities
 
 
-def should_inspect(guard: dict, host: str, method: str, path: str) -> tuple[str, str] | None:
-    """The (owner, repo) to gate, or None when this request is not a gated push.
-    A gated push is a ``POST .../git-receive-pack`` to a write repository while
-    the integration has ``require_dot_github_approval`` set."""
-    if not isinstance(guard, dict) or guard.get("require_dot_github_approval") is not True:
-        return None
-    if host.lower() != "github.com" or method.upper() != "POST":
-        return None
-    parts = [part for part in path.split("/") if part]
-    if len(parts) < 3 or parts[2] != "git-receive-pack":
-        return None
-    owner, repo = parts[0].lower(), parts[1].removesuffix(".git").lower()
-    for item in guard.get("write_repositories") or []:
-        if (
-            isinstance(item, dict)
-            and str(item.get("owner", "")).lower() == owner
-            and str(item.get("repo", "")).removesuffix(".git").lower() == repo
-        ):
-            return owner, repo
-    return None
-
-
 class GateResult:
     """The outcome of inspecting one gated push, ready for the proxy to act on:
     forward the original body when nothing under ``.github/`` changed, or hold it
@@ -462,12 +326,11 @@ class GateResult:
     it did."""
 
     def __init__(
-        self, mirror: Path, commands: list[tuple[str, str, str]], side_band: bool, paths: set[str], pack: bytes
+        self, mirror: Path, commands: list[tuple[str, str, str]], side_band: bool, paths: set[str]
     ) -> None:
         self._mirror = mirror
         self._commands = commands
         self._side_band = side_band
-        self._pack = pack
         self.paths = paths
         self.refs = [ref for _old, _new, ref in commands]
         self.ref_updates = [{"old": old, "new": new, "ref": ref} for old, new, ref in commands]
@@ -477,11 +340,9 @@ class GateResult:
         return touches_github(self.paths)
 
     def hold_for_approval(self, push_id: str) -> bytes:
-        """Retain the objects and return the HTTP response that tells the agent
-        the push is queued."""
+        """Retain the already-indexed objects and return the HTTP response
+        that tells the agent the push is queued."""
         try:
-            if self._pack:
-                _run_git(self._mirror, ["index-pack", "--stdin", "--fix-thin"], stdin=self._pack)
             quarantine_pending(self._mirror, self._commands, push_id)
             report = build_report_status(self.refs, f"queued for approval as push-{push_id}", side_band=self._side_band)
             return build_http_response(report)
@@ -495,9 +356,6 @@ class GateResult:
     def cleanup_pending(self, push_id: str) -> None:
         cleanup_pending(self._mirror, push_id)
 
-    def rejection(self, message: str) -> bytes:
-        return build_http_response(build_report_status(self.refs, message, side_band=self._side_band))
-
 
 def inspect(owner: str, repo: str, body: bytes, token: str | None) -> GateResult:
     """Parse the push, refresh the quarantine mirror, and diff the ref updates.
@@ -505,4 +363,4 @@ def inspect(owner: str, repo: str, body: bytes, token: str | None) -> GateResult
     commands, capabilities, pack = parse_receive_pack(body)
     mirror = ensure_mirror(owner, repo, token)
     paths = changed_paths(mirror, commands, pack)
-    return GateResult(mirror, commands, side_band_requested(capabilities), paths, pack)
+    return GateResult(mirror, commands, side_band_requested(capabilities), paths)

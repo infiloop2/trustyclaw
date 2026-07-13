@@ -1,23 +1,20 @@
 # Admin State Storage and Migrations
 
-Admin state lives in a local PostgreSQL database, `trustyclaw_admin`, served by
-a PostgreSQL instance that runs on the host itself (`trustyclaw-postgres`
-systemd unit). The service talks to it through an in-repo, standard-library
-wire-protocol client (`host/runtime/pgclient.py`) — no driver dependency;
-the client supports exactly the scope the runtime uses (Unix socket, peer
-auth, text-format values). Nothing about it is network-reachable: there is no TCP listener
-at all (`listen_addresses = ''`), only the local Unix socket. The network
-proxy participates under its own database role with narrow grants: read-only
-on `network_policy` and `proxy_provider_pins` (which the admin service writes
-after validation), plus insert/select/delete on its own `network_events`
-table. There is deliberately no fallback cache in the proxy: a database
-outage denies every request until the database returns — simple and fail
-safe, and nothing could keep flowing anyway since the pins and the decision
-log live in the same database. Exactly two things stay
-files: the proxy's TLS material (the `ssl` module and `openssl` consume
-paths, and the CA private key stays out of the admin-owned schema) and the
-deploy-plane `version.json`, which bootstrap must read before the database
-exists.
+Admin, network, app, and tool state live in a local PostgreSQL database,
+`trustyclaw_admin`, served by `trustyclaw-postgres.service`. TrustyClaw
+services use the in-repo standard-library wire-protocol client
+(`host/runtime/pgclient.py`), which implements only Unix sockets, peer auth,
+and text-format values. PostgreSQL has no TCP listener
+(`listen_addresses = ''`); the socket is
+`/var/run/postgresql/.s.PGSQL.5432`.
+
+The admin service owns the database. The proxy, tools service, and each app
+connect under separate peer-authenticated roles with grants limited to the
+tables or schema their process needs. There is no proxy fallback cache: a
+database outage denies agent network requests until the database returns.
+The remaining writable admin-volume paths are the proxy CA/certificates and
+Git quarantine mirror under `proxy-state`, deploy-plane `version.json` (which
+bootstrap must read before PostgreSQL starts), and the admin service home.
 
 ## What lives in the database
 
@@ -25,48 +22,47 @@ The schema lives in `host/migrations/` as ordered, numbered SQL migrations
 applied by the migration runner; the current shape is the result of applying
 them all, so this document describes the resulting tables, never the
 migration history. Columns are
-typed and constrained wherever the shape is ours; the single remaining JSON
-value is provider account metadata — the provider CLI's own evolving shape,
-cached verbatim, deliberately not ours to type.
+typed and constrained wherever the shape is ours; the JSON values are provider
+account metadata (the provider CLI's own evolving shape, cached verbatim) and
+tool-owned metadata and approval payloads (JSON by the tool contract).
 
 | Table | Contents |
 | --- | --- |
-| `config` | Agent name and admin password hash — a single row by constraint, format-checked; refreshed on every deploy (upgrade/recover carry the stored credentials forward). |
-| `operator_connections` | Operator access endpoints, one row per mode (duplicates impossible by key); per-mode field requirements are row constraints. |
-| `tasks` | Task queue and finished-task history (pruned to the newest 100,000 finished). `number` is the single identity; the public `task_<number>` id is just its label, formatted by the accessors. |
+| `config` | Agent name and admin password hash, a single format-checked row replaced during each provisioning bootstrap; upgrade/recover carry the stored password forward. |
+| `operator_connections` | Operator access endpoints, one row per mode (duplicates impossible by key); per-mode field requirements are row constraints, and the Cloudflare tunnel token is encrypted. |
+| `tasks` | Task queue and finished-task history, each holding one `thread_id` foreign key instead of copied session configuration (pruned to the newest 100,000 finished). `number` is the single identity; the public `task_<number>` id is just its label, formatted by the accessors. |
 | `task_steers` | Undelivered steer messages per running task, ordered; delivered steers are deleted (their content lives on as events). |
 | `agent_events` | Agent runtime and task events with typed payload columns (message/source, error, runtime); pruned to the newest 1,000,000. |
-| `thread_sessions` | User thread -> provider session/thread maps (pruned to the 100,000 most recently used per runtime). |
+| `thread_sessions` | One canonical row per user `thread_id`: runtime, provider session/thread id, model, effort, and recency. Rows referenced by retained tasks stay; unreferenced rows beyond the 100,000 most recently used per runtime are pruned. |
 | `oauth_logins` | In-flight OAuth logins, fully typed per flow (device code + login handle for Codex, browser code for Claude). |
-| `provider_accounts` | Admin-side provider account records: `account_id` typed, remaining provider-owned metadata as a cached document. |
+| `provider_accounts` | Admin-side provider account records: `account_id` typed, remaining provider-owned metadata as a cached document. An anchored row (`account_id` plus its provider's approval marker in metadata) is trigger-guarded: `provider_accounts_anchor_guard` refuses any write that changes the anchored `account_id`, strips its approval marker, or deletes the row — the only allowed writes are same-account metadata rewrites and the reset that clears the row, so re-anchoring is mechanically forced through reset-then-login regardless of runtime-code bugs. |
 | `network_policy` + `managed_integrations`, `github_repositories`, `github_settings`, `allowed_domains`, `domain_methods`, `domain_path_guards` | The active network policy as typed, ordered rows (shape defined by `host/config.py`): enabled integrations are presence rows, the GitHub `write_repositories` list keeps operator order (reads are universal, so the rows name only write targets), and `github_settings` is the singleton for integration-level GitHub toggles (`require_dot_github_approval`); replaced atomically, and a missing `network_policy` row is the fail-closed empty default. |
-| `github_credential` | The single fixed GitHub credential (PAT, or GitHub App identity/key). Admin-owned only — no proxy grant; secret columns hold `secretbox` ciphertext, and plaintext never leaves the admin service except into the two credential root helpers. The working token the App mints lives only in `proxy_github_token`. |
+| `github_credential` | The single fixed GitHub credential (PAT, or GitHub App identity/key). Admin-owned only, with no proxy grant; secret columns hold `secretbox` ciphertext. The working token lives only in `proxy_github_token`. |
 | `proxy_provider_pins` | Exactly the two values the proxy guards compare: account id and token hash (format-checked). |
 | `proxy_github_token` | The proxy's working copy of the active GitHub token, injected into policy-approved GitHub requests. `secretbox` ciphertext like every other stored secret; the proxy role holds SELECT on this row and on `secret_keys`, and because grants are per-table that pair decrypts exactly this working set — the credential and audit tables keep no proxy grant. A proxy compromise therefore exposes just this token: short-lived in app mode, the PAT itself in pat mode (one reason to prefer app mode). |
 | `github_repo_audit` | Per-repository audit facts (visibility, the token's effective permissions, default-branch protection, workflows and triggers) fetched by the `audit-github-repo` helper. Admin-owned, no proxy grant; the warning judgments live in code, so message changes never touch stored facts. |
 | `pending_pushes` | Pushes held by the `.github` approval gate. Written by the proxy's role (INSERT, like `network_events`) when a gated push touches `.github/`; the admin service lists and resolves them (approve/reject). The held objects live under `refs/pending/<id>` in the proxy's quarantine mirror on disk, not in this table. |
 | `network_events` | Network allow/deny decisions, written by the proxy's role, fully typed (pruned to the newest 1,000,000; URL fields are size-capped so the row cap is a real disk bound). |
+| `enabled_tools` | Bundled tools the operator has enabled; presence-based and keyed by `tool_id`. |
+| `tool_config` | Secret configuration values keyed by `(tool_id, key)`. Repeated key names are independent between tools; every value is `secretbox` ciphertext. |
+| `tool_credentials` | One OAuth credential per tool, split into typed connected-account columns, encrypted provider token material, and tool-owned non-secret metadata. |
+| `tool_approvals` | Host-owned approval records. `number` is the identity behind the public `approval_<number>.<token>` id (the token is an unguessable poll capability); conditional transitions make each approval single-use, and terminal result text is returned to both operator and agent (decided history is pruned to the newest 10,000). |
+| `tool_events` | Tool call, approval, connection, enablement, and config audit events; pruned to the newest 1,000,000. |
+| `app_schema_migrations` | Host-owned record of applied per-app migration versions. App SQL runs under the app role, which cannot write this table. |
 | `counters` | `next_task_number` (event seqs are a database serial). |
-| `secret_keys` | The at-rest encryption key for stored secrets (see below). Proxy SELECT grant so the proxy can decrypt `proxy_github_token`, the only secret-bearing row it can read. |
+| `secret_keys` | The at-rest encryption key for stored secrets (see below). The proxy and tools roles can read it, but their table grants expose only their own ciphertext-bearing rows. |
 | `schema_migrations` | Applied migration versions (owned by the migration runner). |
 
-Stored secrets — the GitHub token/private key/working token and the
-Cloudflare tunnel token — are encrypted at rest (`host/runtime/secretbox.py`:
-AES-256-CBC via openssl) with a key in the `secret_keys` table, created by
-the schema migration (from Postgres's CSPRNG), so the key exists from the
-moment the schema does. Keeping the key in the database keeps all admin
-state in one place; upgrade and recovery carry key and ciphertext together by
-construction. This is an accidental-exposure control, not a root/offline
-defense: a stray `SELECT *` on a secret-bearing table (or a pasted table
-dump) no longer reveals credential material, while a full database dump
-necessarily includes the key. Rows written before encryption existed keep
-working and re-encrypt on their next write: `decrypt` passes non-ciphertext
-values through unchanged, `write_config` re-saves the tunnel token on every
-deploy/upgrade, and the proxy's working GitHub token is republished by the
-next mint or credential change. No startup sweep is needed.
+Stored secrets include the Cloudflare tunnel token, GitHub PAT or App private
+key and working token, every tool config value, and OAuth provider token
+material. `host/runtime/secretbox.py` encrypts them with AES-256-CBC through
+OpenSSL using the key in `secret_keys`, which the schema creates from
+Postgres's CSPRNG. Upgrade and recovery carry ciphertext and key together on
+the admin volume. This is an accidental-exposure control, not a root or
+offline-database defense: a stray query or pasted row does not expose the
+secret, while a complete database dump necessarily includes the key.
 
-Ephemeral values — idempotency-key replay records
-(`admin_api.IDEMPOTENCY_ENTRIES`) and cached agent runtime statuses
+Ephemeral values — cached agent runtime statuses
 (`orchestrator._RUNTIME_STATUSES`) — live in service memory and reset with the
 process.
 
@@ -79,46 +75,55 @@ data files with new binaries.
 
 ## How runtime code uses it
 
-`host/runtime/state.py` is a storage API of per-operation accessors that run
-real queries against the normalized tables — nothing ever materializes the
-whole state, so request cost is independent of history size (the hot paths
-are indexed: task status/thread/runtime lookups, per-thread history, event
-paging, prune recency). Reads are plain lock-free transactions (MVCC
-snapshots) that fetch only what the caller needs. Writes go through
-`state.mutation()`, which pairs one database transaction with a process-wide
-mutation lock so check-then-act sequences (read a status, decide, write) stay
-atomic without per-row lock ceremony — the admin service is the single writer,
-enforced by its port bind. Events appended inside a mutation join its
-transaction, so an aborted update rolls back its events too; event seqs come
-from a database serial (unique and increasing, with harmless gaps from
-aborts).
+`host/runtime/state.py` exposes per-operation accessors that run real queries
+against normalized tables; no request materializes the complete state. Hot
+paths are indexed for task status/thread/runtime lookup, per-thread history,
+event paging, and pruning. Reads use MVCC transactions and fetch only the rows
+they need. Admin-process check-then-act writes use `state.mutation()`, pairing
+one database transaction with a process-local mutation lock. The proxy and
+tools processes write only through their granted operations, and cross-process
+races such as approval decisions use conditional SQL transitions. Events
+written inside a mutation share its transaction; serial event ids are unique
+and increasing with harmless gaps after aborts.
 
-`host/runtime/db.py` owns connections: a small process-wide pool, with nested
-transactions on one thread taking separate connections so a read inside a
-mutation sees the last committed state.
+`host/runtime/db.py` owns a small pool in each service process, capped at 18
+active sessions per process. PostgreSQL allows 80 connections, enough for the
+three long-running core clients (admin, proxy, and tools), the currently
+bundled app, operator access, and the superuser reserve. Nested transactions
+on one thread take separate connections so a read inside a mutation sees the
+last committed state.
 
-Growth stays bounded by deliberately high caps (100k finished tasks, 1M
-agent events, 1M network events, 100k session mappings per runtime), enforced
-by O(1)-planning range deletes (seq is a serial, so newest-N retention is a
-primary-key range below `MAX(seq) - N`) on the append cadence and the hourly
-maintenance pass. The admin volume is sized for those caps; time-based
-auto-cleanup and volume monitoring can replace them later without touching
-the storage API.
+Growth stays bounded by deliberately high caps (100k finished tasks, 1M rows
+per audit log — agent, network, and tool events each — 100k session mappings
+per runtime, and 10k decided tool approvals), enforced by O(1)-planning range
+deletes (seq is a serial, so newest-N retention is a primary-key range below
+`MAX(seq) - N`): the audit logs prune on their own append cadence, the rest on
+the hourly maintenance pass. The admin volume is sized for those caps;
+time-based auto-cleanup and volume monitoring can replace them later without
+touching the storage API.
 
 ## Access control
 
-Access control is deliberately minimal — the operating system's user model,
-not database passwords or per-table grants:
+Access starts with the operating system's user model and then narrows
+non-owner roles with table or schema grants:
 
 - Connections are Unix-socket only with `peer` authentication: the client's
   OS user must match its database role, and no passwords exist anywhere.
 - `trustyclaw-admin` owns the database and the schema; the admin service (and
   the bootstrap's migration/config steps) connect as it.
-- `trustyclaw-proxy` holds the one narrow role: read-only on the policy and
-  pin tables, write on its own event table (granted in the schema migration).
+- `trustyclaw-proxy` reads network policy, provider pins, GitHub settings and
+  the encrypted working token plus the key needed to decrypt it; it
+  inserts/prunes network events and enqueues
+  held pushes. It cannot read the stored GitHub credential or other admin
+  state.
+- `trustyclaw-tools` reads enablement/config and the shared secret key, and
+  reads/writes tool credentials, approvals, and events. It cannot enable a
+  tool, rewrite config, or reach non-tool state.
+- Every app role owns only its derived `app_<app_id>` schema. The host-owned
+  `app_schema_migrations` table records what bootstrap applied.
 - The `postgres` superuser is reachable only by the `postgres` OS user, i.e.
   by operators through sudo: `sudo -u postgres psql trustyclaw_admin`.
-- Everyone else — most importantly `trustyclaw-agent` — has no role, and
+- Everyone else, most importantly `trustyclaw-agent`, has no role, and
   `pg_hba.conf` ends with an explicit reject rule, so even a process that can
   reach the socket cannot authenticate.
 
