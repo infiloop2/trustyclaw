@@ -165,7 +165,9 @@ class WorkflowTriggerParsingTests(unittest.TestCase):
 
         with patch("host.runtime.audit_github_repo._get", side_effect=fake_no_pages_get):
             facts = audit_github_repo.audit_repository("token", "infiloop2", "trustyclaw")
-        self.assertEqual(facts["has_pages"], False)
+        # pages_public is the single stored Pages fact (tri-state); has_pages
+        # only decides locally whether the /pages endpoint is queried.
+        self.assertNotIn("has_pages", facts)
         self.assertEqual(facts["pages_public"], False)
         self.assertNotIn("/repos/infiloop2/trustyclaw/pages", calls)
 
@@ -176,7 +178,7 @@ class WorkflowTriggerParsingTests(unittest.TestCase):
 
         with patch("host.runtime.audit_github_repo._get", side_effect=fake_unreadable_pages_get):
             facts = audit_github_repo.audit_repository("token", "infiloop2", "trustyclaw")
-        self.assertEqual(facts["has_pages"], True)
+        self.assertNotIn("has_pages", facts)
         self.assertIsNone(facts["pages_public"])
 
     def test_trigger_shapes(self) -> None:
@@ -202,33 +204,26 @@ class WorkflowTriggerParsingTests(unittest.TestCase):
         # The critical secrets-exposure warning keys off exactly these
         # trigger names, in every YAML shape above.
         warnings = github_repo_audit._warnings(
-            {"visibility": "private", "workflows": [{"path": "w.yml", "triggers": ["pull_request_target"]}]}
+            {"visibility": "private", "pages_public": False,
+             "workflows": [{"path": "w.yml", "triggers": ["pull_request_target"]}]}
         )
         self.assertEqual(
             [w["code"] for w in warnings],
             ["secrets_exposed_to_pr_workflows", "workflows_execute_pushes"],
         )
         workflow_run_warnings = github_repo_audit._warnings(
-            {"visibility": "private", "workflows": [{"path": "w.yml", "triggers": ["workflow_run"]}]}
+            {"visibility": "private", "pages_public": False,
+             "workflows": [{"path": "w.yml", "triggers": ["workflow_run"]}]}
         )
         self.assertEqual([w["code"] for w in workflow_run_warnings], ["workflows_execute_pushes"])
         # A private repo with a public Pages site is the same exfiltration
         # sink as a public write repository.
         pages = github_repo_audit._warnings({"visibility": "private", "pages_public": True})
         self.assertEqual([(w["code"], w["severity"]) for w in pages], [("public_pages_site", "critical")])
-        unknown_pages = github_repo_audit._warnings({"visibility": "private", "has_pages": True, "pages_public": None})
+        unknown_pages = github_repo_audit._warnings({"visibility": "private", "pages_public": None})
         self.assertEqual(
             [(w["code"], w["severity"]) for w in unknown_pages],
             [("pages_visibility_unknown", "warning")],
-        )
-        unknown_presence = github_repo_audit._warnings({"visibility": "private", "has_pages": None, "pages_public": None})
-        self.assertEqual(
-            [(w["code"], w["severity"]) for w in unknown_presence],
-            [("pages_visibility_unknown", "warning")],
-        )
-        self.assertEqual(
-            github_repo_audit._warnings({"visibility": "private", "has_pages": False, "pages_public": None}),
-            [],
         )
         public = github_repo_audit._warnings(
             {"visibility": "public", "permissions": {"push": True}, "default_branch_protected": False}
@@ -240,7 +235,9 @@ class WorkflowTriggerParsingTests(unittest.TestCase):
         # A pull-only token on a private repository with no workflows raises
         # nothing.
         self.assertEqual(
-            [w["code"] for w in github_repo_audit._warnings({"visibility": "private", "permissions": {"pull": True}})],
+            [w["code"] for w in github_repo_audit._warnings(
+                {"visibility": "private", "pages_public": False, "permissions": {"pull": True}}
+            )],
             [],
         )
 

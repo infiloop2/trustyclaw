@@ -8,43 +8,34 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#0a0d13">
 <title>TrustyClaw</title>
-<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=__TRUSTYCLAW_ASSET_VERSION__">
-<link rel="alternate icon" href="/favicon.ico?v=__TRUSTYCLAW_ASSET_VERSION__">
-<link rel="stylesheet" href="/admin_ui.css?v=__TRUSTYCLAW_ASSET_VERSION__">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="alternate icon" href="/favicon.ico">
+<link rel="stylesheet" href="/admin_ui.css">
 </head>
 <body>
 <div class="bg-glow" aria-hidden="true"></div>
 
 <header class="topbar">
   <div class="brand">
-    <svg class="brand-mark" width="30" height="30" viewBox="0 0 128 128" aria-hidden="true">
-      <defs>
-        <linearGradient id="claw-grad" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stop-color="#45d6c4"/>
-          <stop offset="1" stop-color="#8b7bf7"/>
-        </linearGradient>
-        <mask id="claw-notch-l">
-          <rect width="128" height="128" fill="#fff"/>
-          <path d="M36 42 L27 11 L40 13 Z" fill="#000"/>
-        </mask>
-        <mask id="claw-notch-r">
-          <rect width="128" height="128" fill="#fff"/>
-          <path d="M92 42 L101 11 L88 13 Z" fill="#000"/>
-        </mask>
-      </defs>
-      <path d="M20 32 C20 72 38 102 64 114 C90 102 108 72 108 32" fill="none" stroke="#3d4f63" stroke-width="7" stroke-linecap="round"/>
-      <circle cx="37" cy="43" r="19" fill="url(#claw-grad)" mask="url(#claw-notch-l)"/>
-      <circle cx="91" cy="43" r="19" fill="url(#claw-grad)" mask="url(#claw-notch-r)"/>
-      <ellipse cx="64" cy="81" rx="31" ry="25" fill="url(#claw-grad)"/>
-      <ellipse cx="53" cy="66" rx="4.2" ry="5" fill="#0a0d13"/>
-      <ellipse cx="75" cy="66" rx="4.2" ry="5" fill="#0a0d13"/>
-      <path d="M56 75 Q64 81 72 75" fill="none" stroke="#0a0d13" stroke-width="3.5" stroke-linecap="round"/>
-      <path d="M50 88 L43 95 L50 102 M78 88 L85 95 L78 102 M68 86 L60 104" fill="none" stroke="#0a0d13" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
-    </svg>
+    <button class="ghost icon-button mobile-nav-toggle" id="mobile-nav-toggle" data-action="toggle-mobile-nav" aria-controls="sidebar" aria-expanded="false" aria-label="Open navigation" hidden>
+      <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h14M3 10h14M3 15h14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+    </button>
+    <img class="brand-mark" width="30" height="30" src="/favicon.svg" alt="">
     <span class="brand-name">TrustyClaw</span>
     <span id="agent-name" class="agent-chip" hidden></span>
   </div>
+  <div id="runtime-overview" class="runtime-overview" aria-label="Agent runtime status and usage" hidden></div>
   <div class="topbar-actions">
+    <span id="upgrade-notice" class="upgrade-notice" tabindex="0" aria-describedby="upgrade-popover" hidden>
+      <svg width="14" height="14" viewBox="0 0 20 20" aria-hidden="true">
+        <path class="upgrade-arrow" d="M10 16V5m0 0L6.5 8.5M10 5l3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        <path class="upgrade-check" d="m5 10.2 3.1 3.1L15 6.7" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span id="upgrade-popover" class="upgrade-popover" role="tooltip">
+        <strong id="upgrade-popover-title"></strong>
+        <span id="upgrade-popover-detail"></span>
+      </span>
+    </span>
     <button class="ghost" data-action="logout" id="logout-button" hidden>Log out</button>
   </div>
 </header>
@@ -53,30 +44,7 @@
 
 <section id="login" hidden>
   <div class="login-card">
-    <svg class="login-mark" width="44" height="44" viewBox="0 0 128 128" aria-hidden="true">
-      <defs>
-        <linearGradient id="login-claw-grad" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stop-color="#45d6c4"/>
-          <stop offset="1" stop-color="#8b7bf7"/>
-        </linearGradient>
-        <mask id="login-claw-notch-l">
-          <rect width="128" height="128" fill="#fff"/>
-          <path d="M36 42 L27 11 L40 13 Z" fill="#000"/>
-        </mask>
-        <mask id="login-claw-notch-r">
-          <rect width="128" height="128" fill="#fff"/>
-          <path d="M92 42 L101 11 L88 13 Z" fill="#000"/>
-        </mask>
-      </defs>
-      <path d="M20 32 C20 72 38 102 64 114 C90 102 108 72 108 32" fill="none" stroke="#3d4f63" stroke-width="7" stroke-linecap="round"/>
-      <circle cx="37" cy="43" r="19" fill="url(#login-claw-grad)" mask="url(#login-claw-notch-l)"/>
-      <circle cx="91" cy="43" r="19" fill="url(#login-claw-grad)" mask="url(#login-claw-notch-r)"/>
-      <ellipse cx="64" cy="81" rx="31" ry="25" fill="url(#login-claw-grad)"/>
-      <ellipse cx="53" cy="66" rx="4.2" ry="5" fill="#0a0d13"/>
-      <ellipse cx="75" cy="66" rx="4.2" ry="5" fill="#0a0d13"/>
-      <path d="M56 75 Q64 81 72 75" fill="none" stroke="#0a0d13" stroke-width="3.5" stroke-linecap="round"/>
-      <path d="M50 88 L43 95 L50 102 M78 88 L85 95 L78 102 M68 86 L60 104" fill="none" stroke="#0a0d13" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
-    </svg>
+    <img class="login-mark" width="44" height="44" src="/favicon.svg" alt="">
     <h1>Welcome back</h1>
     <p class="muted">Your trusted agent host is standing by</p>
     <input id="password" type="password" placeholder="Admin password" autocomplete="current-password">
@@ -85,8 +53,18 @@
 </section>
 
 <div id="app" hidden>
+  <button id="nav-backdrop" class="nav-backdrop" data-action="close-mobile-nav" aria-label="Close navigation" hidden></button>
   <div class="shell">
-    <nav class="sidebar" aria-label="Admin sections">
+    <nav id="sidebar" class="sidebar" aria-label="Admin sections">
+      <div class="sidebar-mobile-head">
+        <span class="sidebar-mobile-brand">
+          <img width="30" height="30" src="/favicon.svg" alt="">
+          <span><strong>TrustyClaw</strong><small>Navigation</small></span>
+        </span>
+        <button class="ghost icon-button" id="mobile-nav-close" data-action="close-mobile-nav" aria-label="Close navigation">
+          <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        </button>
+      </div>
       <button id="tab-home" class="tab-button active-tab" data-action="show-tab" data-tab="home">
         <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 10.2 10 4l7 6.2M5.2 9.2V16h3.2v-3.6h3.2V16h3.2V9.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>Home</span>
@@ -94,6 +72,10 @@
       <button id="tab-network" class="tab-button" data-action="show-tab" data-tab="network">
         <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3 10h14M10 3c2.4 2 3.4 4.4 3.4 7S12.4 15 10 17c-2.4-2-3.4-4.4-3.4-7S7.6 5 10 3Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
         <span>Internet Access and Tools</span>
+      </button>
+      <button id="tab-connection-guide" class="tab-button" data-action="show-tab" data-tab="connection-guide">
+        <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4.5h4.2A1.8 1.8 0 0 1 10 6.3v10.2a2.4 2.4 0 0 0-2.2-1.3H4V4.5Zm12 0h-4.2A1.8 1.8 0 0 0 10 6.3v10.2a2.4 2.4 0 0 1 2.2-1.3H16V4.5Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+        <span>Integration Guides</span>
       </button>
       <button id="tab-processes" class="tab-button" data-action="show-tab" data-tab="processes">
         <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true"><rect x="3.5" y="4" width="13" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 8h6M7 11h6M7 14h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
@@ -115,6 +97,10 @@
         <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.8 16 5v4.4c0 3.9-2.6 6.6-6 7.8-3.4-1.2-6-3.9-6-7.8V5l6-2.2Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M7 10.6h2l1-2.4 1.6 4 1-1.6h1.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>Network audit log</span>
       </button>
+      <button id="tab-tool-log" class="tab-button" data-action="show-tab" data-tab="tool-log">
+        <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true"><path d="M7.2 3v3.2M12.8 3v3.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M5.8 6.2h8.4v2.8a4.2 4.2 0 0 1-8.4 0V6.2Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M10 13.4V17" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        <span>Tool audit log</span>
+      </button>
       <div class="sidebar-divider" aria-hidden="true"></div>
       <div id="sidebar-apps" class="sidebar-section">
         <div class="sidebar-section-title">Apps</div>
@@ -132,26 +118,6 @@
           <div id="health"></div>
         </section>
 
-        <section>
-          <h2>Agent runtimes</h2>
-          <div id="runtime"></div>
-          <div id="runtime-guidance"></div>
-          <div id="oauth"></div>
-          <div class="actions">
-            <button id="start-codex-login" class="primary" data-action="start-login" data-runtime="codex" disabled hidden>Start Codex login</button>
-            <button id="start-claude-login" class="primary" data-action="start-login" data-runtime="claude_code" disabled hidden>Start Claude login</button>
-          </div>
-        </section>
-
-        <section>
-          <div class="section-head">
-            <h2>Provider usage</h2>
-            <button class="ghost sm icon-button" data-action="refresh-provider-usage" title="Refresh provider usage" aria-label="Refresh provider usage">
-              <svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><path d="M16.2 6.5A6.8 6.8 0 1 0 17 10M16.2 3.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </button>
-          </div>
-          <div class="table-scroll"><table id="provider-accounts"></table></div>
-        </section>
       </div>
 
       <div id="panel-agent" class="tab-panel" hidden>
@@ -213,7 +179,6 @@
       </div>
 
       <div id="panel-network" class="tab-panel" hidden>
-        <p id="policy-message" class="inline-message"></p>
         <div id="preset-info-popover" class="info-popover" role="dialog" hidden></div>
         <div id="managed-integrations"></div>
         <!-- Rendered in the GitHub integration dropdown above:
@@ -221,11 +186,13 @@
              shows it only while GitHub is enabled (a disabled integration
              carries no repositories to show). -->
         <div id="github-expansion" class="integration-expansion" hidden>
-          <div class="expansion-card">
-            <div class="field-label">GitHub credential</div>
+          <div class="detail-card">
+            <div class="detail-card-head">
+              <h3>GitHub credential</h3>
+              <button class="ghost sm" id="github-credential-clear" data-action="delete-github-credential" hidden>Clear credential</button>
+            </div>
             <div class="credential-current">
               <span id="github-credential-status" class="muted"></span>
-              <button class="ghost sm" id="github-credential-clear" data-action="delete-github-credential" hidden>Clear credential</button>
             </div>
             <div class="credential-set">
               <div id="github-credential-form-label" class="field-label">Set a new credential</div>
@@ -244,51 +211,88 @@
               </div>
             </div>
           </div>
-          <div class="expansion-card">
-            <div class="field-label">Require approval for <code>.github</code> pushes</div>
-            <p class="muted">A push that changes any <code>.github/</code> path is held for operator approval below instead of reaching GitHub. Clean pushes are unaffected.</p>
-            <div class="approval-controls">
-              <button class="sm" data-action="enable-github-require-approval">Enable</button>
-              <button class="ghost sm" data-action="disable-github-require-approval">Disable</button>
-              <span id="github-require-approval-status" class="muted"></span>
+          <div class="detail-card">
+            <div class="detail-card-head">
+              <h3>Require approval for <code>.github</code> pushes</h3>
+              <span class="seg">
+                <button data-action="enable-github-require-approval">Enable</button>
+                <button data-action="disable-github-require-approval">Disable</button>
+              </span>
             </div>
+            <p class="muted">A push that changes any <code>.github/</code> path is held for operator approval below instead of reaching GitHub. Clean pushes are unaffected.</p>
+            <span id="github-require-approval-status" class="muted"></span>
             <div id="github-pending-pushes"></div>
           </div>
-          <div class="expansion-card">
-            <div class="field-label">Write repositories (reads are universal; listing a repo also allows push and API writes to it)</div>
+          <div class="detail-card">
+            <div class="detail-card-head">
+              <h3>Write repositories</h3>
+              <button class="ghost sm" data-action="recheck-github-audit">Re-check repository audits</button>
+            </div>
+            <p class="muted">Reads are universal; listing a repo also allows push and API writes to it.</p>
             <div id="github-repos"></div>
             <div id="github-repo-controls">
               <div class="repo-add-row">
                 <input id="github-repo" placeholder="owner/repo">
                 <button data-action="add-github-repo">Add write repository</button>
               </div>
-              <div class="actions">
-                <button class="ghost sm" data-action="recheck-github-audit">Re-check repository audits</button>
-              </div>
             </div>
           </div>
         </div>
+        <!-- Bundled tools render below as integration rows like the managed
+             integrations above: collapsed by default, with connection, config,
+             and approvals inside each row's dropdown (tools.js). -->
+        <div id="tools"></div>
         <section class="integration-row custom-domain-card">
-          <div class="integration-summary custom-domain-head">
+          <div class="integration-summary">
             <button id="custom-domain-toggle" class="ghost sm icon-button integration-chevron" data-action="toggle-custom-domain-access" aria-label="Toggle custom domain access details" aria-expanded="false">
               <svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><path d="m7.5 4.5 5 5.5-5 5.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
             </button>
-            <div class="preset-with-info integration-title"><h2>Custom Domain Access</h2></div>
-            <span id="domain-rule-count" class="status disabled">0 domains enabled</span>
+            <div class="integration-title">
+              <div class="preset-with-info">
+                <h2>Custom Domain Access</h2>
+                <button class="info-button" data-action="toggle-integration-info" data-info="custom_domain" aria-label="Custom Domain Access overview and protections" aria-haspopup="dialog" aria-expanded="false">i</button>
+              </div>
+              <div class="integration-subtitle">Creates an explicit network rule for a domain that is not covered by a managed integration or bundled tool.</div>
+            </div>
+            <span class="status-chips"><span id="domain-rule-count" class="status disabled">0 domains enabled</span></span>
           </div>
+          <p class="inline-message integration-row-message" data-integration-message="custom_domain" role="status" aria-live="polite"></p>
           <div id="custom-domain-details" class="integration-details" hidden>
             <div id="domain-rules"></div>
-            <div class="manual-domain">
-              <div class="field-label">Add domain rule</div>
-              <input id="policy-domain" placeholder="api.example.com or *.example.com">
-              <input id="policy-methods" placeholder="GET,HEAD,POST">
-              <textarea id="policy-path-guards" class="compact" placeholder="optional path regex per line"></textarea>
+            <div class="detail-card">
+              <div class="detail-card-head"><h3>Add domain rule</h3></div>
+              <div class="field">
+                <label class="field-label" for="policy-domain">Domain</label>
+                <input id="policy-domain" placeholder="api.example.com or *.example.com">
+              </div>
+              <div class="field">
+                <label class="field-label" for="policy-methods">HTTP methods</label>
+                <input id="policy-methods" placeholder="GET,HEAD,POST">
+              </div>
+              <div class="field">
+                <label class="field-label" for="policy-path-guards">Path guards (optional)</label>
+                <textarea id="policy-path-guards" class="compact" placeholder="optional path regex per line"></textarea>
+              </div>
               <div class="actions">
                 <button data-action="add-domain-rule">Add domain rule</button>
               </div>
             </div>
           </div>
         </section>
+      </div>
+
+      <div id="panel-connection-guide" class="tab-panel" hidden>
+        <div class="connection-guide-shell">
+          <header class="connection-guide-heading">
+            <span class="eyebrow">Internet Access and Tools</span>
+            <h1>Integration Guides</h1>
+          </header>
+          <div class="connection-guide-layout">
+            <select id="connection-guide-select" class="connection-guide-picker" aria-label="Select an integration guide"></select>
+            <nav id="connection-guide-index" class="connection-guide-index" aria-label="Integration guide entries"></nav>
+            <div id="connection-guide-content" class="connection-guide-content"><div class="empty-state">Loading integration guides…</div></div>
+          </div>
+        </div>
       </div>
 
       <div id="panel-net-log" class="tab-panel" hidden>
@@ -303,10 +307,22 @@
           <div class="pager" id="net-event-pager"></div>
         </section>
       </div>
+
+      <div id="panel-tool-log" class="tab-panel" hidden>
+        <section>
+          <h2>Tool audit log</h2>
+          <p class="muted">Every tool call, approval decision, and connection change, newest first. The tool-side peer of the agent and network audit logs.</p>
+          <div class="audit-toolbar">
+            <span class="muted" id="tool-page-summary"></span>
+          </div>
+          <div class="table-scroll"><table id="tool-events"></table></div>
+          <div class="pager" id="tool-event-pager"></div>
+        </section>
+      </div>
     </main>
   </div>
 </div>
 
-<script type="module" src="/admin_ui/app.js?v=__TRUSTYCLAW_ASSET_VERSION__"></script>
+<script type="module" src="/admin_ui/app.js"></script>
 </body>
 </html>

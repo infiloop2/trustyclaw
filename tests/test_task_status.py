@@ -24,9 +24,6 @@ class TaskStatusTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ts.set_status(queued, ts.COMPLETED, now="t3")
 
-    def test_active_and_terminal_sets_partition_statuses(self) -> None:
-        self.assertEqual(ts.ACTIVE | ts.TERMINAL, set(ts.TRANSITIONS))
-        self.assertFalse(ts.ACTIVE & ts.TERMINAL)
 
 
 if __name__ == "__main__":

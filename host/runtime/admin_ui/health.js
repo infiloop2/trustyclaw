@@ -1,19 +1,20 @@
-// Home tab: host health tiles, runtime cards, provider accounts and usage,
-// OAuth logins, runtime guidance, and the reboot control.
+// Host health plus the always-visible top-bar runtime status and usage.
 
 import { api } from "./api.js";
 import {
-  $, badge, clampPercent, esc, formatDateTime, formatUnixTime, gib, notice,
-  objectValue, setHtml, RUNTIME_PROVIDERS,
+  $, badge, clampPercent, esc, gib, inlineMessage, notice, setHtml, RUNTIME_PROVIDERS,
 } from "./helpers.js";
-import { activePolicy, renderIntegrationAccounts } from "./network.js";
+import { renderIntegrationAccounts } from "./network.js";
 
 let latestRuntimes = [];
 let latestAccounts = [];
-let runtimeType = "codex";
 
 export function providerAccounts() {
   return latestAccounts;
+}
+
+export function runtimeRecords() {
+  return latestRuntimes;
 }
 
 function statTile(label, valueHtml, extraClass = "") {
@@ -70,11 +71,11 @@ function filesystemMountTile(label, mount) {
 
 export async function refreshHealth() {
   const health = await api("GET", "/v1/health");
-  $("agent-name").textContent = health.agent_name ? `Agent: ${health.agent_name}` : "";
+  renderUpgradeNotice(health.upgrade);
+  $("agent-name").textContent = health.agent_name ? `Host: ${health.agent_name}` : "";
   $("agent-name").hidden = !health.agent_name;
   const runtimes = Array.isArray(health.agent_runtime.runtimes) ? health.agent_runtime.runtimes : [];
   latestRuntimes = runtimes;
-  runtimeType = runtimes.find(r => r.status === "active")?.type || runtimes[0]?.type || "codex";
   const host = health.host_runtime;
   const mounts = host.filesystem?.mounts || {};
   setHtml($("health"), `
@@ -89,21 +90,33 @@ export async function refreshHealth() {
       ${filesystemMountTile("Admin volume", mounts.admin)}
       ${filesystemMountTile("Agent volume", mounts.agent)}
     </div>`);
-  setHtml($("runtime"), `<div class="runtime-grid">` +
-    runtimes.map(runtime => `
-      <div class="runtime-card">
-        <div>
-          <div class="name">${esc(RUNTIME_PROVIDERS[runtime.type]?.label || runtime.type)}</div>
-          <div class="sub">${esc(runtime.type)}${(runtime.active_task_ids || []).length
-            ? ` &middot; ${(runtime.active_task_ids || []).length} running` : ""}</div>
-        </div>
-        ${badge(runtime.status)}
-      </div>`).join("") + `</div>`);
-  updateLoginButtons(runtimes);
-  renderRuntimeGuidance(runtimes);
-  const pending = runtimes.find(runtime => runtime.status === "awaiting_login");
-  if (pending) await showOauth(false, pending.type);
-  else setHtml($("oauth"), "");
+  renderRuntimeOverview();
+  renderIntegrationAccounts();
+  // A pending login survives page reloads and provider-card re-renders: every
+  // poll re-shows it inside the expanded provider card (showOauth is a no-op
+  // while the card is collapsed, and a GET never starts a new login).
+  for (const pending of runtimes.filter(runtime => runtime.status === "awaiting_login")) {
+    await showOauth(false, pending.type);
+  }
+}
+
+function renderUpgradeNotice(upgrade) {
+  const notice = $("upgrade-notice");
+  const checked = typeof upgrade?.latest === "string";
+  notice.hidden = !checked;
+  if (!checked) return;
+  const available = upgrade.available === true;
+  const title = available
+    ? `Upgrade available: version ${upgrade.latest}`
+    : "Your TrustyClaw is at the latest version.";
+  const detail = available ? "Use your operator plane to upgrade." : "";
+  const label = detail ? `${title}. ${detail}` : title;
+  notice.classList.toggle("upgrade-available", available);
+  notice.classList.toggle("upgrade-current", !available);
+  $("upgrade-popover-title").textContent = title;
+  $("upgrade-popover-detail").textContent = detail;
+  $("upgrade-popover-detail").hidden = !detail;
+  notice.setAttribute("aria-label", label);
 }
 
 function renderVersion(version) {
@@ -121,14 +134,8 @@ export async function refreshProviderAccounts() {
 
 function renderProviderAccounts(response) {
   latestAccounts = Array.isArray(response.accounts) ? response.accounts : [];
+  renderRuntimeOverview();
   renderIntegrationAccounts();
-  if (!latestAccounts.length) {
-    setHtml($("provider-accounts"), `<tr><td class="empty-state">No provider accounts.</td></tr>`);
-    return;
-  }
-  setHtml($("provider-accounts"), `
-    <tr><th>runtime</th><th>account</th><th>plan</th><th>usage</th></tr>
-    ${latestAccounts.map(renderProviderAccountRow).join("")}`);
 }
 
 export async function refreshProviderUsage() {
@@ -137,141 +144,144 @@ export async function refreshProviderUsage() {
   await refreshHealth();
 }
 
-function renderProviderAccountRow(account) {
-  const identity = [];
-  if (account.account_id) identity.push(`<div>${esc(account.account_id)}</div>`);
-  if (account.email) identity.push(`<div class="muted">${esc(account.email)}</div>`);
-  const plan = account.plan_type ? esc(account.plan_type) : `<span class="muted">not reported</span>`;
-  const usage = account.agent_runtime === "claude_code"
-    ? renderClaudeUsage(account.claude_usage)
-    : renderCodexUsage(account.codex_usage);
-  return `
-    <tr>
-      <td>${esc(account.agent_runtime)}<br>${badge(account.status)}</td>
-      <td>${identity.length ? identity.join("") : `<span class="muted">not available</span>`}</td>
-      <td>${plan}</td>
-      <td>${usage}</td>
-    </tr>`;
-}
-
-function renderCodexUsage(codexUsage) {
-  if (codexUsage === undefined || codexUsage == null) return `<span class="muted">not reported</span>`;
-  if (codexUsage && typeof codexUsage === "object" && codexUsage.rate_limits) {
-    return renderRateLimits(codexUsage);
-  }
-  return renderMetadata(codexUsage);
-}
-
-function renderClaudeUsage(claudeUsage) {
-  if (claudeUsage === undefined || claudeUsage == null) return `<span class="muted">not reported</span>`;
-  if (!claudeUsage || typeof claudeUsage !== "object") return renderMetadata(claudeUsage);
-  const rows = [];
-  if (claudeUsage.current_session_used_percent !== undefined) {
-    rows.push(`<div>current session: ${esc(`${claudeUsage.current_session_used_percent}%`)}</div>`);
-  }
-  if (claudeUsage.weekly_used_percent !== undefined) {
-    rows.push(`<div>weekly: ${esc(`${claudeUsage.weekly_used_percent}%`)}</div>`);
-  }
-  if (claudeUsage.weekly_resets_at_text) {
-    rows.push(`<div class="muted">resets ${esc(claudeUsage.weekly_resets_at_text)}</div>`);
-  }
-  if (claudeUsage.last_checked_at) {
-    rows.push(`<div class="muted">checked ${esc(formatDateTime(claudeUsage.last_checked_at))}</div>`);
-  }
-  return rows.length ? rows.join("") : renderMetadata(claudeUsage);
-}
-
-function renderRateLimits(usage) {
-  const snapshot = usage.rate_limits;
-  const rows = [];
-  if (snapshot && typeof snapshot === "object") {
-    const windows = [];
-    if (snapshot.primary) windows.push(["primary", snapshot.primary]);
-    if (snapshot.secondary) windows.push(["secondary", snapshot.secondary]);
-    const renderedWindows = windows.map(([name, window]) => renderRateLimitWindow(name, window)).filter(Boolean).join("");
-    const credits = snapshot.credits ? renderCredits(snapshot.credits) : "";
-    if (renderedWindows || credits) rows.push(`<div>${renderedWindows}${credits}</div>`);
-  }
-  if (usage.last_checked_at) rows.push(`<div class="muted">checked ${esc(formatDateTime(usage.last_checked_at))}</div>`);
-  const extra = { ...usage };
-  delete extra.rate_limits;
-  delete extra.last_checked_at;
-  return rows.join("") + (Object.keys(extra).length ? `<pre class="metadata">${esc(JSON.stringify(extra, null, 2))}</pre>` : "");
-}
-
-function renderRateLimitWindow(name, window) {
-  if (!window || typeof window !== "object") return "";
-  const duration = window.window_duration_mins;
-  const label = duration === 300 ? "5 hour" : duration === 10080 ? "weekly" : `${name} (${duration ?? "unknown"} min)`;
-  const used = window.used_percent === undefined ? "not reported" : `${window.used_percent}%`;
-  const resets = window.resets_at ? `<br><span class="muted">resets ${esc(formatUnixTime(window.resets_at))}</span>` : "";
-  return `<div>${esc(label)}: ${esc(used)}${resets}</div>`;
-}
-
-function renderCredits(credits) {
-  if (!credits || typeof credits !== "object") return "";
-  if (credits.unlimited === true) return `<div>credits: unlimited</div>`;
-  if (credits.has_credits === false) return `<div>credits: none</div>`;
-  if (credits.balance !== undefined) return `<div>credits: ${esc(credits.balance)}</div>`;
-  return "";
-}
-
-function renderMetadata(value) {
-  if (value == null) return `<span class="muted">not reported</span>`;
-  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return esc(value);
-  return `<pre class="metadata">${esc(JSON.stringify(value, null, 2))}</pre>`;
-}
-
-function updateLoginButtons(runtimes) {
-  const statuses = Object.fromEntries(runtimes.map(runtime => [runtime.type, runtime.status]));
-  for (const [runtime, buttonId] of [
-    ["codex", "start-codex-login"],
-    ["claude_code", "start-claude-login"],
-  ]) {
-    const button = $(buttonId);
-    // Login can also start from error: a changed account or malformed local
-    // credentials are recovered by logging in again.
-    const canStart = statuses[runtime] === "awaiting_login" || statuses[runtime] === "error";
-    button.hidden = !canStart;
-    button.disabled = !canStart;
-  }
-}
-
-function providerEnabled(policy, provider) {
-  const managed = objectValue(policy ? policy.managed_network_integrations : null);
-  return objectValue(managed[provider]).enabled === true;
-}
-
-export function renderRuntimeGuidance(runtimes = latestRuntimes) {
-  const messages = [];
-  for (const runtime of runtimes) {
-    const meta = RUNTIME_PROVIDERS[runtime.type];
-    if (!meta) continue;
-    if (runtime.status === "deactivated" && !providerEnabled(activePolicy(), meta.provider)) {
-      messages.push(runtimeGuidance(`${esc(meta.label)} is deactivated because ${esc(meta.providerLabel)} provider access is disabled in the active network policy. Enable the ${esc(meta.providerLabel)} integration to activate this runtime.`));
-    } else if (runtime.status === "error") {
-      messages.push(runtimeGuidance(`${esc(meta.label)} error: ${esc(runtime.error_message || "the last status check failed")}. Start a new login to recover, or reset the linked ${esc(meta.providerLabel)} account under Internet Access and Tools to unlink it first.`));
+function renderRuntimeOverview() {
+  const container = $("runtime-overview");
+  if (!container) return;
+  const runtimes = ["codex", "claude_code"].map(runtime => {
+    const meta = RUNTIME_PROVIDERS[runtime];
+    const record = latestRuntimes.find(entry => entry.type === runtime) || { status: "loading" };
+    const account = latestAccounts.find(entry => entry.agent_runtime === runtime) || {};
+    const windows = usageWindows(account);
+    const running = Array.isArray(record.active_task_ids) ? record.active_task_ids.length : 0;
+    const statusText = String(record.status || "loading").replaceAll("_", " ");
+    const modelSummary = windows.fableWeekly
+      ? `; ${usageSummary(`${windows.fableWeekly.label} weekly`, windows.fableWeekly)}` : "";
+    const runningLabel = running ? `; ${running} running` : "";
+    // The running count is a corner badge rather than inline text so a long
+    // status ("awaiting login") never truncates it away.
+    const runningBadge = running
+      ? `<span class="runtime-running-badge" aria-hidden="true">${running} running</span>` : "";
+    const inner = `
+        <span class="runtime-summary-name">
+          <span class="runtime-status-dot ${esc(record.status)}" aria-hidden="true"></span>
+          <span class="runtime-summary-copy">
+            <span>${esc(meta.label)}</span>
+            <span class="runtime-state">${esc(statusText)}</span>
+          </span>
+        </span>
+        <span class="runtime-usage">
+          ${usageRing("5h", windows.fiveHour)}
+          ${usageRing("wk", windows.weekly)}
+          ${windows.fableWeekly ? usageRing(windows.fableWeekly.label, windows.fableWeekly) : ""}
+        </span>
+        ${runningBadge}`;
+    // Only a deactivated runtime has somewhere worth navigating to: the
+    // Internet Access and Tools tab, to re-enable its managed integration. An
+    // active, logging-in, or errored runtime needs no navigation, so it is a
+    // static chip, not a button.
+    if (record.status === "deactivated") {
+      const summaryLabel = `${meta.label}: ${statusText}${runningLabel}; ${usageSummary("5 hour", windows.fiveHour)}; ${usageSummary("weekly", windows.weekly)}${modelSummary}. Open account settings`;
+      return `
+      <button class="runtime-summary" data-action="open-provider" data-provider="${esc(meta.provider)}" aria-label="${esc(summaryLabel)}">${inner}</button>`;
     }
-  }
-  setHtml($("runtime-guidance"), messages.length ? `<div class="runtime-guidance-list">${messages.join("")}</div>` : "");
+    const summaryLabel = `${meta.label}: ${statusText}${runningLabel}; ${usageSummary("5 hour", windows.fiveHour)}; ${usageSummary("weekly", windows.weekly)}${modelSummary}`;
+    return `
+      <div class="runtime-summary is-static" role="group" aria-label="${esc(summaryLabel)}">${inner}</div>`;
+  }).join("");
+  setHtml(container, `${runtimes}
+    <button class="ghost sm icon-button runtime-refresh" data-action="refresh-provider-usage" title="Refresh provider status and usage" aria-label="Refresh provider status and usage">
+      <svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><path d="M16.2 6.5A6.8 6.8 0 1 0 17 10M16.2 3.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>`);
 }
 
-function runtimeGuidance(html) {
+function usageWindows(account) {
+  if (account.agent_runtime === "claude_code") {
+    const usage = account.claude_usage || {};
+    return {
+      fiveHour: {
+        usedPercent: usage.current_session_used_percent,
+        resetsAt: usage.current_session_resets_at,
+      },
+      weekly: {
+        usedPercent: usage.weekly_used_percent,
+        resetsAt: usage.weekly_resets_at,
+      },
+      // The Fable-specific weekly window; shown only when the usage snapshot
+      // carries one.
+      fableWeekly: usage.fable_weekly_used_percent === undefined ? null : {
+        label: "fable",
+        usedPercent: usage.fable_weekly_used_percent,
+        resetsAt: usage.fable_weekly_resets_at,
+      },
+    };
+  }
+  const limits = account.codex_usage?.rate_limits || {};
+  const windows = Object.values(limits).filter(value => value && typeof value === "object");
+  // Windows are identified by duration, not by primary/secondary position;
+  // Number() tolerates a snapshot serializing durations as strings.
+  const fiveHour = windows.find(window => Number(window.window_duration_mins) === 300);
+  const weekly = windows.find(window => Number(window.window_duration_mins) === 10080);
+  return {
+    fiveHour: { usedPercent: fiveHour?.used_percent, resetsAt: fiveHour?.resets_at },
+    weekly: { usedPercent: weekly?.used_percent, resetsAt: weekly?.resets_at },
+    fableWeekly: null,
+  };
+}
+
+function usageLabel(value) {
+  return value !== undefined && value !== null && Number.isFinite(Number(value))
+    ? `${Number(clampPercent(value))}% used`
+    : "usage unavailable";
+}
+
+function resetCountdown(value, now = Date.now()) {
+  if (value === undefined || value === null || value === "") return "";
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "";
+  const remaining = numeric * 1000 - now;
+  if (remaining <= 0) return "due";
+  const minutes = Math.max(1, Math.ceil(remaining / 60000));
+  if (minutes >= 24 * 60) return `${Math.ceil(minutes / (24 * 60))}d`;
+  if (minutes >= 60) return `${Math.ceil(minutes / 60)}h`;
+  return `${minutes}m`;
+}
+
+function usageSummary(label, window) {
+  const countdown = resetCountdown(window.resetsAt);
+  const reset = countdown === "due" ? "; reset due" : countdown ? `; resets in ${countdown}` : "";
+  return `${label} ${usageLabel(window.usedPercent)}${reset}`;
+}
+
+function usageRing(label, window) {
+  const value = window.usedPercent;
+  const available = value !== undefined && value !== null && Number.isFinite(Number(value));
+  const percent = available ? Number(clampPercent(value)) : 0;
+  const display = available ? `${Math.round(percent)}%` : "--";
+  const countdown = resetCountdown(window.resetsAt);
+  const resetDescription = countdown === "due" ? "; reset due" : countdown ? `; resets in ${countdown}` : "";
+  const title = available ? `${label}: ${percent}% used${resetDescription}` : `${label}: usage unavailable`;
+  const thresholdClass = percent > 90 ? " usage-critical" : percent > 80 ? " usage-warning" : "";
+  // One label line whether or not a countdown is known, so the ring block
+  // (and with it the top bar) keeps a constant height.
   return `
-    <div class="runtime-guidance">
-      <p>${html}</p>
-      <div class="actions">
-        <button class="ghost sm" data-action="show-tab" data-tab="network">Open Internet Access and Tools</button>
-      </div>
-    </div>`;
+    <span class="usage-ring${available ? thresholdClass : " unavailable"}">
+      <svg viewBox="0 0 36 36" role="img" aria-label="${esc(title)}">
+        <circle class="usage-ring-track" cx="18" cy="18" r="15.5" pathLength="100"></circle>
+        <circle class="usage-ring-value" cx="18" cy="18" r="15.5" pathLength="100" stroke-dasharray="${percent} 100"></circle>
+        <text x="18" y="18">${esc(display)}</text>
+      </svg>
+      <span class="usage-window">${esc(label)}${countdown ? ` · ${countdown}` : ""}</span>
+    </span>`;
 }
 
 async function showOauth(start, runtime) {
-  runtime = runtime || runtimeType;
+  const provider = runtime === "claude_code" ? "claude" : "openai";
+  const target = document.querySelector(`[data-provider-oauth="${provider}"]`);
+  if (!target) return;
   try {
     if (runtime === "claude_code") {
       const login = await api(start ? "POST" : "GET", "/v1/agent-runtime/claude-oauth-login");
-      setHtml($("oauth"), `<div class="oauth-card">
+      setHtml(target, `<div class="oauth-card">
         <span>Claude Code login: open
         <a href="${esc(login.login_url)}" target="_blank">${esc(login.login_url)}</a>
         <span class="muted">(expires ${esc(login.expires_at)})</span></span>
@@ -279,12 +289,14 @@ async function showOauth(start, runtime) {
       return;
     }
     const login = await api(start ? "POST" : "GET", "/v1/agent-runtime/codex-oauth-login");
-    setHtml($("oauth"), `<div class="oauth-card">
+    setHtml(target, `<div class="oauth-card">
       <span>Codex login: enter code <b>${esc(login.device_code)}</b> at
       <a href="${esc(login.login_url)}" target="_blank">${esc(login.login_url)}</a>
       <span class="muted">(expires ${esc(login.expires_at)})</span>
       <span class="muted">After approving in your browser, wait ~5 seconds for the status to update.</span></span></div>`);
-  } catch (error) { if (start) notice(error.message); }
+  } catch (error) {
+    if (start) inlineMessage(document.querySelector(`[data-integration-message="${provider}"]`), error.message, true);
+  }
 }
 
 export async function startLogin(runtime) { await showOauth(true, runtime); }
@@ -294,13 +306,15 @@ export async function completeClaudeLogin() {
   if (!code) return;
   try {
     await api("POST", "/v1/agent-runtime/claude-oauth-login/complete", { code });
-    notice("Claude Code login submitted.");
+    inlineMessage(document.querySelector('[data-integration-message="claude"]'), "Claude Code login submitted.");
     await refreshHealth();
-  } catch (error) { notice(error.message); }
+  } catch (error) {
+    inlineMessage(document.querySelector('[data-integration-message="claude"]'), error.message, true);
+  }
 }
 
 export async function rebootHost() {
   if (!confirm("Reboot the host machine?")) return;
   try { await api("POST", "/v1/host-runtime/reboot"); notice("Reboot accepted; the host will be back shortly."); }
-  catch (error) { notice(error.message); }
+  catch (error) { notice(error.message, "error"); }
 }

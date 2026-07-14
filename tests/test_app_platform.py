@@ -9,6 +9,11 @@ from host.runtime import app_platform
 from host.constants import APP_PORT_BASE
 
 
+RELEASED_APP_SLOTS = {
+    "agent_chat": 0,
+}
+
+
 class AppPlatformTests(unittest.TestCase):
     def test_installed_agent_chat_manifest_derives_host_owned_names(self) -> None:
         apps = app_platform.installed_apps()
@@ -20,9 +25,9 @@ class AppPlatformTests(unittest.TestCase):
         self.assertEqual(agent_chat.db_role, "trustyclaw-app-agent_chat")
         self.assertEqual(agent_chat.service_name, "trustyclaw-app-agent_chat.service")
         self.assertEqual(agent_chat.port, APP_PORT_BASE)
-        self.assertEqual(agent_chat.public()["backend"]["localhost_base_url"], f"http://127.0.0.1:{APP_PORT_BASE}")
         self.assertEqual(agent_chat.public()["ui"]["iframe_src"], "/v1/apps/agent_chat/ui/index.html")
-        self.assertEqual(set(agent_chat.public()), {"id", "title", "backend", "database", "ui"})
+        self.assertEqual(set(agent_chat.public()), {"id", "title", "backend", "ui"})
+        self.assertEqual(set(agent_chat.public()["backend"]), {"api_route"})
         self.assertEqual(set(agent_chat.public()["ui"]), {"iframe_src", "sandbox"})
         allocation = agent_chat.allocation
         self.assertIsNotNone(allocation)
@@ -42,30 +47,33 @@ class AppPlatformTests(unittest.TestCase):
         self.assertEqual(len({app.service_name for app in apps}), len(apps))
         self.assertEqual(len({app.port for app in apps}), len(apps))
 
-    def test_app_registry_pins_static_allocations(self) -> None:
-        expected = {
-            "agent_chat": {
-                "uid": 48000,
-                "gid": 48000,
-                "port_offset": 0,
-            },
-        }
-        registry = app_platform.app_registry()
+    def test_app_identity_and_allocations_come_from_each_package(self) -> None:
+        apps = app_platform.installed_apps()
 
-        self.assertEqual(set(registry), set(expected))
-        for app_id, expected_allocation in expected.items():
+        for app in apps:
+            with self.subTest(app_id=app.id):
+                self.assertEqual(app.id, app.package_dir.name)
+                self.assertEqual(app.allocation.uid, app_platform.APP_UID_BASE + app.allocation.port_offset)
+                self.assertEqual(app.allocation.gid, app.allocation.uid)
+                self.assertEqual(app.port, APP_PORT_BASE + app.allocation.port_offset)
+
+    def test_released_apps_and_slots_do_not_change(self) -> None:
+        apps = {app.id: app for app in app_platform.installed_apps()}
+
+        self.assertEqual(set(apps), set(RELEASED_APP_SLOTS))
+        for app_id, host_slot in RELEASED_APP_SLOTS.items():
             with self.subTest(app_id=app_id):
-                allocation = registry[app_id]
-                self.assertEqual(allocation.uid, expected_allocation["uid"])
-                self.assertEqual(allocation.gid, expected_allocation["gid"])
-                self.assertEqual(allocation.port_offset, expected_allocation["port_offset"])
+                app = apps[app_id]
+                self.assertEqual(app.allocation.port_offset, host_slot)
+                self.assertEqual(app.allocation.uid, app_platform.APP_UID_BASE + host_slot)
+                self.assertEqual(app.allocation.gid, app_platform.APP_UID_BASE + host_slot)
+                self.assertEqual(app.port, APP_PORT_BASE + host_slot)
 
     def test_agent_chat_port_does_not_depend_on_manifest_scan_order(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            self._write_minimal_app(root, "aaa_app")
-            self._write_minimal_app(root, "agent_chat")
-            self._write_registry(root, {"agent_chat": {"uid": 48000, "gid": 48000, "port_offset": 0}})
+            self._write_minimal_app(root, "aaa_app", host_slot=1)
+            self._write_minimal_app(root, "agent_chat", host_slot=0)
 
             apps = app_platform.installed_apps(root)
             ports = {app.id: app.port for app in apps}
@@ -83,12 +91,28 @@ class AppPlatformTests(unittest.TestCase):
             with self.assertRaisesRegex(app_platform.AppError, "maximum is 100"):
                 app_platform.installed_apps(root)
 
-    def test_manifest_rejects_hyphenated_app_ids(self) -> None:
+    def test_package_directory_rejects_hyphenated_app_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            self._write_minimal_app(root, "bad_app", manifest_id="bad-app")
+            self._write_minimal_app(root, "bad-app")
 
-            with self.assertRaisesRegex(app_platform.AppError, "id must match"):
+            with self.assertRaisesRegex(app_platform.AppError, "package directory must match"):
+                app_platform.installed_apps(root)
+
+    def test_package_directory_requires_a_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "bad_app").mkdir()
+
+            with self.assertRaisesRegex(app_platform.AppError, "must contain a regular manifest.json"):
+                app_platform.installed_apps(root)
+
+    def test_app_root_rejects_non_package_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "registry.json").write_text("{}")
+
+            with self.assertRaisesRegex(app_platform.AppError, "every entry under host/apps"):
                 app_platform.installed_apps(root)
 
     def test_manifest_rejects_multiline_titles(self) -> None:
@@ -99,21 +123,36 @@ class AppPlatformTests(unittest.TestCase):
             with self.assertRaisesRegex(app_platform.AppError, "title must be a single line"):
                 app_platform.installed_apps(root)
 
-    def test_registry_rejects_out_of_range_port_offsets(self) -> None:
+    def test_manifest_rejects_out_of_range_host_slots(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            self._write_minimal_app(root, "bad_app")
-            self._write_registry(root, {"bad_app": {"uid": 48000, "gid": 48000, "port_offset": -1}})
+            self._write_minimal_app(root, "bad_app", host_slot=-1)
 
-            with self.assertRaisesRegex(app_platform.AppError, "port_offset must be in 0-99"):
+            with self.assertRaisesRegex(app_platform.AppError, "host_slot must be in 0-99"):
                 app_platform.installed_apps(root)
 
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            self._write_minimal_app(root, "bad_app")
-            self._write_registry(root, {"bad_app": {"uid": 48000, "gid": 48000, "port_offset": 100}})
+            self._write_minimal_app(root, "bad_app", host_slot=100)
 
-            with self.assertRaisesRegex(app_platform.AppError, "port_offset must be in 0-99"):
+            with self.assertRaisesRegex(app_platform.AppError, "host_slot must be in 0-99"):
+                app_platform.installed_apps(root)
+
+    def test_installed_apps_reject_duplicate_host_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_minimal_app(root, "first_app", host_slot=4)
+            self._write_minimal_app(root, "second_app", host_slot=4)
+
+            with self.assertRaisesRegex(app_platform.AppError, "duplicate generated app"):
+                app_platform.installed_apps(root)
+
+    def test_manifest_rejects_unknown_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_minimal_app(root, "bad_app", extra={"id": "bad_app"})
+
+            with self.assertRaisesRegex(app_platform.AppError, "unsupported id"):
                 app_platform.installed_apps(root)
 
     def test_ui_asset_resolves_only_inside_app_ui_directory(self) -> None:
@@ -160,24 +199,24 @@ class AppPlatformTests(unittest.TestCase):
         root: Path,
         app_id: str,
         *,
-        manifest_id: str | None = None,
+        host_slot: int = 0,
         title: str | None = None,
+        extra: dict[str, object] | None = None,
     ) -> None:
         app_dir = root / app_id
         app_dir.mkdir()
         (app_dir / "backend.py").write_text("")
         (app_dir / "migrations").mkdir()
         (app_dir / "ui").mkdir()
-        (app_dir / "manifest.json").write_text(json.dumps({
-            "id": app_id if manifest_id is None else manifest_id,
+        manifest: dict[str, object] = {
+            "host_slot": host_slot,
             "title": app_id if title is None else title,
             "backend": {"entrypoint": "backend.py"},
             "database": {"migrations": "migrations"},
             "ui": {"path": "ui"},
-        }))
-
-    def _write_registry(self, root: Path, data: dict[str, dict[str, int]]) -> None:
-        (root / "registry.json").write_text(json.dumps(data))
+        }
+        manifest.update(extra or {})
+        (app_dir / "manifest.json").write_text(json.dumps(manifest))
 
 
 if __name__ == "__main__":

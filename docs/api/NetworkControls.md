@@ -8,11 +8,14 @@ Network controls govern the agent and host service users, not root-owned host
 bootstrap and maintenance work. At the host firewall, root (uid 0) has outbound
 access for package installation, security updates, and ordinary root-owned
 system traffic. The dedicated `trustyclaw-proxy` uid has outbound access only so
-it can make policy-approved upstream connections on behalf of the agent. When
+it can make policy-approved upstream connections on behalf of the agent. The
+separate `trustyclaw-tools` uid has DNS and HTTPS access for bundled tool
+packages; tool calls follow each action's data policy and approval contract,
+not the agent's domain policy. When
 Cloudflare Access operator access is configured, the dedicated `cloudflared` uid
 has outbound access only for DNS, TCP `443`, and TCP/UDP `7844`. The host does
 not install or configure the AWS SSM agent, and snapd is stopped and masked
-during bootstrap. Root, proxy, and optional `cloudflared` egress are still
+during bootstrap. Root, proxy, tools, and optional `cloudflared` egress are still
 bounded by the EC2 security group, which keeps TCP/UDP `7844` open only when a
 `cloudflare_access` operator endpoint is configured. That `7844` rule is
 outbound-only and nftables allows it only for the `cloudflared` uid, not for the
@@ -76,7 +79,7 @@ run after Codex OAuth login. The host expands, in memory:
   "api.openai.com": {
     "allow_http_methods": ["POST"],
     "openai_account_guard": true,
-    "openai_disable_live_web_search": true
+    "openai_external_url_request_guard": true
   },
   "auth.openai.com": {
     "allow_http_methods": ["GET", "POST"]
@@ -84,12 +87,13 @@ run after Codex OAuth login. The host expands, in memory:
   "chatgpt.com": {
     "allow_http_methods": ["GET", "POST"],
     "openai_account_guard": true,
-    "openai_disable_live_web_search": true
+    "openai_external_url_request_guard": true
   }
 }
 ```
 
-The OpenAI live web search guard and account guard are always applied to the
+The OpenAI external URL request guard (cache-only web search, no remote MCP)
+and account guard are always applied to the
 managed API/data-plane domains. The host infers the OpenAI account id from
 Codex login status instead of accepting it in config. OpenAI data-plane
 requests are denied until that inferred account id is available;
@@ -273,9 +277,9 @@ The operator lists, approves, or rejects held pushes through the admin API
 (`/v1/network-tools/github-pending-pushes`; see
 [AdminAPI.md](AdminAPI.md#network)). **Approve** replays the quarantined objects
 to GitHub with the working token via the `approve-github-push` root helper (the
-admin service has no egress); **reject** drops the pending refs and marks the row
-rejected. Approval replay failures and cleanup failures are terminal row states
-with detail for later maintenance, not operator retry prompts. Only pkt-line
+admin service has no egress); **reject** drops the pending refs (best-effort)
+and marks the row rejected. A replay failure marks the row `failed` with
+detail; the recovery is a fresh agent push. Only pkt-line
 command framing is parsed in the proxy; pack objects are only ever read by
 `git`, and any framing, mirror, or git failure fails closed (the push is denied
 with `github_push_gate_unavailable`, never forwarded un-inspected). The
@@ -340,7 +344,7 @@ banners in the admin UI.
 
 | Fact | Source | Warning when |
 | --- | --- | --- |
-| Pages visibility | `GET /repos/{o}/{r}` → `has_pages` (authoritative only when false), then, unless Pages is known disabled, `GET /repos/{o}/{r}/pages` → `public`; a 403/404 on the Pages read leaves the visibility unknown instead of failing the audit, because GitHub answers 404 for missing Pages permission too | **Public Pages site on a private repo:** a push to the Pages source publishes agent-written content to the internet — the same exfiltration sink as a public write repository. **Unknown Pages visibility when `has_pages` is true or unknown on a private repo:** warning severity, because the audit could not verify whether Pages is a public leak vector. |
+| Pages visibility | `GET /repos/{o}/{r}` → `has_pages` (authoritative only when false), then, unless Pages is known disabled, `GET /repos/{o}/{r}/pages` → `public`; a 403/404 on the Pages read leaves the visibility unknown instead of failing the audit, because GitHub answers 404 for missing Pages permission too | **Public Pages site on a private repo:** a push to the Pages source publishes agent-written content to the internet — the same exfiltration sink as a public write repository. **Unknown Pages visibility on a private repo:** warning severity, because the audit could not verify whether Pages is a public leak vector. |
 | Visibility | `GET /repos/{o}/{r}` → `private`/`visibility` | **Public write repo:** everything the agent pushes here (branches, commit messages, PRs and descriptions) is world-visible, and because reads are universal an injected agent can copy any private repo the token reaches into a commit, issue, or PR here — a public write target is an exfiltration sink. Highest severity when the token can reach private repositories. |
 | Token permissions + default-branch protection | `GET /repos/{o}/{r}` → `permissions`; `GET /repos/{o}/{r}/branches/{default}` → `protected` | `push` present **and** the default branch unprotected (warning severity): the agent identity can push straight to the default branch. Recommend a ruleset/branch protection so the agent only opens PRs and a human merges. |
 | Workflows and their triggers | `GET /repos/{o}/{r}/contents/.github/workflows`, then a plain substring search of each file for the dangerous trigger names (false positives over-warn, which is fine) | Any workflow: an agent push or PR can execute agent-written code with whatever secrets and network that repo grants. `pull_request_target` is highest severity — secrets exposed to PR-influenced code. |
@@ -454,9 +458,9 @@ WebSockets use the same domain rule. A WebSocket connection starts with an HTTP
 guards are configured. For `wss://` URLs, proxy `CONNECT` handling is internal
 to the host and is not listed in `allow_http_methods`. After the upgrade
 succeeds, WebSocket frames continue on the approved connection; they are not
-separate HTTP requests. On managed OpenAI domains with the live web search
+separate HTTP requests. On managed OpenAI domains with the external URL request
 guard, each client-to-upstream WebSocket message is additionally inspected with
-the same live web search guard as HTTP request bodies; a violating message
+the same guard as HTTP request bodies; a violating message
 closes the connection.
 
 Path guards use Python `re` syntax and must match the full request target path.

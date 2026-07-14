@@ -9,6 +9,9 @@ on:
         default: all
         options:
           - all
+          - brave
+          - gmail
+          - gcal
           - claude
           - codex
           - github
@@ -190,6 +193,12 @@ jobs:
           STAGE_GITHUB_APP_ID: ${{ secrets.TRUSTYCLAW_STAGE_GITHUB_APP_ID }}
           STAGE_GITHUB_APP_INSTALLATION_ID: ${{ secrets.TRUSTYCLAW_STAGE_GITHUB_APP_INSTALLATION_ID }}
           STAGE_GITHUB_APP_PRIVATE_KEY: ${{ secrets.TRUSTYCLAW_STAGE_GITHUB_APP_PRIVATE_KEY }}
+          # The brave/gmail/gcal (and all) suites run the bundled-tool checks.
+          # A dedicated brave/gmail/gcal suite requires its credential (this Brave
+          # key secret, or a connected Google account for gmail/gcal) and fails
+          # if it is not configured; the all suite self-skips unconfigured tools.
+          # See docs/development/persistent-aws-stage.md.
+          TRUSTYCLAW_STAGE_BRAVE_API_KEY: ${{ secrets.TRUSTYCLAW_STAGE_BRAVE_API_KEY }}
         run: |
           set -euo pipefail
           python3 tests/stage/stage_aws.py \

@@ -3,8 +3,8 @@
 Mints a short-lived, installation-wide GitHub App token: it covers every
 repository the App installation grants (operator-managed on GitHub), and
 per-repository enforcement is the network proxy's GitHub guard. It runs as
-root because only root (and the proxy, for policy-approved agent traffic) has
-outbound network access; the admin service that owns the credential has none.
+root because the admin service that owns the credential has no outbound
+network access.
 The App private key only ever moves through pipes — admin service stdin in,
 openssl stdin on — and is never written anywhere.
 

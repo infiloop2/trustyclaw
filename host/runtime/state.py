@@ -1,27 +1,21 @@
-"""Admin-state storage and the proxy-state file helpers.
+"""Normalized host-state accessors and proxy file-path helpers.
 
-Admin state — host config, the task queue, agent/task events, thread->session
-maps, OAuth logins, provider account records — lives in the
-local ``trustyclaw_admin`` Postgres database (see ``host/migrations/`` for the
-schema and ``host.runtime.db``/``host.runtime.pgclient`` for how the service
-connects). This module is the storage API: per-operation accessors that run
-real queries against the normalized tables. Reads are plain lock-free
-transactions (MVCC snapshots) that fetch only what the caller needs; writes go
-through ``mutation()``, which pairs one database transaction with the
-process-wide mutation lock below so check-then-act sequences stay atomic.
+Host, network, app-migration, and tool state lives in the local
+``trustyclaw_admin`` Postgres database (see ``host/migrations/`` for the schema
+and ``host.runtime.db``/``host.runtime.pgclient`` for the Unix-socket client).
+This module exposes per-operation queries rather than materializing the full
+state. Reads use MVCC snapshots; process-local check-then-act writes use
+``mutation()``, while cross-process transitions rely on database constraints
+and conditional updates.
 
-Idempotency-key replay records and agent runtime statuses deliberately do
-not live here: idempotency is in-process memory in ``admin_api``, runtime
-status is in-process memory in ``orchestrator`` (derived health, re-computed
-within seconds of startup), and both reset with the service.
+Agent runtime statuses deliberately do not live here: runtime status is
+in-process memory in ``orchestrator`` (derived health, re-computed within
+seconds of startup) and resets with the service.
 
-The network proxy participates under its own database role with narrow
-grants: read-only on the policy and pin tables (which the admin service
-writes after validation), plus insert/select/delete on its own
-``network_events`` table. A database outage fails closed: the proxy denies
-every request until the database returns. The proxy's TLS material (CA
-keypair, minted leaf certificates) lives as proxy-owned files because ``ssl``
-and ``openssl`` consume paths.
+The proxy and tools services participate under narrow database roles. A
+database outage fails closed: the proxy denies every request until the
+database returns. Proxy TLS material stays in proxy-owned files because
+``ssl`` and OpenSSL consume paths.
 """
 
 from __future__ import annotations
@@ -31,6 +25,8 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import hmac
+import secrets
 import threading
 import time
 from typing import Any, Iterator
@@ -38,43 +34,35 @@ from typing import Any, Iterator
 from host.runtime import db, secretbox
 
 
-DEFAULT_STATE_DIR = Path("/mnt/trustyclaw-admin/admin-state")
 DEFAULT_PROXY_STATE_DIR = Path("/mnt/trustyclaw-admin/proxy-state")
 # Serializes every admin-state write cycle. Private on purpose: writes go only
 # through mutation() below, so the locking contract is enforced by structure.
 # Three things to know:
-# - It is in-process only. That is sufficient because the admin service is the
-#   single writer of admin state, enforced by the port bind in admin_api.main()
-#   (a second instance dies on the bind before touching state); the proxy
-#   service has no database access at all. Postgres transactions make each
-#   commit atomic, but this lock is what makes a whole check-then-act sequence
-#   (read a status, decide, write) atomic against the other threads of this
-#   process, without per-row lock ceremony.
+# - It is in-process only. The admin port bind permits one admin process, while
+#   the proxy and tools processes reach only their granted operations. Postgres
+#   transactions and conditional updates carry cross-process correctness; this
+#   lock makes a whole check-then-act sequence atomic against sibling threads.
 # - It is an RLock so a helper that reads state can be called from inside a
 #   mutation() block without deadlocking (reads run on their own database
 #   connections and see the last committed state).
-# - Nesting: code inside mutation() may take the JSONL lock below (network
-#   event appends in tests) and the orchestrator's _POOL_LOCK (task claiming).
-#   Nothing enters mutation() while holding either of those — keep it that
-#   way, or the lock graph grows a cycle.
+# - Nesting: code inside mutation() may take the orchestrator's _LIVE_LOCK
+#   (task claiming). Nothing enters mutation() while holding it — keep it
+#   that way, or the lock graph grows a cycle.
 _MUTATION_LOCK = threading.RLock()
 TASK_LIMIT = 5
 EVENT_LIMIT = 5
-# The event table keeps only the most recent MAX_EVENTS entries; the prune
-# runs every PRUNE_EVERY appends so its cost stays amortized.
+# Every audit log (agent events, network events, tool events) keeps only the
+# most recent MAX_EVENTS entries; the prune runs every PRUNE_EVERY appends so
+# its cost stays amortized.
 MAX_EVENTS = 1_000_000
 PRUNE_EVERY = 500
-# The network event table keeps the same generous cap as the agent events.
-MAX_NETWORK_EVENTS = 1_000_000
-# Both audit logs (agent events, network events) page newest-first in pages
-# of EVENT_PAGE_LIMIT rows; the limit query parameter can only shrink a page.
+# The audit logs page newest-first in pages of EVENT_PAGE_LIMIT rows; the
+# limit query parameter can only shrink a page.
 EVENT_PAGE_LIMIT = 100
-PENDING_PUSH_RESOLVING_TIMEOUT_SECONDS = 15 * 60
 
 _TASK_COLUMNS = (
     "number",
     "status",
-    "agent_runtime",
     "thread_id",
     "input_message",
     "output_message",
@@ -83,23 +71,19 @@ _TASK_COLUMNS = (
     "updated_at",
 )
 _TASK_FIELDS = ", ".join(_TASK_COLUMNS)
+_TASK_WITH_SESSION_COLUMNS = (*_TASK_COLUMNS, "agent_runtime", "model", "effort")
+_TASK_SELECT_FIELDS = ", ".join(f"tasks.{column}" for column in _TASK_COLUMNS) + (
+    ", thread_sessions.agent_runtime, thread_sessions.model, thread_sessions.effort"
+)
+_TASK_SESSION_JOIN = (
+    " JOIN thread_sessions ON thread_sessions.thread_id = tasks.thread_id"
+)
 ACTIVE_STATUSES_SQL = "('queued', 'running')"
 TERMINAL_STATUSES_SQL = "('completed', 'failed', 'cancelled')"
 
 
-def _state_dir() -> Path:
-    return Path(os.environ.get("TRUSTYCLAW_STATE_DIR", str(DEFAULT_STATE_DIR)))
-
-
 def _proxy_state_dir() -> Path:
-    if "TRUSTYCLAW_PROXY_STATE_DIR" in os.environ:
-        return Path(os.environ["TRUSTYCLAW_PROXY_STATE_DIR"])
-    if "TRUSTYCLAW_STATE_DIR" in os.environ:
-        # Tests and local single-process harnesses commonly redirect one state
-        # directory. Keep that override self-contained unless a proxy-state
-        # override is provided explicitly.
-        return _state_dir()
-    return DEFAULT_PROXY_STATE_DIR
+    return Path(os.environ.get("TRUSTYCLAW_PROXY_STATE_DIR", str(DEFAULT_PROXY_STATE_DIR)))
 
 
 @dataclass(frozen=True)
@@ -125,10 +109,6 @@ def network_proxy_cert_files(host: str) -> NetworkProxyCertFiles:
         ca_cert=_proxy_state_dir() / "network_proxy_ca.crt",
         ca_key=_proxy_state_dir() / "network_proxy_ca.key",
     )
-
-
-def read_network_proxy_ca_cert() -> bytes:
-    return (_proxy_state_dir() / "network_proxy_ca.crt").read_bytes()
 
 
 def utc_now() -> str:
@@ -228,7 +208,7 @@ def save_config(config: dict[str, Any]) -> None:
 
 
 def _task_from_row(row: Any) -> dict[str, Any]:
-    task: dict[str, Any] = dict(zip(_TASK_COLUMNS, row[: len(_TASK_COLUMNS)]))
+    task: dict[str, Any] = dict(zip(_TASK_WITH_SESSION_COLUMNS, row))
     task["task_id"] = f"task_{task.pop('number')}"
     return task
 
@@ -260,7 +240,7 @@ def insert_task(cur: Any, task: dict[str, Any]) -> None:
         raise ValueError(f"task_id must look like task_<number>: {task.get('task_id')!r}")
     cur.execute(
         f"INSERT INTO tasks ({_TASK_FIELDS})"
-        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
         [number] + [task.get(column) for column in _TASK_COLUMNS[1:]],
     )
     for message in task.get("steer_messages") or []:
@@ -271,7 +251,7 @@ def save_task(cur: Any, task: dict[str, Any]) -> None:
     """Write back every mutable task field (matched by task_id). Steers are
     not part of the row; use the task_steers accessors."""
     cur.execute(
-        "UPDATE tasks SET status = %s, agent_runtime = %s, thread_id = %s,"
+        "UPDATE tasks SET status = %s, thread_id = %s,"
         " input_message = %s, output_message = %s, error_message = %s,"
         " created_at = %s, updated_at = %s"
         " WHERE number = %s",
@@ -320,7 +300,11 @@ def get_task(task_id: str, cur: Any = None) -> dict[str, Any] | None:
     if number is None:
         return None
     with _read(cur) as cur:
-        cur.execute(f"SELECT {_TASK_FIELDS} FROM tasks WHERE number = %s", (number,))
+        cur.execute(
+            f"SELECT {_TASK_SELECT_FIELDS} FROM tasks{_TASK_SESSION_JOIN}"
+            " WHERE tasks.number = %s",
+            (number,),
+        )
         row = cur.fetchone()
         if row is None:
             return None
@@ -329,19 +313,22 @@ def get_task(task_id: str, cur: Any = None) -> dict[str, Any] | None:
     return task
 
 
-def active_tasks(cur: Any = None) -> list[dict[str, Any]]:
+def active_tasks() -> list[dict[str, Any]]:
     """Queued and running tasks in creation order."""
-    with _read(cur) as cur:
+    with db.transaction() as cur:
         cur.execute(
-            f"SELECT {_TASK_FIELDS} FROM tasks WHERE status IN {ACTIVE_STATUSES_SQL}"
-            " ORDER BY number"
+            f"SELECT {_TASK_SELECT_FIELDS} FROM tasks{_TASK_SESSION_JOIN}"
+            f" WHERE tasks.status IN {ACTIVE_STATUSES_SQL} ORDER BY tasks.number"
         )
         return [_task_from_row(row) for row in cur.fetchall()]
 
 
 def running_tasks(cur: Any = None) -> list[dict[str, Any]]:
     with _read(cur) as cur:
-        cur.execute(f"SELECT {_TASK_FIELDS} FROM tasks WHERE status = 'running' ORDER BY number")
+        cur.execute(
+            f"SELECT {_TASK_SELECT_FIELDS} FROM tasks{_TASK_SESSION_JOIN}"
+            " WHERE tasks.status = 'running' ORDER BY tasks.number"
+        )
         return [_task_from_row(row) for row in cur.fetchall()]
 
 
@@ -354,8 +341,9 @@ def queued_tasks_brief(cur: Any) -> list[dict[str, Any]]:
     """Queued tasks in claim order, without their (potentially large)
     messages — the claim loop only needs identity and routing fields."""
     cur.execute(
-        "SELECT number, agent_runtime, thread_id FROM tasks"
-        " WHERE status = 'queued' ORDER BY number"
+        "SELECT tasks.number, thread_sessions.agent_runtime, tasks.thread_id"
+        f" FROM tasks{_TASK_SESSION_JOIN}"
+        " WHERE tasks.status = 'queued' ORDER BY tasks.number"
     )
     return [
         {"task_id": f"task_{number}", "agent_runtime": agent_runtime, "thread_id": thread_id}
@@ -367,37 +355,38 @@ def tasks_for_thread(thread_id: str, limit: int) -> list[dict[str, Any]]:
     """A thread's tasks, most recently updated first (ties broken by newest)."""
     with db.transaction() as cur:
         cur.execute(
-            f"SELECT {_TASK_FIELDS} FROM tasks WHERE thread_id = %s"
-            " ORDER BY updated_at DESC, number DESC LIMIT %s",
+            f"SELECT {_TASK_SELECT_FIELDS} FROM tasks{_TASK_SESSION_JOIN}"
+            " WHERE tasks.thread_id = %s"
+            " ORDER BY tasks.updated_at DESC, tasks.number DESC LIMIT %s",
             (thread_id, limit),
         )
         return [_task_from_row(row) for row in cur.fetchall()]
 
 
-def thread_task_runtime(cur: Any, thread_id: str) -> str | None:
-    """The runtime already bound to this thread by any existing task."""
-    cur.execute("SELECT agent_runtime FROM tasks WHERE thread_id = %s LIMIT 1", (thread_id,))
-    row = cur.fetchone()
-    return str(row[0]) if row else None
-
-
 def thread_summaries() -> list[dict[str, Any]]:
-    """Per-thread aggregates over the whole task history plus the active task
-    list, for the threads listing. Message columns are never fetched."""
+    """Canonical thread configuration plus retained task aggregates."""
     with db.transaction() as cur:
         cur.execute(
-            "SELECT thread_id, min(agent_runtime), max(updated_at), count(*)"
-            " FROM tasks GROUP BY thread_id"
+            "SELECT thread_sessions.thread_id, thread_sessions.agent_runtime,"
+            " thread_sessions.model, thread_sessions.effort,"
+            " GREATEST(COALESCE(thread_sessions.last_used_at, ''),"
+            " COALESCE(max(tasks.updated_at), '')), count(tasks.number)"
+            " FROM thread_sessions LEFT JOIN tasks"
+            " ON tasks.thread_id = thread_sessions.thread_id"
+            " GROUP BY thread_sessions.thread_id, thread_sessions.agent_runtime,"
+            " thread_sessions.model, thread_sessions.effort, thread_sessions.last_used_at"
         )
         summaries = {
             str(thread_id): {
                 "thread_id": str(thread_id),
                 "agent_runtime": agent_runtime,
+                "model": model,
+                "effort": effort,
                 "last_used_at": last_used_at or "",
                 "active_tasks": [],
                 "task_count": int(count),
             }
-            for thread_id, agent_runtime, last_used_at, count in cur.fetchall()
+            for thread_id, agent_runtime, model, effort, last_used_at, count in cur.fetchall()
         }
         cur.execute(
             "SELECT thread_id, number, status FROM tasks"
@@ -420,7 +409,7 @@ def fail_running_tasks(cur: Any, error_message: str, runtime: str | None = None)
     )
     params: list[Any] = [error_message, utc_now()]
     if runtime is not None:
-        sql += " AND agent_runtime = %s"
+        sql += " AND thread_id IN (SELECT thread_id FROM thread_sessions WHERE agent_runtime = %s)"
         params.append(runtime)
     cur.execute(sql + " RETURNING number", params)
     return [f"task_{row[0]}" for row in cur.fetchall()]
@@ -443,14 +432,19 @@ def prune_finished_tasks(cur: Any, keep: int) -> None:
 
 def thread_session(cur: Any, runtime: str, thread_id: str) -> dict[str, Any] | None:
     cur.execute(
-        "SELECT provider_session_id, last_used_at FROM thread_sessions"
+        "SELECT provider_session_id, last_used_at, model, effort FROM thread_sessions"
         " WHERE agent_runtime = %s AND thread_id = %s",
         (runtime, thread_id),
     )
     row = cur.fetchone()
     if row is None:
         return None
-    return {"provider_session_id": row[0], "last_used_at": row[1]}
+    return {
+        "provider_session_id": row[0],
+        "last_used_at": row[1],
+        "model": str(row[2]),
+        "effort": str(row[3]),
+    }
 
 
 def save_thread_session(
@@ -459,44 +453,58 @@ def save_thread_session(
     thread_id: str,
     provider_session_id: str | None,
     last_used_at: str | None,
+    model: str,
+    effort: str,
 ) -> None:
     cur.execute(
-        "INSERT INTO thread_sessions (agent_runtime, thread_id, provider_session_id, last_used_at)"
-        " VALUES (%s, %s, %s, %s)"
-        " ON CONFLICT (agent_runtime, thread_id) DO UPDATE SET"
+        "INSERT INTO thread_sessions (agent_runtime, thread_id, provider_session_id, last_used_at, model, effort)"
+        " VALUES (%s, %s, %s, %s, %s, %s)"
+        " ON CONFLICT (thread_id) DO UPDATE SET"
         " provider_session_id = EXCLUDED.provider_session_id,"
-        " last_used_at = EXCLUDED.last_used_at",
-        (runtime, thread_id, provider_session_id, last_used_at),
+        " last_used_at = EXCLUDED.last_used_at"
+        " WHERE thread_sessions.agent_runtime = EXCLUDED.agent_runtime"
+        " AND thread_sessions.model = EXCLUDED.model"
+        " AND thread_sessions.effort = EXCLUDED.effort"
+        " RETURNING 1",
+        (runtime, thread_id, provider_session_id, last_used_at, model, effort),
     )
+    if cur.fetchone() is None:
+        raise ValueError(f"thread {thread_id!r} already has another session configuration")
 
 
-def thread_session_runtime(cur: Any, thread_id: str) -> str | None:
+def thread_session_config(cur: Any, thread_id: str) -> dict[str, Any] | None:
     cur.execute(
-        "SELECT agent_runtime FROM thread_sessions WHERE thread_id = %s LIMIT 1",
+        "SELECT agent_runtime, provider_session_id, last_used_at, model, effort"
+        " FROM thread_sessions WHERE thread_id = %s",
         (thread_id,),
     )
     row = cur.fetchone()
-    return str(row[0]) if row else None
-
-
-def session_summaries() -> list[tuple[str, str, str]]:
-    """(runtime, thread_id, last_used_at) for every mapping, for the threads
-    listing."""
-    with db.transaction() as cur:
-        cur.execute(
-            "SELECT agent_runtime, thread_id, COALESCE(last_used_at, '') FROM thread_sessions"
-        )
-        return [(str(r), str(t), str(u)) for r, t, u in cur.fetchall()]
+    if row is None:
+        return None
+    return {
+        "agent_runtime": str(row[0]),
+        "provider_session_id": row[1],
+        "last_used_at": row[2],
+        "model": str(row[3]),
+        "effort": str(row[4]),
+    }
 
 
 def prune_thread_sessions(cur: Any, runtime: str, keep: int) -> None:
-    """Drop a runtime's least recently used thread mappings beyond ``keep``. A
-    dropped thread is not an error — a later task on it starts a fresh runtime
-    conversation."""
+    """Drop least-recently-used unreferenced threads beyond ``keep``.
+
+    Retained tasks keep their canonical thread row; once task history pruning
+    removes the last reference, the ordinary LRU cap applies.
+    """
     cur.execute(
-        "DELETE FROM thread_sessions WHERE agent_runtime = %s AND thread_id NOT IN ("
-        " SELECT thread_id FROM thread_sessions WHERE agent_runtime = %s"
-        "  ORDER BY last_used_at DESC NULLS LAST, thread_id LIMIT %s)",
+        "DELETE FROM thread_sessions AS candidate"
+        " WHERE candidate.agent_runtime = %s"
+        " AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.thread_id = candidate.thread_id)"
+        " AND candidate.thread_id NOT IN ("
+        "  SELECT retained.thread_id FROM thread_sessions AS retained"
+        "  WHERE retained.agent_runtime = %s"
+        "  AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.thread_id = retained.thread_id)"
+        "  ORDER BY retained.last_used_at DESC NULLS LAST, retained.thread_id LIMIT %s)",
         (runtime, runtime, keep),
     )
 
@@ -638,54 +646,64 @@ def record_agent_event(event_type: str, task_id: str | None, payload: dict[str, 
         append_agent_event(cur, event_type, task_id, payload)
 
 
-def read_agent_events() -> list[dict[str, Any]]:
+def _prune_events(cur: Any, table: str) -> None:
+    # Shared retention for the three audit logs (agent, network, tool events).
+    # seq is a serial, so newest-N retention is a primary-key range
+    # delete below MAX(seq) - N: two index-endpoint lookups and the excess
+    # rows, instead of scanning N index entries per prune. Seq gaps from
+    # aborted transactions only make retention keep slightly fewer rows.
+    # ``table`` is always a module-constant name, never external input.
+    cur.execute(
+        f"DELETE FROM {table} WHERE"
+        f" seq <= (SELECT COALESCE(MAX(seq), 0) FROM {table}) - %s",
+        (MAX_EVENTS,),
+    )
+
+
+def _page_before(
+    table: str,
+    fields: str,
+    row_fn: Any,
+    before: int | None,
+    limit: int,
+    extra_clause: str | None = None,
+    extra_params: tuple[Any, ...] = (),
+) -> list[dict[str, Any]]:
+    """One newest-first page of an audit log: rows with ``seq < before`` (all
+    rows when ``before`` is None). ``table``/``fields``/``extra_clause`` are
+    module constants, never external input."""
+    clauses = list(() if extra_clause is None else (extra_clause,))
+    params: list[Any] = list(extra_params)
+    if before is not None:
+        clauses.append("seq < %s")
+        params.append(before)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     with db.transaction() as cur:
         cur.execute(
-            f"SELECT {_EVENT_FIELDS} FROM agent_events ORDER BY seq"
+            f"SELECT {fields} FROM {table}{where} ORDER BY seq DESC LIMIT %s",
+            tuple(params) + (limit,),
         )
-        return [_event_dict(row) for row in cur.fetchall()]
+        return [row_fn(row) for row in cur.fetchall()]
 
 
-def prune_agent_events(cur: Any = None) -> None:
-    with _read(cur) as cur:
-        # seq is a serial, so newest-N retention is a primary-key range
-        # delete below MAX(seq) - N: two index-endpoint lookups and the excess
-        # rows, instead of scanning N index entries per prune. Seq gaps from
-        # aborted transactions only make retention keep slightly fewer rows.
-        cur.execute(
-            "DELETE FROM agent_events WHERE"
-            " seq <= (SELECT COALESCE(MAX(seq), 0) FROM agent_events) - %s",
-            (MAX_EVENTS,),
-        )
+def prune_agent_events(cur: Any) -> None:
+    _prune_events(cur, "agent_events")
 
 
-@dataclass(frozen=True)
-class Page:
-    items: list[dict[str, Any]]
+def page_agent_events_before(
+    before: int | None, *, limit: int = EVENT_PAGE_LIMIT
+) -> list[dict[str, Any]]:
+    return _page_before("agent_events", _EVENT_FIELDS, _event_dict, before, limit)
 
 
-def page_agent_events_before(before: int | None, *, limit: int = EVENT_PAGE_LIMIT) -> Page:
-    """One newest-first page of the agent audit log: events with
-    ``seq < before`` (all events when ``before`` is None), newest first."""
-    where = " WHERE seq < %s" if before is not None else ""
-    params: tuple[Any, ...] = (before,) if before is not None else ()
-    with db.transaction() as cur:
-        cur.execute(
-            f"SELECT {_EVENT_FIELDS} FROM agent_events{where}"
-            " ORDER BY seq DESC LIMIT %s",
-            params + (limit,),
-        )
-        return Page([_event_dict(row) for row in cur.fetchall()])
-
-
-def page_task_events(task_id: str, since: int | None) -> Page:
+def page_task_events(task_id: str, since: int | None) -> list[dict[str, Any]]:
     with db.transaction() as cur:
         cur.execute(
             f"SELECT {_EVENT_FIELDS} FROM agent_events"
             " WHERE task_id = %s AND seq > %s ORDER BY seq LIMIT %s",
             (task_id, since if since is not None else 0, EVENT_LIMIT),
         )
-        return Page([_event_dict(row) for row in cur.fetchall()])
+        return [_event_dict(row) for row in cur.fetchall()]
 
 
 # -- network policy and proxy account pins (admin writes, proxy reads) ---------------
@@ -784,8 +802,8 @@ def save_network_policy(controls: dict[str, Any], updated_at: str) -> None:
                 )
 
 
-def save_proxy_openai_account_id(account_id: str | None) -> None:
-    _save_proxy_pin("openai", {"account_id": account_id})
+def save_proxy_openai_account_id(account_id: str | None, cur: Any = None) -> None:
+    _save_proxy_pin("openai", {"account_id": account_id}, cur)
 
 
 def read_proxy_openai_account_id() -> str | None:
@@ -793,27 +811,32 @@ def read_proxy_openai_account_id() -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def save_proxy_claude_account(account: dict[str, Any] | None) -> None:
-    _save_proxy_pin("claude", account or {})
+def save_proxy_claude_account(account: dict[str, Any] | None, cur: Any = None) -> None:
+    _save_proxy_pin("claude", account or {}, cur)
 
 
 def read_proxy_claude_account() -> dict[str, Any]:
     return _read_proxy_pin("claude")
 
 
-def _save_proxy_pin(provider: str, data: dict[str, Any]) -> None:
-    # Exactly the two values the guards compare; the proxy never receives the
-    # rest of the account metadata.
+def _save_proxy_pin(provider: str, data: dict[str, Any], cur: Any = None) -> None:
+    # Exactly the two values the guards compare (account_id and
+    # access_token_sha256); the proxy never receives the rest of the account
+    # metadata. Callers inside a mutation pass their cursor so the pin commits
+    # atomically with the anchor/status change.
+    if cur is None:
+        with mutation() as fresh:
+            _save_proxy_pin(provider, data, fresh)
+        return
     account_id = data.get("account_id")
     access_token_sha256 = data.get("access_token_sha256")
-    with mutation() as cur:
-        cur.execute(
-            "INSERT INTO proxy_provider_pins (provider, account_id, access_token_sha256)"
-            " VALUES (%s, %s, %s)"
-            " ON CONFLICT (provider) DO UPDATE SET account_id = EXCLUDED.account_id,"
-            " access_token_sha256 = EXCLUDED.access_token_sha256",
-            (provider, account_id, access_token_sha256),
-        )
+    cur.execute(
+        "INSERT INTO proxy_provider_pins (provider, account_id, access_token_sha256)"
+        " VALUES (%s, %s, %s)"
+        " ON CONFLICT (provider) DO UPDATE SET account_id = EXCLUDED.account_id,"
+        " access_token_sha256 = EXCLUDED.access_token_sha256",
+        (provider, account_id, access_token_sha256),
+    )
 
 
 def _read_proxy_pin(provider: str) -> dict[str, Any]:
@@ -908,14 +931,13 @@ def save_proxy_github_token(token: str | None, expires_at: str | None = None) ->
     secret; the proxy role holds SELECT on this row and on secret_keys (see
     migration 0002), which together decrypt exactly this working set and
     nothing else."""
-    if token is not None and (not isinstance(token, str) or not token):
-        raise ValueError("the proxy github token must be a non-empty string or None")
+    ciphertext = _encrypt_secret(token)
     with mutation() as cur:
         cur.execute("DELETE FROM proxy_github_token")
-        if token is not None:
+        if ciphertext is not None:
             cur.execute(
                 "INSERT INTO proxy_github_token (singleton, token, expires_at, updated_at) VALUES (TRUE, %s, %s, %s)",
-                (secretbox.encrypt(token), expires_at, utc_now()),
+                (ciphertext, expires_at, utc_now()),
             )
 
 
@@ -1008,7 +1030,7 @@ def enqueue_pending_push(
 
 
 def _pending_push_row(row: tuple[Any, ...]) -> dict[str, Any]:
-    push_id, owner, repo, ref_updates, changed_paths, requested_at, status, _claimed_at, resolved_at, detail = row
+    push_id, owner, repo, ref_updates, changed_paths, requested_at, status, resolved_at, detail = row
     value: dict[str, Any] = {
         "id": str(push_id),
         "owner": str(owner),
@@ -1025,19 +1047,13 @@ def _pending_push_row(row: tuple[Any, ...]) -> dict[str, Any]:
     return value
 
 
-_PENDING_PUSH_COLUMNS = "id, owner, repo, ref_updates, changed_paths, requested_at, status, claimed_at, resolved_at, detail"
+_PENDING_PUSH_COLUMNS = "id, owner, repo, ref_updates, changed_paths, requested_at, status, resolved_at, detail"
 
 
-def read_pending_pushes(status: str | None = None) -> list[dict[str, Any]]:
-    """Pending pushes, newest first. ``status`` filters to one state."""
+def read_pending_pushes() -> list[dict[str, Any]]:
+    """Pending pushes, newest first."""
     with db.transaction() as cur:
-        if status is None:
-            cur.execute(f"SELECT {_PENDING_PUSH_COLUMNS} FROM pending_pushes ORDER BY requested_at DESC")
-        else:
-            cur.execute(
-                f"SELECT {_PENDING_PUSH_COLUMNS} FROM pending_pushes WHERE status = %s ORDER BY requested_at DESC",
-                (status,),
-            )
+        cur.execute(f"SELECT {_PENDING_PUSH_COLUMNS} FROM pending_pushes ORDER BY requested_at DESC")
         return [_pending_push_row(row) for row in cur.fetchall()]
 
 
@@ -1048,34 +1064,23 @@ def get_pending_push(push_id: str) -> dict[str, Any] | None:
     return _pending_push_row(row) if row else None
 
 
-def claim_pending_push(push_id: str) -> dict[str, Any] | None:
-    """Move a pending or stale resolving push into ``resolving`` and return it."""
-    now = utc_now()
-    stale_before = time.strftime(
-        "%Y-%m-%dT%H:%M:%SZ",
-        time.gmtime(time.time() - PENDING_PUSH_RESOLVING_TIMEOUT_SECONDS),
-    )
-    with mutation() as cur:
-        cur.execute(
-            "UPDATE pending_pushes SET status = 'resolving', claimed_at = %s"
-            " WHERE id = %s AND (status = 'pending'"
-            " OR (status = 'resolving' AND (claimed_at IS NULL OR claimed_at < %s)))"
-            f" RETURNING {_PENDING_PUSH_COLUMNS}",
-            (now, push_id, stale_before),
-        )
-        row = cur.fetchone()
-    return _pending_push_row(row) if row else None
-
-
-def resolve_pending_push(push_id: str, status: str, detail: str | None = None) -> None:
+def resolve_pending_push(push_id: str, status: str, detail: str | None = None) -> dict[str, Any]:
     """Mark a pending push resolved (approved/rejected/failed) with an optional
-    detail message. A no-op if the row is gone or already in a final state."""
+    detail message, and return the resolved row. The caller
+    (github_pending_push) holds RESOLVE_LOCK and has just read the row as
+    pending, so the conditional update always matches; a vanished row would be
+    a programming error and fails loudly."""
     with mutation() as cur:
         cur.execute(
-            "UPDATE pending_pushes SET status = %s, claimed_at = NULL, resolved_at = %s, detail = %s"
-            " WHERE id = %s AND status IN ('pending', 'resolving')",
+            "UPDATE pending_pushes SET status = %s, resolved_at = %s, detail = %s"
+            " WHERE id = %s AND status = 'pending'"
+            f" RETURNING {_PENDING_PUSH_COLUMNS}",
             (status, utc_now(), detail or None, push_id),
         )
+        row = cur.fetchone()
+    if row is None:
+        raise RuntimeError(f"pending push {push_id} vanished mid-resolve")
+    return _pending_push_row(row)
 
 
 def read_github_credential_metadata() -> dict[str, Any]:
@@ -1110,7 +1115,7 @@ def append_network_event(
     reason: str | None = None,
 ) -> None:
     """Record one allow/deny decision. Runs in the proxy process under its own
-    database role (granted exactly the network_events table). A failure
+    database role, whose event-table grant permits this operation. A failure
     surfaces to the caller's connection handler: a decision that cannot be
     logged fails that request, never the proxy itself — fail closed."""
     # Field caps keep the row cap a real disk bound: the agent's own request
@@ -1144,16 +1149,10 @@ def append_network_event(
             prune_network_events(cur)
 
 
-def prune_network_events(cur: Any = None) -> None:
-    """Same O(1)-planning range delete as prune_agent_events; this runs on
-    the proxy's request path (every PRUNE_EVERY appends), so it must never
-    scan the whole retained log."""
-    with _read(cur) as cur:
-        cur.execute(
-            "DELETE FROM network_events WHERE"
-            " seq <= (SELECT COALESCE(MAX(seq), 0) FROM network_events) - %s",
-            (MAX_NETWORK_EVENTS,),
-        )
+def prune_network_events(cur: Any) -> None:
+    """Runs on the proxy's request path (every PRUNE_EVERY appends), so it
+    must never scan the whole retained log — see _prune_events."""
+    _prune_events(cur, "network_events")
 
 
 def _network_event_dict(row: Any) -> dict[str, Any]:
@@ -1177,31 +1176,343 @@ def _network_event_dict(row: Any) -> dict[str, Any]:
 _NETWORK_EVENT_FIELDS = "seq, created_at, protocol, method, host, port, path, query, decision, reason"
 
 
-def read_network_events() -> list[dict[str, Any]]:
-    with db.transaction() as cur:
-        cur.execute(f"SELECT {_NETWORK_EVENT_FIELDS} FROM network_events ORDER BY seq")
-        return [_network_event_dict(row) for row in cur.fetchall()]
-
-
 def page_network_events_before(
     before: int | None,
     *,
     decision: str | None = None,
     limit: int = EVENT_PAGE_LIMIT,
-) -> Page:
-    clauses: list[str] = []
-    params: list[Any] = []
-    if decision is not None:
-        clauses.append("decision = %s")
-        params.append(decision)
-    if before is not None:
-        clauses.append("seq < %s")
-        params.append(before)
-    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+) -> list[dict[str, Any]]:
+    extra = ("decision = %s", (decision,)) if decision is not None else (None, ())
+    return _page_before(
+        "network_events", _NETWORK_EVENT_FIELDS, _network_event_dict, before, limit,
+        extra_clause=extra[0], extra_params=extra[1],
+    )
+
+
+# -- tools ---------------------------------------------------------------------
+
+
+# Public "approval_<number>" ids, like "task_<number>" for tasks.
+_APPROVAL_ID_PREFIX = "approval_"
+_TOOL_APPROVAL_FIELDS = "number, tool_id, action_id, status, summary, payload, check_token, result, created_at, decided_at"
+
+
+class PendingToolApprovalLimitReached(Exception):
+    """Raised when inserting another pending tool approval would exceed the cap."""
+
+
+def enabled_tool_ids() -> set[str]:
+    with db.transaction() as cur:
+        cur.execute("SELECT tool_id FROM enabled_tools")
+        return {row[0] for row in cur.fetchall()}
+
+
+def set_tool_enabled(cur: Any, tool_id: str, enabled: bool) -> None:
+    if enabled:
+        cur.execute(
+            "INSERT INTO enabled_tools (tool_id) VALUES (%s) ON CONFLICT (tool_id) DO NOTHING",
+            (tool_id,),
+        )
+    else:
+        cur.execute("DELETE FROM enabled_tools WHERE tool_id = %s", (tool_id,))
+
+
+def tool_config_keys(tool_id: str) -> set[str]:
+    """The configured key names for one tool; values stay in the database
+    except for tool_config_values callers building a tool call's config view."""
+    with db.transaction() as cur:
+        cur.execute("SELECT key FROM tool_config WHERE tool_id = %s", (tool_id,))
+        return {row[0] for row in cur.fetchall()}
+
+
+def tool_config_values(tool_id: str, keys: list[str]) -> dict[str, str]:
+    """Configured values for one tool's manifest keys. Config is scoped per
+    tool, so a shared key name resolves to this tool's own value. Values are
+    secretbox ciphertext at rest and decrypted here for the tool call's config
+    view."""
+    wanted = set(keys)
+    if not wanted:
+        return {}
+    with db.transaction() as cur:
+        cur.execute("SELECT key, value FROM tool_config WHERE tool_id = %s", (tool_id,))
+        return {row[0]: secretbox.decrypt(row[1]) for row in cur.fetchall() if row[0] in wanted}
+
+
+def save_tool_config_value(cur: Any, tool_id: str, key: str, value: str) -> None:
+    """Set one tool's deployment config value; an empty value clears the key.
+    Stored as secretbox ciphertext so config secrets never sit in the clear."""
+    if value:
+        cur.execute(
+            "INSERT INTO tool_config (tool_id, key, value) VALUES (%s, %s, %s)"
+            " ON CONFLICT (tool_id, key) DO UPDATE SET value = EXCLUDED.value",
+            (tool_id, key, secretbox.encrypt(value)),
+        )
+    else:
+        cur.execute("DELETE FROM tool_config WHERE tool_id = %s AND key = %s", (tool_id, key))
+
+
+def tool_credential(tool_id: str) -> dict[str, Any] | None:
+    """One tool's stored OAuth credential (the store behind HostAPI.credentials),
+    reassembled into the StoredCredential shape from its columns, or None if
+    the tool is not connected."""
     with db.transaction() as cur:
         cur.execute(
-            f"SELECT {_NETWORK_EVENT_FIELDS} FROM network_events{where}"
-            " ORDER BY seq DESC LIMIT %s",
-            tuple(params) + (limit,),
+            "SELECT account_id, account_label, account_scopes, secret, metadata"
+            " FROM tool_credentials WHERE tool_id = %s",
+            (tool_id,),
         )
-        return Page([_network_event_dict(row) for row in cur.fetchall()])
+        row = cur.fetchone()
+    if row is None:
+        return None
+    account_id, account_label, account_scopes, secret_ciphertext, metadata = row
+    secret = json.loads(secretbox.decrypt(secret_ciphertext))
+    return {
+        "account": {
+            "id": account_id,
+            "label": account_label,
+            "scopes": [str(scope) for scope in account_scopes] if isinstance(account_scopes, list) else [],
+        },
+        "secret": secret if isinstance(secret, dict) else {},
+        "metadata": metadata if isinstance(metadata, dict) else {},
+    }
+
+
+def put_tool_credential(tool_id: str, value: dict[str, Any]) -> None:
+    """Store a StoredCredential in its columns. Only the provider token
+    material is a secret: it is serialized and secretbox-encrypted; the
+    connected-account fields and tool bookkeeping are non-secret by contract
+    (host/tools/host_api.py) and stored as plain columns. Malformed records
+    are rejected rather than stored partially."""
+    account = value.get("account")
+    secret = value.get("secret")
+    metadata = value.get("metadata")
+    if (
+        not isinstance(account, dict)
+        or not isinstance(account.get("id"), str)
+        or not account["id"]
+        or not isinstance(account.get("label"), str)
+        or not isinstance(account.get("scopes"), list)
+        or not isinstance(secret, dict)
+        or not isinstance(metadata, dict)
+    ):
+        raise ValueError(f"malformed stored credential for tool {tool_id}")
+    with mutation() as cur:
+        cur.execute(
+            "INSERT INTO tool_credentials (tool_id, account_id, account_label, account_scopes, secret, metadata)"
+            " VALUES (%s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (tool_id) DO UPDATE SET account_id = EXCLUDED.account_id,"
+            " account_label = EXCLUDED.account_label, account_scopes = EXCLUDED.account_scopes,"
+            " secret = EXCLUDED.secret, metadata = EXCLUDED.metadata",
+            (
+                tool_id,
+                account["id"],
+                account["label"],
+                db.jsonb([str(scope) for scope in account["scopes"]]),
+                secretbox.encrypt(json.dumps(secret)),
+                db.jsonb(metadata),
+            ),
+        )
+
+
+def delete_tool_credential(tool_id: str) -> None:
+    with mutation() as cur:
+        cur.execute("DELETE FROM tool_credentials WHERE tool_id = %s", (tool_id,))
+
+
+# -- tool audit log ------------------------------------------------------------
+# The tool-side peer of the agent and network event logs: one row per tool
+# event, paged newest-first with the same before-cursor model.
+
+_TOOL_EVENT_FIELDS = "seq, created_at, tool_id, action_id, outcome, detail"
+
+
+def _tool_event_dict(row: Any) -> dict[str, Any]:
+    seq, created_at, tool_id, action_id, outcome, detail = row
+    return {
+        "seq": int(seq),
+        "timestamp": created_at,
+        "event_id": f"tool_event_{seq}",
+        "tool_id": tool_id,
+        "action_id": action_id,
+        "outcome": outcome,
+        "detail": detail or "",
+    }
+
+
+def record_tool_event(tool_id: str, action_id: str, outcome: str, detail: str = "") -> None:
+    """Append one tool audit event in its own transaction. seq is a serial:
+    unique and increasing, with harmless gaps from aborted transactions.
+    Prunes to MAX_EVENTS amortized, like the agent event log."""
+    with mutation() as cur:
+        cur.execute(
+            "INSERT INTO tool_events (created_at, tool_id, action_id, outcome, detail)"
+            " VALUES (%s, %s, %s, %s, %s) RETURNING seq",
+            (utc_now(), tool_id, action_id, outcome, detail),
+        )
+        if int(cur.fetchone()[0]) % PRUNE_EVERY == 0:
+            _prune_events(cur, "tool_events")
+
+
+def page_tool_events_before(
+    before: int | None, *, limit: int = EVENT_PAGE_LIMIT
+) -> list[dict[str, Any]]:
+    return _page_before("tool_events", _TOOL_EVENT_FIELDS, _tool_event_dict, before, limit)
+
+
+def _approval_id(number: int, check_token: str) -> str:
+    # The public id carries the unguessable check token, so the id itself is
+    # the agent's poll capability: no separate token to marry back up, and the
+    # sequential number alone cannot be enumerated. token_urlsafe has no dots,
+    # so the number splits off unambiguously.
+    return f"{_APPROVAL_ID_PREFIX}{number}.{check_token}"
+
+
+def _tool_approval_dict(row: Any) -> dict[str, Any]:
+    number, tool_id, action_id, status, summary, payload, check_token, result, created_at, decided_at = row
+    return {
+        "approval_id": _approval_id(number, check_token),
+        "tool_id": tool_id,
+        "action_id": action_id,
+        "status": status,
+        "summary": summary,
+        "payload": dict(payload) if isinstance(payload, dict) else {},
+        "result": result or "",
+        "created_at": int(created_at),
+        "decided_at": int(decided_at),
+    }
+
+
+def _approval_number(approval_id: str) -> int | None:
+    if not isinstance(approval_id, str) or not approval_id.startswith(_APPROVAL_ID_PREFIX):
+        return None
+    number_part = approval_id[len(_APPROVAL_ID_PREFIX):].split(".", 1)[0]
+    return int(number_part) if number_part.isdigit() else None
+
+
+def insert_tool_approval(
+    tool_id: str,
+    action_id: str,
+    summary: str,
+    payload: dict[str, Any],
+    created_at: int,
+    *,
+    pending_limit: int,
+) -> dict[str, Any]:
+    with mutation() as cur:
+        # All inserts run in the tools service under this process's
+        # mutation lock, so the count check cannot race another insert.
+        # (The admin maintenance pass may expire rows concurrently, which
+        # only makes the backpressure count conservative.)
+        cur.execute("SELECT COUNT(*) FROM tool_approvals WHERE status = 'pending'")
+        if int(cur.fetchone()[0]) >= pending_limit:
+            raise PendingToolApprovalLimitReached()
+        cur.execute(
+            "INSERT INTO tool_approvals (tool_id, action_id, status, summary, payload, check_token, created_at)"
+            " VALUES (%s, %s, 'pending', %s, %s, %s, %s)"
+            f" RETURNING {_TOOL_APPROVAL_FIELDS}",
+            (tool_id, action_id, summary, db.jsonb(payload), secrets.token_urlsafe(32), created_at),
+        )
+        return _tool_approval_dict(cur.fetchone())
+
+
+def tool_approval(approval_id: str, tool_id: str | None = None) -> dict[str, Any] | None:
+    """The approval record for the full ``approval_<n>.<token>`` id, optionally
+    restricted to one tool's partition. Returns None unless the id's token
+    matches the stored one (constant-time), so a guessed number never
+    resolves — verification for every caller lives here."""
+    number = _approval_number(approval_id)
+    if number is None:
+        return None
+    with db.transaction() as cur:
+        if tool_id is None:
+            cur.execute(
+                f"SELECT {_TOOL_APPROVAL_FIELDS} FROM tool_approvals WHERE number = %s",
+                (number,),
+            )
+        else:
+            cur.execute(
+                f"SELECT {_TOOL_APPROVAL_FIELDS} FROM tool_approvals"
+                " WHERE number = %s AND tool_id = %s",
+                (number, tool_id),
+            )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    record = _tool_approval_dict(row)
+    if not hmac.compare_digest(approval_id, record["approval_id"]):
+        return None
+    return record
+
+
+def list_tool_approvals(limit: int, tool_id: str | None = None) -> list[dict[str, Any]]:
+    """Newest approvals first, pending before decided so open decisions
+    surface at the top of the admin UI. Scoped to one tool when tool_id is set,
+    which is how the operator UI shows approvals per tool rather than unified."""
+    order = " ORDER BY (status = 'pending') DESC, number DESC LIMIT %s"
+    with db.transaction() as cur:
+        if tool_id is None:
+            cur.execute(f"SELECT {_TOOL_APPROVAL_FIELDS} FROM tool_approvals{order}", (limit,))
+        else:
+            cur.execute(
+                f"SELECT {_TOOL_APPROVAL_FIELDS} FROM tool_approvals WHERE tool_id = %s{order}",
+                (tool_id, limit),
+            )
+        return [_tool_approval_dict(row) for row in cur.fetchall()]
+
+
+def transition_tool_approval(
+    approval_id: str,
+    from_status: str,
+    to_status: str,
+    decided_at: int,
+    result: str | None = None,
+) -> bool:
+    """Atomic conditional status transition; False when the record is absent
+    or no longer in from_status, so concurrent decisions cannot both win.
+    ``result`` is the terminal outcome text: the approved action's
+    user-visible message when it executed, or the error when it failed."""
+    number = _approval_number(approval_id)
+    if number is None:
+        return False
+    with mutation() as cur:
+        cur.execute(
+            "UPDATE tool_approvals SET status = %s, decided_at = %s,"
+            " result = COALESCE(%s, result)"
+            " WHERE number = %s AND status = %s RETURNING number",
+            (to_status, decided_at, result, number, from_status),
+        )
+        return cur.fetchone() is not None
+
+
+def fail_approved_tool_approvals(decided_at: int) -> None:
+    """Mark every approval stuck in ``approved`` as failed — a direct scan, so
+    no record escapes through a listing horizon. Write a failure ``result``
+    too, so ``check_tool_approval`` reports the interrupted execution instead
+    of an empty outcome."""
+    result = "The tools service restarted while executing this approved action; its outcome is unknown."
+    with mutation() as cur:
+        cur.execute(
+            "UPDATE tool_approvals SET status = 'failed', decided_at = %s, result = %s WHERE status = 'approved'",
+            (decided_at, result),
+        )
+
+
+def expire_tool_approvals(cutoff: int) -> None:
+    """Expire pending approvals created before the cutoff (host expiry
+    policy, applied by the maintenance pass)."""
+    with mutation() as cur:
+        cur.execute(
+            "UPDATE tool_approvals SET status = 'expired', decided_at = %s"
+            " WHERE status = 'pending' AND created_at < %s",
+            (int(time.time()), cutoff),
+        )
+
+
+def prune_tool_approvals(keep: int) -> None:
+    """Cap decided-approval history; pending records are never pruned."""
+    with mutation() as cur:
+        cur.execute(
+            "DELETE FROM tool_approvals WHERE status <> 'pending' AND number <="
+            " (SELECT COALESCE(MAX(number), 0) FROM tool_approvals) - %s",
+            (keep,),
+        )

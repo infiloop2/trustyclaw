@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 from host.config import ConfigError, parse_input_config
 from host.cli import lifecycle as deploy
+from host.cli import lifecycle_aws
 from host.cli import power
 from host.runtime import app_platform
 
@@ -59,6 +60,58 @@ def sample_upgrade_config() -> dict[str, object]:
 
 
 class DeployUnitTests(unittest.TestCase):
+    def test_aws_env_drops_ambient_session_token_for_static_keys(self) -> None:
+        config = parse_input_config(sample_config())
+        env_values = {
+            "TEST_AWS_ACCESS_KEY_ID": "access",
+            "TEST_AWS_SECRET_ACCESS_KEY": "secret",
+            "AWS_SESSION_TOKEN": "stale-ambient-token",
+        }
+        with patch.dict(os.environ, env_values, clear=False):
+            env = lifecycle_aws._aws_env(config)
+        self.assertEqual(env["AWS_ACCESS_KEY_ID"], "access")
+        self.assertEqual(env["AWS_SECRET_ACCESS_KEY"], "secret")
+        self.assertEqual(env["AWS_DEFAULT_REGION"], "us-east-1")
+        self.assertNotIn("AWS_SESSION_TOKEN", env)
+
+    def test_aws_env_passes_configured_session_token(self) -> None:
+        raw = sample_config()
+        raw["aws_session_token_env"] = "TEST_AWS_SESSION_TOKEN"
+        config = parse_input_config(raw)
+        env_values = {
+            "TEST_AWS_ACCESS_KEY_ID": "access",
+            "TEST_AWS_SECRET_ACCESS_KEY": "secret",
+            "TEST_AWS_SESSION_TOKEN": "sts-token",
+        }
+        with patch.dict(os.environ, env_values, clear=False):
+            env = lifecycle_aws._aws_env(config)
+        self.assertEqual(env["AWS_SESSION_TOKEN"], "sts-token")
+
+    def test_aws_env_requires_configured_session_token_to_be_set(self) -> None:
+        raw = sample_config()
+        raw["aws_session_token_env"] = "TEST_AWS_SESSION_TOKEN"
+        config = parse_input_config(raw)
+        env_values = {
+            "TEST_AWS_ACCESS_KEY_ID": "access",
+            "TEST_AWS_SECRET_ACCESS_KEY": "secret",
+        }
+        with patch.dict(os.environ, env_values, clear=False):
+            os.environ.pop("TEST_AWS_SESSION_TOKEN", None)
+            with self.assertRaisesRegex(ConfigError, "TEST_AWS_SESSION_TOKEN is not set"):
+                lifecycle_aws._aws_env(config)
+
+    def test_input_config_rejects_invalid_session_token_env_name(self) -> None:
+        raw = sample_config()
+        raw["aws_session_token_env"] = "not a valid env name"
+        with self.assertRaisesRegex(ConfigError, "aws_session_token_env must be a valid environment variable name"):
+            parse_input_config(raw)
+
+    def test_upgrade_config_accepts_session_token_env(self) -> None:
+        raw = sample_upgrade_config()
+        raw["aws_session_token_env"] = "TEST_AWS_SESSION_TOKEN"
+        config = parse_input_config(raw, require_operator_connections=False)
+        self.assertEqual(config.aws_session_token_env, "TEST_AWS_SESSION_TOKEN")
+
     def test_default_network_selects_public_default_subnet(self) -> None:
         config = parse_input_config(sample_config())
         responses = [
@@ -645,7 +698,6 @@ class DeployUnitTests(unittest.TestCase):
             ("upgrade", current_version, [], "upgrade requires preserved state older"),
             ("upgrade", "99.0.0", [], "upgrade requires preserved state older"),
             ("reconfigure", "99.0.0", [], "reconfigure requires preserved state to match"),
-            ("upgrade", "0.4.9", [], "predates the Postgres storage"),
         ]
         for mode, tagged_version, extra_args, message in cases:
             with self.subTest(mode=mode, tagged_version=tagged_version, extra_args=extra_args):
@@ -727,18 +779,6 @@ class DeployUnitTests(unittest.TestCase):
                 deploy.LifecycleCommand(mode="recover", config_path="config.json", allow_upgrade=True),
                 "0.7.0",
                 "cannot move preserved state backward",
-            ),
-            # Pre-Postgres state is refused for every mode, before the running
-            # host would be replaced.
-            (
-                deploy.LifecycleCommand(mode="upgrade", config_path="config.json"),
-                "0.4.1",
-                "predates the Postgres storage",
-            ),
-            (
-                deploy.LifecycleCommand(mode="recover", config_path="config.json", allow_upgrade=True),
-                "0.4.1",
-                "predates the Postgres storage",
             ),
         ]
         for command, tagged_version, message in cases:
@@ -1161,10 +1201,10 @@ class DeployUnitTests(unittest.TestCase):
         # 0600/0700 cluster files on the admin volume must keep a valid owner
         # across root-volume replacement.
         self.assertIn("POSTGRES_UID=47745", bootstrap)
-        self.assertIn("Installed app service users use the reserved static range 48000-48099", bootstrap)
+        self.assertIn("App package host_slot values generate stable UID/GID assignments", bootstrap)
         self.assertIn("TRUSTYCLAW_APP_AGENT_CHAT_UID=48000", bootstrap)
         self.assertIn("TRUSTYCLAW_APP_AGENT_CHAT_GID=48000", bootstrap)
-        self.assertIn("App ports are host-owned static assignments", bootstrap)
+        self.assertIn("App ports are generated from the same package-local host_slot values", bootstrap)
         self.assertIn("APP_AGENT_CHAT_PORT=7450", bootstrap)
         self.assertIn("ensure_user postgres \"$POSTGRES_UID\" postgres /var/lib/postgresql", bootstrap)
         self.assertLess(
@@ -1197,6 +1237,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("/usr/local/lib/trustyclaw-host/read-claude-account", bootstrap)
         self.assertIn("/usr/local/lib/trustyclaw-host/clear-agent-auth", bootstrap)
         self.assertIn("/usr/local/lib/trustyclaw-host/read-agent-file", bootstrap)
+        self.assertIn("/usr/local/lib/trustyclaw-host/check-for-upgrade", bootstrap)
         # Network policy, provider pins, and network events live in the
         # database now (proxy role read-only for policy/pins); the three sudo
         # helpers that bridged the old file boundary are gone.
@@ -1268,6 +1309,13 @@ class DeployUnitTests(unittest.TestCase):
             bootstrap.index("oif lo tcp dport $APP_AGENT_CHAT_PORT drop"),
             bootstrap.index("oif lo accept"),
         )
+        # The dedicated tools service runs the bundled tool packages, so it gets
+        # DNS and HTTPS egress for their third-party APIs; the admin service holds
+        # no internet egress, and the agent path is unchanged.
+        self.assertIn('meta skuid "trustyclaw-tools" udp dport 53 accept', bootstrap)
+        self.assertIn('meta skuid "trustyclaw-tools" tcp dport 53 accept', bootstrap)
+        self.assertIn('meta skuid "trustyclaw-tools" tcp dport 443 accept', bootstrap)
+        self.assertNotIn('meta skuid "trustyclaw-admin" tcp dport 443 accept', bootstrap)
         self.assertIn("pathlib.Path('/tmp/trustyclaw_cloudflare_rules').write_text(", bootstrap)
         self.assertIn("if cloudflare_enabled else ''", bootstrap)
         self.assertIn("$(cat /tmp/trustyclaw_cloudflare_rules)", bootstrap)
@@ -1326,8 +1374,14 @@ class DeployUnitTests(unittest.TestCase):
         agent_instructions = Path("host/bootstrap/agent-home/agents_claude.md").read_text()
         codex_config = Path("host/bootstrap/agent-home/.codex/config.toml").read_text()
         claude_settings = Path("host/bootstrap/agent-home/.claude/settings.json").read_text()
-        self.assertIn("You are runnign with full permissions", agent_instructions)
+        self.assertIn("You are running with full permissions", agent_instructions)
         self.assertIn("Do not prompt the operator for local approvals", agent_instructions)
+        # The tools section tells the agent how to discover and use bundled tools.
+        self.assertIn("`trustyclaw` MCP server", agent_instructions)
+        self.assertIn("`<tool_id>_<action_id>`", agent_instructions)
+        self.assertIn("list_bundled_tools", agent_instructions)
+        self.assertIn("check_tool_approval", agent_instructions)
+        self.assertIn("approval_id", agent_instructions)
         self.assertIn("TrustyClaw network policy proxy", agent_instructions)
         self.assertIn("github_push_queued_for_approval", agent_instructions)
         self.assertIn("queued for approval as push-<id>", agent_instructions)
@@ -1352,11 +1406,25 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("plugins = false", bootstrap)
         self.assertIn("tool_search = false", bootstrap)
         self.assertIn("tool_suggest = false", bootstrap)
+        # The bundled tools MCP shim is wired into Codex through the managed
+        # /etc/codex/managed_config.toml layer, and the admin service gets the
+        # runtime directory that holds the agent-facing tools socket.
+        self.assertIn("/etc/codex/managed_config.toml", bootstrap)
+        self.assertIn("[mcp_servers.trustyclaw]", bootstrap)
+        self.assertIn('args = ["-m", "host.runtime.tools_mcp_shim"]', bootstrap)
+        self.assertIn('env = { PYTHONPATH = "/opt/trustyclaw-host" }', bootstrap)
+        # The admin-api unit's RuntimeDirectory holds the app-backend admin
+        # socket dir; the agent-facing tools socket dir is owned by the dedicated
+        # trustyclaw-tools.service.
+        self.assertIn("RuntimeDirectory=trustyclaw-admin-api\n", bootstrap)
+        self.assertIn("ExecStart=/usr/bin/python3 -m host.runtime.tools_service", bootstrap)
+        self.assertIn("RuntimeDirectory=trustyclaw-tools\n", bootstrap)
+        self.assertIn("RuntimeDirectoryMode=0755", bootstrap)
         # The bootstrap runs with umask 077: the npm-installed CLI and the
         # managed config directory must be opened up so the agent can use
         # them, and the deploy verifies the agent can actually run both CLIs.
-        self.assertIn("CODEX_CLI_VERSION=0.140.0", bootstrap)
-        self.assertIn("CLAUDE_CODE_VERSION=2.1.177", bootstrap)
+        self.assertIn("CODEX_CLI_VERSION=0.144.0", bootstrap)
+        self.assertIn("CLAUDE_CODE_VERSION=2.1.206", bootstrap)
         self.assertIn('"@openai/codex@${CODEX_CLI_VERSION}"', bootstrap)
         self.assertIn('"@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"', bootstrap)
         self.assertIn('"codex-cli ${CODEX_CLI_VERSION}"', bootstrap)
@@ -1507,13 +1575,7 @@ class DeployUnitTests(unittest.TestCase):
                 allocation=app_platform.AppAllocation(uid=48007, gid=48007, port_offset=7),
             )
 
-            with (
-                patch("host.cli.lifecycle_bootstrap.app_platform.installed_apps", return_value=[app]),
-                patch(
-                    "host.cli.lifecycle_bootstrap.app_platform.app_registry",
-                    return_value={"custom_app": app_platform.AppAllocation(uid=48007, gid=48007, port_offset=7)},
-                ),
-            ):
+            with patch("host.cli.lifecycle_bootstrap.app_platform.installed_apps", return_value=[app]):
                 bootstrap = deploy._render_bootstrap(parse_input_config(sample_config()))
 
         self.assertIn("cat > /etc/systemd/system/trustyclaw-app-custom_app.service <<'UNIT'", bootstrap)
@@ -1525,11 +1587,7 @@ class DeployUnitTests(unittest.TestCase):
 
     def test_rendered_bootstrap_pins_every_app_uid_in_reserved_range(self) -> None:
         bootstrap = deploy._render_bootstrap(parse_input_config(sample_config()))
-        expected_app_uids = {
-            "agent_chat": 48000,
-        }
         apps = app_platform.installed_apps()
-        self.assertEqual(set(expected_app_uids), {app.id for app in apps})
         seen_uids: set[int] = set()
 
         for app in apps:
@@ -1541,7 +1599,7 @@ class DeployUnitTests(unittest.TestCase):
                 self.assertIsNotNone(gid_match)
                 uid = int(uid_match.group(1))
                 gid = int(gid_match.group(1))
-                self.assertEqual(uid, expected_app_uids[app.id])
+                self.assertEqual(uid, app.allocation.uid)
                 self.assertEqual(gid, uid)
                 self.assertGreaterEqual(uid, 48000)
                 self.assertLessEqual(uid, 48099)
@@ -1566,11 +1624,11 @@ class DeployUnitTests(unittest.TestCase):
         # roles only, and an explicit reject for everyone else (the agent user
         # has no role and no pg_hba rule that admits it).
         self.assertIn("listen_addresses = ''", bootstrap)
-        # Modest server cap by choice; the services bound their own active
-        # sessions below it (db.MAX_ACTIVE_CONNECTIONS) and queue bursts
-        # client-side, so a proxied request never loses its event insert to
-        # connection exhaustion.
-        self.assertIn("max_connections = 50", bootstrap)
+        # Server cap sized above the three DB-using services' combined client
+        # caps (3 x db.MAX_ACTIVE_CONNECTIONS = 54) plus reserve/psql/app
+        # headroom, so a burst queues client-side rather than losing a proxied
+        # request's event insert to connection exhaustion.
+        self.assertIn("max_connections = 80", bootstrap)
         self.assertIn("local  trustyclaw_admin  trustyclaw-admin  peer", bootstrap)
         self.assertIn("local  all               postgres          peer", bootstrap)
         self.assertIn("local  all               all               reject", bootstrap)
@@ -1581,15 +1639,30 @@ class DeployUnitTests(unittest.TestCase):
         # the explicit grant the fail-closed proxy loses its event log and
         # fails every agent request.
         self.assertIn('GRANT CONNECT ON DATABASE trustyclaw_admin TO \\"trustyclaw-proxy\\";', bootstrap)
+        # The tools service's scoped role: bootstrap provisions the role and its
+        # database CONNECT before migrations run; the table grants live in the
+        # schema migration (0007), the same pattern as the proxy role's grants.
+        self.assertIn('GRANT CONNECT ON DATABASE trustyclaw_admin TO \\"trustyclaw-tools\\";', bootstrap)
+        self.assertNotIn('GRANT SELECT ON enabled_tools', bootstrap)
+        migration = (Path(__file__).resolve().parents[1] / "host" / "migrations" / "0007_tool_state.sql").read_text()
+        # Read-only on enablement and config (operator-written by the admin
+        # API); the REVOKE first drops broader grants from earlier iterations.
+        self.assertIn('REVOKE INSERT, UPDATE, DELETE ON enabled_tools, tool_config FROM "trustyclaw-tools";', migration)
+        self.assertIn('GRANT SELECT ON enabled_tools, tool_config TO "trustyclaw-tools";', migration)
+        # Read/write on the credentials, approvals, and events it mutates (plus
+        # their serial sequences), read on secret_keys to decrypt
+        # config/credentials -- nothing else.
+        self.assertIn(
+            'GRANT SELECT, INSERT, UPDATE, DELETE ON tool_credentials, tool_approvals, '
+            'tool_events TO "trustyclaw-tools";',
+            migration,
+        )
+        self.assertIn('GRANT USAGE ON SEQUENCE tool_approvals_number_seq, tool_events_seq_seq TO "trustyclaw-tools";', migration)
+        self.assertIn('GRANT SELECT ON secret_keys TO "trustyclaw-tools";', migration)
         # PG14 leaves the public schema creatable by PUBLIC; only the
         # schema-owning admin role may create objects.
         self.assertIn("REVOKE CREATE ON SCHEMA public FROM PUBLIC;", bootstrap)
         self.assertIn('GRANT CREATE ON SCHEMA public TO \\"trustyclaw-admin\\";', bootstrap)
-        # Pre-Postgres (0.4.x) preserved state is refused before anything is
-        # modified: this release is deliberately breaking, without in-place
-        # legacy import.
-        self.assertIn('MIN_STATE_VERSION = "0.5.0"', bootstrap)
-        self.assertIn("cannot be upgraded in place", bootstrap)
         # The database runs under its own unit and the admin API waits for it.
         self.assertIn("/etc/systemd/system/trustyclaw-postgres.service", bootstrap)
         self.assertIn("systemctl enable --now trustyclaw-postgres.service", bootstrap)
@@ -1664,6 +1737,7 @@ class DeployUnitTests(unittest.TestCase):
             "clear-agent-auth",
             "read-agent-file",
             "reboot-host",
+            "check-for-upgrade",
         ):
             script = (Path(f"host/bootstrap/helpers/{name}.sh").read_text()).replace("@PROXY_PORT@", "7445")
             with tempfile.NamedTemporaryFile("w", delete=False) as handle:
@@ -1671,6 +1745,18 @@ class DeployUnitTests(unittest.TestCase):
                 script_path = handle.name
             self.addCleanup(lambda path=script_path: Path(path).unlink(missing_ok=True))
             subprocess.run(["bash", "-n", script_path], check=True)
+
+    def test_upgrade_helper_has_one_fixed_bounded_source(self) -> None:
+        helper = Path("host/bootstrap/helpers/check-for-upgrade.sh").read_text()
+
+        self.assertIn(
+            "https://raw.githubusercontent.com/infiloop2/trustyclaw/refs/heads/main/VERSION",
+            helper,
+        )
+        self.assertIn("--proto '=https'", helper)
+        self.assertIn("--max-time 10", helper)
+        self.assertIn("--max-filesize 64", helper)
+        self.assertNotIn("$@", helper)
 
     def test_agent_file_helper_skips_entries_that_disappear_during_listing(self) -> None:
         with tempfile.TemporaryDirectory() as home:
@@ -1844,8 +1930,14 @@ class DeployUnitTests(unittest.TestCase):
         self.assertNotIn("host/bootstrap/agent-home/CLAUDE.md", names)
         self.assertIn("host/bootstrap/agent-home/.codex/config.toml", names)
         self.assertIn("host/bootstrap/agent-home/.claude/settings.json", names)
+        # The tools service imports the bundled tool packages at startup; they
+        # ship under host/tools inside the host archive.
+        self.assertIn("host/tools/host_api.py", names)
+        self.assertIn("host/tools/gmail/__init__.py", names)
+        self.assertIn("host/tools/shared/google.py", names)
         self.assertNotIn("host/cli", names)
         self.assertFalse(any(name.startswith("host/cli/") for name in names))
+        self.assertFalse(any("__pycache__" in name for name in names))
 
 
 class FakeCliIntegrationTests(unittest.TestCase):

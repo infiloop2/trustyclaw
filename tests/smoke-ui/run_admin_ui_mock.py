@@ -31,21 +31,29 @@ sys.path.insert(0, str(REPO_ROOT))
 import app_mocks
 from host.config import ConfigError, parse_network_controls
 from host.constants import LOOPBACK
+from host.session_options import session_config_error
 from host.runtime import app_platform
+from host.runtime.tools_host import BUNDLED_TOOLS
 
 RUNTIME_DIR = REPO_ROOT / "host/runtime"
+TOOLS_DIR = REPO_ROOT / "host/tools"
 VERSION = (REPO_ROOT / "VERSION").read_text().strip()
 UI_ASSETS = {
-    "/": ("admin_ui.html", "text/html; charset=utf-8"),
-    "/admin_ui.css": ("admin_ui.css", "text/css; charset=utf-8"),
-    "/favicon.ico": ("admin_favicon.svg", "image/svg+xml"),
-    "/favicon.svg": ("admin_favicon.svg", "image/svg+xml"),
+    "/": (RUNTIME_DIR / "admin_ui.html", "text/html; charset=utf-8"),
+    "/oauth/callback": (RUNTIME_DIR / "admin_ui.html", "text/html; charset=utf-8"),
+    "/admin_ui.css": (RUNTIME_DIR / "admin_ui.css", "text/css; charset=utf-8"),
+    "/favicon.ico": (RUNTIME_DIR / "admin_favicon.svg", "image/svg+xml"),
+    "/favicon.svg": (RUNTIME_DIR / "admin_favicon.svg", "image/svg+xml"),
 }
 UI_ASSETS.update({
-    f"/admin_ui/{module.name}": (f"admin_ui/{module.name}", "application/javascript; charset=utf-8")
+    f"/admin_ui/{module.name}": (module, "application/javascript; charset=utf-8")
     for module in sorted((RUNTIME_DIR / "admin_ui").glob("*.js"))
 })
-UI_ASSET_VERSION_PLACEHOLDER = "__TRUSTYCLAW_ASSET_VERSION__"
+for asset in sorted(TOOLS_DIR.glob("**/guide_assets/**/*.png")):
+    route = f"/guide-assets/{asset.name}"
+    if route in UI_ASSETS:
+        raise RuntimeError(f"duplicate tool guide asset filename: {asset.name}")
+    UI_ASSETS[route] = (asset, "image/png")
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; "
@@ -66,6 +74,13 @@ SECURITY_HEADERS = {
 PASSWORD = "dev"
 TASK_RE = re.compile(r"^/v1/tasks/([^/]+)(?:/(steer|cancel|kill|events))?$")
 THREAD_TASKS_RE = re.compile(r"^/v1/threads/([^/]+)/tasks$")
+TOOL_ACTION_RE = re.compile(r"^/v1/tools/([a-z0-9_]+)/(enable|disable|oauth_connect/start|oauth_connect/complete|oauth_connect/disconnect)$")
+GITHUB_PENDING_PUSH_RE = re.compile(r"^/v1/network-tools/github-pending-pushes/([a-z0-9]+)/(approve|reject)$")
+TOOL_APPROVALS_LIST_RE = re.compile(r"^/v1/tools/([a-z0-9_]+)/approvals$")
+TOOL_APPROVAL_RE = re.compile(r"^/v1/tools/([a-z0-9_]+)/approvals/([^/]+)/(approve|deny)$")
+TOOL_APPROVAL_GET_RE = re.compile(r"^/v1/tools/([a-z0-9_]+)/approvals/([^/]+)$")
+TOOL_CONFIG_RE = re.compile(r"^/v1/tools/([a-z0-9_]+)/config$")
+MOCK_OAUTH_CODE = "mock-auth-code"
 RUNTIMES = ("codex", "claude_code")
 PROVIDER_BY_RUNTIME = {"codex": "openai", "claude_code": "claude"}
 MAX_RUNNING_PER_RUNTIME = 3
@@ -97,6 +112,7 @@ class MockState:
     next_task_number: int = 1
     next_agent_event_seq: int = 1
     next_network_event_seq: int = 1
+    next_tool_event_seq: int = 1
     agent_events: list[dict[str, Any]] = field(default_factory=list)
     tasks: list[dict[str, Any]] = field(default_factory=list)
     task_events: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
@@ -112,6 +128,36 @@ class MockState:
     codex_oauth: dict[str, str] = field(default_factory=dict)
     claude_oauth: dict[str, str] = field(default_factory=dict)
     reboot_requested: bool = False
+    upgrade_available: bool = True
+    github_pending_pushes: list[dict[str, Any]] = field(default_factory=list)
+    tool_enabled: set[str] = field(default_factory=set)
+    # Config is scoped per tool: tool_id -> set of configured keys.
+    tool_config: dict[str, set[str]] = field(default_factory=dict)
+    tool_connections: dict[str, dict[str, Any]] = field(default_factory=dict)
+    tool_approvals: list[dict[str, Any]] = field(default_factory=list)
+    tool_events: list[dict[str, Any]] = field(default_factory=list)
+    next_approval_number: int = 1
+
+    def add_tool_approval(
+        self, tool_id: str, action: str, summary: str, payload: dict[str, Any], status: str = "pending",
+        created_at: int | None = None, result: str = "",
+    ) -> dict[str, Any]:
+        approval = {
+            "approval_id": f"approval_{self.next_approval_number}",
+            "tool_id": tool_id,
+            "action_id": action,
+            "status": status,
+            "summary": summary,
+            "payload": payload,
+            # Terminal outcome text (the executed action's message or the
+            # failure error); empty until executed/failed, like the real API.
+            "result": result,
+            "created_at": created_at if created_at is not None else int(time.time()),
+            "decided_at": 0 if status == "pending" else int(time.time()),
+        }
+        self.next_approval_number += 1
+        self.tool_approvals.append(approval)
+        return approval
 
     def now(self) -> str:
         return iso(datetime.now(timezone.utc))
@@ -148,6 +194,19 @@ class MockState:
             event["reason"] = "host is not in the allowed network policy"
         self.network_events.append(event)
         self.next_network_event_seq += 1
+
+    def add_tool_event(
+        self, tool_id: str, action: str, outcome: str, detail: str = "", timestamp: str | None = None
+    ) -> None:
+        self.tool_events.append({
+            "seq": self.next_tool_event_seq,
+            "timestamp": timestamp or self.now(),
+            "tool_id": tool_id,
+            "action_id": action,
+            "outcome": outcome,
+            "detail": detail,
+        })
+        self.next_tool_event_seq += 1
 
     def public_task(self, task: dict[str, Any], queue_position: int | None = None) -> dict[str, Any]:
         result = {key: value for key, value in task.items() if not key.startswith("_")}
@@ -274,6 +333,8 @@ def seed_state() -> None:
             "task_id": spec["task_id"],
             "status": spec["status"],
             "agent_runtime": spec["agent_runtime"],
+            "model": "opus" if spec["agent_runtime"] == "claude_code" else "gpt-5.6-terra",
+            "effort": "high",
             "thread_id": spec["thread_id"],
             "input_message": spec["input_message"],
             "created_at": ago(spec["created_min"]),
@@ -336,6 +397,69 @@ def seed_state() -> None:
     ]:
         STATE.add_network_event(method, host, path, decision, ago(minutes))
 
+    # Tools: the Google tools are configured, enabled, and connected; Brave
+    # Search is still unconfigured. One calendar change already executed and
+    # one Gmail send is waiting for the operator's decision.
+    for tool_id in ("gmail", "google_calendar"):
+        STATE.tool_config[tool_id] = {"GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"}
+    STATE.tool_enabled.update({"gmail", "google_calendar"})
+    for tool_id in ("gmail", "google_calendar"):
+        STATE.tool_connections[tool_id] = {
+            "connected": True,
+            "account": {"id": "mock-google-sub", "label": "akshay@infiloop.io", "scopes": ["email"]},
+        }
+    STATE.add_tool_approval(
+        "google_calendar",
+        "event_change",
+        'Create Google Calendar event "Team retro".',
+        {
+            "action": "event_change",
+            "calendar_account": {"email": "akshay@infiloop.io", "sub": "mock-google-sub"},
+            "proposal": {"operation": "create", "summary": "Team retro"},
+            "tool_id": "google_calendar",
+        },
+        status="executed",
+        created_at=int(time.time()) - 3600,
+        result='Created Google Calendar event "Team retro".',
+    )
+    STATE.add_tool_approval(
+        "gmail",
+        "send_email",
+        'Send Gmail message to billing@acme.dev with subject "Invoice follow-up".',
+        {
+            "action": "send_email",
+            "action_type": "gmail_propose_send",
+            "gmail_account": {"email": "akshay@infiloop.io", "sub": "mock-google-sub"},
+            "proposal": {
+                "draft": {
+                    "to": "billing@acme.dev",
+                    "subject": "Invoice follow-up",
+                    "body": "Following up on invoice #1042 from last week.",
+                },
+            },
+            "tool_id": "gmail",
+        },
+    )
+    STATE.add_tool_approval(
+        "google_calendar",
+        "event_change",
+        'Delete Google Calendar event "Quarterly planning" (starts 2026-07-10T09:00) [id evt_planning; 4 guests].',
+        {
+            "action": "event_change",
+            "calendar_account": {"email": "akshay@infiloop.io", "sub": "mock-google-sub"},
+            "proposal": {"operation": "delete", "event_id": "evt_planning"},
+            "tool_id": "google_calendar",
+        },
+    )
+    # Tool audit log: a read, the executed approval, and a connect.
+    for tool_id, action, outcome, detail, minutes in [
+        ("google_calendar", "oauth_connect", "connected", "akshay@infiloop.io", 120),
+        ("gmail", "search_messages", "executed", "", 90),
+        ("google_calendar", "event_change", "executed", "approval_1", 60),
+        ("brave_search", "web_search", "failed", "Brave Search API rejected the configured API key.", 20),
+    ]:
+        STATE.add_tool_event(tool_id, action, outcome, detail, ago(minutes))
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "TrustyClawMock/0.2"
@@ -359,12 +483,20 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             if method == "GET" and parsed.path in UI_ASSETS:
-                filename, content_type = UI_ASSETS[parsed.path]
-                if parsed.path == "/":
-                    html = (RUNTIME_DIR / filename).read_text()
-                    data = html.replace(UI_ASSET_VERSION_PLACEHOLDER, VERSION).encode()
-                else:
-                    data = (RUNTIME_DIR / filename).read_bytes()
+                asset, content_type = UI_ASSETS[parsed.path]
+                data = asset.read_bytes()
+                if parsed.path == "/admin_ui/health.js":
+                    data += b"""
+
+// Mock-only affordance: click the passive production indicator to preview
+// both version states without adding a test hook to production code.
+const mockUpgradeNotice = $("upgrade-notice");
+mockUpgradeNotice.style.cursor = "pointer";
+mockUpgradeNotice.addEventListener("click", async () => {
+  await api("POST", "/v1/mock/upgrade-toggle", {});
+  await refreshHealth();
+});
+"""
                 self._send(HTTPStatus.OK, data, content_type)
                 return
             if method == "GET":
@@ -441,6 +573,10 @@ class Handler(BaseHTTPRequestHandler):
 def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> dict[str, Any]:
     if method == "GET" and path == "/v1/health":
         return health()
+    if method == "POST" and path == "/v1/mock/upgrade-toggle":
+        with STATE.lock:
+            STATE.upgrade_available = not STATE.upgrade_available
+            return {"available": STATE.upgrade_available}
     if method == "GET" and path == "/v1/agent-runtime/status":
         return agent_runtime_status()
     if method == "GET" and path == "/v1/agent-runtime/account":
@@ -476,6 +612,9 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> dic
     if method == "GET" and path == "/v1/events":
         before, limit = event_page_query(query, {"before", "limit"}, "event")
         return {"events": agent_events_before(before, limit)}
+    if method == "GET" and path == "/v1/tools/events":
+        before, limit = event_page_query(query, {"before", "limit"}, "tool event")
+        return {"events": tool_events_before(before, limit)}
     if path == "/v1/network/policy":
         if method == "GET":
             return {"network_controls": STATE.policy}
@@ -484,7 +623,11 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> dic
     if path == "/v1/network-tools/github-credential":
         return github_credential_route(method, body)
     if method == "GET" and path == "/v1/network-tools/github-pending-pushes":
-        return {"pending_pushes": []}
+        with STATE.lock:
+            return {"pending_pushes": [dict(push) for push in STATE.github_pending_pushes]}
+    pending_push_match = GITHUB_PENDING_PUSH_RE.fullmatch(path)
+    if method == "POST" and pending_push_match:
+        return decide_github_pending_push(pending_push_match.group(1), pending_push_match.group(2))
     if method == "POST" and path == "/v1/network-tools/github-audit":
         return github_credential_route("GET", None)
     if method == "GET" and path == "/v1/network/events":
@@ -497,10 +640,166 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> dic
         return read_agent_file(one(query, "path") or "/")
     if method == "GET" and path == "/v1/agent-processes":
         return agent_processes()
+    if method == "GET" and path == "/v1/tools":
+        return list_tools()
+    tool_config_match = TOOL_CONFIG_RE.fullmatch(path)
+    if method == "PUT" and tool_config_match:
+        return put_tool_config(tool_config_match.group(1), body)
+    approvals_list = TOOL_APPROVALS_LIST_RE.fullmatch(path)
+    if method == "GET" and approvals_list:
+        # Summary-only (payloads fetched on demand), scoped to one tool, mirroring the real API.
+        tool_id = approvals_list.group(1)
+        return {"approvals": [
+            {k: v for k, v in a.items() if k != "payload"}
+            for a in reversed(STATE.tool_approvals) if a["tool_id"] == tool_id
+        ]}
+    approval_get = TOOL_APPROVAL_GET_RE.fullmatch(path)
+    if method == "GET" and approval_get:
+        for approval in STATE.tool_approvals:
+            if approval["approval_id"] == approval_get.group(2) and approval["tool_id"] == approval_get.group(1):
+                return {"approval": approval}
+        raise ApiError(HTTPStatus.NOT_FOUND, "unknown approval")
+    approval_match = TOOL_APPROVAL_RE.fullmatch(path)
+    if method == "POST" and approval_match:
+        return decide_tool_approval(approval_match.group(2), approval_match.group(3))
+    tool_match = TOOL_ACTION_RE.fullmatch(path)
+    if method == "POST" and tool_match:
+        return tool_action(tool_match.group(1), tool_match.group(2), body)
     if method == "POST" and path == "/v1/host-runtime/reboot":
         STATE.reboot_requested = True
         return {"status": "accepted"}
     raise ApiError(HTTPStatus.NOT_FOUND, "route not found")
+
+
+def list_tools() -> dict[str, Any]:
+    entries = []
+    with STATE.lock:
+        for tool_id, tool in BUNDLED_TOOLS.items():
+            manifest = tool.manifest
+            entry: dict[str, Any] = {
+                "tool_id": tool_id,
+                "display_name": manifest.display_name,
+                "description": manifest.description,
+                "connection": manifest.connection,
+                "enabled": tool_id in STATE.tool_enabled,
+                "actions": [
+                    {
+                        "id": spec.id,
+                        "description": spec.description,
+                        "data_policy": spec.data_policy,
+                        "approval": spec.approval,
+                        "input_schema": spec.input_schema,
+                        "output_schema": spec.output_schema,
+                    }
+                    for spec in manifest.actions
+                ],
+                "config": [
+                    {
+                        "key": requirement.key,
+                        "description": requirement.description,
+                        "set": requirement.key in STATE.tool_config.get(tool_id, set()),
+                    }
+                    for requirement in manifest.config
+                ],
+                "protections": list(manifest.protections),
+                "setup_steps": [
+                    {
+                        "title": step.title,
+                        "description": step.description,
+                        "link_url": step.link_url,
+                        "link_label": step.link_label,
+                        "image_path": step.image_path,
+                        "image_alt": step.image_alt,
+                        "show_callback": step.show_callback,
+                        "show_config": step.show_config,
+                    }
+                    for step in manifest.setup_steps
+                ],
+                "data_summary": {
+                    "cards": [
+                        {
+                            "title": card.title,
+                            "description": card.description,
+                            "points": [{"label": point.label, "text": point.text} for point in card.points],
+                            "links": [{"label": link.label, "url": link.url} for link in card.links],
+                        }
+                        for card in manifest.data_summary.cards
+                    ],
+                },
+            }
+            if manifest.connection == "oauth":
+                entry["connection_status"] = STATE.tool_connections.get(tool_id) or {"connected": False}
+            entries.append(entry)
+    return {"tools": entries}
+
+
+def put_tool_config(tool_id: str, body: Any) -> dict[str, Any]:
+    tool = BUNDLED_TOOLS.get(tool_id)
+    if tool is None:
+        raise ApiError(HTTPStatus.NOT_FOUND, f"unknown tool: {tool_id}")
+    key = body.get("key") if isinstance(body, dict) else None
+    value = body.get("value", "") if isinstance(body, dict) else ""
+    declared = {req.key for req in tool.manifest.config}
+    if not isinstance(key, str) or key not in declared:
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"key must be a config key declared by {tool_id}")
+    with STATE.lock:
+        keys = STATE.tool_config.setdefault(tool_id, set())
+        if isinstance(value, str) and value.strip():
+            keys.add(key)
+        else:
+            keys.discard(key)
+        return {"tool_id": tool_id, "key": key, "set": key in keys}
+
+
+def tool_action(tool_id: str, operation: str, body: Any) -> dict[str, Any]:
+    tool = BUNDLED_TOOLS.get(tool_id)
+    if tool is None:
+        raise ApiError(HTTPStatus.NOT_FOUND, f"unknown tool: {tool_id}")
+    manifest = tool.manifest
+    with STATE.lock:
+        if operation == "enable":
+            # Enablement is not gated on config, matching the real API.
+            STATE.tool_enabled.add(tool_id)
+            return {"tool_id": tool_id, "enabled": True}
+        if operation == "disable":
+            STATE.tool_enabled.discard(tool_id)
+            return {"tool_id": tool_id, "enabled": False}
+        if manifest.connection != "oauth":
+            raise ApiError(HTTPStatus.CONFLICT, f"{tool_id} has no connect flow")
+        if tool_id not in STATE.tool_enabled:
+            raise ApiError(HTTPStatus.CONFLICT, f"{tool_id} is not enabled")
+        if operation == "oauth_connect/start":
+            return {
+                "authorization_url": f"/oauth/callback?code={MOCK_OAUTH_CODE}&state=mock-state",
+                "state": "mock-state",
+            }
+        if operation == "oauth_connect/complete":
+            code = body.get("code") if isinstance(body, dict) else None
+            if code != MOCK_OAUTH_CODE:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "invalid authorization code")
+            account = {"id": "mock-google-sub", "label": "operator@example.com", "scopes": ["email"]}
+            STATE.tool_connections[tool_id] = {"connected": True, "account": account}
+            return {"account": account}
+        STATE.tool_connections.pop(tool_id, None)
+        return {"tool_id": tool_id, "connected": False}
+
+
+def decide_tool_approval(approval_id: str, decision: str) -> dict[str, Any]:
+    with STATE.lock:
+        approval = next((entry for entry in STATE.tool_approvals if entry["approval_id"] == approval_id), None)
+        if approval is None or approval["status"] != "pending":
+            raise ApiError(HTTPStatus.CONFLICT, f"Approval {approval_id} is not pending.")
+        approval["decided_at"] = int(time.time())
+        if decision == "deny":
+            approval["status"] = "denied"
+            STATE.add_tool_event(approval["tool_id"], approval["action_id"], "denied", approval_id)
+            return {"approval": approval}
+        approval["status"] = "executed"
+        message = f"{approval['tool_id']} action completed after approval."
+        approval["result"] = message
+        result = {"status": "executed", "message": message}
+        STATE.add_tool_event(approval["tool_id"], approval["action_id"], "executed", approval_id)
+    return {"approval": approval, "result": result}
 
 
 def health() -> dict[str, Any]:
@@ -509,6 +808,7 @@ def health() -> dict[str, Any]:
         start_queued_tasks_locked()
         runtime = agent_runtime_status_locked()
         running = sum(1 for task in STATE.tasks if task["status"] == "running")
+        upgrade_available = STATE.upgrade_available
     # Gentle drift so the dashboard feels alive; busier while tasks run.
     wave = math.sin(time.time() / 47.0)
     cpu = round(6.5 + 3.5 * wave + 24.0 * min(running, 2), 1)
@@ -518,14 +818,16 @@ def health() -> dict[str, Any]:
         "status": "ok",
         "agent_name": "trustyclaw-mock",
         "version": {"status": "ok", "runtime": VERSION, "state": VERSION},
+        "upgrade": {
+            "available": upgrade_available,
+            "latest": "99.0.0" if upgrade_available else VERSION,
+        },
         "agent_runtime": runtime,
         "network_controls": {"status": "active"},
         "host_runtime": {
             "cpu": {"usage_percent": cpu},
             "memory": {"used_bytes": memory_used, "total_bytes": 2 * gib},
             "filesystem": {
-                "used_bytes": int(11.2 * gib),
-                "total_bytes": 30 * gib,
                 "mounts": {
                     "root": {"used_bytes": int(11.2 * gib), "total_bytes": 30 * gib},
                     "admin": {"used_bytes": int(0.4 * gib), "total_bytes": 8 * gib},
@@ -571,18 +873,22 @@ def agent_accounts() -> dict[str, Any]:
                             "account_id": "acct_mock_openai",
                             "email": "akshay@infiloop.io",
                             "plan_type": "pro",
+                            # Deliberately mixed so the top bar shows every
+                            # ring state at once: a healthy 5h window resetting
+                            # in minutes, and a near-full weekly window (warning
+                            # threshold) resetting days out.
                             "codex_usage": {
                                 "last_checked_at": checked_at,
                                 "rate_limits": {
                                     "primary": {
-                                        "used_percent": 60,
+                                        "used_percent": 8,
                                         "window_duration_mins": 300,
-                                        "resets_at": 1782788896,
+                                        "resets_at": int(time.time()) + 40 * 60,
                                     },
                                     "secondary": {
-                                        "used_percent": 20,
+                                        "used_percent": 84,
                                         "window_duration_mins": 10080,
-                                        "resets_at": 1783296254,
+                                        "resets_at": int(time.time()) + 6 * 24 * 60 * 60,
                                     },
                                     "credits": {"has_credits": False, "unlimited": False, "balance": "0"},
                                 },
@@ -601,10 +907,17 @@ def agent_accounts() -> dict[str, Any]:
                             "account_id": "acct_mock_claude",
                             "email": "claude@example.invalid",
                             "plan_type": "max",
+                            # Mixed on purpose: a critical (red) 5h session
+                            # resetting in hours, a healthy (green) weekly, and
+                            # a warning (amber) Fable weekly window, so all
+                            # three ring thresholds appear side by side.
                             "claude_usage": {
-                                "current_session_used_percent": 14,
-                                "weekly_used_percent": 31,
-                                "weekly_resets_at_text": "Jul 7, 3:59pm (UTC)",
+                                "current_session_used_percent": 97,
+                                "current_session_resets_at": int(time.time()) + 90 * 60,
+                                "weekly_used_percent": 46,
+                                "weekly_resets_at": int(time.time()) + 5 * 24 * 60 * 60,
+                                "fable_weekly_used_percent": 88,
+                                "fable_weekly_resets_at": int(time.time()) + 5 * 24 * 60 * 60,
                                 "last_checked_at": checked_at,
                             },
                         }
@@ -710,13 +1023,38 @@ def create_task(body: Any) -> dict[str, Any]:
         raise ApiError(HTTPStatus.BAD_REQUEST, "request body must be an object")
     input_message = str(body.get("input_message", "")).strip()
     thread_id = str(body.get("thread_id", "")).strip()
-    agent_runtime = str(body.get("agent_runtime", "codex"))
-    if not input_message or not thread_id or agent_runtime not in {"codex", "claude_code"}:
+    if not input_message or not thread_id:
         raise ApiError(HTTPStatus.BAD_REQUEST, "invalid task")
     with STATE.lock:
+        stored: tuple[str, str, str] | None = None
         for existing in STATE.tasks:
-            if existing["thread_id"] == thread_id and existing["agent_runtime"] != agent_runtime:
-                raise ApiError(HTTPStatus.CONFLICT, "thread already belongs to another agent runtime")
+            if existing["thread_id"] != thread_id:
+                continue
+            config = (existing["agent_runtime"], existing["model"], existing["effort"])
+            if stored is not None and stored != config:
+                raise ApiError(HTTPStatus.CONFLICT, "thread has inconsistent session configuration")
+            stored = config
+
+        fields = ("agent_runtime", "model", "effort")
+        supplied = [field for field in fields if field in body]
+        if stored is not None:
+            if supplied:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "session configuration must be omitted for existing thread")
+            agent_runtime, model, effort = stored
+        else:
+            if not supplied:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "session configuration required for new thread")
+            if len(supplied) != len(fields):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "session configuration must be provided together")
+            agent_runtime = str(body["agent_runtime"])
+            model = body["model"]
+            effort = body["effort"]
+            if (
+                agent_runtime not in {"codex", "claude_code"}
+                or session_config_error(agent_runtime, model, effort) is not None
+            ):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "invalid task")
+            assert isinstance(model, str) and isinstance(effort, str)
         task_id = f"task_{STATE.next_task_number}"
         STATE.next_task_number += 1
         now = STATE.now()
@@ -724,6 +1062,8 @@ def create_task(body: Any) -> dict[str, Any]:
             "task_id": task_id,
             "status": "queued",
             "agent_runtime": agent_runtime,
+            "model": model,
+            "effort": effort,
             "thread_id": thread_id,
             "input_message": input_message,
             "created_at": now,
@@ -806,6 +1146,8 @@ def list_threads() -> dict[str, Any]:
                 {
                     "thread_id": task["thread_id"],
                     "agent_runtime": task["agent_runtime"],
+                    "model": task["model"],
+                    "effort": task["effort"],
                     "last_used_at": task["updated_at"],
                     "task_count": 0,
                     "active_tasks": [],
@@ -865,6 +1207,14 @@ def network_events_before(before: int | None, decision: str, limit: int) -> list
         return events[:limit]
 
 
+def tool_events_before(before: int | None, limit: int) -> list[dict[str, Any]]:
+    with STATE.lock:
+        events = list(reversed(STATE.tool_events))
+        if before is not None:
+            events = [event for event in events if event["seq"] < before]
+        return events[:limit]
+
+
 def agent_processes() -> dict[str, Any]:
     with STATE.lock:
         progress_running_tasks_locked()
@@ -872,90 +1222,50 @@ def agent_processes() -> dict[str, Any]:
 
         def add_process(
             pid: int,
-            ppid: int,
             name: str,
             cmdline: str,
             rss_mib: int,
             elapsed_seconds: int,
-            scope: str,
             state: str = "S",
         ) -> None:
             processes.append(
                 {
                     "pid": pid,
-                    "ppid": ppid,
-                    "user": "trustyclaw-agent",
                     "state": state,
                     "name": name,
                     "cmdline": cmdline,
                     "rss_bytes": rss_mib * 1024 * 1024,
                     "elapsed_seconds": elapsed_seconds,
-                    "scope": scope,
                 }
             )
 
         if STATE.codex_oauth and not STATE.logged_in.get("codex"):
-            add_process(
-                4300,
-                1,
-                "codex",
-                "codex login --device-code",
-                64,
-                22,
-                "run-mock-codex-login.scope",
-            )
+            add_process(4300, "codex", "codex login --device-code", 64, 22)
         if STATE.claude_oauth:
-            add_process(
-                4400,
-                1,
-                "claude",
-                "claude auth login --claudeai",
-                71,
-                18,
-                "run-mock-claude-login.scope",
-            )
+            add_process(4400, "claude", "claude auth login --claudeai", 71, 18)
         if STATE.logged_in.get("codex"):
-            add_process(
-                4310,
-                1,
-                "codex",
-                "codex app-server --listen stdio://",
-                88,
-                184,
-                "run-mock-codex-app-server.scope",
-            )
+            add_process(4310, "codex", "codex app-server --listen stdio://", 88, 184)
         if STATE.logged_in.get("claude_code"):
-            add_process(
-                4410,
-                1,
-                "claude",
-                "claude -p /usage --output-format json",
-                96,
-                9,
-                "run-mock-claude-usage.scope",
-            )
+            add_process(4410, "claude", "claude -p /usage --output-format json", 96, 9)
 
         running = [task for task in STATE.tasks if task["status"] == "running"]
         for index, task in enumerate(running, start=1):
             runtime = task["agent_runtime"]
-            scope = f"run-mock-{task['task_id']}.scope"
             base_pid = 4500 + (index * 10)
             if runtime == "codex":
-                add_process(base_pid, 4310, "codex", "codex exec --json", 142, 31, scope)
+                add_process(base_pid, "codex", "codex exec --json", 142, 31)
                 add_process(
                     base_pid + 1,
-                    base_pid,
                     "python3",
                     "python3 -m pytest tests/test_admin_api.py -q",
                     118,
                     24,
-                    scope,
                     state="R",
                 )
-                add_process(base_pid + 2, base_pid, "rg", "rg -n TODO host tests", 11, 4, scope)
+                add_process(base_pid + 2, "rg", "rg -n TODO host tests", 11, 4)
             else:
-                add_process(base_pid, 1, "claude", "claude --print --output-format stream-json", 176, 28, scope)
-                add_process(base_pid + 1, base_pid, "bash", "bash -lc npm test -- --runInBand", 9, 20, scope)
+                add_process(base_pid, "claude", "claude --print --output-format stream-json", 176, 28)
+                add_process(base_pid + 1, "bash", "bash -lc npm test -- --runInBand", 9, 20)
         return {"processes": processes, "truncated": False}
 
 
@@ -1263,6 +1573,9 @@ def replace_policy(body: Any) -> dict[str, Any]:
         raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
     with STATE.lock:
         previous_statuses = {runtime: STATE.runtime_status(runtime) for runtime in RUNTIMES}
+        previous_github = github_integration_locked()
+        previously_required = previous_github.get("require_dot_github_approval") is True
+        previous_repositories = previous_github.get("write_repositories") or []
         STATE.policy = parsed
         STATE.codex_oauth = {}
         STATE.claude_oauth = {}
@@ -1274,8 +1587,59 @@ def replace_policy(body: Any) -> dict[str, Any]:
                 fail_running_tasks_locked(runtime, "agent runtime deactivated because its managed network provider is disabled")
             elif previous == "deactivated" and status != "deactivated":
                 STATE.add_agent_event("agent_runtime.awaiting_login", None, {"agent_runtime": runtime})
+        if not previously_required or not previous_repositories:
+            maybe_hold_github_push_locked()
         start_queued_tasks_locked()
         return {"network_controls": STATE.policy}
+
+
+def github_integration_locked() -> dict[str, Any]:
+    managed = STATE.policy.get("managed_network_integrations")
+    github = managed.get("github") if isinstance(managed, dict) else None
+    return github if isinstance(github, dict) else {}
+
+
+def maybe_hold_github_push_locked() -> None:
+    """Simulate the .github approval gate catching a push the moment the gate
+    turns on: like the seeded tasks, this gives the UI a realistic held push to
+    decide on without a real agent pushing."""
+    github = github_integration_locked()
+    if github.get("require_dot_github_approval") is not True:
+        return
+    repositories = github.get("write_repositories") or []
+    if not repositories or any(push["status"] == "pending" for push in STATE.github_pending_pushes):
+        return
+    repository = repositories[0]
+    STATE.github_pending_pushes.append({
+        "id": f"{len(STATE.github_pending_pushes) + 1:04x}",
+        "owner": repository.get("owner"),
+        "repo": repository.get("repo"),
+        "status": "pending",
+        "requested_at": int(time.time()) - 40,
+        "ref_updates": [{
+            "ref": "refs/heads/agent/harden-ci",
+            "old_oid": "9c1f7e2ab3d44a5f8e6b7c8d9e0f1a2b3c4d5e6f",
+            "new_oid": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        }],
+        "changed_paths": [".github/workflows/deploy.yml", ".github/CODEOWNERS"],
+    })
+
+
+def decide_github_pending_push(push_id: str, decision: str) -> dict[str, Any]:
+    with STATE.lock:
+        push = next((row for row in STATE.github_pending_pushes if row["id"] == push_id), None)
+        if push is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, f"unknown pending push: {push_id}")
+        if push["status"] != "pending":
+            raise ApiError(HTTPStatus.CONFLICT, f"push-{push_id} is already {push['status']}")
+        if decision == "approve":
+            push["status"] = "approved"
+            STATE.add_network_event(
+                "POST", "github.com", f"/{push['owner']}/{push['repo']}.git/git-receive-pack", "allowed"
+            )
+        else:
+            push["status"] = "rejected"
+        return {"pending_push": dict(push)}
 
 
 def fail_running_tasks_locked(runtime: str, error_message: str) -> None:

@@ -4,29 +4,35 @@
 | --- | --- | --- |
 | `trustyclaw-network-proxy.service` | `trustyclaw-proxy` | Policy proxy on `127.0.0.1:7445`. |
 | `trustyclaw-postgres.service` | `postgres` | Admin-state PostgreSQL, Unix socket only (no TCP listener). |
-| `trustyclaw-admin-api.service` | `trustyclaw-admin` | Admin API on `127.0.0.1:7443`. |
+| `trustyclaw-admin-api.service` | `trustyclaw-admin` | Admin API on `127.0.0.1:7443`. Owns admin state; holds no internet egress. |
+| `trustyclaw-tools.service` | `trustyclaw-tools` | Runs the bundled tool packages and owns the agent-facing tools socket `/run/trustyclaw-tools/tools.sock` (peer-credential authenticated). The only TrustyClaw application service besides the proxy with DNS+HTTPS egress; its Postgres role is scoped to the five tool tables plus read access to the encryption key needed for tool secrets. |
 | `trustyclaw-app-<app_id>.service` | `trustyclaw-app-<app_id>` | Installed app backend on its host-assigned loopback app port, reachable only from the admin API service uid. |
 | `trustyclaw-cloudflared.service` | `cloudflared` | Optional Cloudflare Tunnel connector for Cloudflare Access operator endpoints. Installed only when `operator_connections` contains `cloudflare_access`. |
 | `trustyclaw_agent.slice` | — | Top-level cgroup slice holding every agent runtime scope (underscore, not dash: dashes in slice names encode nesting, and the weight must compare against `system.slice` directly). `CPUWeight=50` guarantees the host services CPU time under contention while leaving idle cores to the agent; `MemoryHigh=70%`/`MemoryMax=80%`/`MemorySwapMax=5G` contain a runaway agent's RAM and swap to its own cgroup; `TasksMax=4096` stops a fork bomb from exhausting kernel PIDs. |
+| `trustyclaw_app.slice` | — | Top-level cgroup slice holding installed app services. `CPUWeight=50` gives host services priority under contention while allowing apps to use idle CPU; the current app slice does not impose memory, swap, or task-count caps. |
 
 ## Process Inventory
 
 | Process | User | Started By | Purpose |
 | --- | --- | --- | --- |
-| `systemd` | root | OS boot | Starts nftables, Postgres, admin API, proxy, and optional Cloudflare Tunnel services. |
+| `systemd` | root | OS boot | Starts nftables, Postgres, proxy, tools, admin API, installed app, and optional Cloudflare Tunnel services. |
 | `nftables` | kernel/root configured | bootstrap/systemd | Enforces inbound and per-user outbound network policy. |
 | `trustyclaw-network-proxy.service` | `trustyclaw-proxy` | systemd | Handles all agent HTTP(S)/WS(S) egress and writes network events. |
 | `trustyclaw-postgres.service` | `postgres` | systemd | Stores admin state; local Unix-socket connections only. |
 | `trustyclaw-admin-api.service` | `trustyclaw-admin` | systemd | Serves localhost API/UI, owns task state, and supervises runtime work. |
+| `trustyclaw-tools.service` | `trustyclaw-tools` | systemd | Executes bundled tool calls and operator-delegated OAuth/approval work; owns the peer-authenticated tools socket. |
 | `trustyclaw-app-<app_id>.service` | `trustyclaw-app-<app_id>` | systemd | Serves an installed app API on a loopback app port selected by the host. The admin API is the only uid allowed to open new TCP connections to that listener. |
 | `trustyclaw-cloudflared.service` | `cloudflared` | systemd | Optional Cloudflare Tunnel connector. Reads `/etc/trustyclaw/cloudflared.token` and exposes the admin API through the configured Cloudflare Access hostname. |
 | `run-codex-app-server` helper | starts as root, then `trustyclaw-agent` | admin API via sudo | Starts one Codex stdio app-server process. |
-| `codex app-server` | `trustyclaw-agent` | launch helper | Executes Codex turns for one active/warm thread. |
+| `codex app-server` | `trustyclaw-agent` | launch helper | Executes one Codex turn, resuming its provider thread by id, then exits. |
 | `run-claude-code` helper | starts as root, then `trustyclaw-agent` | admin API via sudo | Starts one Claude Code CLI process. |
 | `claude` | `trustyclaw-agent` | launch helper | Executes one Claude Code turn, then exits. |
+| `tools MCP shim` | `trustyclaw-agent` | Codex / Claude Code | Bridges the harness's MCP client to the tools service's socket; one per agent session that uses tools. |
 | `read-codex-account-id` / `read-claude-account` | starts as root, then `trustyclaw-agent` | admin API via sudo | Reads provider auth files narrowly and prints only account guard metadata. |
 | `clear-agent-auth` | starts as root, then `trustyclaw-agent` | admin API via sudo | Removes local Codex/Claude auth files during linked-account reset. |
-| `mint-github-app-token` helper | root | admin API via sudo | Mints installation-wide GitHub App tokens (root is the only egress path besides the proxy); the proxy repo guard is the per-repository boundary. |
+| `read-agent-file` helper | starts as root, then `trustyclaw-agent` | admin API via sudo | Lists agent-home directories or returns a bounded text preview without giving admin general agent-home access. |
+| `mint-github-app-token` helper | root | admin API via sudo | Mints installation-wide GitHub App tokens through root egress because the admin service has none; the proxy repo guard is the per-repository boundary. |
+| `audit-github-repo` helper | root | admin API via sudo | Reads GitHub repository/security facts with the working token and returns facts without storing secrets. |
 | `approve-github-push` helper | root | admin API via sudo | Replays or cleans up a push held by the `.github` approval gate using the proxy-state quarantine mirror and a working GitHub token piped on stdin. |
 | `reboot-host` helper | root | admin API via sudo | Requests a host reboot. |
 
@@ -35,9 +41,10 @@
 | Thread Group | Process | Purpose |
 | --- | --- | --- |
 | HTTP handler threads | admin API | One per concurrent API request. Mutations use state transactions and run slow helper calls outside the state lock. |
+| Tools socket handler threads | tools service | One per agent tool call (and per delegated operator operation), bounded by a concurrency cap; tool packages run their third-party requests on these threads. |
 | Maintenance thread | admin API | Periodically prunes bounded state and event history. |
 | Runtime status poller | admin API/orchestrator | Rechecks provider login state and updates each runtime status. |
-| Task worker threads | admin API/orchestrator | Six total workers claim queued tasks; at most three tasks run per runtime. |
+| Task worker threads | admin API/orchestrator | Six total workers claim queued tasks; at most three tasks run per runtime. Each turn spawns and closes its own runtime process. |
 | Proxy handler threads | network proxy | One per proxied connection, capped so buffered request bodies cannot exhaust memory. |
 | Proxy certificate lock users | network proxy | Serialize per-host certificate generation so concurrent TLS CONNECTs do not race on cert files. |
 
@@ -61,22 +68,25 @@ cgroup must not decouple lifecycles, so when the admin service stops,
 restarts, or crashes, systemd stops the scopes too and no orphaned runtime
 keeps running after its task was recovered as failed.
 Codex runs as stdio app-server child processes; status
-checks and login flows use short-lived servers, while task turns run on
-per-thread servers that are kept warm between tasks (at most one per worker
-slot) so chat-style follow-ups skip the app-server boot. Claude Code does not
-expose the same app-server protocol, so the host runs one CLI process per turn
-and resumes the Claude session id recorded for the user thread. Both runtimes
-persist login/session state under `agent-home`, so restarted admin services can
+checks and login flows use short-lived servers, and each task turn runs on a
+fresh app-server that resumes its provider thread by id. The host supplies the
+session's selected model on Codex thread start/resume and its model and effort
+on every turn. Claude Code does not expose the same app-server protocol, so the
+host runs one CLI process per turn
+with the selected `--model` and `--effort`, then resumes the Claude session id
+recorded for the user thread. Both runtimes persist login/session state under
+`agent-home`, so restarted admin services can
 re-derive active status from the agent user's home directory.
 
 ## Reboot and restart
 
-The admin API, proxy, Postgres, nftables, and optional Cloudflare Tunnel
-service are `systemctl enable`d, so they resume on every boot. The proxy and
-Postgres start before the admin API, `cloudflared` starts after the admin API
-when configured, and nftables reloads `/etc/nftables.conf`. Because admin
-state and agent home data live on the two data EBS volumes, a reboot —
-including via `POST /v1/host-runtime/reboot` — preserves them: the proxy comes
+The admin API, proxy, tools, Postgres, app backends, nftables, and optional
+Cloudflare Tunnel service are `systemctl enable`d, so they resume on every
+boot. Postgres starts before the proxy and tools services; the proxy, tools,
+and Postgres start before the admin API; app backends and `cloudflared` start
+after the admin API when installed. nftables reloads `/etc/nftables.conf`.
+Because admin state and agent home data live on the two data EBS volumes, a
+reboot, including via `POST /v1/host-runtime/reboot`, preserves them: the proxy comes
 back immediately enforcing the last active policy (no fail-open window),
 Cloudflare Tunnel reconnects when configured, agent login and queued tasks
 survive, and the swapfile is re-enabled from `/etc/fstab`. Redeploys can
@@ -85,5 +95,11 @@ and agent volumes for the same `agent_name`.
 
 On start the admin API runs a recovery pass: a task that was `running` when the
 host went down is marked `failed` (an in-flight agent turn cannot survive a
-reboot), while `queued` tasks stay queued and the worker resumes them once the
-task's chosen runtime is `active`.
+reboot). `queued` tasks survive the reboot, but a task claimed before its
+chosen runtime's first status poll publishes `active` fails with that
+non-active status: tasks run only against an active runtime, never park
+behind one.
+
+The tools service independently marks an approval caught in `approved`
+execution as `failed` with an unknown outcome; it never repeats the
+third-party side effect after a restart.

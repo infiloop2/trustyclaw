@@ -25,10 +25,12 @@ root-owned host code if that code is broken.
 The admin plane is the admin API/UI reached through SSH forwarding or
 Cloudflare Access and authenticated with the admin bearer password. It is lower authority than the
 operator plane and is meant for normal host operation after deploy. It can
-create, steer, cancel, and inspect agent tasks; read task and network events;
-manage runtime network policy; start provider login flows and read provider
-account summaries; synchronize provider account pins into proxy state; inspect
-health; and request a host reboot.
+create, steer, cancel, and inspect agent tasks; inspect agent files and
+processes; read agent, network, and tool audit events; manage runtime network
+policy and the GitHub credential/approval queue; start provider login flows
+and read provider account summaries; configure, connect, enable, and approve
+bundled tools; use installed app surfaces; inspect health; and request a host
+reboot.
 
 Admin-plane host controls cross privilege boundaries only through fixed
 root-owned helpers. That gives the admin API enough authority for routine

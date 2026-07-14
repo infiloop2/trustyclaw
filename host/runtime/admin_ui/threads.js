@@ -49,15 +49,6 @@ export async function refreshSelectedThread() {
   renderThreadHistory();
 }
 
-function taskNumber(taskId) {
-  const tail = String(taskId).split("_").pop();
-  return /^\d+$/.test(tail) ? Number(tail) : 0;
-}
-
-function taskRecency(task) {
-  return task.updated_at || task.created_at || "";
-}
-
 export function renderThreadHistory() {
   if (selectedThreadId === null) {
     setHtml($("thread-detail"), `
@@ -67,10 +58,9 @@ export function renderThreadHistory() {
       <div class="empty-state thread-empty">Select a session to inspect retained tasks and events.</div>`);
     return;
   }
-  const ordered = threadTasks.slice().sort((a, b) =>
-    taskRecency(a) > taskRecency(b) ? -1
-      : taskRecency(a) < taskRecency(b) ? 1
-        : taskNumber(b.task_id) - taskNumber(a.task_id));
+  // The backend returns tasks newest-first (state.tasks_for_thread orders by
+  // updated_at DESC, number DESC), so render them in response order.
+  const ordered = threadTasks;
   setHtml($("thread-detail"), `
     <div class="thread-head">
       <span class="thread-title">${esc(selectedThreadId)}</span>

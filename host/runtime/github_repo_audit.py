@@ -21,7 +21,7 @@ from typing import Any
 
 from host.runtime import state
 from host.runtime.github_credential import HelperError, _run_helper_json
-from host.runtime.network_policy import load_policy
+from host.runtime.network_policy import managed_integration
 
 AUDIT_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/audit-github-repo"]
 # Repository configuration changes rarely; the forced refreshes on credential
@@ -135,12 +135,7 @@ def _warnings(facts: dict[str, Any]) -> list[dict[str, str]]:
                 "disable Pages.",
             }
         )
-    if (
-        facts.get("visibility") == "private"
-        and facts.get("has_pages") is not False
-        and "pages_public" in facts
-        and facts.get("pages_public") is None
-    ):
+    if facts.get("visibility") == "private" and facts.get("pages_public") is None:
         warnings.append(
             {
                 "code": "pages_visibility_unknown",
@@ -206,12 +201,6 @@ def _stale(audit: dict[str, Any] | None) -> bool:
         # A failed fetch is never fresh: the promise is that failures retry
         # on the next pass, not after a full TTL.
         return True
-    facts = audit.get("facts") or {}
-    if "has_pages" not in facts or "pages_public" not in facts:
-        # A row from before the Pages facts existed: re-audit now instead of
-        # hiding the public-Pages warning until the TTL expires. Current
-        # audits always store both keys (pages_public is null when unreadable).
-        return True
     fetched_at = audit.get("fetched_at")
     if not isinstance(fetched_at, str):
         return True
@@ -227,12 +216,8 @@ def _policy_repositories() -> list[tuple[str, str]]:
     enabled integration). Reads are universal, so only write targets are
     worth auditing — the visibility and workflow warnings are about what the
     agent's pushes and PRs expose."""
-    integrations = load_policy().get("managed_network_integrations", {})
-    github = integrations.get("github") if isinstance(integrations, dict) else None
-    if not isinstance(github, dict):
-        return []
     repositories: list[tuple[str, str]] = []
-    for item in github.get("write_repositories") or []:
+    for item in managed_integration("github").get("write_repositories") or []:
         if isinstance(item, dict) and isinstance(item.get("owner"), str) and isinstance(item.get("repo"), str):
             repositories.append((item["owner"], item["repo"]))
     return repositories

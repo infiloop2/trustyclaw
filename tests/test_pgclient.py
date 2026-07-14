@@ -82,7 +82,7 @@ class PgClientTests(unittest.TestCase):
         self.assertEqual(result.rows, [("", None)])
 
     def test_large_values_round_trip(self) -> None:
-        # Task messages can be 50k characters and idempotency responses carry
+        # Task messages can be 50k characters and API responses carry
         # whole API payloads; framing must handle values beyond one recv().
         big = "x" * 300_000
         self.conn.execute("CREATE TEMP TABLE big_values (t TEXT)")

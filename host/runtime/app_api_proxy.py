@@ -14,8 +14,9 @@ import json
 from typing import Any
 from urllib.parse import urlencode
 
-from host.constants import LOOPBACK
-from host.runtime import admin_api, app_platform
+from host.constants import LOOPBACK, MAX_REQUEST_BODY_BYTES
+from host.runtime import app_platform
+from host.runtime.admin_errors import ApiError
 
 
 APP_API_PROXY_TIMEOUT_SECONDS = 10
@@ -26,19 +27,17 @@ def route_app_request(
     path: str,
     query: dict[str, list[str]],
     body: Any,
-    *,
-    bridge_app_id: str | None,
 ) -> Any:
+    # Bridge-tagged requests were already scoped to this app's API prefix by
+    # admin_api.route() before dispatch reaches here.
     parts = path.strip("/").split("/")
     if len(parts) >= 4 and parts[0] == "v1" and parts[1] == "apps" and parts[3] == "api":
-        if bridge_app_id and bridge_app_id != parts[2]:
-            raise admin_api.ApiError(HTTPStatus.FORBIDDEN, "app bridge cannot target a different app")
         app = app_platform.app_by_id(parts[2])
         if app is None:
-            raise admin_api.ApiError(HTTPStatus.NOT_FOUND, "app not found")
+            raise ApiError(HTTPStatus.NOT_FOUND, "app not found")
         suffix = "/" + "/".join(parts[4:]) if len(parts) > 4 else "/"
         return proxy_app_api(app, method, suffix, query, body)
-    raise admin_api.ApiError(HTTPStatus.NOT_FOUND, "app route not found")
+    raise ApiError(HTTPStatus.NOT_FOUND, "app route not found")
 
 
 def proxy_app_api(
@@ -61,22 +60,22 @@ def proxy_app_api(
         conn = http.client.HTTPConnection(LOOPBACK, app.port, timeout=APP_API_PROXY_TIMEOUT_SECONDS)
         conn.request(method, target, body=encoded_body, headers=headers)
         response = conn.getresponse()
-        raw = response.read(admin_api.MAX_REQUEST_BODY_BYTES + 1)
+        raw = response.read(MAX_REQUEST_BODY_BYTES + 1)
     except OSError as exc:
-        raise admin_api.ApiError(HTTPStatus.BAD_GATEWAY, f"app backend unavailable: {app.id}") from exc
+        raise ApiError(HTTPStatus.BAD_GATEWAY, f"app backend unavailable: {app.id}") from exc
     finally:
         if conn is not None:
             try:
                 conn.close()
             except Exception:
                 pass
-    if len(raw) > admin_api.MAX_REQUEST_BODY_BYTES:
-        raise admin_api.ApiError(HTTPStatus.BAD_GATEWAY, "app backend response too large")
+    if len(raw) > MAX_REQUEST_BODY_BYTES:
+        raise ApiError(HTTPStatus.BAD_GATEWAY, "app backend response too large")
     try:
         data = json.loads(raw.decode() or "{}")
     except json.JSONDecodeError as exc:
-        raise admin_api.ApiError(HTTPStatus.BAD_GATEWAY, "app backend returned invalid JSON") from exc
+        raise ApiError(HTTPStatus.BAD_GATEWAY, "app backend returned invalid JSON") from exc
     if response.status >= 400:
         message = data.get("error", {}).get("message") if isinstance(data, dict) else None
-        raise admin_api.ApiError(HTTPStatus(response.status), message or "app backend request failed")
+        raise ApiError(HTTPStatus(response.status), message or "app backend request failed")
     return data
