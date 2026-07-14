@@ -5,7 +5,7 @@ AI agents. They also guide its design and evolution.
 
 - **Rigor at the boundary, freedom inside.** The host, its tools, and the
   internet connection should get proper software engineering: review,
-  audits, and understood data policies. Then the agent should rein freely
+  audits, and understood data policies. Then the agent should have free rein
   inside.
 - **Private by default.** AI should be private by default; any data egress
   should be intentionally configured by the user, with approval gating or

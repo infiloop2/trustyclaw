@@ -20,6 +20,20 @@ def _write(directory: Path, name: str, up: str, down: str = "") -> None:
     (directory / name).write_text(f"-- migrate:up\n{up}\n\n-- migrate:down\n{down}\n")
 
 
+def _app_up(app_id: str) -> list[int]:
+    """The production app-migration loop (bootstrap shells pending, then
+    apply-sql as the app role and record as admin per version), driven
+    in-process for tests. No advisory lock: tests are single-process."""
+    app = app_platform.app_by_id(app_id)
+    assert app is not None
+    applied = []
+    for version in app_migrate.pending(app_id):
+        app_migrate.apply_sql(app_id, version, connection_user=app.db_role)
+        app_migrate.record(app_id, version)
+        applied.append(version)
+    return applied
+
+
 class MigrateRunnerTests(unittest.TestCase):
     DB_NAME = "trustyclaw_migrate_test"
 
@@ -28,6 +42,9 @@ class MigrateRunnerTests(unittest.TestCase):
         self.env_patch = patch.dict("os.environ", {"TRUSTYCLAW_DB_NAME": self.DB_NAME})
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
+        # Close pooled connections to this class's database before the env
+        # restore, so no later test checks one out against the wrong database.
+        self.addCleanup(db.close_pool)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.migrations = Path(self.temp_dir.name)
@@ -125,6 +142,9 @@ class RepoMigrationDataTests(unittest.TestCase):
         self.env_patch = patch.dict("os.environ", {"TRUSTYCLAW_DB_NAME": self.DB_NAME})
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
+        # Close pooled connections to this class's database before the env
+        # restore, so no later test checks one out against the wrong database.
+        self.addCleanup(db.close_pool)
         self.repo_migrations = Path(__file__).resolve().parents[1] / "host" / "migrations"
 
     def test_0002_migrates_legacy_preset_policy_rows(self) -> None:
@@ -171,6 +191,99 @@ class RepoMigrationDataTests(unittest.TestCase):
         self.assertFalse(parsed.managed_network_integrations.npm_packages.enabled)
         self.assertFalse(parsed.managed_network_integrations.github.enabled)
 
+    def test_0008_migrates_existing_tasks_and_provider_sessions(self) -> None:
+        migrate.up(target=7, directory=self.repo_migrations, quiet=True)
+        with db.transaction() as cur:
+            cur.execute(
+                """
+                INSERT INTO tasks (
+                    number, status, agent_runtime, thread_id, input_message,
+                    created_at, updated_at
+                ) VALUES
+                    (1, 'completed', 'codex', 'codex-thread', 'done', '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z'),
+                    (2, 'queued', 'claude_code', 'claude-thread', 'waiting', '2026-01-01T00:00:02Z', '2026-01-01T00:00:02Z')
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO thread_sessions (
+                    agent_runtime, thread_id, provider_session_id, last_used_at
+                ) VALUES ('codex', 'codex-thread', 'provider-thread', '2026-01-01T00:00:01Z')
+                """
+            )
+
+        self.assertEqual(migrate.up(target=8, directory=self.repo_migrations, quiet=True), [8])
+
+        with db.transaction() as cur:
+            cur.execute("SELECT thread_id FROM tasks ORDER BY number")
+            self.assertEqual(
+                cur.fetchall(),
+                [
+                    ("codex-thread",),
+                    ("claude-thread",),
+                ],
+            )
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = 'public' AND table_name = 'tasks'"
+                " ORDER BY ordinal_position"
+            )
+            self.assertEqual(
+                [row[0] for row in cur.fetchall()],
+                [
+                    "number",
+                    "status",
+                    "thread_id",
+                    "input_message",
+                    "output_message",
+                    "error_message",
+                    "created_at",
+                    "updated_at",
+                ],
+            )
+            cur.execute(
+                "SELECT thread_id, provider_session_id, model, effort"
+                " FROM thread_sessions ORDER BY thread_id"
+            )
+            self.assertEqual(
+                cur.fetchall(),
+                [
+                    ("claude-thread", None, "opus", "high"),
+                    ("codex-thread", "provider-thread", "gpt-5.6-terra", "high"),
+                ],
+            )
+
+        with self.assertRaises(Exception), db.transaction() as cur:
+            cur.execute(
+                """
+                INSERT INTO thread_sessions (
+                    agent_runtime, thread_id, provider_session_id, last_used_at, model, effort
+                ) VALUES (
+                    'codex', 'invalid', NULL, '2026-01-01T00:00:03Z',
+                    'gpt-5.6-luna', 'ultra'
+                )
+                """
+            )
+
+        self.assertEqual(
+            migrate.down(target=7, directory=self.repo_migrations, quiet=True),
+            [8],
+        )
+        with db.transaction() as cur:
+            cur.execute("SELECT number, agent_runtime, thread_id FROM tasks ORDER BY number")
+            self.assertEqual(
+                cur.fetchall(),
+                [(1, "codex", "codex-thread"), (2, "claude_code", "claude-thread")],
+            )
+            cur.execute(
+                "SELECT agent_runtime, thread_id, provider_session_id"
+                " FROM thread_sessions ORDER BY thread_id"
+            )
+            self.assertEqual(
+                cur.fetchall(),
+                [("codex", "codex-thread", "provider-thread")],
+            )
+
 
 class AppMigrationTests(unittest.TestCase):
     DB_NAME = "trustyclaw_app_migrate_test"
@@ -180,6 +293,9 @@ class AppMigrationTests(unittest.TestCase):
         self.env_patch = patch.dict("os.environ", {"TRUSTYCLAW_DB_NAME": self.DB_NAME})
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
+        # Close pooled connections to this class's database before the env
+        # restore, so no later test checks one out against the wrong database.
+        self.addCleanup(db.close_pool)
         migrate.up(quiet=True)
         with db.transaction() as cur:
             cur.execute(
@@ -197,29 +313,12 @@ class AppMigrationTests(unittest.TestCase):
             cur.execute('CREATE SCHEMA app_agent_chat AUTHORIZATION "trustyclaw-app-agent_chat"')
 
     def test_app_migration_runs_in_app_schema_and_records_host_version(self) -> None:
-        self.assertEqual(app_migrate.up("agent_chat", quiet=True), [1, 2])
-        self.assertEqual(app_migrate.up("agent_chat", quiet=True), [])
+        self.assertEqual(_app_up("agent_chat"), [1, 2, 3, 4])
+        self.assertEqual(_app_up("agent_chat"), [])
 
         with db.transaction() as cur:
             cur.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'app_agent_chat'")
-            self.assertEqual({row[0] for row in cur.fetchall()}, {"preferences", "thread_tasks", "threads"})
-            cur.execute(
-                """
-                SELECT column_name, data_type
-                FROM information_schema.columns
-                WHERE table_schema = 'app_agent_chat' AND table_name = 'preferences'
-                ORDER BY ordinal_position
-                """
-            )
-            self.assertEqual(
-                cur.fetchall(),
-                [
-                    ("singleton", "boolean"),
-                    ("density", "text"),
-                    ("show_completed", "boolean"),
-                    ("updated_at", "text"),
-                ],
-            )
+            self.assertEqual({row[0] for row in cur.fetchall()}, {"thread_tasks", "threads"})
             cur.execute(
                 """
                 SELECT column_name, data_type
@@ -232,10 +331,7 @@ class AppMigrationTests(unittest.TestCase):
                 cur.fetchall(),
                 [
                     ("thread_id", "text"),
-                    ("agent_runtime", "text"),
                     ("archived", "boolean"),
-                    ("created_at", "text"),
-                    ("updated_at", "text"),
                 ],
             )
             cur.execute(
@@ -251,13 +347,17 @@ class AppMigrationTests(unittest.TestCase):
                 [
                     ("task_id", "text"),
                     ("thread_id", "text"),
-                    ("created_at", "text"),
                 ],
             )
             cur.execute("SELECT app_id, version, name FROM app_schema_migrations")
             self.assertEqual(
                 cur.fetchall(),
-                [("agent_chat", 1, "app_state"), ("agent_chat", 2, "clear_stale_host_refs")],
+                [
+                    ("agent_chat", 1, "app_state"),
+                    ("agent_chat", 2, "clear_stale_host_refs"),
+                    ("agent_chat", 3, "minimal_thread_index"),
+                    ("agent_chat", 4, "drop_preferences"),
+                ],
             )
             cur.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'preferences'")
             self.assertEqual(cur.fetchall(), [])
@@ -265,16 +365,21 @@ class AppMigrationTests(unittest.TestCase):
     def test_app_migration_recovers_when_sql_commits_before_host_record(self) -> None:
         app_migrate.apply_sql("agent_chat", 1, connection_user="trustyclaw-app-agent_chat")
 
-        self.assertEqual(app_migrate.up("agent_chat", quiet=True), [1, 2])
+        self.assertEqual(_app_up("agent_chat"), [1, 2, 3, 4])
 
         with db.transaction() as cur:
             cur.execute("SELECT app_id, version, name FROM app_schema_migrations")
             self.assertEqual(
                 cur.fetchall(),
-                [("agent_chat", 1, "app_state"), ("agent_chat", 2, "clear_stale_host_refs")],
+                [
+                    ("agent_chat", 1, "app_state"),
+                    ("agent_chat", 2, "clear_stale_host_refs"),
+                    ("agent_chat", 3, "minimal_thread_index"),
+                    ("agent_chat", 4, "drop_preferences"),
+                ],
             )
             cur.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'app_agent_chat'")
-            self.assertEqual({row[0] for row in cur.fetchall()}, {"preferences", "thread_tasks", "threads"})
+            self.assertEqual({row[0] for row in cur.fetchall()}, {"thread_tasks", "threads"})
 
     def test_agent_chat_cleanup_migration_deletes_stale_host_references(self) -> None:
         app_migrate.apply_sql("agent_chat", 1, connection_user="trustyclaw-app-agent_chat")
@@ -294,13 +399,45 @@ class AppMigrationTests(unittest.TestCase):
                 """
             )
 
-        self.assertEqual(app_migrate.up("agent_chat", quiet=True), [2])
+        self.assertEqual(_app_up("agent_chat"), [2, 3, 4])
 
         with db.transaction() as cur:
             cur.execute("SELECT count(*) FROM app_agent_chat.thread_tasks")
             self.assertEqual(cur.fetchone(), (0,))
             cur.execute("SELECT count(*) FROM app_agent_chat.threads")
             self.assertEqual(cur.fetchone(), (0,))
+
+    def test_agent_chat_migration_removes_host_owned_thread_configuration(self) -> None:
+        for version in (1, 2):
+            app_migrate.apply_sql(
+                "agent_chat", version, connection_user="trustyclaw-app-agent_chat"
+            )
+            app_migrate.record("agent_chat", version)
+        with db.transaction(user="trustyclaw-app-agent_chat") as cur:
+            cur.execute("SET LOCAL search_path TO app_agent_chat")
+            cur.execute(
+                """
+                INSERT INTO threads (thread_id, agent_runtime, archived, created_at, updated_at)
+                VALUES
+                    ('codex-thread', 'codex', FALSE, '2026-06-08T00:00:00Z', '2026-06-08T00:00:00Z'),
+                    ('claude-thread', 'claude_code', FALSE, '2026-06-08T00:00:00Z', '2026-06-08T00:00:00Z')
+                """
+            )
+
+        self.assertEqual(_app_up("agent_chat"), [3, 4])
+
+        with db.transaction() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = 'app_agent_chat' AND table_name = 'threads'"
+                " ORDER BY ordinal_position"
+            )
+            self.assertEqual(
+                [row[0] for row in cur.fetchall()],
+                ["thread_id", "archived"],
+            )
+            cur.execute("SELECT thread_id FROM app_agent_chat.threads ORDER BY thread_id")
+            self.assertEqual(cur.fetchall(), [("claude-thread",), ("codex-thread",)])
 
     def test_app_migration_cannot_reset_back_to_host_role(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -319,10 +456,11 @@ class AppMigrationTests(unittest.TestCase):
                 migrations_dir=migrations,
                 ui_dir=Path(temp_dir),
                 port=7450,
+                allocation=app_platform.AppAllocation(uid=48000, gid=48000, port_offset=0),
             )
             with patch("host.runtime.app_platform.app_by_id", return_value=app):
                 with self.assertRaises(Exception):
-                    app_migrate.up("agent_chat", quiet=True)
+                    _app_up("agent_chat")
 
         with db.transaction() as cur:
             cur.execute("SELECT to_regclass('public.host_escape_attempt')")

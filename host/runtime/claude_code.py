@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import json
 import queue
 import re
@@ -22,6 +23,22 @@ from typing import Any, Callable
 DEFAULT_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/run-claude-code"]
 DEFAULT_ACCOUNT_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/read-claude-account"]
 AGENT_CWD = "/mnt/trustyclaw-agent/agent-home"
+# The bundled tools surface: Claude Code spawns the MCP shim as the agent
+# user; the shim forwards to the host tools socket (see
+# docs/architecture/tools/host-integration.md). --strict-mcp-config (below)
+# makes this the only MCP server. With no tools enabled the shim lists
+# nothing, so passing it unconditionally is harmless.
+TOOLS_MCP_CONFIG = json.dumps(
+    {
+        "mcpServers": {
+            "trustyclaw": {
+                "command": "/usr/bin/python3",
+                "args": ["-m", "host.runtime.tools_mcp_shim"],
+                "env": {"PYTHONPATH": "/opt/trustyclaw-host"},
+            }
+        }
+    }
+)
 ACCOUNT_HELPER_TIMEOUT_SECONDS = 15
 # The attest helper makes one HTTPS round trip (10s inside the helper) on top
 # of the file read, so it gets a larger budget than the plain account read.
@@ -30,14 +47,30 @@ STATUS_TIMEOUT_SECONDS = 45
 USAGE_TIMEOUT_SECONDS = 30
 LOGIN_START_TIMEOUT_SECONDS = 30
 LOGIN_URL_RE = re.compile(r"If the browser didn't open, visit: (https://\S+)")
-USAGE_SESSION_RE = re.compile(r"(?m)^Current session:\s*(\d+(?:\.\d+)?)%\s+used\s*$")
-USAGE_WEEK_RE = re.compile(r"(?m)^Current week \(all models\):\s*(\d+(?:\.\d+)?)%\s+used\s+·\s+resets\s+(.+?)\s*$")
+# Usage lines are parsed one window per line: a window header, a percent, and
+# an optional reset time. Each piece is matched independently so one odd line
+# (or a missing reset) degrades to a partial snapshot instead of no snapshot.
+# All captured values are bounded because the text comes from an agent-run CLI.
+USAGE_WINDOW_RE = re.compile(
+    r"^\s*Current\s+(session|week\s*\(([^()]{1,40})\))\s*:\s*(.+?)\s*$", re.IGNORECASE
+)
+USAGE_PERCENT_RE = re.compile(r"(\d{1,3}(?:\.\d{1,2})?)\s*%\s+used\b", re.IGNORECASE)
+USAGE_RESETS_RE = re.compile(r"\bresets\s+(.{1,100}?)\s*$", re.IGNORECASE)
+USAGE_RESET_RE = re.compile(r"^([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{1,2})(?::(\d{2}))?(am|pm)\s+\(UTC\)$", re.IGNORECASE)
+USAGE_RESET_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
 
 _login_process: "ClaudeLoginProcess | None" = None
 _login_lock = threading.Lock()
 
 
 class ClaudeCodeError(RuntimeError):
+    pass
+
+
+class ClaudeAuthenticationError(ClaudeCodeError):
     pass
 
 
@@ -53,9 +86,9 @@ class ClaudeLogin:
 class ClaudeCodeSession:
     """Owns at most one running Claude CLI process.
 
-    start()/alive() exist to satisfy the orchestrator's pooled-server contract;
-    the actual Claude process is spawned per turn because Claude's resumable
-    CLI sessions are persisted on disk.
+    start() exists to satisfy the orchestrator's server contract; the actual
+    Claude process is spawned in run() because Claude's resumable CLI sessions
+    are persisted on disk.
     """
 
     def __init__(self, command: list[str] | None = None) -> None:
@@ -63,16 +96,11 @@ class ClaudeCodeSession:
         self._proc: subprocess.Popen[str] | None = None
         self._messages: queue.Queue[dict[str, Any]] = queue.Queue()
         self._stderr_tail: deque[str] = deque(maxlen=20)
-        self._closed = False
 
     def start(self, init_timeout: float = 60.0) -> None:
-        self._closed = False
-
-    def alive(self) -> bool:
-        return not self._closed and (self._proc is None or self._proc.poll() is None)
+        return
 
     def close(self) -> None:
-        self._closed = True
         proc = self._proc
         if proc is None:
             return
@@ -100,6 +128,8 @@ class ClaudeCodeSession:
         self,
         input_message: str,
         session_id: str | None,
+        model: str,
+        effort: str,
         steer_messages: Callable[[], list[str]],
         on_message: Callable[[str], None],
         steer_delivered: Callable[[str], None],
@@ -112,9 +142,22 @@ class ClaudeCodeSession:
             "--output-format",
             "stream-json",
             "--verbose",
+            "--model",
+            model,
+            "--effort",
+            effort,
             "--setting-sources",
             "user",
+            # Deliberately no --safe-mode: the pinned CLI drops every
+            # non-SDK MCP server in safe mode (verified empirically), which
+            # would disable the bundled tools. --strict-mcp-config keeps the
+            # MCP surface pinned to exactly the shim below, and the agent's
+            # isolation comes from the OS boundaries and the installed
+            # bypassPermissions user settings, not harness flags (see
+            # docs/architecture/privilege-boundaries.md).
             "--strict-mcp-config",
+            "--mcp-config",
+            TOOLS_MCP_CONFIG,
         ]
         if session_id:
             argv.extend(["--resume", session_id])
@@ -195,9 +238,6 @@ class ClaudeCodeSession:
             detail = "; ".join(self._stderr_tail)
             raise ClaudeCodeError(f"Claude Code process is not running{': ' + detail if detail else ''}")
         return self._proc
-
-
-AgentServer = ClaudeCodeSession
 
 
 class ClaudeLoginProcess:
@@ -306,9 +346,6 @@ def account_status() -> tuple[str, str | None, dict[str, Any] | None]:
     if not account:
         return "error", "Claude auth is logged in but OAuth token metadata is unavailable", None
     _fill_claude_account_metadata(account, status)
-    usage = read_claude_usage()
-    if usage:
-        account["claude_usage"] = usage
     return "active", None, account
 
 
@@ -323,35 +360,102 @@ def read_claude_usage(command: list[str] | None = None) -> dict[str, Any]:
             text=True,
             timeout=USAGE_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ClaudeCodeError(str(exc)) from exc
     if proc.returncode != 0:
-        return {}
+        _raise_usage_probe_error("\n".join(part for part in (proc.stdout, proc.stderr) if part))
     try:
         value = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return {}
+    except json.JSONDecodeError as exc:
+        raise ClaudeCodeError(f"Claude usage probe returned invalid JSON: {exc}") from exc
     if not isinstance(value, dict):
-        return {}
+        raise ClaudeCodeError("Claude usage probe returned an invalid response")
     result = value.get("result")
+    if value.get("is_error") is True or value.get("subtype") == "error":
+        _raise_usage_probe_error(result if isinstance(result, str) else proc.stderr)
     if not isinstance(result, str):
         return {}
     return _parse_claude_usage_result(result)
 
 
-def _parse_claude_usage_result(result: str) -> dict[str, Any]:
-    session_match = USAGE_SESSION_RE.search(result)
-    week_match = USAGE_WEEK_RE.search(result)
-    if not session_match or not week_match:
-        return {}
-    resets_at_text = week_match.group(2).strip()
-    if not resets_at_text or "\n" in resets_at_text or len(resets_at_text) > 100:
-        return {}
-    return {
-        "current_session_used_percent": _percent_value(session_match.group(1)),
-        "weekly_used_percent": _percent_value(week_match.group(1)),
-        "weekly_resets_at_text": resets_at_text,
-    }
+def _raise_usage_probe_error(detail: Any) -> None:
+    message = str(detail or "Claude usage probe failed").strip()[:500]
+    normalized = message.lower()
+    authentication_markers = (
+        "failed to authenticate",
+        "invalid authentication credentials",
+        "invalid bearer",
+        "oauth token has expired",
+        "authentication_error",
+        "api error: 401",
+    )
+    if any(marker in normalized for marker in authentication_markers):
+        raise ClaudeAuthenticationError("Claude OAuth credentials are no longer valid")
+    raise ClaudeCodeError(message)
+
+
+def _parse_claude_usage_result(result: str, now: datetime | None = None) -> dict[str, Any]:
+    """Extract usage windows from the CLI's human-readable /usage text.
+
+    Recognizes ``Current session`` (``current_session_*``), ``Current week
+    (all models)`` (``weekly_*``), and ``Current week (Fable)``
+    (``fable_weekly_*``); other model-specific week lines are ignored. Windows
+    parse independently and the reset time is optional per window, so a partial
+    or drifted response yields whatever parsed instead of an empty snapshot;
+    the first line per window wins."""
+    captured_at = now or datetime.now(timezone.utc)
+    usage: dict[str, Any] = {}
+    for line in result.splitlines():
+        window_match = USAGE_WINDOW_RE.match(line)
+        if not window_match:
+            continue
+        week_label = window_match.group(2)
+        if week_label is None:
+            prefix = "current_session"
+        elif week_label.strip().lower() == "all models":
+            prefix = "weekly"
+        elif week_label.strip().lower() == "fable":
+            prefix = "fable_weekly"
+        else:
+            continue  # only the all-models and Fable weekly windows are tracked
+        if f"{prefix}_used_percent" in usage:
+            continue
+        rest = window_match.group(3)
+        percent_match = USAGE_PERCENT_RE.search(rest)
+        if not percent_match:
+            continue
+        usage[f"{prefix}_used_percent"] = _percent_value(percent_match.group(1))
+        resets_match = USAGE_RESETS_RE.search(rest)
+        resets_at = _parse_usage_reset_at(resets_match.group(1), captured_at) if resets_match else None
+        if resets_at is not None:
+            usage[f"{prefix}_resets_at"] = resets_at
+    return usage
+
+
+def _parse_usage_reset_at(value: str, now: datetime) -> int | None:
+    match = USAGE_RESET_RE.fullmatch(value)
+    if not match:
+        return None
+    month = USAGE_RESET_MONTHS.get(match.group(1).lower())
+    if month is None:
+        return None
+    hour12 = int(match.group(3))
+    minute = int(match.group(4) or 0)
+    if hour12 < 1 or hour12 > 12 or minute > 59:
+        return None
+    hour = hour12 % 12 + (12 if match.group(5).lower() == "pm" else 0)
+    try:
+        reset_at = datetime(now.year, month, int(match.group(2)), hour, minute, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    # The provider omits the year. A December capture can legitimately report
+    # an early-January reset, while a recent stale snapshot remains overdue.
+    if reset_at < now - timedelta(days=183):
+        try:
+            reset_at = reset_at.replace(year=now.year + 1)
+        except ValueError:
+            return None
+    return int(reset_at.timestamp())
 
 
 def _percent_value(value: str) -> int | float:
@@ -463,11 +567,21 @@ def run_turn(
     server: ClaudeCodeSession,
     input_message: str,
     session_id: str | None,
+    model: str,
+    effort: str,
     steer_messages: Callable[[], list[str]],
     on_message: Callable[[str], None],
     steer_delivered: Callable[[str], None],
 ) -> tuple[str, str]:
-    return server.run(input_message, session_id, steer_messages, on_message, steer_delivered)
+    return server.run(
+        input_message,
+        session_id,
+        model,
+        effort,
+        steer_messages,
+        on_message,
+        steer_delivered,
+    )
 
 
 def _subprocess_cwd(command: list[str]) -> str | None:
@@ -482,17 +596,9 @@ def _fill_claude_account_metadata(account: dict[str, Any], status: dict[str, Any
         account["email"] = status["email"].strip()
     if not account.get("organization_id") and isinstance(status.get("orgId"), str) and status["orgId"].strip():
         account["organization_id"] = status["orgId"].strip()
-    if not account.get("account_id"):
-        for key in ("accountId", "account_id", "userId", "userID", "user_id"):
-            value = status.get(key)
-            if isinstance(value, str) and value.strip():
-                account["account_id"] = value.strip()
-                break
-    if not account.get("account_id") and isinstance(account.get("email"), str):
-        # Claude's status output exposes email/org but not always the account
-        # UUID. This field is user-facing metadata only; the proxy guard pins
-        # on access_token_sha256.
-        account["account_id"] = account["email"]
+    # No account_id here on purpose: the trusted id always comes from the
+    # stored anchor or a fresh server attestation (orchestrator._with_identity
+    # replaces it on every active account), never from CLI output.
     plan_type = _extract_claude_plan_type(status)
     if plan_type:
         account["plan_type"] = plan_type

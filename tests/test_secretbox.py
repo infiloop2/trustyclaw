@@ -28,9 +28,11 @@ class SecretBoxTests(unittest.TestCase):
     def test_salted_ciphertexts_differ_per_call(self) -> None:
         self.assertNotEqual(secretbox.encrypt("same"), secretbox.encrypt("same"))
 
-    def test_plaintext_values_pass_through_decrypt(self) -> None:
-        # Pre-encryption rows keep working; they become ciphertext on rewrite.
-        self.assertEqual(secretbox.decrypt("legacy-plain-token"), "legacy-plain-token")
+    def test_decrypt_refuses_values_without_the_ciphertext_prefix(self) -> None:
+        # Every writer encrypts, so an unprefixed value is corruption, not a
+        # legacy row.
+        with self.assertRaises(secretbox.SecretBoxError):
+            secretbox.decrypt("not-ciphertext")
 
     def test_key_row_comes_from_the_migration_and_is_reused(self) -> None:
         # The schema migration creates the key, so it exists before any

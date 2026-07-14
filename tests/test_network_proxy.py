@@ -14,8 +14,10 @@ from unittest.mock import patch
 
 import pg_harness
 
-from host.runtime.network_policy import load_policy, save_policy
-from host.runtime.state import read_network_events, save_proxy_openai_account_id
+from host.runtime.network_policy import load_policy
+from host.runtime.state import save_network_policy as save_policy
+from host.runtime.state import save_proxy_claude_account, save_proxy_openai_account_id
+from state_seed import read_network_events
 from host.runtime import network_proxy
 
 
@@ -56,7 +58,7 @@ class NetworkProxyTests(unittest.TestCase):
         pg_harness.reset_database()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
-        self.env_patch = patch.dict("os.environ", {"TRUSTYCLAW_STATE_DIR": self.temp_dir.name})
+        self.env_patch = patch.dict("os.environ", {"TRUSTYCLAW_PROXY_STATE_DIR": self.temp_dir.name})
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
 
@@ -198,46 +200,43 @@ class NetworkProxyTests(unittest.TestCase):
                 chunks.append(chunk)
             return b"".join(chunks)
 
-    def test_http_allow_deny_and_event_log(self) -> None:
-        upstream = self.start_http_server()
+    def test_plain_http_is_denied_even_for_allowed_domains(self) -> None:
+        # The proxy is HTTPS-only: an http:// request is denied before any
+        # body read, DNS resolution, or upstream dial, whatever the policy
+        # says, and the denial is logged like any other decision.
         proxy = self.start_proxy()
         proxy_port = proxy.server_address[1]
-        self.save_policy(
-            {
-                "127.0.0.1": {
-                    "allow_http_methods": ["GET"],
-                    "path_guards": ["^/allowed(?:\\?.*)?$"],
-                }
-            }
+        self.save_policy({"127.0.0.1": {"allow_http_methods": ["GET"]}})
+
+        allowed_domain = self.send_raw(
+            "127.0.0.1",
+            proxy_port,
+            b"GET http://127.0.0.1/allowed?x=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        other_port = self.send_raw(
+            "127.0.0.1",
+            proxy_port,
+            b"GET http://127.0.0.1:8080/allowed HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n",
         )
 
-        with self.map_upstream(80, upstream.server_address[1]):
-            allowed = self.send_raw(
-                "127.0.0.1",
-                proxy_port,
-                b"GET http://127.0.0.1/allowed?x=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-            )
-            denied = self.send_raw(
-                "127.0.0.1",
-                proxy_port,
-                b"GET http://127.0.0.1/denied HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-            )
-
-        self.assertIn(b"200 OK", allowed)
-        self.assertIn(b"/allowed?x=1", allowed)
-        self.assertIn(b"403", denied)
+        self.assertIn(b"403", allowed_domain)
+        self.assertIn(b"plain HTTP is not supported", allowed_domain)
+        self.assertIn(b"403", other_port)
         events = read_network_events()
-        self.assertEqual([event["decision"] for event in events], ["allowed", "denied"])
+        self.assertEqual([event["decision"] for event in events], ["denied", "denied"])
         self.assertEqual(events[0]["protocol"], "http")
         self.assertEqual(events[0]["query"], "x=1")
+        self.assertEqual(events[0]["reason"], "plain HTTP is not supported; use HTTPS")
+        self.assertEqual(events[1]["port"], 8080)
         self.assertEqual(events[1]["seq"], events[0]["seq"] + 1)
 
     def test_chunked_request_body_is_decoded_and_forwarded_with_content_length(self) -> None:
-        upstream = self.start_http_server()
+        self.proxy_ca()
+        upstream = self.start_http_server(tls=True)
         proxy = self.start_proxy()
         self.save_policy({"127.0.0.1": {"allow_http_methods": ["POST"]}})
         request = (
-            b"POST http://127.0.0.1/upload HTTP/1.1\r\n"
+            b"POST /upload HTTP/1.1\r\n"
             b"Host: 127.0.0.1\r\n"
             b"Transfer-Encoding: chunked\r\n\r\n"
             b"5\r\nhello\r\n"
@@ -245,8 +244,8 @@ class NetworkProxyTests(unittest.TestCase):
             b"0\r\n\r\n"
         )
 
-        with self.map_upstream(80, upstream.server_address[1]):
-            response = self.send_raw("127.0.0.1", proxy.server_address[1], request)
+        with self.map_upstream(443, upstream.server_address[1], tls=True):
+            response = self.https_via_proxy(proxy.server_address[1], request)
 
         self.assertIn(b"200 OK", response)
         self.assertIn(b"echo:hello world", response)
@@ -265,19 +264,18 @@ class NetworkProxyTests(unittest.TestCase):
             (b"", "malformed Content-Length"),
         )
 
-    def test_plain_http_body_parse_denial_is_logged(self) -> None:
+    def test_tunnel_body_parse_denial_is_logged(self) -> None:
+        self.proxy_ca()
         proxy = self.start_proxy()
         self.save_policy({"127.0.0.1": {"allow_http_methods": ["GET"]}})
 
-        response = self.send_raw(
-            "127.0.0.1",
+        response = self.https_via_proxy(
             proxy.server_address[1],
-            b"GET http://127.0.0.1/ HTTP/1.1\r\n"
+            b"GET / HTTP/1.1\r\n"
             b"Host: 127.0.0.1\r\n"
             b"Content-Length: nope\r\n\r\n",
         )
 
-        self.assertIn(b"400", response)
         self.assertIn(b"malformed Content-Length", response)
         event = read_network_events()[-1]
         self.assertEqual(event["decision"], "denied")
@@ -296,38 +294,10 @@ class NetworkProxyTests(unittest.TestCase):
             with self.subTest(request_line=request_line), self.assertRaisesRegex(OSError, "malformed request line"):
                 network_proxy.read_request_head(Reader([request_line, b"\r\n"]))
 
-    def test_http_to_non_default_port_is_denied(self) -> None:
-        proxy = self.start_proxy()
-        self.save_policy({"127.0.0.1": {"allow_http_methods": ["GET"]}})
-
-        denied = self.send_raw(
-            "127.0.0.1",
-            proxy.server_address[1],
-            b"GET http://127.0.0.1:8080/allowed HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n",
-        )
-
-        self.assertIn(b"403", denied)
-        self.assertEqual(read_network_events()[-1]["port"], 8080)
-
-    def test_http_host_header_must_match_absolute_request_uri(self) -> None:
-        proxy = self.start_proxy()
-        self.save_policy({"127.0.0.1": {"allow_http_methods": ["GET"]}})
-
-        denied = self.send_raw(
-            "127.0.0.1",
-            proxy.server_address[1],
-            b"GET http://127.0.0.1/allowed HTTP/1.1\r\nHost: evil.example.org\r\n\r\n",
-        )
-
-        self.assertIn(b"403", denied)
-        event = read_network_events()[-1]
-        self.assertEqual(event["decision"], "denied")
-        self.assertIn("Host header", event["reason"])
-
-    def test_malformed_ports_get_400_instead_of_killing_the_handler(self) -> None:
-        # A non-numeric port in the CONNECT target or an absolute request URI
-        # must produce an HTTP error, not an unhandled ValueError that kills
-        # the handler thread with no response.
+    def test_malformed_ports_get_an_error_instead_of_killing_the_handler(self) -> None:
+        # A non-numeric port in the CONNECT target must produce an HTTP error,
+        # not an unhandled ValueError that kills the handler thread with no
+        # response; a malformed plain-HTTP target still gets the 403 denial.
         proxy = self.start_proxy()
         self.save_policy({"127.0.0.1": {"allow_http_methods": ["GET"]}})
 
@@ -343,7 +313,7 @@ class NetworkProxyTests(unittest.TestCase):
         )
 
         self.assertIn(b"400", connect)
-        self.assertIn(b"400", absolute)
+        self.assertIn(b"403", absolute)
 
     def test_connect_to_unlisted_host_is_denied_before_any_dial(self) -> None:
         proxy = self.start_proxy()
@@ -405,37 +375,24 @@ class NetworkProxyTests(unittest.TestCase):
         self.assertEqual(event["decision"], "denied")
         self.assertIn("Host header", event["reason"])
 
-    def test_https_absolute_target_must_match_connect_host(self) -> None:
+    def test_https_non_origin_form_targets_are_denied(self) -> None:
+        # Only origin-form targets are served inside the TLS tunnel: an
+        # absolute-form target (even one naming another host) and a malformed
+        # authority are the same crisp, logged denial.
         self.proxy_ca()
         proxy = self.start_proxy()
         self.save_policy({"127.0.0.1": {"allow_http_methods": ["GET"]}})
 
-        response = self.https_via_proxy(
-            proxy.server_address[1],
-            b"GET https://evil.example.org/secure HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-        )
-
-        self.assertIn(b"403 Forbidden", response)
-        event = read_network_events()[-1]
-        self.assertEqual(event["decision"], "denied")
-        self.assertIn("request target", event["reason"])
-
-    def test_https_malformed_target_port_is_denied(self) -> None:
-        # Inside the TLS tunnel the same malformed-port shape is a policy
-        # denial (logged, 403) rather than a dropped connection.
-        self.proxy_ca()
-        proxy = self.start_proxy()
-        self.save_policy({"127.0.0.1": {"allow_http_methods": ["GET"]}})
-
-        response = self.https_via_proxy(
-            proxy.server_address[1],
-            b"GET https://127.0.0.1:4a3/secure HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-        )
-
-        self.assertIn(b"403 Forbidden", response)
-        event = read_network_events()[-1]
-        self.assertEqual(event["decision"], "denied")
-        self.assertIn("request target is invalid", event["reason"])
+        for target in (b"https://evil.example.org/secure", b"https://127.0.0.1:4a3/secure"):
+            with self.subTest(target=target):
+                response = self.https_via_proxy(
+                    proxy.server_address[1],
+                    b"GET " + target + b" HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                )
+                self.assertIn(b"403 Forbidden", response)
+                event = read_network_events()[-1]
+                self.assertEqual(event["decision"], "denied")
+                self.assertIn("request target must be origin-form", event["reason"])
 
     def test_connect_client_tls_abort_gets_no_http_response_bytes(self) -> None:
         # After "200 Connection Established" the client speaks TLS or nothing.
@@ -652,7 +609,7 @@ class WebSocketHandshakeTests(unittest.TestCase):
 class WebSocketGuardTests(unittest.TestCase):
     POLICY = {
         "allowed_network_access": {
-            "chatgpt.com": {"allow_http_methods": ["GET"], "openai_disable_live_web_search": True},
+            "chatgpt.com": {"allow_http_methods": ["GET"], "openai_external_url_request_guard": True},
             "example.com": {"allow_http_methods": ["GET"]},
         },
     }
@@ -661,12 +618,12 @@ class WebSocketGuardTests(unittest.TestCase):
         pg_harness.reset_database()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
-        self.env_patch = patch.dict("os.environ", {"TRUSTYCLAW_STATE_DIR": self.temp_dir.name})
+        self.env_patch = patch.dict("os.environ", {"TRUSTYCLAW_PROXY_STATE_DIR": self.temp_dir.name})
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
 
     def guard(self) -> network_proxy.WebSocketClientGuard:
-        return network_proxy.WebSocketClientGuard(self.POLICY, "chatgpt.com")
+        return network_proxy.WebSocketClientGuard()
 
     def test_cached_web_search_message_is_forwarded_unchanged(self) -> None:
         frame = masked_frame(CACHED_SEARCH)
@@ -677,9 +634,35 @@ class WebSocketGuardTests(unittest.TestCase):
             self.guard().feed(masked_frame(LIVE_SEARCH))
         self.assertIn("live web search is disabled", denied.exception.reason)
 
-    def test_web_search_preview_marker_is_denied_in_any_message(self) -> None:
-        with self.assertRaises(network_proxy.WebSocketDenied):
-            self.guard().feed(masked_frame(b"plain text mentioning web_search_preview"))
+    def test_non_json_message_mentioning_web_search_is_forwarded(self) -> None:
+        # The upstream parses messages as JSON; a frame it cannot parse cannot
+        # declare tools, and text mentioning a tool name carries no capability.
+        frame = masked_frame(b"plain text mentioning web_search_preview")
+        self.assertEqual(self.guard().feed(frame), frame)
+
+    def test_web_search_mention_in_prompt_text_is_forwarded(self) -> None:
+        frame = masked_frame(
+            b'{"type":"response.create","instructions":"never use web_search_preview",'
+            b'"tools":[{"type":"function","name":"exec"}]}'
+        )
+        self.assertEqual(self.guard().feed(frame), frame)
+
+    def test_dated_web_search_preview_variant_is_denied(self) -> None:
+        with self.assertRaises(network_proxy.WebSocketDenied) as denied:
+            self.guard().feed(
+                masked_frame(b'{"tools":[{"type":"web_search_preview_2025_03_11"}]}')
+            )
+        self.assertIn("web_search_preview is disabled", denied.exception.reason)
+
+    def test_remote_mcp_tool_is_denied(self) -> None:
+        with self.assertRaises(network_proxy.WebSocketDenied) as denied:
+            self.guard().feed(
+                masked_frame(
+                    b'{"tools":[{"type":"mcp","server_label":"evil",'
+                    b'"server_url":"https://evil.example/mcp"}]}'
+                )
+            )
+        self.assertIn("remote MCP tools are disabled", denied.exception.reason)
 
     def test_fragmented_message_is_reassembled_before_the_check(self) -> None:
         guard = self.guard()

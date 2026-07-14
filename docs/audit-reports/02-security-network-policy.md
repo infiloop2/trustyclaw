@@ -90,7 +90,8 @@ No live proxy run or PoC traffic.
 ### What was reviewed
 
 - `host/runtime/network_proxy.py`: `do_CONNECT` + `_serve_tls_request` (TLS
-  interposition), `_proxy_http` (plain HTTP/WS), `connect_public` (SSRF vet),
+  interposition), `_proxy_http` (plain HTTP/WS, removed since — the proxy is
+  now HTTPS-only), `connect_public` (SSRF vet),
   `host_header_denial`/target-vs-Host consistency, `read_request_head`,
   `read_body`/`read_chunked_body` (smuggling, size caps), `send_http_request`
   (single-request pinning, header stripping), the WebSocket frame guard, and

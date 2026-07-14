@@ -14,12 +14,8 @@ longer reveals credential material, because reading the ciphertext columns
 alone is useless without the key row. A full database dump necessarily
 includes the key.
 
-Values are stored as ``enc:v1:<base64>``. ``decrypt`` passes through values
-without that prefix unchanged, so any pre-encryption row keeps working and
-becomes encrypted on its next write — and ``write_config`` re-saves operator
-config on every deploy/upgrade, so the one pre-secretbox secret (the
-Cloudflare tunnel token) is re-encrypted by the same deploy that introduces
-encryption. No startup sweep is needed.
+Values are stored as ``enc:v1:<base64>``; ``decrypt`` refuses anything
+without that prefix, since every writer encrypts.
 """
 
 from __future__ import annotations
@@ -57,12 +53,8 @@ def encrypt(value: str) -> str:
 
 def decrypt(value: str) -> str:
     if not value.startswith(PREFIX):
-        return value
+        raise SecretBoxError("stored secret is not secretbox ciphertext")
     return _run_openssl(["-d", "-base64", "-A"], value[len(PREFIX):].encode(), _load_key())
-
-
-def is_encrypted(value: str) -> bool:
-    return value.startswith(PREFIX)
 
 
 def _run_openssl(mode_args: list[str], data: bytes, key: str) -> str:

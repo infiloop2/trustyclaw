@@ -32,8 +32,17 @@ for line in sys.stdin:
     if method == "initialize":
         send({"id": msg["id"], "result": {}})
     elif method == "thread/start":
+        assert msg["params"]["model"] == "gpt-5.6-sol"
+        assert "effort" not in msg["params"]
         send({"id": msg["id"], "result": {"thread": {"id": "thread_1"}}})
+    elif method == "thread/resume":
+        assert msg["params"]["threadId"] == "thread_existing"
+        assert msg["params"]["model"] == "gpt-5.6-sol"
+        assert "effort" not in msg["params"]
+        send({"id": msg["id"], "result": {"thread": {"id": "thread_existing"}}})
     elif method == "turn/start":
+        assert msg["params"]["model"] == "gpt-5.6-sol"
+        assert msg["params"]["effort"] == "ultra"
         send({"method": "item/agentMessage/delta", "params": {"delta": "Hel"}})
         send({"id": msg["id"], "result": {"turn": {"id": "turn_1"}}})
         send({"method": "item/agentMessage/delta", "params": {"delta": "lo"}})
@@ -122,17 +131,24 @@ for line in sys.stdin:
 
 
 def fake_account_server(
-    result: dict[str, Any], rate_limits: dict[str, Any] | None = None, *, rate_limits_error: bool = False
+    result: dict[str, Any],
+    rate_limits: dict[str, Any] | None = None,
+    *,
+    rate_limits_error: bool = False,
+    refresh_error: str | None = None,
 ) -> str:
     result_json = json.dumps(result)
     rate_limits_json = json.dumps(rate_limits or {})
     rate_limits_error_json = json.dumps(rate_limits_error)
+    refresh_error_json = json.dumps(refresh_error)
     return f"""
 import json, sys
 
 result = json.loads({result_json!r})
 rate_limits = json.loads({rate_limits_json!r})
 rate_limits_error = json.loads({rate_limits_error_json!r})
+refresh_error = json.loads({refresh_error_json!r})
+account_reads = 0
 
 def send(obj):
     sys.stdout.write(json.dumps(obj) + "\\n")
@@ -144,13 +160,18 @@ for line in sys.stdin:
     if method == "initialize":
         send({{"id": msg["id"], "result": {{}}}})
     elif method == "account/read":
+        account_reads += 1
+        assert msg["params"]["refreshToken"] is (account_reads > 1)
+        if account_reads > 1 and refresh_error is not None:
+            send({{"id": msg["id"], "error": {{"message": refresh_error}}}})
+            break
         send({{"id": msg["id"], "result": result}})
     elif method == "account/rateLimits/read":
         if rate_limits_error:
             send({{"id": msg["id"], "error": {{"message": "denied by network policy"}}}})
         else:
             send({{"id": msg["id"], "result": rate_limits}})
-        break
+            break
     """
 
 
@@ -283,7 +304,25 @@ class FakeLoginServer:
         return ""
 
 
+def park_login(server: Any, login_id: str = "login-x") -> None:
+    with codex_app_server_module._login_lock:
+        codex_app_server_module._parked_login = codex_app_server_module._ParkedLogin(
+            server=server, login_id=login_id  # type: ignore[arg-type]
+        )
+
+
+def parked_server() -> Any:
+    with codex_app_server_module._login_lock:
+        parked = codex_app_server_module._parked_login
+    return parked.server if parked is not None else None
+
+
 class CodexAppServerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # The live-validation verdict is a process-global memo; isolate tests.
+        codex_app_server_module.clear_live_validation_failure()
+        self.addCleanup(codex_app_server_module.clear_live_validation_failure)
+
     def tearDown(self) -> None:
         codex_app_server_module.close_login_server()
 
@@ -293,10 +332,19 @@ class CodexAppServerTests(unittest.TestCase):
         rate_limits: dict[str, Any] | None = None,
         *,
         rate_limits_error: bool = False,
+        refresh_error: str | None = None,
     ) -> tuple[str, str | None, dict[str, Any] | None]:
         previous = codex_app_server_module.DEFAULT_COMMAND
         codex_app_server_module.DEFAULT_COMMAND = [
-            sys.executable, "-u", "-c", fake_account_server(result, rate_limits, rate_limits_error=rate_limits_error),
+            sys.executable,
+            "-u",
+            "-c",
+            fake_account_server(
+                result,
+                rate_limits,
+                rate_limits_error=rate_limits_error,
+                refresh_error=refresh_error,
+            ),
         ]
         try:
             return codex_app_server_module.account_status()
@@ -319,22 +367,132 @@ class CodexAppServerTests(unittest.TestCase):
                 (
                     "active",
                     None,
-                    {"account_id": "acct_123", "email": "dev@example.com", "planType": "pro"},
+                    {"account_id": "acct_123", "email": "dev@example.com", "plan_type": "pro"},
                 ),
             )
 
-    def test_account_status_tolerates_rate_limit_read_failure(self) -> None:
-        # An unapproved account has no proxy pin, so the guarded usage probe is
-        # denied; the account must still classify as active (without usage) so
-        # the refresh can settle it as awaiting operator login.
+    def test_account_status_refreshes_credentials_after_rate_limit_read_failure(self) -> None:
+        # A pinned account whose live usage read fails may hold stale cached
+        # credentials. account/read with refreshToken=true validates the
+        # credential through the auth endpoint without weakening the
+        # data-plane guard.
         result = {"account": {"email": "dev@example.com", "planType": "pro", "type": "chatgpt"}}
-        with patch("host.runtime.codex_app_server.read_codex_account_id", return_value="acct_123"):
+        with (
+            patch("host.runtime.codex_app_server.read_codex_account_id", return_value="acct_123"),
+            patch("host.runtime.codex_app_server.read_proxy_openai_account_id", return_value="acct_123"),
+        ):
             self.assertEqual(
                 self.account_status_with_result(result, rate_limits_error=True),
                 (
                     "active",
                     None,
-                    {"account_id": "acct_123", "email": "dev@example.com", "planType": "pro"},
+                    {"account_id": "acct_123", "email": "dev@example.com", "plan_type": "pro"},
+                ),
+            )
+
+    def test_account_status_never_forces_a_refresh_before_the_first_pin(self) -> None:
+        # An unapproved account has no proxy pin, so the guarded usage probe is
+        # always denied; that is routine, not a credential problem. The account
+        # classifies as readable (without usage) so the refresh settles it as
+        # awaiting operator approval, and its refresh token is never rotated:
+        # the refresh_error would fail this test if the fallback ran.
+        result = {"account": {"email": "dev@example.com", "planType": "pro", "type": "chatgpt"}}
+        with (
+            patch("host.runtime.codex_app_server.read_codex_account_id", return_value="acct_123"),
+            patch("host.runtime.codex_app_server.read_proxy_openai_account_id", return_value=None),
+        ):
+            self.assertEqual(
+                self.account_status_with_result(
+                    result,
+                    rate_limits_error=True,
+                    refresh_error="401 Invalid authentication credentials",
+                ),
+                (
+                    "active",
+                    None,
+                    {"account_id": "acct_123", "email": "dev@example.com", "plan_type": "pro"},
+                ),
+            )
+
+    def test_account_status_maps_failed_credential_refresh_to_awaiting_login(self) -> None:
+        result = {"account": {"email": "dev@example.com", "planType": "pro", "type": "chatgpt"}}
+        with (
+            patch("host.runtime.codex_app_server.read_codex_account_id", return_value="acct_123"),
+            patch("host.runtime.codex_app_server.read_proxy_openai_account_id", return_value="acct_123"),
+        ):
+            self.assertEqual(
+                self.account_status_with_result(
+                    result,
+                    rate_limits_error=True,
+                    refresh_error="401 Invalid authentication credentials",
+                ),
+                ("awaiting_login", None, None),
+            )
+
+    def test_failed_credential_refresh_is_not_retried_until_a_new_login(self) -> None:
+        # The verdict about a rejected credential is final: later polls repeat
+        # it without provider traffic (a successful-refresh fake would flip the
+        # status back to active if the fallback ran again). An operator login
+        # or account reset clears the verdict and revalidates from scratch.
+        result = {"account": {"email": "dev@example.com", "planType": "pro", "type": "chatgpt"}}
+        with (
+            patch("host.runtime.codex_app_server.read_codex_account_id", return_value="acct_123"),
+            patch("host.runtime.codex_app_server.read_proxy_openai_account_id", return_value="acct_123"),
+        ):
+            self.assertEqual(
+                self.account_status_with_result(
+                    result,
+                    rate_limits_error=True,
+                    refresh_error="401 Invalid authentication credentials",
+                ),
+                ("awaiting_login", None, None),
+            )
+            self.assertEqual(
+                self.account_status_with_result(result, rate_limits_error=True),
+                ("awaiting_login", None, None),
+            )
+            codex_app_server_module.clear_live_validation_failure()
+            self.assertEqual(
+                self.account_status_with_result(result, rate_limits_error=True),
+                (
+                    "active",
+                    None,
+                    {"account_id": "acct_123", "email": "dev@example.com", "plan_type": "pro"},
+                ),
+            )
+
+    def test_failed_credential_refresh_error_is_retried_after_the_window(self) -> None:
+        # A non-authentication failure (network, app-server) is remembered too,
+        # but only for LIVE_VALIDATION_RETRY_SECONDS: infrastructure recovers
+        # on its own, so the next scheduled recheck revalidates.
+        result = {"account": {"email": "dev@example.com", "planType": "pro", "type": "chatgpt"}}
+        with (
+            patch("host.runtime.codex_app_server.read_codex_account_id", return_value="acct_123"),
+            patch("host.runtime.codex_app_server.read_proxy_openai_account_id", return_value="acct_123"),
+        ):
+            status, error_message, account = self.account_status_with_result(
+                result, rate_limits_error=True, refresh_error="app-server unreachable"
+            )
+            self.assertEqual((status, account), ("error", None))
+            assert error_message is not None
+            self.assertIn("app-server unreachable", error_message)
+            self.assertEqual(
+                self.account_status_with_result(result, rate_limits_error=True),
+                (status, error_message, None),
+            )
+            failure = codex_app_server_module._live_validation_failure
+            assert failure is not None
+            codex_app_server_module._live_validation_failure = (
+                failure[0],
+                failure[1],
+                failure[2] - codex_app_server_module.LIVE_VALIDATION_RETRY_SECONDS - 1,
+            )
+            self.assertEqual(
+                self.account_status_with_result(result, rate_limits_error=True),
+                (
+                    "active",
+                    None,
+                    {"account_id": "acct_123", "email": "dev@example.com", "plan_type": "pro"},
                 ),
             )
 
@@ -380,7 +538,7 @@ class CodexAppServerTests(unittest.TestCase):
                     {
                         "account_id": "acct_123",
                         "email": "dev@example.com",
-                        "planType": "pro",
+                        "plan_type": "pro",
                         "codex_usage": {
                             "rate_limits": {
                                 "primary": {
@@ -402,8 +560,7 @@ class CodexAppServerTests(unittest.TestCase):
 
     def test_account_status_polls_parked_device_login_server_until_active_without_closing_it(self) -> None:
         login_server = FakeLoginServer({"email": "dev@example.com", "planType": "pro", "type": "chatgpt"})
-        with codex_app_server_module._login_lock:
-            codex_app_server_module._login_server = login_server  # type: ignore[assignment]
+        park_login(login_server)
 
         with (
             patch("host.runtime.codex_app_server.CodexAppServer", side_effect=AssertionError("started new server")),
@@ -414,7 +571,7 @@ class CodexAppServerTests(unittest.TestCase):
                 (
                     "active",
                     None,
-                    {"account_id": "acct_123", "email": "dev@example.com", "planType": "pro"},
+                    {"account_id": "acct_123", "email": "dev@example.com", "plan_type": "pro"},
                 ),
             )
 
@@ -423,84 +580,54 @@ class CodexAppServerTests(unittest.TestCase):
 
     def test_account_status_discards_only_the_same_dead_parked_login_server(self) -> None:
         login_server = FakeLoginServer(None, alive=False)
-        with codex_app_server_module._login_lock:
-            codex_app_server_module._login_server = login_server  # type: ignore[assignment]
+        park_login(login_server)
 
         self.assertIsNone(codex_app_server_module._current_login_server())
 
-        with codex_app_server_module._login_lock:
-            self.assertIsNone(codex_app_server_module._login_server)
+        self.assertIsNone(parked_server())
         self.assertTrue(login_server.closed)
 
     def test_login_server_pop_ignores_stale_server_reference(self) -> None:
         old_server = FakeLoginServer(None, alive=False)
         new_server = FakeLoginServer(None)
-        with codex_app_server_module._login_lock:
-            codex_app_server_module._login_server = new_server  # type: ignore[assignment]
+        park_login(new_server)
 
-        self.assertIsNone(codex_app_server_module._pop_login_server_if_current(old_server))  # type: ignore[arg-type]
+        self.assertIsNone(codex_app_server_module._pop_parked(lambda parked: parked.server is old_server))
 
-        with codex_app_server_module._login_lock:
-            self.assertIs(codex_app_server_module._login_server, new_server)
+        self.assertIs(parked_server(), new_server)
         self.assertFalse(old_server.closed)
         self.assertFalse(new_server.closed)
 
-    def test_close_if_current_leaves_a_login_started_during_reset_running(self) -> None:
-        reset_target = FakeLoginServer(None)
-        with codex_app_server_module._login_lock:
-            codex_app_server_module._login_server = reset_target  # type: ignore[assignment]
-
-        # Reset snapshots the parked server, then a fresh login parks a new one.
-        snapshot = codex_app_server_module.current_login_server()
-        new_login = FakeLoginServer(None)
-        with codex_app_server_module._login_lock:
-            codex_app_server_module._login_server = new_login  # type: ignore[assignment]
-
-        codex_app_server_module.close_login_server_if_current(snapshot)
-
-        self.assertFalse(new_login.closed)
-        with codex_app_server_module._login_lock:
-            self.assertIs(codex_app_server_module._login_server, new_login)
-
-    def test_close_if_current_closes_the_snapshotted_server_when_unreplaced(self) -> None:
+    def test_close_login_server_closes_whatever_is_parked(self) -> None:
         server = FakeLoginServer(None)
-        with codex_app_server_module._login_lock:
-            codex_app_server_module._login_server = server  # type: ignore[assignment]
+        park_login(server)
 
-        codex_app_server_module.close_login_server_if_current(codex_app_server_module.current_login_server())
+        codex_app_server_module.close_login_server()
 
         self.assertTrue(server.closed)
-        with codex_app_server_module._login_lock:
-            self.assertIsNone(codex_app_server_module._login_server)
+        self.assertIsNone(parked_server())
 
     def test_close_completed_login_server_ignores_a_newer_login_id(self) -> None:
         new_login = FakeLoginServer(None)
-        with codex_app_server_module._login_lock:
-            codex_app_server_module._login_server = new_login  # type: ignore[assignment]
-            codex_app_server_module._login_id = "login-2"
+        park_login(new_login, "login-2")
 
         codex_app_server_module.close_completed_login_server("login-1")
 
         self.assertFalse(new_login.closed)
-        with codex_app_server_module._login_lock:
-            self.assertIs(codex_app_server_module._login_server, new_login)
+        self.assertIs(parked_server(), new_login)
 
     def test_close_completed_login_server_closes_the_matching_login(self) -> None:
         server = FakeLoginServer(None)
-        with codex_app_server_module._login_lock:
-            codex_app_server_module._login_server = server  # type: ignore[assignment]
-            codex_app_server_module._login_id = "login-1"
+        park_login(server, "login-1")
 
         codex_app_server_module.close_completed_login_server("login-1")
 
         self.assertTrue(server.closed)
-        with codex_app_server_module._login_lock:
-            self.assertIsNone(codex_app_server_module._login_server)
+        self.assertIsNone(parked_server())
 
     def test_account_status_keeps_parked_device_login_server_while_awaiting_login(self) -> None:
         login_server = FakeLoginServer(None)
-        with codex_app_server_module._login_lock:
-            codex_app_server_module._login_server = login_server  # type: ignore[assignment]
+        park_login(login_server)
 
         with patch("host.runtime.codex_app_server.CodexAppServer", side_effect=AssertionError("started new server")):
             self.assertEqual(codex_app_server_module.account_status(), ("awaiting_login", None, None))
@@ -510,8 +637,7 @@ class CodexAppServerTests(unittest.TestCase):
 
     def test_account_status_keeps_parked_device_login_server_for_login_required_error(self) -> None:
         login_server = FakeLoginServer(None, account_error="not logged in")
-        with codex_app_server_module._login_lock:
-            codex_app_server_module._login_server = login_server  # type: ignore[assignment]
+        park_login(login_server)
 
         with patch("host.runtime.codex_app_server.CodexAppServer", side_effect=AssertionError("started new server")):
             self.assertEqual(codex_app_server_module.account_status(), ("awaiting_login", None, None))
@@ -524,9 +650,7 @@ class CodexAppServerTests(unittest.TestCase):
         # it must drain the completion notification so read_completed_device_login_account_id
         # can later look it up, even while the account itself still reads empty.
         login_server = FakeLoginServer(None, completed={"login-1"})
-        with codex_app_server_module._login_lock:
-            codex_app_server_module._login_server = login_server  # type: ignore[assignment]
-            codex_app_server_module._login_id = "login-1"
+        park_login(login_server, "login-1")
 
         # The poller captures the trusted account id from the login tokens the
         # instant it observes the completion, so patch the helper around the poll.
@@ -685,15 +809,49 @@ class CodexAppServerTests(unittest.TestCase):
     def test_run_turn_emits_each_message_and_returns_the_last_one(self) -> None:
         messages: list[str] = []
         with CodexAppServer([sys.executable, "-u", "-c", FAKE_APP_SERVER]) as server:
-            thread_id, output = run_turn(server, "do the task", None, lambda: [], messages.append, lambda _m: None)
+            thread_id, output = run_turn(
+                server,
+                "do the task",
+                None,
+                "gpt-5.6-sol",
+                "ultra",
+                lambda: [],
+                messages.append,
+                lambda _m: None,
+            )
 
         self.assertEqual(thread_id, "thread_1")
         self.assertEqual(messages, ["Hello", "Final answer"])
         self.assertEqual(output, "Final answer")
 
+    def test_run_turn_passes_model_when_resuming_a_thread(self) -> None:
+        with CodexAppServer([sys.executable, "-u", "-c", FAKE_APP_SERVER]) as server:
+            thread_id, output = run_turn(
+                server,
+                "continue",
+                "thread_existing",
+                "gpt-5.6-sol",
+                "ultra",
+                lambda: [],
+                lambda _m: None,
+                lambda _m: None,
+            )
+
+        self.assertEqual(thread_id, "thread_existing")
+        self.assertEqual(output, "Final answer")
+
     def test_run_turn_returns_unflushed_deltas_on_completion(self) -> None:
         with CodexAppServer([sys.executable, "-u", "-c", FAKE_DELTA_ONLY_SERVER]) as server:
-            _, output = run_turn(server, "do the task", None, lambda: [], lambda _m: None, lambda _m: None)
+            _, output = run_turn(
+                server,
+                "do the task",
+                None,
+                "gpt-5.6-terra",
+                "high",
+                lambda: [],
+                lambda _m: None,
+                lambda _m: None,
+            )
         self.assertEqual(output, "partial answer")
 
     def test_run_turn_retries_a_steer_that_raced_turn_startup(self) -> None:
@@ -703,7 +861,7 @@ class CodexAppServerTests(unittest.TestCase):
         pending = ["redirect"]
         with CodexAppServer([sys.executable, "-u", "-c", FAKE_STEER_RETRY_SERVER]) as server:
             _, output = run_turn(
-                server, "do the task", None,
+                server, "do the task", None, "gpt-5.6-terra", "high",
                 lambda: list(pending), lambda _m: None, pending.remove,
             )
         self.assertEqual(output, "STEERED")
@@ -714,7 +872,7 @@ class CodexAppServerTests(unittest.TestCase):
         with CodexAppServer([sys.executable, "-u", "-c", FAKE_STEER_REJECT_SERVER]) as server:
             with self.assertRaises(CodexAppServerError) as error:
                 run_turn(
-                    server, "do the task", None,
+                    server, "do the task", None, "gpt-5.6-terra", "high",
                     lambda: list(pending), lambda _m: None, pending.remove,
                 )
         self.assertIn("malformed input", str(error.exception))

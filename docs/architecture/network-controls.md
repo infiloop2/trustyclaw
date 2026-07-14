@@ -4,17 +4,23 @@ Defense in depth, fail closed at each layer:
 
 1. **nftables**: inbound is dropped except loopback, established traffic, and
    SSH port 22 when SSH operator access is configured. Outbound is dropped for
-   everyone except root, `trustyclaw-proxy`, optional `cloudflared`,
-   `systemd-resolved`, and `systemd-timesyncd`, with narrow loopback exceptions:
-   the agent may reach only the proxy port, the admin API may reach app backend
-   ports, and app service users may answer established admin-proxy connections.
+   everyone except root, `trustyclaw-proxy`, `trustyclaw-tools` (DNS and
+   HTTPS only, for the bundled tool packages' third-party APIs — see
+   [tools host integration](tools/host-integration.md); `trustyclaw-admin` has
+   no egress at all), optional `cloudflared`, `systemd-resolved`, and
+   `systemd-timesyncd`, with narrow
+   loopback exceptions: the agent may reach only the proxy port, the admin API
+   may reach app backend ports, and app service users may answer established
+   admin-proxy connections. The agent has no direct network path at all.
    Non-root DNS is blocked even toward the local `systemd-resolved` stub (DNS
-   lookups are an exfiltration channel); only `systemd-resolved`, the proxy, and
-   optional `cloudflared` may query upstream DNS. If the proxy is down, the
-   agent simply has no connectivity.
+   lookups are an exfiltration channel); only `systemd-resolved`, the proxy,
+   tools service, and optional `cloudflared` may query upstream DNS. If the
+   proxy is down, the agent simply has no connectivity.
 2. **Proxy environment**: agent processes run with `HTTP_PROXY`/`HTTPS_PROXY`/
    `ALL_PROXY` pointing at the local proxy and trust its CA via the system
-   store and `NODE_EXTRA_CA_CERTS`.
+   store and `NODE_EXTRA_CA_CERTS`. Tool-package traffic is separate: it runs
+   as `trustyclaw-tools` and uses that service's direct DNS/HTTPS allowance,
+   never the agent policy proxy.
 3. **Policy proxy**: every request is checked against `network_controls` before
    any upstream DNS resolution or connection happens, so a denied host name is
    never even resolved (host names are otherwise an exfiltration channel).
@@ -32,18 +38,21 @@ The proxy enforces, per request:
 
 - Domain match — exact rule wins over wildcards, longest wildcard wins; the rule
   must have a non-empty `allow_http_methods`.
-- Method against `allow_http_methods`; plain HTTP only on port 80, HTTPS/WSS
-  only on port 443.
+- Method against `allow_http_methods`; HTTPS/WSS on port 443 only. Plain HTTP
+  is not supported: every request gets a logged 403 before any body read, DNS
+  resolution, or upstream connection.
 - `path_guards` regexes against path plus query.
 - OpenAI guards: `managed_network_integrations.openai` expands to the required OpenAI domains,
-  denies live web search on the API/data-plane domains (the
-  `web_search_preview` tool, or `web_search` without
-  `external_web_access: false`) while allowing the cached tool, and requires
+  denies requests that would make OpenAI reach an external URL with request
+  data (any web-search tool other than `web_search` with
+  `external_web_access: false`, Chat Completions search, standalone search
+  requests that do not opt into cached retrieval, and remote MCP tools) while
+  allowing cache-backed search, and requires
   data-plane traffic to match the account id inferred from Codex login status
   (failing closed while that id is unavailable). The agent's Codex runtime is
   also pinned to cached web search via a managed
   `/etc/codex/requirements.toml`, which also disables Codex app/plugin
-  connector surfaces. The proxy remains a second web-search enforcement layer.
+  connector surfaces. The proxy remains a second enforcement layer.
 - Anthropic guards: `managed_network_integrations.claude` expands to the
   Claude Code OAuth path on `platform.claude.com` and the Anthropic API domain.
   The API domain fails closed until Claude Code OAuth has produced a locally
@@ -79,14 +88,17 @@ handshake passes policy. Request bodies are buffered for inspection — chunked
 bodies are decoded and re-sent with an explicit `Content-Length` — and bodies over
 128 MiB are rejected so the policy always sees the complete body.
 
-The host firewall accepts outbound traffic from root, from the dedicated
-`trustyclaw-proxy` uid, and from the optional `cloudflared` uid. Root egress
-covers bootstrap/package installation, security updates, and ordinary root-owned
-system traffic. The host does not install or configure the AWS SSM agent, and
+The host firewall accepts outbound traffic from root, the dedicated
+`trustyclaw-proxy` and `trustyclaw-tools` uids, and the optional `cloudflared`
+uid. Root egress covers bootstrap/package installation, security updates, and
+ordinary root-owned system traffic. The host does not install or configure the
+AWS SSM agent, and
 snapd is explicitly stopped and masked during bootstrap. Proxy egress is limited
-to DNS and TCP 80/443, and only after a request has passed policy. Cloudflare
-Tunnel egress is limited to DNS, TCP 443, and TCP/UDP 7844, and the EC2 security
-group keeps TCP/UDP 7844 open only when a `cloudflare_access` operator endpoint
+to DNS and TCP 80/443, and only after a request has passed policy. Tools-service
+egress is limited to DNS and TCP 443 for the bundled packages' third-party
+calls. Cloudflare Tunnel egress is limited to DNS, TCP 443, and TCP/UDP 7844,
+and the EC2 security group keeps TCP/UDP 7844 open only when a
+`cloudflare_access` operator endpoint
 is configured. That 7844 allowance is outbound-only and paired with nftables uid
 checks: it is usable by the `cloudflared` connector, not by the agent, admin
 API, or proxy users. It does not expose an inbound EC2 port.
@@ -105,7 +117,8 @@ writes under its own narrow database role. A denied `CONNECT` (no inner
 request was readable) is logged with method `CONNECT`.
 
 Policy replacement (`PUT /v1/network/policy`) validates the body and replaces
-the `network_policy` database row, which the proxy role can only read. The
+the normalized policy tables in one transaction; the proxy role can only read
+those enforcement inputs. The
 proxy reads and validates the policy per request, with deliberately no
 fallback cache: a database outage denies every request until the database
 returns, and an invalid stored policy equally denies all requests. Fail
@@ -124,7 +137,7 @@ reference for those fields.
 | `allow_http_methods` (generated) | every integration | Same mechanics as manual rules; the integration registry fixes the method list per generated domain (for example `POST` only on `api.openai.com`, `GET`/`HEAD` only on `raw.githubusercontent.com`). |
 | `path_guards` (generated) | `claude`, `python_packages`, `npm_packages` | Same regex mechanics as manual rules, with registry-fixed patterns (for example `^/v1/oauth(?:/.*)?$` on `platform.claude.com`, `^/packages(?:/.*)?$` on `files.pythonhosted.org`). Request paths are percent-decoded and dot-segment-normalized before matching so `..` segments cannot escape a guard. |
 | `openai_account_guard` | `openai` | Requires a `chatgpt-account-id` header on data-plane requests that is present and equal to the account id inferred from Codex login status (stored as the openai row in `proxy_provider_pins`). Missing id or missing header fails closed. |
-| `openai_disable_live_web_search` | `openai` | Buffers and decodes the request body (gzip/deflate in-process, zstd/brotli via system binaries, decoded output capped at 128 MiB), then denies `web_search_preview` anywhere and `web_search` tools without `external_web_access: false`. Also applied to each client-to-upstream WebSocket message on guarded domains. |
+| `openai_external_url_request_guard` | `openai` | Denies requests that would make OpenAI reach an external URL with request data. Buffers and decodes the request body (gzip/deflate in-process, decoded output capped at 128 MiB; any other encoding is denied outright), then enforces the rule structurally on the parsed JSON: a web-search-family tool object must be exactly `web_search` with `external_web_access: false` (preview and dated variants always browse live and are denied), Chat Completions search (`web_search_options`, `*-search*` models) is denied outright, remote MCP tools (`type: mcp` by `server_url` or hosted `connector_id`, or a `server_url` key anywhere) are denied outright, and the Codex standalone search endpoints (`/backend-api/codex/alpha/search`, `/v1/alpha/search`) must set `settings.external_web_access: false` because the server default there is live. Prompt text mentioning a tool name carries no capability and never matches; JSON-looking bodies that fail to parse are denied. Also applied to each client-to-upstream WebSocket message on guarded domains. |
 | `anthropic_account_guard` | `claude` | Denies `api.anthropic.com` requests unless the presented bearer token's SHA-256 hash equals the hash stored in the claude `proxy_provider_pins` row after Claude OAuth. Allows the unauthenticated `GET /api/hello` readiness probe and a fixed set of bearer-authenticated pre-pin bootstrap `GET` paths. The proxy stores and compares only the hash. |
 | `github_repo_guard` | `github` | Carries the normalized `write_repositories` list and `require_dot_github_approval` toggle. Applies the access decision tables — every read allowed on `github.com` web/smart-HTTP, `api.github.com` REST, and `codeload`/`raw`; writes gated to the write list, with repository administration denied outright, GraphQL denied outright, and REST content-write bypasses denied when `.github` approval is required. The signed-URL domains carry no guard: they expand to plain `GET`/`HEAD` rules (presigned S3 paths have no owner/repo; the signed URL is the access control). Runs after the generic domain/method/path checks, before upstream connection, with no DNS dependency. |
 
@@ -222,17 +235,15 @@ orchestrator poller each cycle. Enablement and credential health are separate
 concerns: the policy decides reachability, the credential row decides the
 token, and they meet only in reconcile's convergence rule — the working
 token is published exactly while GitHub is enabled with a credential stored,
-absent otherwise. A credential change or a publish that widens the GitHub
-scope (enables it, lists a new repository, or turns a listed repository
-writable) mints a fresh App token — installation tokens carry the
-repositories *and App permissions* granted at mint time, so the token must
-postdate whatever was just granted; every other reconcile (the poller,
-narrowing or unrelated policy edits) reuses the cached token until it nears
-its one-hour expiry. Failure handling is one rule, fail closed: any failure
+absent otherwise. A credential change or any publish that changes the GitHub
+integration, in either direction, mints a fresh App token — installation
+tokens carry the repositories *and App permissions* granted at mint time, so
+the token must postdate whatever was just granted; only the poller and
+unrelated policy edits reuse the cached token until it nears its one-hour
+expiry. Failure handling is one rule, fail closed: any failure
 records itself in the credential's validation status, withdraws the working
 token and the cached mint — a token that may not match the stored credential
 or the published repository list must never stay injectable — and is retried
 on the next poller cycle. Until it converges, git and gh simply run
-unauthenticated. A startup reconcile that cannot run at all (database
-briefly unavailable) is retried on a short interval so workers do not claim
-tasks against a stale working token for a full poller cycle.
+unauthenticated — fail closed; the poller's fixed cadence (well inside the
+App token's refresh margin) is the one retry path.

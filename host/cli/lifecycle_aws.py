@@ -38,6 +38,11 @@ def _aws_env(config: InputConfig) -> dict[str, str]:
         raise ConfigError(f"environment variable {config.aws_access_key_id_env} is not set")
     if not secret_key:
         raise ConfigError(f"environment variable {config.aws_secret_access_key_env} is not set")
+    session_token: str | None = None
+    if config.aws_session_token_env is not None:
+        session_token = os.environ.get(config.aws_session_token_env)
+        if not session_token:
+            raise ConfigError(f"environment variable {config.aws_session_token_env} is not set")
     env = os.environ.copy()
     env.update(
         {
@@ -46,7 +51,13 @@ def _aws_env(config: InputConfig) -> dict[str, str]:
             "AWS_DEFAULT_REGION": config.aws_region,
         }
     )
-    env.pop("AWS_SESSION_TOKEN", None)
+    # Session-token credentials (STS roles) are first-class; anything already
+    # in the caller's environment is still dropped so stale ambient tokens
+    # cannot leak into a static-key deployment.
+    if session_token is not None:
+        env["AWS_SESSION_TOKEN"] = session_token
+    else:
+        env.pop("AWS_SESSION_TOKEN", None)
     return env
 
 

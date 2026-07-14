@@ -10,9 +10,10 @@ stage test.
 
 The smoke covers subnet/SG/IMDSv2/SSH provisioning, bootstrap on real Ubuntu,
 admin API access over the SSH tunnel, auth rejection, task lifecycle edge cases,
-idempotency, policy validation, event pagination, concurrent policy replaces,
+policy validation, event pagination, concurrent policy replaces,
 proxy protocol edge cases, live network enforcement, managed provider policy
-validation, and the network event prune race.
+validation, tool-service/socket boundaries, credential-free tool calls, and
+the network event prune race.
 
 Assumptions (checked, with clear failures):
 
@@ -26,8 +27,9 @@ into the region pinned in `tests/smoke/smoke_aws.py` (`SMOKE_REGION`, which matc
 the IAM policy), and generates an ephemeral operator SSH key it discards at
 teardown. So you write no config and create no key.
 
-Cost: one `t3.small` + one 16 GiB root gp3 volume + two 8 GiB encrypted data
-gp3 volumes for a few minutes. Teardown removes the instance root volume, both
+Cost: one `t3.small`, one 16 GiB root gp3 volume, one 16 GiB encrypted admin
+volume, and one 8 GiB encrypted agent volume for a few minutes. Teardown
+removes the instance root volume, both
 data volumes, and the smoke security group even if deploy fails before writing a
 result file.
 

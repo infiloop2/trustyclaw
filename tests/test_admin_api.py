@@ -5,6 +5,7 @@ import hashlib
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import socket
 import tempfile
@@ -27,9 +28,11 @@ from host.runtime import (
     github_credential,
     github_pending_push,
     orchestrator,
-    proxy_state_client,
+    tools_admin_api,
+    tools_api,
 )
-from host.runtime.network_policy import load_policy, save_policy
+from host.runtime.network_policy import load_policy
+from host.runtime.state import save_network_policy as save_policy
 from host.runtime.state import save_github_credential
 from host.runtime import state
 from host.runtime.state import (
@@ -38,8 +41,8 @@ from host.runtime.state import (
     read_openai_account,
     read_proxy_claude_account,
     read_proxy_openai_account_id,
-    save_claude_account,
     save_config,
+    save_claude_account,
     save_openai_account,
 )
 from state_seed import load_state, save_state
@@ -58,18 +61,148 @@ def save_attested_claude_account(account_id: str, **extra: Any) -> None:
 
 
 class AdminUiStaticTests(unittest.TestCase):
-    def test_inline_svg_icons_have_intrinsic_sizes_for_safari(self) -> None:
+    def test_database_free_admin_ui_contract(self) -> None:
+        # The database-backed integration-test class is skipped when local PostgreSQL is
+        # unavailable, but this method reads static assets only. Run the same
+        # assertions here so exact UI-copy and domain-list contracts are always
+        # exercised before CI.
+        AdminApiIntegrationTests.test_admin_ui_has_thread_task_event_smoke_path(self)
+
+    def test_connection_guide_preserves_network_and_data_disclosure_contracts(self) -> None:
+        runtime = Path(__file__).parents[1] / "host/runtime"
+        catalog = (runtime / "admin_ui" / "integration_catalog.js").read_text()
+        guide = (runtime / "admin_ui" / "connection_guide.js").read_text()
+        html = (runtime / "admin_ui.html").read_text()
+
+        for required_text in (
+            "GraphQL denied",
+            "LFS uploads denied",
+            "github.com",
+            "api.github.com",
+            "uploads.github.com",
+            "codeload.github.com",
+            "objects.githubusercontent.com",
+            "github-cloud.githubusercontent.com",
+            "raw.githubusercontent.com",
+            "release-assets.githubusercontent.com",
+            "pypi.org",
+            "files.pythonhosted.org",
+            "nodejs.org",
+            "registry.npmjs.org",
+        ):
+            self.assertIn(required_text, catalog)
+        self.assertIn("query parameters", catalog)
+        self.assertIn("renderDataSummary", guide)
+        self.assertNotIn("renderDataFlows", guide)
+        self.assertIn("What happens to your data", guide)
+        self.assertIn("Technical details", guide)
+        self.assertIn("renderGuide(selected)", guide)
+        self.assertNotIn("guide.connection", guide)
+        self.assertNotIn("guides.map(renderGuide)", guide)
+        self.assertNotIn("scrollIntoView", guide)
+        self.assertIn("Integration Guides", html)
+        self.assertNotIn("What each integration enables", html)
+
+    def test_connection_guide_screenshots_are_local_png_assets(self) -> None:
+        repo = Path(__file__).parents[1]
+        asset_dir = repo / "host/tools/shared/guide_assets/google"
+        mock = (repo / "tests/smoke-ui/run_admin_ui_mock.py").read_text()
+        for name in (
+            "google-auth-app-information.png",
+            "google-auth-data-access.png",
+            "google-auth-web-client.png",
+        ):
+            asset = asset_dir / name
+            self.assertTrue(asset.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
+            self.assertIn(f"/guide-assets/{name}", admin_api.UI_ASSETS)
+        self.assertIn('route = f"/guide-assets/{asset.name}"', mock)
+        self.assertFalse((repo / "host/runtime/admin_ui/guide_assets").exists())
+
+    def test_disabled_integrations_omit_irrelevant_connection_state(self) -> None:
+        runtime = Path(__file__).parents[1] / "host/runtime"
+        network_js = (runtime / "admin_ui" / "network.js").read_text()
+        tools_js = (runtime / "admin_ui" / "tools.js").read_text()
+        css = (runtime / "admin_ui.css").read_text()
+
+        self.assertIn('if (!enabled) {\n      setHtml(node, "");', network_js)
+        self.assertIn('const summary = !enabled && !identity', network_js)
+        self.assertIn('tool.connection === "oauth" && (tool.enabled || connected)', tools_js)
+        self.assertIn(".connection-summary {", css)
+        self.assertIn("color: var(--text-dim);", css)
+
+    def test_mobile_navigation_uses_an_accessible_drawer(self) -> None:
+        runtime = Path(__file__).parents[1] / "host/runtime"
+        html = (runtime / "admin_ui.html").read_text()
+        app_js = (runtime / "admin_ui" / "app.js").read_text()
+        css = (runtime / "admin_ui.css").read_text()
+
+        self.assertIn('id="mobile-nav-toggle"', html)
+        self.assertIn('aria-controls="sidebar"', html)
+        self.assertIn('id="nav-backdrop"', html)
+        self.assertIn("function setMobileNavOpen(open, restoreFocus = false)", app_js)
+        self.assertIn('sidebar.inert = mobile && !mobileNavOpen', app_js)
+        self.assertIn('document.querySelector(".topbar").inert = mobileNavOpen', app_js)
+        self.assertIn('document.querySelector("main").inert = mobileNavOpen', app_js)
+        self.assertIn(".sidebar.mobile-open { transform: translateX(0); }", css)
+
+    def test_provider_usage_rings_have_warning_and_critical_thresholds(self) -> None:
+        runtime = Path(__file__).parents[1] / "host/runtime"
+        health_js = (runtime / "admin_ui" / "health.js").read_text()
+        css = (runtime / "admin_ui.css").read_text()
+
+        self.assertIn('percent > 90 ? " usage-critical" : percent > 80 ? " usage-warning"', health_js)
+        # The rings use the muted usage-* palette so they read quietly in the
+        # dark top bar; ok/warning/critical stay visually distinct.
+        self.assertIn(".usage-ring.usage-warning .usage-ring-value { stroke: var(--usage-warn); }", css)
+        self.assertIn(".usage-ring.usage-critical .usage-ring-value { stroke: var(--usage-critical); }", css)
+
+    def test_provider_usage_rings_show_compact_reset_countdowns(self) -> None:
+        runtime = Path(__file__).parents[1] / "host/runtime"
+        health_js = (runtime / "admin_ui" / "health.js").read_text()
+        css = (runtime / "admin_ui.css").read_text()
+
+        self.assertIn("function resetCountdown(value, now = Date.now())", health_js)
+        self.assertIn("current_session_resets_at", health_js)
+        self.assertNotIn("resets_at_text", health_js)
+        # The countdown shares the single window-label line under the ring so
+        # the top bar keeps a constant height.
+        self.assertIn('${esc(label)}${countdown ? ` · ${countdown}` : ""}', health_js)
+        self.assertNotIn("usage-reset", health_js)
+        self.assertNotIn(".usage-reset {", css)
+        self.assertIn(".usage-window {", css)
+
+    def test_upgrade_notice_is_compact_accessible_and_version_driven(self) -> None:
+        runtime = Path(__file__).parents[1] / "host/runtime"
+        html = (runtime / "admin_ui.html").read_text()
+        health_js = (runtime / "admin_ui" / "health.js").read_text()
+        css = (runtime / "admin_ui.css").read_text()
+
+        self.assertIn('id="upgrade-notice"', html)
+        self.assertIn('id="upgrade-popover"', html)
+        self.assertNotIn('href="https://github.com/infiloop2/trustyclaw', html)
+        self.assertIn("renderUpgradeNotice(health.upgrade)", health_js)
+        self.assertIn('"Your TrustyClaw is at the latest version."', health_js)
+        self.assertIn('"Use your operator plane to upgrade."', health_js)
+        self.assertIn('notice.setAttribute("aria-label", label)', health_js)
+        self.assertIn(".upgrade-notice {", css)
+        self.assertIn("background: var(--ok-soft);", css)
+        self.assertIn("border-radius: 999px;", css)
+        self.assertIn(".upgrade-popover {", css)
+        self.assertIn(".upgrade-notice:hover .upgrade-popover", css)
+
+    def test_icons_have_intrinsic_sizes_and_share_the_favicon_asset(self) -> None:
         runtime = Path(__file__).parents[1] / "host/runtime"
         html = (runtime / "admin_ui.html").read_text()
         css = (runtime / "admin_ui.css").read_text()
 
-        self.assertIn('<svg class="brand-mark" width="30" height="30"', html)
-        self.assertIn('<svg class="login-mark" width="44" height="44"', html)
-        self.assertEqual(html.count('<svg width="19" height="19" viewBox="0 0 20 20"'), 7)
-        self.assertIn('/favicon.svg?v=__TRUSTYCLAW_ASSET_VERSION__', html)
-        self.assertIn('/favicon.ico?v=__TRUSTYCLAW_ASSET_VERSION__', html)
-        self.assertIn('/admin_ui.css?v=__TRUSTYCLAW_ASSET_VERSION__', html)
-        self.assertIn('<script type="module" src="/admin_ui/app.js?v=__TRUSTYCLAW_ASSET_VERSION__"></script>', html)
+        favicon_src = '/favicon.svg'
+        self.assertIn(f'<img class="brand-mark" width="30" height="30" src="{favicon_src}" alt="">', html)
+        self.assertIn(f'<img class="login-mark" width="44" height="44" src="{favicon_src}" alt="">', html)
+        self.assertEqual(html.count('<svg width="19" height="19" viewBox="0 0 20 20"'), 9)
+        self.assertIn('/favicon.svg', html)
+        self.assertIn('/favicon.ico', html)
+        self.assertIn('/admin_ui.css', html)
+        self.assertIn('<script type="module" src="/admin_ui/app.js"></script>', html)
         self.assertIn(".brand-mark { display: block; flex: 0 0 30px; height: 30px; width: 30px; }", css)
         self.assertIn(".login-mark { display: inline-block; height: 44px; margin-bottom: 0.4rem; width: 44px; }", css)
         self.assertIn(".tab-button svg { display: block; height: 19px; width: 19px; }", css)
@@ -83,14 +216,11 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertIn('id="app-tabs"', html)
         app_js = (runtime / "admin_ui" / "app.js").read_text()
         self.assertIn("trustyclaw-app-api", app_js)
-        self.assertNotIn("const APP_BRIDGE_ROUTES", app_js)
-        self.assertIn("function canonicalAppBridgePath", app_js)
-        self.assertIn('path.includes("\\\\")', app_js)
-        self.assertIn("new URL(path, window.location.origin)", app_js)
-        self.assertIn("canonical.pathname", app_js)
-        self.assertIn("canonical.requestPath", app_js)
         self.assertIn('"X-TrustyClaw-App-Bridge": app.id', app_js)
-        bridge_code = app_js.split("function isAppBridgeAllowed", 1)[1].split("document.addEventListener", 1)[0]
+        # The bridge scope is enforced server-side (route() 403s any
+        # bridge-tagged request outside the app's own API); the shell keeps
+        # only a friendly prefix pre-check.
+        bridge_code = app_js.split("async function handleAppApiMessage", 1)[1].split("document.addEventListener", 1)[0]
         self.assertIn("app.backend.api_route", bridge_code)
         self.assertNotIn("/v1/tasks", bridge_code)
         self.assertNotIn("host-runtime", bridge_code)
@@ -178,10 +308,10 @@ class AdminUiStaticTests(unittest.TestCase):
             return_value={"tasks": [{"task_id": "task_1", "thread_id": "agent_chat__chat"}]},
         ) as route:
             response = app_backend_admin_api.route_app_backend_request(
-                "agent_chat", "GET", "/v1/threads/chat/tasks", {}, None, ""
+                "agent_chat", "GET", "/v1/threads/chat/tasks", {}, None
             )
 
-        route.assert_called_once_with("GET", "/v1/threads/agent_chat__chat/tasks", {}, None)
+        route.assert_called_once_with("GET", "/v1/threads/agent_chat__chat/tasks", {}, None, app_backend_id="agent_chat")
         self.assertEqual(response["tasks"], [{"task_id": "task_1", "thread_id": "chat"}])
 
     def test_app_backend_visible_response_rejects_unscoped_thread_ids(self) -> None:
@@ -211,10 +341,10 @@ class AdminUiStaticTests(unittest.TestCase):
             ) as route,
         ):
             response = app_backend_admin_api.route_app_backend_request(
-                "agent_chat", "GET", "/v1/tasks/task_1", {}, None, ""
+                "agent_chat", "GET", "/v1/tasks/task_1", {}, None
             )
 
-        route.assert_called_once_with("GET", "/v1/tasks/task_1", {}, None)
+        route.assert_called_once_with("GET", "/v1/tasks/task_1", {}, None, app_backend_id="agent_chat")
         self.assertEqual(response, {"task_id": "task_1", "thread_id": "chat"})
 
     def test_host_task_ids_stay_raw_for_app_threads(self) -> None:
@@ -222,6 +352,8 @@ class AdminUiStaticTests(unittest.TestCase):
             "task_id": "task_1",
             "status": "queued",
             "agent_runtime": "codex",
+            "model": "gpt-5.6-terra",
+            "effort": "high",
             "thread_id": "agent_chat__chat",
             "input_message": "x",
             "created_at": "2026-06-08T00:00:00Z",
@@ -235,25 +367,26 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertEqual(response["thread_id"], "agent_chat__chat")
 
     def test_admin_task_create_rejects_app_reserved_thread_prefixes(self) -> None:
-        admin_api.REQUEST_CONTEXT.app_backend_id = None
-        self.addCleanup(lambda: setattr(admin_api.REQUEST_CONTEXT, "app_backend_id", None))
-
         with self.assertRaises(admin_api.ApiError) as error:
-            admin_api._validate_thread_id_not_reserved_by_app("agent_chat__chat")
+            admin_api._validate_thread_id_not_reserved_by_app("agent_chat__chat", None)
 
         self.assertEqual(error.exception.status, HTTPStatus.BAD_REQUEST)
 
-        admin_api.REQUEST_CONTEXT.app_backend_id = "agent_chat"
-        admin_api._validate_thread_id_not_reserved_by_app("agent_chat__chat")
+        admin_api._validate_thread_id_not_reserved_by_app("agent_chat__chat", "agent_chat")
 
-    def test_app_bridge_marker_cannot_target_different_app(self) -> None:
-        admin_api.REQUEST_CONTEXT.bridge_app_id = "other-app"
-        self.addCleanup(lambda: setattr(admin_api.REQUEST_CONTEXT, "bridge_app_id", None))
-
-        with self.assertRaises(admin_api.ApiError) as error:
-            admin_api.route("GET", "/v1/apps/agent_chat/api/health", {}, None)
-
-        self.assertEqual(error.exception.status, HTTPStatus.FORBIDDEN)
+    def test_app_bridge_marker_cannot_leave_the_apps_own_api(self) -> None:
+        # A bridge-tagged request is scoped server-side before any dispatch:
+        # another app's API, host task routes, and the network policy are all
+        # 403 with nothing executed.
+        for path in (
+            "/v1/apps/agent_chat/api/health",
+            "/v1/tasks",
+            "/v1/network/policy",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(admin_api.ApiError) as error:
+                    admin_api.route("GET", path, {}, None, bridge_app_id="other-app")
+                self.assertEqual(error.exception.status, HTTPStatus.FORBIDDEN)
 
 
 class AgentProcessSnapshotTests(unittest.TestCase):
@@ -277,46 +410,27 @@ class AgentProcessSnapshotTests(unittest.TestCase):
             with (
                 patch("host.runtime.admin_api.AGENT_CGROUP_ROOT", root / "cgroup"),
                 patch("host.runtime.admin_api.PROC_ROOT", proc),
-                patch("host.runtime.admin_api.pwd.getpwuid", side_effect=KeyError),
             ):
                 snapshot = admin_api.agent_processes()
 
         self.assertFalse(snapshot["truncated"])
         self.assertEqual(len(snapshot["processes"]), 1)
         process = snapshot["processes"][0]
+        # Exactly the fields the admin UI renders.
         self.assertEqual(process["pid"], 123)
-        self.assertEqual(process["ppid"], 1)
-        self.assertEqual(process["user"], "47743")
         self.assertEqual(process["state"], "S")
         self.assertEqual(process["name"], "codex")
         self.assertEqual(process["cmdline"], "codex app-server --listen stdio://")
         self.assertEqual(process["rss_bytes"], 1234 * 1024)
-        self.assertEqual(process["scope"], "run-codex.scope")
         self.assertGreaterEqual(process["elapsed_seconds"], 0)
-
-    def test_claude_usage_normalizer_keeps_partial_usage(self) -> None:
         self.assertEqual(
-            admin_api._normalize_claude_usage(
-                {
-                    "current_session_used_percent": 0,
-                    "weekly_used_percent": 0,
-                    "weekly_resets_at_text": "Jul 3, 3:59pm (UTC)",
-                }
-            ),
-            {
-                "current_session_used_percent": 0,
-                "weekly_used_percent": 0,
-                "weekly_resets_at_text": "Jul 3, 3:59pm (UTC)",
-            },
+            set(process), {"pid", "state", "name", "cmdline", "rss_bytes", "elapsed_seconds"}
         )
 
 
 class AdminApiIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         pg_harness.reset_database()
-        admin_api.IDEMPOTENCY_ENTRIES.clear()
-        orchestrator._CLAUDE_ATTESTATIONS.clear()
-        self.addCleanup(orchestrator._CLAUDE_ATTESTATIONS.clear)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.proxy_temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
@@ -353,13 +467,18 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.addCleanup(self.server.shutdown)
         self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
 
-    def request(self, method: str, path: str, body: object | None = None, auth: bool = True, idem: str | None = None):
+    def request(self, method: str, path: str, body: object | None = None, auth: bool = True):
+        if method == "POST" and path == "/v1/tasks" and isinstance(body, dict):
+            body = dict(body)
+            if "model" not in body and "effort" not in body:
+                if body.get("agent_runtime") == "claude_code":
+                    body.update({"model": "opus", "effort": "high"})
+                elif body.get("agent_runtime") == "codex":
+                    body.update({"model": "gpt-5.6-terra", "effort": "high"})
         data = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(f"{self.base_url}{path}", data=data, method=method)
         if auth:
             request.add_header("Authorization", "Bearer admin-secret")
-        if idem:
-            request.add_header("Idempotency-Key", idem)
         if body is not None:
             request.add_header("Content-Type", "application/json")
         with urllib.request.urlopen(request, timeout=5) as response:
@@ -382,6 +501,10 @@ class AdminApiIntegrationTests(unittest.TestCase):
             patch("host.runtime.admin_api.host_metrics", return_value={"cpu": {}, "memory": {}, "filesystem": {}, "swap": {}}),
             patch("host.runtime.admin_api.proxy_alive", return_value=proxy_alive),
             patch("host.runtime.admin_api.version_status", return_value={"status": "ok", "runtime": "0.2.0", "state": "0.2.0"}),
+            patch(
+                "host.runtime.admin_api.upgrade_check.status",
+                return_value={"available": True, "latest": "0.3.0"},
+            ),
         ):
             return self.request("GET", "/v1/health")
 
@@ -394,8 +517,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
         method: str,
         path: str,
         body: object | None = None,
-        *,
-        idem: str = "",
     ) -> dict[str, Any]:
         return app_backend_admin_api.route_app_backend_request(
             "agent_chat",
@@ -403,7 +524,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
             path,
             {},
             body,
-            idem,
         )
 
     def test_health_requires_auth_and_reports_state(self) -> None:
@@ -419,6 +539,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(self.runtime(body, "claude_code")["status"], "deactivated")
         self.assertEqual(body["network_controls"]["status"], "active")
         self.assertEqual(body["version"], {"status": "ok", "runtime": "0.2.0", "state": "0.2.0"})
+        self.assertEqual(body["upgrade"], {"available": True, "latest": "0.3.0"})
 
     def test_apps_endpoint_requires_auth_and_lists_agent_chat(self) -> None:
         with self.assertRaises(urllib.error.HTTPError) as error:
@@ -431,7 +552,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         app = next(item for item in body["apps"] if item["id"] == "agent_chat")
         self.assertEqual(app["title"], "Agent Chat")
         self.assertEqual(app["ui"]["iframe_src"], "/v1/apps/agent_chat/ui/index.html")
-        self.assertEqual(app["database"]["schema"], "app_agent_chat")
+        self.assertEqual(app["backend"]["api_route"], "/v1/apps/agent_chat/api/")
 
     def test_app_backend_header_does_not_authenticate_tcp_admin_api(self) -> None:
         request = urllib.request.Request(f"{self.base_url}/v1/threads", method="GET")
@@ -446,8 +567,13 @@ class AdminApiIntegrationTests(unittest.TestCase):
         task = self.app_backend_request(
             "POST",
             "/v1/tasks",
-            {"input_message": "from app", "thread_id": "chat", "agent_runtime": "codex"},
-            idem="app-prefix-create",
+            {
+                "input_message": "from app",
+                "thread_id": "chat",
+                "agent_runtime": "codex",
+                "model": "gpt-5.6-terra",
+                "effort": "high",
+            },
         )
 
         self.assertEqual(task["thread_id"], "chat")
@@ -460,7 +586,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
             "POST",
             "/v1/tasks",
             {"input_message": "host-visible chat", "thread_id": "chat", "agent_runtime": "codex"},
-            idem="host-visible-chat-create",
         )
 
         listed = self.app_backend_request("GET", "/v1/threads/chat/tasks")
@@ -490,7 +615,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
             "POST",
             "/v1/tasks",
             {"input_message": "outside app", "thread_id": "outside", "agent_runtime": "codex"},
-            idem="outside-create",
         )
 
         with self.assertRaises(admin_api.ApiError) as error:
@@ -503,8 +627,13 @@ class AdminApiIntegrationTests(unittest.TestCase):
             self.app_backend_request(
                 "POST",
                 "/v1/tasks",
-                {"input_message": "too long", "thread_id": "a" * 64, "agent_runtime": "codex"},
-                idem="app-prefix-too-long",
+                {
+                    "input_message": "too long",
+                    "thread_id": "a" * 64,
+                    "agent_runtime": "codex",
+                    "model": "gpt-5.6-terra",
+                    "effort": "high",
+                },
             )
 
         self.assertEqual(error.exception.status, HTTPStatus.BAD_REQUEST)
@@ -602,8 +731,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
         with patch("host.runtime.admin_api.shutil.disk_usage", side_effect=fake_disk_usage):
             metrics = admin_api.filesystem_metrics()
 
-        self.assertEqual(metrics["used_bytes"], 1)
-        self.assertEqual(metrics["total_bytes"], 10)
         self.assertEqual(metrics["mounts"], {
             "root": {"used_bytes": 1, "total_bytes": 10},
             "admin": {"used_bytes": 2, "total_bytes": 20},
@@ -615,14 +742,12 @@ class AdminApiIntegrationTests(unittest.TestCase):
             b"POST /v1/tasks HTTP/1.1\r\n"
             b"Host: 127.0.0.1\r\n"
             b"Authorization: Bearer admin-secret\r\n"
-            b"Idempotency-Key: raw-invalid-length\r\n"
             b"Content-Length: nope\r\n\r\n"
         )
         huge = self.raw_request(
             b"POST /v1/tasks HTTP/1.1\r\n"
             b"Host: 127.0.0.1\r\n"
             b"Authorization: Bearer admin-secret\r\n"
-            b"Idempotency-Key: raw-huge-length\r\n"
             b"Content-Length: 1048577\r\n\r\n"
         )
 
@@ -815,29 +940,8 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 504)
         self.assertIn("root helper could not be terminated", error.exception.read().decode())
 
-    def test_idempotency_key_replay_returns_original_response(self) -> None:
-        _, first = self.request("POST", "/v1/tasks", {"input_message": "do it", "thread_id": "t1", "agent_runtime": "codex"}, idem="same-key")
-        _, replay = self.request("POST", "/v1/tasks", {"input_message": "do it", "thread_id": "t1", "agent_runtime": "codex"}, idem="same-key")
-
-        self.assertEqual(first["task_id"], replay["task_id"])
-        _, listed = self.request("GET", "/v1/tasks")
-        self.assertEqual(len(listed["tasks"]), 1)
-
-        with self.assertRaises(urllib.error.HTTPError) as error:
-            self.request("POST", f"/v1/tasks/{first['task_id']}/cancel", idem="same-key")
-        self.assertEqual(error.exception.code, 400)
-
-    def test_mutations_require_valid_idempotency_key(self) -> None:
-        with self.assertRaises(urllib.error.HTTPError) as error:
-            self.request("POST", "/v1/tasks", {"input_message": "hello", "thread_id": "t1", "agent_runtime": "codex"})
-        self.assertEqual(error.exception.code, 400)
-
-        with self.assertRaises(urllib.error.HTTPError) as error:
-            self.request("POST", "/v1/tasks", {"input_message": "hello", "thread_id": "t1", "agent_runtime": "codex"}, idem="bad key")
-        self.assertEqual(error.exception.code, 400)
-
     def test_task_create_list_update_cancel_and_events(self) -> None:
-        status, task = self.request("POST", "/v1/tasks", {"input_message": "first task", "thread_id": "t1", "agent_runtime": "codex"}, idem="task-1")
+        status, task = self.request("POST", "/v1/tasks", {"input_message": "first task", "thread_id": "t1", "agent_runtime": "codex"})
         self.assertEqual(status, 200)
         self.assertEqual(task["status"], "queued")
         self.assertEqual(task["agent_runtime"], "codex")
@@ -848,18 +952,147 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(listed["tasks"][0]["input_message"], "first task")
         self.assertEqual(listed["tasks"][0]["thread_id"], "t1")
 
-        _, updated = self.request("PUT", f"/v1/tasks/{task_id}", {"input_message": "updated task"}, idem="task-2")
+        _, updated = self.request("PUT", f"/v1/tasks/{task_id}", {"input_message": "updated task"})
         self.assertEqual(updated["input_message"], "updated task")
 
         _, events = self.request("GET", f"/v1/tasks/{task_id}/events")
         self.assertEqual(events["events"], [])
 
-        _, cancel = self.request("POST", f"/v1/tasks/{task_id}/cancel", idem="task-3")
+        _, cancel = self.request("POST", f"/v1/tasks/{task_id}/cancel")
         self.assertEqual(cancel["status"], "accepted")
         _, cancelled = self.request("GET", f"/v1/tasks/{task_id}")
         self.assertEqual(cancelled["status"], "cancelled")
         _, events = self.request("GET", f"/v1/tasks/{task_id}/events")
         self.assertEqual([event["event_type"] for event in events["events"]], ["task.cancelled"])
+
+    def test_task_create_validates_and_returns_session_options(self) -> None:
+        status, codex = self.request(
+            "POST",
+            "/v1/tasks",
+            {
+                "input_message": "codex task",
+                "thread_id": "codex-options",
+                "agent_runtime": "codex",
+                "model": "gpt-5.6-luna",
+                "effort": "max",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual((codex["model"], codex["effort"]), ("gpt-5.6-luna", "max"))
+
+        status, claude = self.request(
+            "POST",
+            "/v1/tasks",
+            {
+                "input_message": "claude task",
+                "thread_id": "claude-options",
+                "agent_runtime": "claude_code",
+                "model": "fable",
+                "effort": "ultracode",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual((claude["model"], claude["effort"]), ("fable", "ultracode"))
+
+        invalid = [
+            {"model": "gpt-5.6-luna", "effort": "ultra"},
+            {"model": "opus", "effort": "high"},
+            {"model": "gpt-5.6-terra"},
+            {"effort": "high"},
+            {"model": None, "effort": None},
+        ]
+        for index, fields in enumerate(invalid):
+            with self.subTest(fields=fields), self.assertRaises(urllib.error.HTTPError) as error:
+                self.request(
+                    "POST",
+                    "/v1/tasks",
+                    {
+                        "input_message": "invalid",
+                        "thread_id": f"invalid-options-{index}",
+                        "agent_runtime": "codex",
+                        **fields,
+                    },
+                )
+            self.assertEqual(error.exception.code, 400)
+
+    def test_task_follow_up_uses_only_the_stored_session_configuration(self) -> None:
+        body = {
+            "input_message": "first",
+            "thread_id": "fixed-options",
+            "agent_runtime": "codex",
+            "model": "gpt-5.6-terra",
+            "effort": "high",
+        }
+        self.request("POST", "/v1/tasks", body)
+
+        for index, fields in enumerate(
+            (
+                {"model": "gpt-5.6-terra", "effort": "high"},
+                {"model": "gpt-5.6-sol", "effort": "high"},
+                {"model": "gpt-5.6-terra", "effort": "max"},
+            )
+        ):
+            with self.subTest(fields=fields), self.assertRaises(urllib.error.HTTPError) as error:
+                self.request(
+                    "POST",
+                    "/v1/tasks",
+                    {**body, "input_message": "conflict", **fields},
+                )
+            self.assertEqual(error.exception.code, 400)
+            self.assertIn("must be omitted for an existing thread", error.exception.read().decode())
+
+        with self.assertRaises(urllib.error.HTTPError) as partial_error:
+            self.request(
+                "POST",
+                "/v1/tasks",
+                {
+                    "input_message": "partial conflict",
+                    "thread_id": body["thread_id"],
+                    "model": "gpt-5.6-terra",
+                },
+            )
+        self.assertEqual(partial_error.exception.code, 400)
+        self.assertIn(
+            "must be omitted for an existing thread",
+            partial_error.exception.read().decode(),
+        )
+
+        _, follow_up = self.request(
+            "POST",
+            "/v1/tasks",
+            {"input_message": "follow up", "thread_id": body["thread_id"]},
+        )
+        self.assertEqual(
+            (follow_up["agent_runtime"], follow_up["model"], follow_up["effort"]),
+            (body["agent_runtime"], body["model"], body["effort"]),
+        )
+
+    def test_task_without_session_options_requires_an_existing_thread(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request(
+                "POST",
+                "/v1/tasks",
+                {"input_message": "first", "thread_id": "unknown-options"},
+            )
+
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn("required when starting a new thread", error.exception.read().decode())
+
+    def test_task_session_options_must_be_provided_together(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request(
+                "POST",
+                "/v1/tasks",
+                {
+                    "input_message": "first",
+                    "thread_id": "partial-options",
+                    "agent_runtime": "codex",
+                    "model": "gpt-5.6-terra",
+                },
+            )
+
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn("must be provided together", error.exception.read().decode())
 
     def test_thread_list_combines_runtime_sessions_and_current_tasks(self) -> None:
         state = load_state()
@@ -943,7 +1176,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual([task["task_id"] for task in body["tasks"]], ["task_1", "task_2"])
         self.assertEqual(body["tasks"][1]["output_message"], "done")
 
-    def test_create_task_rejects_thread_runtime_conflicts(self) -> None:
+    def test_create_task_rejects_configuration_for_existing_threads(self) -> None:
         state = load_state()
         state["tasks"] = [
             {
@@ -967,24 +1200,29 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 "POST",
                 "/v1/tasks",
                 {"input_message": "bad", "thread_id": "used-by-task", "agent_runtime": "claude_code"},
-                idem="conflict-task",
             )
-        self.assertEqual(task_error.exception.code, 409)
+        self.assertEqual(task_error.exception.code, 400)
 
         with self.assertRaises(urllib.error.HTTPError) as session_error:
             self.request(
                 "POST",
                 "/v1/tasks",
                 {"input_message": "bad", "thread_id": "used-by-session", "agent_runtime": "codex"},
-                idem="conflict-session",
             )
-        self.assertEqual(session_error.exception.code, 409)
+        self.assertEqual(session_error.exception.code, 400)
+
+        with self.assertRaises(urllib.error.HTTPError) as repeated_error:
+            self.request(
+                "POST",
+                "/v1/tasks",
+                {"input_message": "bad", "thread_id": "used-by-task", "agent_runtime": "codex"},
+            )
+        self.assertEqual(repeated_error.exception.code, 400)
 
         _, accepted = self.request(
             "POST",
             "/v1/tasks",
-            {"input_message": "ok", "thread_id": "used-by-task", "agent_runtime": "codex"},
-            idem="conflict-ok",
+            {"input_message": "ok", "thread_id": "used-by-task"},
         )
         self.assertEqual(accepted["thread_id"], "used-by-task")
 
@@ -994,12 +1232,23 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
     def test_task_event_history_can_be_paged_for_selected_task(self) -> None:
         with state.mutation() as cur:
+            state.save_thread_session(
+                cur,
+                "codex",
+                "t1",
+                None,
+                "2026-06-08T00:00:01Z",
+                "gpt-5.6-terra",
+                "high",
+            )
             state.insert_task(
                 cur,
                 {
                     "task_id": "task_1",
                     "status": "completed",
                     "agent_runtime": "codex",
+                    "model": "gpt-5.6-terra",
+                    "effort": "high",
                     "thread_id": "t1",
                     "input_message": "done",
                     "output_message": "ok",
@@ -1036,22 +1285,20 @@ class AdminApiIntegrationTests(unittest.TestCase):
         )
         api = (runtime / "admin_api.py").read_text()
         self.assertIn("<h2>Sessions</h2>", html)
-        self.assertIn('<link rel="stylesheet" href="/admin_ui.css?v=__TRUSTYCLAW_ASSET_VERSION__">', html)
-        self.assertIn('<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=__TRUSTYCLAW_ASSET_VERSION__">', html)
-        self.assertIn('<script type="module" src="/admin_ui/app.js?v=__TRUSTYCLAW_ASSET_VERSION__"></script>', html)
-        self.assertIn("UI_ASSET_VERSION_PLACEHOLDER", api)
-        self.assertIn("repo_version()", api)
+        self.assertIn('<link rel="stylesheet" href="/admin_ui.css">', html)
+        self.assertIn('<link rel="icon" type="image/svg+xml" href="/favicon.svg">', html)
+        self.assertIn('<script type="module" src="/admin_ui/app.js"></script>', html)
         self.assertIn("Cache-Control", api)
         self.assertIn("no-store, max-age=0", api)
-        self.assertIn('<svg class="brand-mark" width="30" height="30"', html)
-        self.assertIn('<svg class="login-mark" width="44" height="44"', html)
+        self.assertIn('<img class="brand-mark" width="30" height="30" src="/favicon.svg" alt="">', html)
+        self.assertIn('<img class="login-mark" width="44" height="44" src="/favicon.svg" alt="">', html)
         self.assertIn("admin_favicon.svg", api)
-        self.assertEqual(html.count('<svg width="19" height="19" viewBox="0 0 20 20"'), 7)
+        self.assertEqual(html.count('<svg width="19" height="19" viewBox="0 0 20 20"'), 9)
         self.assertIn('id="tab-processes"', html)
         self.assertIn("/v1/agent-processes", ui)
         self.assertIn("refreshAgentProcesses", ui)
         self.assertIn(".tab-button svg { display: block; height: 19px; width: 19px; }", ui)
-        self.assertIn('`Agent: ${health.agent_name}`', ui)
+        self.assertIn('`Host: ${health.agent_name}`', ui)
         self.assertNotIn("animation: panel-in", ui)
         self.assertIn("refreshVisibleTab(name).catch(() => {})", ui)
         self.assertIn('if (name === "agent-log")', ui)
@@ -1076,6 +1323,10 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertIn("filesystemMountTile", ui)
         self.assertIn("memorySwapTile", ui)
         self.assertIn('data-action="refresh-provider-usage"', ui)
+        self.assertIn('id="runtime-overview"', html)
+        self.assertNotIn("Agent runtimes", html)
+        self.assertNotIn("Provider usage", html)
+        self.assertIn("usageRing", ui)
         self.assertIn("/v1/agent-runtime/refresh", ui)
         self.assertIn("/v1/threads", ui)
         self.assertIn("/v1/threads/${encodeURIComponent(selectedThreadId)}/tasks", ui)
@@ -1087,7 +1338,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertIn("refreshTaskEvents", ui)
         self.assertIn("task-events-inline", ui)
         self.assertIn("expandedTaskEvents", ui)
-        self.assertIn("taskRecency", ui)
+        self.assertIn("renderThreadHistory", ui)
         self.assertIn("function taskEventsHtml(task, eventState)", ui)
         self.assertIn("Agent session log", html)
         self.assertNotIn("Agent thread log", html)
@@ -1141,7 +1392,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertIn('role="dialog"', html)
         # Per-integration rows publish immediately; there is no proposal state.
         self.assertIn("MANAGED_INTEGRATIONS", ui)
-        self.assertIn("INTEGRATION_INFO", ui)
+        self.assertIn("integration_catalog.js", ui)
         self.assertIn("publishPolicy", ui)
         self.assertIn("setIntegrationEnabled", ui)
         self.assertIn('data-action="enable-integration"', ui)
@@ -1160,10 +1411,17 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertNotIn("Managed integrations", html)
         self.assertNotIn("Curated access bundles", html)
         self.assertIn('<section class="integration-row"', ui)
-        # The integration explanations stay crisp and complete.
-        self.assertIn("This integration enables direct internet access to these domains and paths.", ui)
-        self.assertIn("any public repository, and any private repository the token reaches", ui)
-        self.assertIn('github: { label: "GitHub", info: "github" }', ui)
+        # Popovers stay high-level and link to the complete guide.
+        self.assertIn("Protections", ui)
+        self.assertIn("View integration guide", ui)
+        self.assertIn("Authenticated traffic for another account is denied", ui)
+        self.assertIn("writes work only for repositories configured", ui)
+        self.assertNotIn("iconTile", ui)
+        self.assertNotIn('class="icon-tile"', html)
+        self.assertIn('data-provider-status="${esc(name)}"', ui)
+        self.assertIn('connected: <span class="chip-label">${esc(identity)}</span>', ui)
+        self.assertIn('Start ${esc(runtimeLabel)} login', ui)
+        self.assertIn('>Disconnect</button>', ui)
         self.assertIn('aria-haspopup="dialog"', ui)
         self.assertIn('<h2>${esc(meta.label)}</h2>', ui)
         self.assertIn('data-action="toggle-integration-expansion"', ui)
@@ -1174,19 +1432,19 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertIn('id="custom-domain-details"', html)
         self.assertIn('data-action="toggle-custom-domain-access"', html)
         self.assertIn("api.openai.com", ui)
-        self.assertIn("POST; account guard; live web search disabled", ui)
+        self.assertIn("pinned-account and external-URL request guards", ui)
         self.assertIn("auth.openai.com", ui)
-        self.assertIn("GET, POST", ui)
+        self.assertIn("GET and POST", ui)
         self.assertIn("api.anthropic.com", ui)
-        self.assertIn("GET, POST; account guard", ui)
+        self.assertIn("pinned-account and OAuth-token guards", ui)
         self.assertIn("api.github.com", ui)
         self.assertIn("GraphQL denied", ui)
         self.assertIn("LFS uploads denied", ui)
         self.assertIn("pypi.org", ui)
-        self.assertIn("GET, HEAD; only /simple and /pypi/<package>/json paths", ui)
+        self.assertIn("GET and HEAD only under /simple and /pypi/<package>/json", ui)
         self.assertIn("registry.npmjs.org", ui)
-        self.assertIn("manual-domain", ui)
         self.assertIn("Add domain rule", html)
+        self.assertIn("Path guards (optional)", html)
         for domain in (
             "github.com",
             "api.github.com",
@@ -1203,6 +1461,21 @@ class AdminApiIntegrationTests(unittest.TestCase):
         ):
             self.assertIn(domain, ui)
         self.assertIn("addDomainRule", ui)
+        self.assertIn('id="tab-connection-guide"', html)
+        self.assertIn('id="panel-connection-guide"', html)
+        self.assertIn('id="connection-guide-index"', html)
+        self.assertIn('id="connection-guide-select"', html)
+        self.assertIn("connection-guide-open", ui)
+        self.assertIn("overflow-y: auto", ui)
+        self.assertNotIn('id="policy-message"', html)
+        self.assertNotIn('id="tools-message"', html)
+        self.assertIn('data-integration-message="${esc(name)}"', ui)
+        self.assertIn('data-tool-message="${esc(tool.tool_id)}"', ui)
+        self.assertIn("refreshConnectionGuide", ui)
+        self.assertIn('data-action="open-connection-guide"', ui)
+        self.assertIn("guide-protections", ui)
+        self.assertIn("Exact network boundary", ui)
+        self.assertIn("guide-assets", api)
         self.assertIn("removeDomainRule", ui)
         self.assertNotIn("loadAllTaskEvents", ui)
         self.assertNotIn("/v1/tasks/finished", ui)
@@ -1218,14 +1491,13 @@ class AdminApiIntegrationTests(unittest.TestCase):
             )
         ):
             with self.subTest(body=body), self.assertRaises(urllib.error.HTTPError) as error:
-                self.request("POST", "/v1/tasks", body, idem=f"runtime-bad-{index}")
+                self.request("POST", "/v1/tasks", body)
             self.assertEqual(error.exception.code, 400)
 
         _, body = self.request(
             "POST",
             "/v1/tasks",
             {"input_message": "hello", "thread_id": "t1", "agent_runtime": "claude_code"},
-            idem="runtime-claude",
         )
         self.assertEqual(body["agent_runtime"], "claude_code")
 
@@ -1236,7 +1508,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 "api.example.com": {"allow_http_methods": ["GET"], "path_guards": ["^/v1$"]}
             },
         }
-        _, response = self.request("PUT", "/v1/network/policy", body, idem="network-1")
+        _, response = self.request("PUT", "/v1/network/policy", body)
 
         self.assertEqual(response["network_controls"]["allowed_network_access"]["api.example.com"]["allow_http_methods"], ["GET"])
         # The stored policy keeps the operator-facing shape: managed provider
@@ -1253,14 +1525,14 @@ class AdminApiIntegrationTests(unittest.TestCase):
         body = {"ssh_port_opened": False, "managed_network_integrations": {"openai": {"enabled": True}}, "allowed_network_access": {}}
         with patch("host.runtime.admin_api.subprocess.run") as run:
             with self.assertRaises(urllib.error.HTTPError) as error:
-                self.request("PUT", "/v1/network/policy", body, idem="ssh-1")
+                self.request("PUT", "/v1/network/policy", body)
         self.assertEqual(error.exception.code, 400)
         run.assert_not_called()
 
     def test_network_policy_replace_succeeds_when_existing_policy_is_error(self) -> None:
         save_policy({"bogus": True}, "2026-06-08T00:00:01Z")
         body = {"managed_network_integrations": {"openai": {"enabled": True}}, "allowed_network_access": {}}
-        status, _ = self.request("PUT", "/v1/network/policy", body, idem="reload-recover")
+        status, _ = self.request("PUT", "/v1/network/policy", body)
         self.assertEqual(status, 200)
         self.assertEqual(load_policy()["managed_network_integrations"], {"openai": {"enabled": True}})
 
@@ -1301,7 +1573,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
         with patch("host.runtime.github_pending_push._run_helper_json", side_effect=fake_helper):
             status, approved = self.request(
-                "POST", "/v1/network-tools/github-pending-pushes/aa11bb22/approve", {}, idem="approve-1"
+                "POST", "/v1/network-tools/github-pending-pushes/aa11bb22/approve", {}
             )
         self.assertEqual(status, 200)
         self.assertEqual(approved["pending_push"]["status"], "approved")
@@ -1313,11 +1585,12 @@ class AdminApiIntegrationTests(unittest.TestCase):
         # Reject invokes the helper in cleanup mode, then marks the row.
         with patch("host.runtime.github_pending_push._run_helper_json", side_effect=fake_helper):
             _, rejected = self.request(
-                "POST", "/v1/network-tools/github-pending-pushes/cc33dd44/reject", {}, idem="reject-1"
+                "POST", "/v1/network-tools/github-pending-pushes/cc33dd44/reject", {}
             )
         self.assertEqual(rejected["pending_push"]["status"], "rejected")
         self.assertEqual(calls[1]["action"], "cleanup")
         self.assertNotIn("token", calls[1])
+        self.assertNotIn("ref_updates", calls[1])
         self.assertEqual(timeouts[1], github_pending_push.APPROVE_HELPER_TIMEOUT_SECONDS)
 
         state.enqueue_pending_push(
@@ -1335,7 +1608,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
         with patch("host.runtime.github_pending_push._run_helper_json", side_effect=fail_approve_then_cleanup):
             with self.assertRaises(urllib.error.HTTPError) as failed:
-                self.request("POST", "/v1/network-tools/github-pending-pushes/dd55ee66/approve", {}, idem="approve-3")
+                self.request("POST", "/v1/network-tools/github-pending-pushes/dd55ee66/approve", {})
         self.assertEqual(failed.exception.code, 409)
         failed_row = state.get_pending_push("dd55ee66")
         self.assertIsNotNone(failed_row)
@@ -1350,75 +1623,21 @@ class AdminApiIntegrationTests(unittest.TestCase):
             [{"old": "0" * 40, "new": "8" * 40, "ref": "refs/heads/no-token"}],
             [".github/workflows/no-token.yml"],
         )
-        no_token_calls: list[dict] = []
-
-        def cleanup_without_token(command, payload, *, timeout=None):  # type: ignore[no-untyped-def]
-            no_token_calls.append(payload)
-            self.assertEqual(timeout, github_pending_push.APPROVE_HELPER_TIMEOUT_SECONDS)
-            return {"ok": True}
-
-        with patch("host.runtime.github_pending_push._run_helper_json", side_effect=cleanup_without_token):
+        # Approving with no working token resolves the row exactly once: the
+        # replay never runs (no token to push with), so the push fails
+        # terminally and only the quarantine refs are torn down. Recovery is a
+        # fresh push once the credential is fixed.
+        with patch("host.runtime.github_pending_push._run_helper_json") as no_token_run:
             with self.assertRaises(urllib.error.HTTPError) as no_token:
-                self.request("POST", "/v1/network-tools/github-pending-pushes/0badcafe/approve", {}, idem="approve-no-token")
+                self.request("POST", "/v1/network-tools/github-pending-pushes/0badcafe/approve", {})
         self.assertEqual(no_token.exception.code, 409)
+        self.assertEqual([call.args[1]["action"] for call in no_token_run.call_args_list], ["cleanup"])
+        self.assertNotIn("token", no_token_run.call_args_list[0].args[1])
         no_token_row = state.get_pending_push("0badcafe")
         self.assertIsNotNone(no_token_row)
         assert no_token_row is not None
         self.assertEqual(no_token_row["status"], "failed")
-        self.assertIn("no working GitHub token", no_token_row["detail"])
-        self.assertEqual([call["action"] for call in no_token_calls], ["cleanup"])
-        self.assertNotIn("token", no_token_calls[0])
-
-        state.enqueue_pending_push(
-            "0feedbee", "infiloop2", "trustyclaw",
-            [{"old": "0" * 40, "new": "9" * 40, "ref": "refs/heads/no-token-cleanup-fail"}],
-            [".github/workflows/no-token-cleanup.yml"],
-        )
-
-        def fail_no_token_cleanup(command, payload, *, timeout=None):  # type: ignore[no-untyped-def]
-            raise github_credential.HelperError("stale lock")
-
-        with patch("host.runtime.github_pending_push._run_helper_json", side_effect=fail_no_token_cleanup):
-            with self.assertRaises(urllib.error.HTTPError) as no_token_cleanup:
-                self.request(
-                    "POST",
-                    "/v1/network-tools/github-pending-pushes/0feedbee/approve",
-                    {},
-                    idem="approve-no-token-cleanup",
-                )
-        self.assertEqual(no_token_cleanup.exception.code, 409)
-        no_token_cleanup_row = state.get_pending_push("0feedbee")
-        self.assertIsNotNone(no_token_cleanup_row)
-        assert no_token_cleanup_row is not None
-        self.assertEqual(no_token_cleanup_row["status"], "failed")
-        self.assertIn("cleanup failed: stale lock", no_token_cleanup_row["detail"])
         state.save_proxy_github_token("ghs_working")
-
-        state.enqueue_pending_push(
-            "1122aabb", "infiloop2", "trustyclaw",
-            [{"old": "0" * 40, "new": "6" * 40, "ref": "refs/heads/landed-cleanup"}],
-            [".github/workflows/landed.yml"],
-        )
-        landed_cleanup_calls: list[dict] = []
-
-        def cleanup_after_landed_push(command, payload, *, timeout=None):  # type: ignore[no-untyped-def]
-            landed_cleanup_calls.append(payload)
-            self.assertEqual(timeout, github_pending_push.APPROVE_HELPER_TIMEOUT_SECONDS)
-            if payload["action"] == "approve":
-                raise github_credential.HelperError(
-                    "pending ref lock",
-                    code=github_pending_push.HELPER_CLEANUP_AFTER_PUSH_CODE,
-                )
-            return {"ok": True}
-
-        with patch("host.runtime.github_pending_push._run_helper_json", side_effect=cleanup_after_landed_push):
-            status, landed = self.request(
-                "POST", "/v1/network-tools/github-pending-pushes/1122aabb/approve", {}, idem="approve-landed-1"
-            )
-        self.assertEqual(status, 200)
-        self.assertEqual(landed["pending_push"]["status"], "approved")
-        self.assertIn("pending-ref cleanup failed", landed["pending_push"]["detail"])
-        self.assertEqual([call["action"] for call in landed_cleanup_calls], ["approve"])
 
         state.enqueue_pending_push(
             "ff99aa00", "infiloop2", "trustyclaw",
@@ -1432,35 +1651,35 @@ class AdminApiIntegrationTests(unittest.TestCase):
             raise github_credential.HelperError("stale lock")
 
         with patch("host.runtime.github_pending_push._run_helper_json", side_effect=fail_cleanup):
-            with self.assertRaises(urllib.error.HTTPError) as cleanup_failed:
-                self.request("POST", "/v1/network-tools/github-pending-pushes/ff99aa00/reject", {}, idem="reject-cleanup-1")
-            self.assertEqual(cleanup_failed.exception.code, 409)
-            cleanup_row = state.get_pending_push("ff99aa00")
-            self.assertIsNotNone(cleanup_row)
-            assert cleanup_row is not None
-            self.assertEqual(cleanup_row["status"], "failed")
-            self.assertIn("pending-ref cleanup failed: stale lock", cleanup_row["detail"])
+            # Rejecting means the push never leaves the box: a failed ref
+            # cleanup (best-effort housekeeping) does not change the outcome.
+            status, rejected_with_bad_cleanup = self.request(
+                "POST", "/v1/network-tools/github-pending-pushes/ff99aa00/reject", {}
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(rejected_with_bad_cleanup["pending_push"]["status"], "rejected")
         self.assertEqual([call["action"] for call in cleanup_calls], ["cleanup"])
 
         # A missing id is 404; an already-resolved one is 409.
         with self.assertRaises(urllib.error.HTTPError) as missing:
-            self.request("POST", "/v1/network-tools/github-pending-pushes/deadbeef/approve", {}, idem="approve-2")
+            self.request("POST", "/v1/network-tools/github-pending-pushes/deadbeef/approve", {})
         self.assertEqual(missing.exception.code, 404)
         with self.assertRaises(urllib.error.HTTPError) as resolved:
-            self.request("POST", "/v1/network-tools/github-pending-pushes/cc33dd44/reject", {}, idem="reject-2")
+            self.request("POST", "/v1/network-tools/github-pending-pushes/cc33dd44/reject", {})
         self.assertEqual(resolved.exception.code, 409)
 
         state.enqueue_pending_push(
             "ee77ff88", "infiloop2", "trustyclaw",
             [{"old": "0" * 40, "new": "4" * 40, "ref": "refs/heads/racing"}], [".github/workflows/race.yml"],
         )
-        claimed = state.claim_pending_push("ee77ff88")
-        self.assertIsNotNone(claimed)
-        assert claimed is not None
-        self.assertEqual(claimed["status"], "resolving")
-        with patch("host.runtime.github_pending_push._run_helper_json") as run:
-            with self.assertRaises(urllib.error.HTTPError) as racing:
-                self.request("POST", "/v1/network-tools/github-pending-pushes/ee77ff88/reject", {}, idem="reject-3")
+        # A resolution racing another one gets a crisp conflict: resolutions
+        # serialize on RESOLVE_LOCK with a bounded wait.
+        self.assertTrue(github_pending_push.RESOLVE_LOCK.acquire(timeout=1))
+        self.addCleanup(github_pending_push.RESOLVE_LOCK.release)
+        with patch.object(github_pending_push, "RESOLVE_LOCK_TIMEOUT_SECONDS", 0.05):
+            with patch("host.runtime.github_pending_push._run_helper_json") as run:
+                with self.assertRaises(urllib.error.HTTPError) as racing:
+                    self.request("POST", "/v1/network-tools/github-pending-pushes/ee77ff88/reject", {})
         self.assertEqual(racing.exception.code, 409)
         run.assert_not_called()
 
@@ -1477,7 +1696,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
             "PUT",
             "/v1/network-tools/github-credential",
             {"mode": "pat", "token": "github_pat_test"},
-            idem="github-credential-set",
         )
         self.assertTrue(saved["configured"])
         self.assertEqual(saved["mode"], "pat")
@@ -1488,7 +1706,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertTrue(loaded["configured"])
         self.assertNotIn("github_pat_test", json.dumps(loaded))
 
-        _, deleted = self.request("DELETE", "/v1/network-tools/github-credential", idem="github-credential-delete")
+        _, deleted = self.request("DELETE", "/v1/network-tools/github-credential")
         self.assertFalse(deleted["configured"])
         self.assertEqual(deleted["repository_audits"][0]["warnings"][0]["code"], "repository_audit_incomplete")
         self.assertIsNone(state.read_proxy_github_token())
@@ -1503,7 +1721,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 },
                 "allowed_network_access": {},
             },
-            idem="github-policy-no-credential",
         )
         self.assertEqual(status, 200)
 
@@ -1538,7 +1755,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                     "installation_id": "67890",
                     "private_key_pem": "-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END RSA PRIVATE KEY-----",
                 },
-                idem="github-credential-app",
             )
             # A fresh token is reused, not re-minted, by plain convergences
             # (the poller path).
@@ -1563,7 +1779,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                     },
                     "allowed_network_access": {},
                 },
-                idem="github-credential-repo-change",
             )
         self.assertEqual(len(mints), 2)
         self.assertEqual(saved["mode"], "app")
@@ -1592,7 +1807,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                     "installation_id": "67890",
                     "private_key_pem": "-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END RSA PRIVATE KEY-----",
                 },
-                idem="github-credential-app-fail",
             )
         self.assertEqual(saved["mode"], "app")
         self.assertEqual(saved["validation"]["status"], "error")
@@ -1643,7 +1857,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
             "PUT",
             "/v1/network-tools/github-credential",
             {"mode": "pat", "token": "github_pat_retired"},
-            idem="github-credential-replace-set-pat",
         )
         self.assertEqual(state.read_proxy_github_token(), "github_pat_retired")
 
@@ -1662,7 +1875,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                     "installation_id": "67890",
                     "private_key_pem": "-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END RSA PRIVATE KEY-----",
                 },
-                idem="github-credential-replace-app-fail",
             )
         # The new credential is stored with the mint failure recorded, and
         # the retired PAT is withdrawn.
@@ -1705,7 +1917,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                     },
                     "allowed_network_access": {},
                 },
-                idem="github-premint-enable",
             )
         self.assertEqual(status, 200)
         self.assertEqual(mints, [1])
@@ -1733,7 +1944,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                     },
                     "allowed_network_access": {},
                 },
-                idem="github-widen",
             )
         self.assertEqual(state.read_proxy_github_token(), "ghs_widened")
         # Any GitHub-integration change mints fresh — removals included — one
@@ -1751,7 +1961,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                     },
                     "allowed_network_access": {},
                 },
-                idem="github-narrow",
             )
         self.assertEqual(status, 200)
         self.assertEqual(state.read_proxy_github_token(), "ghs_narrowed")
@@ -1773,7 +1982,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                     },
                     "allowed_network_access": {},
                 },
-                idem="github-unrelated-edit",
             )
         self.assertEqual(status, 200)
         self.assertEqual(state.read_proxy_github_token(), "ghs_narrowed")
@@ -1811,7 +2019,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
             raise AssertionError(f"unexpected helper call: {command}")
 
         with patch("host.runtime.github_credential._run_helper_json", side_effect=fake_helper):
-            status, _ = self.request("PUT", "/v1/network/policy", enabling_policy, idem="github-enable-mint-down")
+            status, _ = self.request("PUT", "/v1/network/policy", enabling_policy)
             self.assertEqual(status, 200)
             # Enabled, but failed closed: the previously published token is
             # withdrawn (it may not cover the published list), and the mint
@@ -1850,7 +2058,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 "PUT",
                 "/v1/network/policy",
                 {"managed_network_integrations": {"github": {"enabled": True}}, "allowed_network_access": {}},
-                idem="github-read-only-enable",
             )
         self.assertEqual(status, 200)
         self.assertEqual(state.read_proxy_github_token(), "ghs_read_only")
@@ -1862,14 +2069,12 @@ class AdminApiIntegrationTests(unittest.TestCase):
             "PUT",
             "/v1/network-tools/github-credential",
             {"mode": "pat", "token": "github_pat_test"},
-            idem="github-credential-reconcile",
         )
         self.assertIsNotNone(state.read_proxy_github_token())
         status, _ = self.request(
             "PUT",
             "/v1/network/policy",
             {"managed_network_integrations": {}, "allowed_network_access": {}},
-            idem="github-disable",
         )
         self.assertEqual(status, 200)
         self.assertIsNone(state.read_proxy_github_token())
@@ -1911,7 +2116,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
             def run_delete() -> None:
                 try:
-                    deleter_result.append(self.request("DELETE", "/v1/network-tools/github-credential", idem="github-credential-race"))
+                    deleter_result.append(self.request("DELETE", "/v1/network-tools/github-credential"))
                 except Exception as exc:  # noqa: BLE001 - surfaced in assertions
                     deleter_result.append(exc)
 
@@ -1960,7 +2165,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
             "PUT",
             "/v1/network-tools/github-credential",
             {"mode": "pat", "token": "github_pat_staged"},
-            idem="github-credential-stage",
         )
         self.assertTrue(saved["configured"])
         # Staging while disabled leaves the credential's own health untouched
@@ -1978,7 +2182,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 },
                 "allowed_network_access": {},
             },
-            idem="github-credential-stage-enable",
         )
         self.assertEqual(status, 200)
         self.assertEqual(state.read_proxy_github_token(), "github_pat_staged")
@@ -1987,10 +2190,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
             "PUT",
             "/v1/network/policy",
             {"managed_network_integrations": {}, "allowed_network_access": {}},
-            idem="github-credential-stage-disable",
         )
         self.assertIsNone(state.read_proxy_github_token())
-        _, cleared = self.request("DELETE", "/v1/network-tools/github-credential", idem="github-credential-stage-delete")
+        _, cleared = self.request("DELETE", "/v1/network-tools/github-credential")
         self.assertFalse(cleared["configured"])
         self.assertNotIn("repository_audits", cleared)
 
@@ -2011,45 +2213,26 @@ class AdminApiIntegrationTests(unittest.TestCase):
             )
         ):
             with self.subTest(body=body), self.assertRaises(urllib.error.HTTPError) as error:
-                self.request("PUT", "/v1/network-tools/github-credential", body, idem=f"github-credential-bad-{index}")
+                self.request("PUT", "/v1/network-tools/github-credential", body)
             self.assertEqual(error.exception.code, 400)
 
-    def test_network_policy_replacements_are_serialized(self) -> None:
-        body = {"managed_network_integrations": {"openai": {"enabled": True}}, "allowed_network_access": {}}
-        active = 0
-        max_active = 0
-        lock = threading.Lock()
-
-        def fake_save(policy, updated_at):  # type: ignore[no-untyped-def]
-            nonlocal active, max_active
-            with lock:
-                active += 1
-                max_active = max(max_active, active)
-            time.sleep(0.05)
-            with lock:
-                active -= 1
-
+    def test_concurrent_network_policy_replacements_are_last_writer_wins(self) -> None:
+        # No dedicated policy lock: the DB write is atomic under the mutation
+        # lock, both requests succeed, and the stored policy is one of the two
+        # submitted bodies (never a blend).
+        enabled = {"managed_network_integrations": {"openai": {"enabled": True}}, "allowed_network_access": {}}
+        disabled = {"managed_network_integrations": {"openai": {"enabled": False}}, "allowed_network_access": {}}
         results: list[dict[str, object]] = []
-        with patch("host.runtime.admin_api.state.save_network_policy", side_effect=fake_save):
-            threads = [threading.Thread(target=lambda: results.append(admin_api.replace_network_policy(body))) for _ in range(2)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join()
-
+        threads = [
+            threading.Thread(target=lambda body=body: results.append(admin_api.replace_network_policy(body)))
+            for body in (enabled, disabled)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
         self.assertEqual(len(results), 2)
-        self.assertEqual(max_active, 1)
-
-    def test_network_policy_replace_fails_fast_when_update_is_in_progress(self) -> None:
-        body = {"managed_network_integrations": {"openai": {"enabled": True}}, "allowed_network_access": {}}
-        self.assertTrue(admin_api.NETWORK_POLICY_LOCK.acquire(blocking=False))
-        self.addCleanup(admin_api.NETWORK_POLICY_LOCK.release)
-
-        with patch("host.runtime.admin_api.NETWORK_POLICY_LOCK_TIMEOUT_SECONDS", 0):
-            with self.assertRaises(admin_api.ApiError) as error:
-                admin_api.replace_network_policy(body)
-
-        self.assertEqual(error.exception.status, HTTPStatus.CONFLICT)
+        self.assertIn(load_policy(), [parse_network_controls(body).to_json() for body in (enabled, disabled)])
 
     def test_reboot_helper_swallows_unkillable_timeout(self) -> None:
         # A timed-out helper may still reboot the host, so neither timeout shape
@@ -2070,14 +2253,14 @@ class AdminApiIntegrationTests(unittest.TestCase):
         # Queued tasks are never pruned, so the queue is the one task input
         # that could grow state.json without bound; creates beyond the cap 409.
         with patch.object(admin_api, "QUEUED_TASK_LIMIT", 2):
-            self.request("POST", "/v1/tasks", {"input_message": "a", "thread_id": "q1", "agent_runtime": "codex"}, idem="cap-1")
-            self.request("POST", "/v1/tasks", {"input_message": "b", "thread_id": "q2", "agent_runtime": "codex"}, idem="cap-2")
+            self.request("POST", "/v1/tasks", {"input_message": "a", "thread_id": "q1", "agent_runtime": "codex"})
+            self.request("POST", "/v1/tasks", {"input_message": "b", "thread_id": "q2", "agent_runtime": "codex"})
             with self.assertRaises(urllib.error.HTTPError) as error:
-                self.request("POST", "/v1/tasks", {"input_message": "c", "thread_id": "q3", "agent_runtime": "codex"}, idem="cap-3")
+                self.request("POST", "/v1/tasks", {"input_message": "c", "thread_id": "q3", "agent_runtime": "codex"})
             self.assertEqual(error.exception.code, 409)
             # Cancelling a queued task frees a slot.
-            self.request("POST", "/v1/tasks/task_1/cancel", idem="cap-cancel")
-            _, body = self.request("POST", "/v1/tasks", {"input_message": "c", "thread_id": "q3", "agent_runtime": "codex"}, idem="cap-4")
+            self.request("POST", "/v1/tasks/task_1/cancel")
+            _, body = self.request("POST", "/v1/tasks", {"input_message": "c", "thread_id": "q3", "agent_runtime": "codex"})
         self.assertEqual(body["status"], "queued")
 
     def test_pending_steers_are_capped(self) -> None:
@@ -2089,32 +2272,18 @@ class AdminApiIntegrationTests(unittest.TestCase):
         }]
         save_state(state)
         with patch.object(admin_api, "PENDING_STEER_LIMIT", 2):
-            self.request("POST", "/v1/tasks/task_1/steer", {"steer_message": "s1"}, idem="steer-1")
-            self.request("POST", "/v1/tasks/task_1/steer", {"steer_message": "s2"}, idem="steer-2")
+            self.request("POST", "/v1/tasks/task_1/steer", {"steer_message": "s1"})
+            self.request("POST", "/v1/tasks/task_1/steer", {"steer_message": "s2"})
             with self.assertRaises(urllib.error.HTTPError) as error:
-                self.request("POST", "/v1/tasks/task_1/steer", {"steer_message": "s3"}, idem="steer-3")
+                self.request("POST", "/v1/tasks/task_1/steer", {"steer_message": "s3"})
             self.assertEqual(error.exception.code, 409)
             # The queue drains as the worker delivers; a slot frees up.
             state = load_state()
             state["tasks"][0]["steer_messages"].pop(0)
             save_state(state)
-            _, body = self.request("POST", "/v1/tasks/task_1/steer", {"steer_message": "s3"}, idem="steer-4")
+            _, body = self.request("POST", "/v1/tasks/task_1/steer", {"steer_message": "s3"})
         self.assertEqual(body["status"], "accepted")
         self.assertEqual(load_state()["tasks"][0]["steer_messages"], ["s2", "s3"])
-
-    def test_idempotency_replay_does_not_re_execute_completed_request(self) -> None:
-        _, first = self.request("POST", "/v1/tasks", {"input_message": "once", "thread_id": "t1", "agent_runtime": "codex"}, idem="dup")
-        _, replay = self.request("POST", "/v1/tasks", {"input_message": "once", "thread_id": "t1", "agent_runtime": "codex"}, idem="dup")
-        self.assertEqual(first["task_id"], replay["task_id"])
-        _, listed = self.request("GET", "/v1/tasks")
-        self.assertEqual(len(listed["tasks"]), 1)
-
-    def test_idempotency_expired_key_re_executes(self) -> None:
-        _, first = self.request("POST", "/v1/tasks", {"input_message": "stale", "thread_id": "t1", "agent_runtime": "codex"}, idem="aged")
-        # Age the stored entry beyond retention.
-        admin_api.IDEMPOTENCY_ENTRIES["aged"]["stored_at"] -= admin_api.IDEMPOTENCY_RETENTION_SECONDS + 1
-        _, second = self.request("POST", "/v1/tasks", {"input_message": "stale", "thread_id": "t1", "agent_runtime": "codex"}, idem="aged")
-        self.assertNotEqual(first["task_id"], second["task_id"])
 
     def test_login_completion_clears_device_login_record(self) -> None:
         # Once the account goes active the device code is spent; keeping the
@@ -2259,7 +2428,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         state["agent_runtime_statuses"]["codex"]["status"] = "error"
         state["agent_runtime_statuses"]["claude_code"]["status"] = "awaiting_login"
         save_state(state)
-        save_approved_openai_account("acct_smoke", email="codex@example.com", planType="pro")
+        save_approved_openai_account("acct_smoke", email="codex@example.com", plan_type="pro")
         save_attested_claude_account("acct_claude", email="claude@example.com", access_token_sha256="0" * 64)
 
         _, body = self.request("GET", "/v1/agent-runtime/account")
@@ -2320,7 +2489,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         save_approved_openai_account(
             "acct_smoke",
             email="codex@example.com",
-            planType="pro",
+            plan_type="pro",
             type="chatgpt",
             codex_usage={
                 "last_checked_at": "2026-06-29T23:10:00Z",
@@ -2329,7 +2498,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                     "secondary": {"used_percent": 11, "window_duration_mins": 10080, "resets_at": 1783296254},
                     "credits": {"has_credits": False, "unlimited": False, "balance": "0"},
                 },
-                "access_token": "hidden",
             },
         )
 
@@ -2368,13 +2536,15 @@ class AdminApiIntegrationTests(unittest.TestCase):
             },
         )
 
-    def test_agent_accounts_normalize_exact_codex_usage_fields(self) -> None:
+    def test_agent_accounts_expose_stored_codex_usage(self) -> None:
+        # The runtime adapter sanitizes usage at capture and every active
+        # refresh rewrites the row, so the API exposes the stored shape as is.
         state = load_state()
         state["agent_runtime_statuses"]["codex"]["status"] = "active"
         save_state(state)
         save_approved_openai_account(
             "acct_smoke",
-            planType="pro",
+            plan_type="pro",
             codex_usage={
                 "last_checked_at": "2026-06-29T23:10:00Z",
                 "rate_limits": {
@@ -2382,17 +2552,14 @@ class AdminApiIntegrationTests(unittest.TestCase):
                         "used_percent": 8,
                         "window_duration_mins": 300,
                         "resets_at": 1782788897,
-                        "unknown": "dropped",
                     },
                     "secondary": {
                         "used_percent": 11,
                         "window_duration_mins": 10080,
                         "resets_at": 1783296254,
                     },
-                    "credits": {"has_credits": False, "unlimited": False, "balance": "0", "unknown": "dropped"},
-                    "unknown": "dropped",
+                    "credits": {"has_credits": False, "unlimited": False, "balance": "0"},
                 },
-                "unknown": "dropped",
             },
         )
 
@@ -2437,8 +2604,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
             plan_type="pro",
             claude_usage={
                 "current_session_used_percent": 0,
+                "current_session_resets_at": 1782781800,
                 "weekly_used_percent": 0,
-                "weekly_resets_at_text": "Jul 3, 3:59pm (UTC)",
+                "weekly_resets_at": 1783094340,
                 "last_checked_at": "2026-06-29T23:10:00Z",
             },
             access_token_sha256="f" * 64,
@@ -2460,8 +2628,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
                         "plan_type": "pro",
                         "claude_usage": {
                             "current_session_used_percent": 0,
+                            "current_session_resets_at": 1782781800,
                             "weekly_used_percent": 0,
-                            "weekly_resets_at_text": "Jul 3, 3:59pm (UTC)",
+                            "weekly_resets_at": 1783094340,
                             "last_checked_at": "2026-06-29T23:10:00Z",
                         },
                     },
@@ -2478,7 +2647,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
             claude_usage={
                 "current_session_used_percent": 0,
                 "weekly_used_percent": 0,
-                "weekly_resets_at_text": "Jul 3, 3:59pm (UTC)",
+                "weekly_resets_at": 1783094340,
             },
             access_token_sha256="f" * 64,
         )
@@ -2490,7 +2659,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
             {
                 "current_session_used_percent": 0,
                 "weekly_used_percent": 0,
-                "weekly_resets_at_text": "Jul 3, 3:59pm (UTC)",
+                "weekly_resets_at": 1783094340,
             },
         )
 
@@ -2500,7 +2669,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 "POST",
                 "/v1/agent-runtime/refresh",
                 {"agent_runtime": "claude_code"},
-                idem="refresh-claude",
             )
 
         refresh.assert_called_once_with("claude_code")
@@ -2508,7 +2676,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
     def test_agent_runtime_refresh_endpoint_refreshes_all_runtimes_by_default(self) -> None:
         with patch("host.runtime.admin_api.orchestrator.refresh_runtime_status") as refresh:
-            self.request("POST", "/v1/agent-runtime/refresh", {}, idem="refresh-all")
+            self.request("POST", "/v1/agent-runtime/refresh", {})
 
         self.assertEqual([call.args[0] for call in refresh.call_args_list], ["codex", "claude_code"])
 
@@ -2518,7 +2686,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 "POST",
                 "/v1/agent-runtime/refresh",
                 {"agent_runtime": "bad"},
-                idem="refresh-bad",
             )
 
         self.assertEqual(error.exception.code, HTTPStatus.BAD_REQUEST)
@@ -2563,7 +2730,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         ):
             for path in ("/v1/agent-runtime/codex-oauth-login", "/v1/agent-runtime/claude-oauth-login"):
                 with self.subTest(path=path), self.assertRaises(urllib.error.HTTPError) as error:
-                    self.request("POST", path, idem=f"disabled-{path.rsplit('/', 1)[-1]}")
+                    self.request("POST", path)
                 self.assertEqual(error.exception.code, 409)
 
     def test_current_oauth_rejects_disabled_provider_even_with_stale_oauth_state(self) -> None:
@@ -2713,7 +2880,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         }
         save_state(snapshot)
         save_approved_openai_account("acct_old")
-        proxy_state_client.sync_openai_account_id("acct_old")
+        state.save_proxy_openai_account_id("acct_old")
 
         completed = subprocess.CompletedProcess(
             [*admin_api.AGENT_AUTH_CLEAR_HELPER_COMMAND, "codex"], 0, stdout='{"removed":[]}', stderr=""
@@ -2753,7 +2920,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         snapshot["agent_runtime_statuses"]["claude_code"]["status"] = "active"
         save_state(snapshot)
         save_claude_account({"account_id": "acct_old", "access_token_sha256": "f" * 64})
-        proxy_state_client.sync_claude_account({"account_id": "acct_old", "access_token_sha256": "f" * 64})
+        state.save_proxy_claude_account({"account_id": "acct_old", "access_token_sha256": "f" * 64})
 
         completed = subprocess.CompletedProcess(
             [*admin_api.AGENT_AUTH_CLEAR_HELPER_COMMAND, "claude"], 0, stdout='{"removed":[]}', stderr=""
@@ -2817,7 +2984,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         snapshot["next_task_number"] = 2
         save_state(snapshot)
         save_approved_openai_account("acct_old")
-        proxy_state_client.sync_openai_account_id("acct_old")
+        state.save_proxy_openai_account_id("acct_old")
 
         completed = subprocess.CompletedProcess(
             [*admin_api.AGENT_AUTH_CLEAR_HELPER_COMMAND, "codex"], 0, stdout='{"removed":[]}', stderr=""
@@ -2844,7 +3011,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
             "2026-06-08T00:00:00Z",
         )
         save_approved_openai_account("acct_old")
-        proxy_state_client.sync_openai_account_id("acct_old")
+        state.save_proxy_openai_account_id("acct_old")
         failed = subprocess.CompletedProcess(
             [*admin_api.AGENT_AUTH_CLEAR_HELPER_COMMAND, "codex"],
             1,
@@ -2921,7 +3088,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(first["status"], "awaiting_code")
         self.assertEqual(start.call_count, 1)
 
-    def test_prune_state_trims_finished_tasks_and_idempotency(self) -> None:
+    def test_prune_state_trims_finished_tasks_and_thread_maps(self) -> None:
         # The production caps are six figures now; the trimming behavior is
         # pinned with small patched limits so the test stays fast.
         state = load_state()
@@ -2930,29 +3097,24 @@ class AdminApiIntegrationTests(unittest.TestCase):
         finished = [
             {"task_id": f"task_{n}", "status": "completed", "agent_runtime": "codex",
              "thread_id": f"t{n}", "input_message": "x",
-             "steer_messages": [], "created_at": "t", "updated_at": "t"}
+             "steer_messages": [], "created_at": "2026-06-07T00:00:00Z",
+             "updated_at": "2026-06-07T00:00:00Z"}
             for n in range(1, finished_limit + 6)
         ]
         queued = {"task_id": "task_9000", "status": "queued", "agent_runtime": "codex",
                   "thread_id": "t9000", "input_message": "live",
-                  "steer_messages": [], "created_at": "t", "updated_at": "t"}
+                  "steer_messages": [], "created_at": "2026-06-07T00:00:00Z",
+                  "updated_at": "2026-06-07T00:00:00Z"}
         state["tasks"] = finished + [queued]
-        with patch.object(admin_api, "IDEMPOTENCY_ENTRY_LIMIT", 2), patch.object(
+        with patch.object(
             admin_api, "FINISHED_TASK_LIMIT", finished_limit
         ), patch.object(admin_api, "THREAD_MAP_LIMIT", map_limit):
-            admin_api.IDEMPOTENCY_ENTRIES.update({
-                "old": {"method": "POST", "path": "/v1/tasks", "response": {}, "stored_at": time.time() - 20},
-                "fresh": {"method": "POST", "path": "/v1/tasks", "response": {}, "stored_at": time.time()},
-                "newer": {"method": "POST", "path": "/v1/tasks", "response": {}, "stored_at": time.time() + 1},
-                "stale": {"method": "POST", "path": "/v1/tasks", "response": {},
-                          "stored_at": time.time() - admin_api.IDEMPOTENCY_RETENTION_SECONDS - 1},
-            })
             state["codex_threads"] = {
-                f"chat-{n}": {"codex_thread_id": f"thread_{n}", "last_used_at": f"2026-06-08T{n // 60:02d}:{n % 60:02d}:00Z"}
+                f"codex-chat-{n}": {"codex_thread_id": f"thread_{n}", "last_used_at": f"2026-06-08T{n // 60:02d}:{n % 60:02d}:00Z"}
                 for n in range(map_limit + 5)
             }
             state["claude_sessions"] = {
-                f"chat-{n}": {"session_id": f"session_{n}", "last_used_at": f"2026-06-09T{n // 60:02d}:{n % 60:02d}:00Z"}
+                f"claude-chat-{n}": {"session_id": f"session_{n}", "last_used_at": f"2026-06-09T{n // 60:02d}:{n % 60:02d}:00Z"}
                 for n in range(map_limit + 5)
             }
             save_state(state)
@@ -2960,14 +3122,19 @@ class AdminApiIntegrationTests(unittest.TestCase):
             admin_api.prune_state()
 
         pruned = load_state()
-        self.assertEqual(set(admin_api.IDEMPOTENCY_ENTRIES), {"fresh", "newer"})
-        # The oldest thread mappings are dropped, the most recently used kept.
-        self.assertEqual(len(pruned["codex_threads"]), map_limit)
-        self.assertNotIn("chat-0", pruned["codex_threads"])
-        self.assertIn(f"chat-{map_limit + 4}", pruned["codex_threads"])
-        self.assertEqual(len(pruned["claude_sessions"]), map_limit)
-        self.assertNotIn("chat-0", pruned["claude_sessions"])
-        self.assertIn(f"chat-{map_limit + 4}", pruned["claude_sessions"])
+        # The oldest unreferenced mappings are dropped and the most recently
+        # used kept. Canonical rows referenced by retained tasks do not consume
+        # that allowance.
+        codex_history = {key for key in pruned["codex_threads"] if key.startswith("codex-chat-")}
+        self.assertEqual(len(codex_history), map_limit)
+        self.assertNotIn("codex-chat-0", codex_history)
+        self.assertIn(f"codex-chat-{map_limit + 4}", codex_history)
+        claude_history = {
+            key for key in pruned["claude_sessions"] if key.startswith("claude-chat-")
+        }
+        self.assertEqual(len(claude_history), map_limit)
+        self.assertNotIn("claude-chat-0", claude_history)
+        self.assertIn(f"claude-chat-{map_limit + 4}", claude_history)
         statuses = [t["status"] for t in pruned["tasks"]]
         self.assertIn("queued", statuses)  # active task always kept
         self.assertEqual(statuses.count("completed"), finished_limit)
@@ -2975,18 +3142,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
         kept_ids = {t["task_id"] for t in pruned["tasks"]}
         self.assertNotIn("task_1", kept_ids)
         self.assertIn(f"task_{finished_limit + 5}", kept_ids)
-
-    def test_idempotency_entries_are_capped_on_mutation_path(self) -> None:
-        admin_api.IDEMPOTENCY_ENTRIES.update({
-            "old": {"method": "POST", "path": "/v1/tasks", "response": {}, "stored_at": time.time() - 20},
-            "middle": {"method": "POST", "path": "/v1/tasks", "response": {}, "stored_at": time.time() - 10},
-        })
-
-        with patch.object(admin_api, "IDEMPOTENCY_ENTRY_LIMIT", 2):
-            _, body = self.request("POST", "/v1/tasks", {"input_message": "new", "thread_id": "t1", "agent_runtime": "codex"}, idem="new")
-
-        self.assertEqual(body["status"], "queued")
-        self.assertEqual(set(admin_api.IDEMPOTENCY_ENTRIES), {"middle", "new"})
 
     def test_network_events_are_read_from_the_database_with_cursor_paging(self) -> None:
         # Network events live in the database now (the proxy writes them under
@@ -3060,7 +3215,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
     def test_reboot_uses_privileged_helper(self) -> None:
         succeeded = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
         with patch("host.runtime.admin_api.subprocess.run", return_value=succeeded) as run:
-            _, body = self.request("POST", "/v1/host-runtime/reboot", idem="reboot-1")
+            _, body = self.request("POST", "/v1/host-runtime/reboot")
         self.assertEqual(body["status"], "accepted")
         run.assert_called_with(
             ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/reboot-host"],
@@ -3108,7 +3263,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         save_state(state)
 
         with patch("host.runtime.admin_api.orchestrator.close_task_server") as close:
-            _, body = self.request("POST", "/v1/tasks/task_1/kill", idem="kill-1")
+            _, body = self.request("POST", "/v1/tasks/task_1/kill")
         self.assertEqual(body["status"], "accepted")
         close.assert_called_once_with("task_1")
         _, task = self.request("GET", "/v1/tasks/task_1")
@@ -3128,12 +3283,12 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertNotIn("output_message", task)
 
     def test_kill_rejects_tasks_that_are_not_running(self) -> None:
-        _, queued = self.request("POST", "/v1/tasks", {"input_message": "waiting", "thread_id": "t1", "agent_runtime": "codex"}, idem="kill-q")
+        _, queued = self.request("POST", "/v1/tasks", {"input_message": "waiting", "thread_id": "t1", "agent_runtime": "codex"})
         with self.assertRaises(urllib.error.HTTPError) as error:
-            self.request("POST", f"/v1/tasks/{queued['task_id']}/kill", idem="kill-q2")
+            self.request("POST", f"/v1/tasks/{queued['task_id']}/kill")
         self.assertEqual(error.exception.code, 409)
         with self.assertRaises(urllib.error.HTTPError) as error:
-            self.request("POST", "/v1/tasks/task_999999/kill", idem="kill-404")
+            self.request("POST", "/v1/tasks/task_999999/kill")
         self.assertEqual(error.exception.code, 404)
 
     def test_create_task_requires_a_valid_thread_id(self) -> None:
@@ -3142,10 +3297,10 @@ class AdminApiIntegrationTests(unittest.TestCase):
             if bad is not None:
                 body["thread_id"] = bad
             with self.assertRaises(urllib.error.HTTPError) as error:
-                self.request("POST", "/v1/tasks", body, idem=f"thread-bad-{index}")
+                self.request("POST", "/v1/tasks", body)
             self.assertEqual(error.exception.code, 400)
         _, task = self.request(
-            "POST", "/v1/tasks", {"input_message": "hello", "thread_id": "Chat_01-a", "agent_runtime": "codex"}, idem="thread-ok"
+            "POST", "/v1/tasks", {"input_message": "hello", "thread_id": "Chat_01-a", "agent_runtime": "codex"}
         )
         self.assertEqual(task["thread_id"], "Chat_01-a")
 
@@ -3204,14 +3359,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
             }
         ]
         save_state(state)
-        admin_api.IDEMPOTENCY_ENTRIES["key-1"] = {
-            "method": "POST", "path": "/v1/tasks", "in_flight": True, "stored_at": time.time()
-        }
 
         # The port bind is the single-instance gate: a second instance must die
-        # there without failing the live instance's running task or dropping
-        # its in-flight idempotency reservations (which live in the live
-        # process's memory, out of any other instance's reach). The service
+        # there without failing the live instance's running task. The service
         # never runs migrations (that is bootstrap's job), so a stray start
         # also cannot move the schema under the live instance.
         with patch(
@@ -3223,8 +3373,271 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
         persisted = load_state()
         self.assertEqual(persisted["tasks"][0]["status"], "running")
-        self.assertIn("key-1", admin_api.IDEMPOTENCY_ENTRIES)
 
+
+
+class ToolRoutesTests(unittest.TestCase):
+    def setUp(self) -> None:
+        pg_harness.reset_database()
+        save_config(
+            {
+                "agent_name": "trustyclaw-test",
+                "admin_password_sha256": hashlib.sha256(b"admin-secret").hexdigest(),
+            }
+        )
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), admin_api.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        # The operator delegation routes (connect complete/disconnect, approval
+        # decide) forward to the trustyclaw-tools service socket, so stand one up
+        # in-process (same DB and BUNDLED_TOOLS) and point the admin API at it.
+        socket_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(socket_dir.cleanup)
+        tools_socket = str(Path(socket_dir.name) / "tools.sock")
+        previous_socket = tools_admin_api.TOOLS_SOCKET_PATH
+        tools_admin_api.TOOLS_SOCKET_PATH = tools_socket
+        self.addCleanup(setattr, tools_admin_api, "TOOLS_SOCKET_PATH", previous_socket)
+        tools_server = tools_api.ToolsServer(
+            tools_socket, frozenset({os.getuid()}), frozenset({os.getuid()})
+        )
+        threading.Thread(target=tools_server.serve_forever, daemon=True).start()
+        self.addCleanup(tools_server.server_close)
+        self.addCleanup(tools_server.shutdown)
+
+    def request(self, method: str, path: str, body: object | None = None, auth: bool = True):
+        data = json.dumps(body).encode() if body is not None else b"{}" if method != "GET" else None
+        request = urllib.request.Request(f"{self.base_url}{path}", data=data, method=method)
+        if auth:
+            request.add_header("Authorization", "Bearer admin-secret")
+        if method != "GET":
+            request.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, json.loads(response.read())
+
+    def tool_entry(self, body: dict, tool_id: str) -> dict:
+        return next(entry for entry in body["tools"] if entry["tool_id"] == tool_id)
+
+    def test_listing_requires_auth_and_reports_manifest_state(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request("GET", "/v1/tools", auth=False)
+        self.assertEqual(error.exception.code, 401)
+
+        status, body = self.request("GET", "/v1/tools")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            sorted(entry["tool_id"] for entry in body["tools"]),
+            ["brave_search", "gmail", "google_calendar"],
+        )
+        gmail = self.tool_entry(body, "gmail")
+        self.assertFalse(gmail["enabled"])
+        self.assertEqual(gmail["connection"], "oauth")
+        self.assertEqual(gmail["connection_status"], {"connected": False})
+        self.assertTrue(any(action["id"] == "send_email" for action in gmail["actions"]))
+        self.assertTrue(all("output_schema" in action for action in gmail["actions"]))
+        # Data policy is per action.
+        self.assertTrue(all(action["data_policy"] for action in gmail["actions"]))
+        send = next(action for action in gmail["actions"] if action["id"] == "send_email")
+        self.assertIn("approval", send["data_policy"].lower())
+        self.assertEqual(send["approval"], "operator")
+        read = next(action for action in gmail["actions"] if action["id"] == "read_message")
+        self.assertEqual(read["approval"], "direct")
+        self.assertTrue(all(gmail["protections"]))
+        self.assertGreaterEqual(len(gmail["setup_steps"]), 5)
+        self.assertIn("Google Cloud", gmail["setup_steps"][0]["description"])
+        self.assertTrue(any(step["image_path"] for step in gmail["setup_steps"]))
+        self.assertEqual(
+            [card["title"] for card in gmail["data_summary"]["cards"]],
+            ["What leaves this host", "Where it can go", "What Google can do with it", "How long Google retains it"],
+        )
+        reads_point = gmail["data_summary"]["cards"][0]["points"][0]
+        self.assertEqual(reads_point["label"], "Reads")
+        self.assertIn("Gmail search query", reads_point["text"])
+        self.assertIn("your own Gmail account", gmail["data_summary"]["cards"][1]["description"])
+        # The callback URI and config keys render inside the step that needs them.
+        self.assertTrue(any(step["show_callback"] for step in gmail["setup_steps"]))
+        self.assertTrue(gmail["setup_steps"][-1]["show_config"])
+        self.assertTrue(
+            all(
+                link["url"].startswith("https://")
+                for card in gmail["data_summary"]["cards"]
+                for link in card["links"]
+            )
+        )
+        config_keys = {entry["key"]: entry for entry in gmail["config"]}
+        self.assertFalse(config_keys["GOOGLE_OAUTH_CLIENT_ID"]["set"])
+        # All config values are secrets; there is no per-key secret flag.
+        self.assertNotIn("secret", config_keys["GOOGLE_OAUTH_CLIENT_ID"])
+
+    def test_config_and_enable_flow(self) -> None:
+        # Config is scoped per tool: a key must be declared by that tool.
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request("PUT", "/v1/tools/brave_search/config", {"key": "NOT_DECLARED", "value": "x"})
+        self.assertEqual(error.exception.code, 400)
+
+        status, body = self.request("GET", "/v1/tools")
+        brave = self.tool_entry(body, "brave_search")
+        brave_config = {entry["key"]: entry for entry in brave["config"]}
+        self.assertFalse(brave_config["BRAVE_SEARCH_API_KEY"]["set"])
+        self.assertNotIn("secret", brave_config["BRAVE_SEARCH_API_KEY"])
+
+        # Enablement is not gated on config: enabling without config succeeds, and
+        # the tool is enabled even though its config is not set.
+        status, body = self.request("POST", "/v1/tools/brave_search/enable")
+        self.assertEqual(body, {"tool_id": "brave_search", "enabled": True})
+        status, body = self.request("GET", "/v1/tools")
+        entry = self.tool_entry(body, "brave_search")
+        self.assertTrue(entry["enabled"])
+        self.assertFalse(entry["config"][0]["set"])
+
+        # Setting the config flips its set status; enablement is unchanged.
+        status, body = self.request("PUT", "/v1/tools/brave_search/config", {"key": "BRAVE_SEARCH_API_KEY", "value": "key-1"})
+        self.assertEqual(body, {"tool_id": "brave_search", "key": "BRAVE_SEARCH_API_KEY", "set": True})
+        status, body = self.request("GET", "/v1/tools")
+        entry = self.tool_entry(body, "brave_search")
+        self.assertTrue(entry["enabled"])
+        self.assertTrue(entry["config"][0]["set"])
+
+        status, body = self.request("POST", "/v1/tools/brave_search/disable")
+        self.assertEqual(body["enabled"], False)
+        status, body = self.request("PUT", "/v1/tools/brave_search/config", {"key": "BRAVE_SEARCH_API_KEY", "value": ""})
+        self.assertEqual(body["set"], False)
+
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request("POST", "/v1/tools/unknown_tool/enable")
+        self.assertEqual(error.exception.code, 404)
+
+    def test_connect_flow_routing_and_gating(self) -> None:
+        # enable_only tools have no connect flow.
+        self.request("PUT", "/v1/tools/brave_search/config", {"key": "BRAVE_SEARCH_API_KEY", "value": "key-1"})
+        self.request("POST", "/v1/tools/brave_search/enable")
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request("POST", "/v1/tools/brave_search/oauth_connect/start", {"redirect_uri": "http://x/cb"})
+        self.assertEqual(error.exception.code, 409)
+
+        # OAuth tools require enablement before connecting.
+        self.request("PUT", "/v1/tools/gmail/config", {"key": "GOOGLE_OAUTH_CLIENT_ID", "value": "client-1"})
+        self.request("PUT", "/v1/tools/gmail/config", {"key": "GOOGLE_OAUTH_CLIENT_SECRET", "value": "secret-1"})
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request("POST", "/v1/tools/gmail/oauth_connect/start", {"redirect_uri": "http://x/cb"})
+        self.assertEqual(error.exception.code, 409)
+
+        self.request("POST", "/v1/tools/gmail/enable")
+        status, body = self.request(
+            "POST", "/v1/tools/gmail/oauth_connect/start", {"redirect_uri": "http://localhost:7443/oauth/callback"}
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("accounts.google.com", body["authorization_url"])
+        self.assertIn("client-1", body["authorization_url"])
+        self.assertTrue(body["state"])
+
+        # A forged callback state is rejected without any third-party call.
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request(
+                "POST",
+                "/v1/tools/gmail/oauth_connect/complete",
+                {"code": "code-1", "state": "forged.state", "redirect_uri": "http://localhost:7443/oauth/callback"},
+            )
+        self.assertEqual(error.exception.code, 400)
+
+        status, body = self.request("POST", "/v1/tools/gmail/oauth_connect/disconnect")
+        self.assertEqual(body, {"tool_id": "gmail", "connected": False})
+
+        # Disconnect must stay available after the tool is disabled, or
+        # stored OAuth tokens would be stuck with no path to revoke them.
+        self.request("POST", "/v1/tools/gmail/disable")
+        status, body = self.request("POST", "/v1/tools/gmail/oauth_connect/disconnect")
+        self.assertEqual(body, {"tool_id": "gmail", "connected": False})
+
+    def test_approval_decisions(self) -> None:
+        from test_tools_host import FakeTool
+
+        with patch.dict(admin_api.tools_host.BUNDLED_TOOLS, {"fake_notes": FakeTool()}):
+            self.request("PUT", "/v1/tools/fake_notes/config", {"key": "FAKE_NOTES_TOKEN", "value": "token-1"})
+            self.request("POST", "/v1/tools/fake_notes/enable")
+            pending = admin_api.tools_host.execute_action("fake_notes", "write_note", {"text": "hello"})
+            approval_id = pending["approval_id"]
+
+            status, body = self.request("GET", "/v1/tools/fake_notes/approvals")
+            self.assertEqual(body["approvals"][0]["approval_id"], approval_id)
+            self.assertEqual(body["approvals"][0]["status"], "pending")
+            # The list is summary-only; the payload is fetched on demand.
+            self.assertNotIn("payload", body["approvals"][0])
+            status, single = self.request("GET", f"/v1/tools/fake_notes/approvals/{approval_id}")
+            self.assertEqual(single["approval"]["payload"], {"text": "hello"})
+            with self.assertRaises(urllib.error.HTTPError) as missing:
+                self.request("GET", "/v1/tools/fake_notes/approvals/approval_9999")
+            self.assertEqual(missing.exception.code, 404)
+            # An approval is scoped to its tool: another tool's path cannot read
+            # or decide it.
+            with self.assertRaises(urllib.error.HTTPError) as wrong_tool:
+                self.request("GET", f"/v1/tools/gmail/approvals/{approval_id}")
+            self.assertEqual(wrong_tool.exception.code, 404)
+            with self.assertRaises(urllib.error.HTTPError) as wrong_tool_decide:
+                self.request("POST", f"/v1/tools/gmail/approvals/{approval_id}/approve")
+            self.assertEqual(wrong_tool_decide.exception.code, 404)
+
+            status, body = self.request("POST", f"/v1/tools/fake_notes/approvals/{approval_id}/approve")
+            self.assertEqual(body["approval"]["status"], "executed")
+            self.assertEqual(body["result"], {"status": "executed", "message": "Wrote the note (5 chars)."})
+
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.request("POST", f"/v1/tools/fake_notes/approvals/{approval_id}/deny")
+            self.assertEqual(error.exception.code, 409)
+
+            denied = admin_api.tools_host.execute_action("fake_notes", "write_note", {"text": "no"})
+            status, body = self.request("POST", f"/v1/tools/fake_notes/approvals/{denied['approval_id']}/deny")
+            self.assertEqual(body["approval"]["status"], "denied")
+
+    def test_approval_list_limit_matches_pending_cap(self) -> None:
+        with patch.object(admin_api.state, "list_tool_approvals", return_value=[]) as listing:
+            status, body = self.request("GET", "/v1/tools/fake_notes/approvals")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"approvals": []})
+        listing.assert_called_once_with(admin_api.tools_host.PENDING_APPROVAL_LIMIT, tool_id="fake_notes")
+
+    def test_tool_events_endpoint_pages_newest_first(self) -> None:
+        from test_tools_host import FakeTool
+
+        with patch.dict(admin_api.tools_host.BUNDLED_TOOLS, {"fake_notes": FakeTool()}):
+            self.request("PUT", "/v1/tools/fake_notes/config", {"key": "FAKE_NOTES_TOKEN", "value": "token-1"})
+            self.request("POST", "/v1/tools/fake_notes/enable")
+            for _ in range(3):
+                admin_api.tools_host.execute_action("fake_notes", "read_note", {})
+
+            status, body = self.request("GET", "/v1/tools/events?limit=2")
+            self.assertEqual(status, 200)
+            self.assertEqual(len(body["events"]), 2)
+            seqs = [event["seq"] for event in body["events"]]
+            self.assertEqual(seqs, sorted(seqs, reverse=True))
+            self.assertEqual(body["events"][0]["tool_id"], "fake_notes")
+            self.assertEqual(body["events"][0]["action_id"], "read_note")
+
+            status, older = self.request("GET", f"/v1/tools/events?before={seqs[-1]}")
+            self.assertTrue(all(event["seq"] < seqs[-1] for event in older["events"]))
+
+            # Config and enablement changes are audited alongside calls.
+            all_events = self.request("GET", "/v1/tools/events")[1]["events"]
+            kinds = {(event["action_id"], event["outcome"], event["detail"]) for event in all_events}
+            self.assertIn(("config", "set", "FAKE_NOTES_TOKEN"), kinds)
+            self.assertIn(("enablement", "enabled", ""), kinds)
+            self.request("POST", "/v1/tools/fake_notes/disable")
+            after_disable = self.request("GET", "/v1/tools/events")[1]["events"]
+            self.assertEqual(after_disable[0]["action_id"], "enablement")
+            self.assertEqual(after_disable[0]["outcome"], "disabled")
+
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.request("GET", "/v1/tools/events?bogus=1")
+            self.assertEqual(error.exception.code, 400)
+
+    def test_oauth_callback_serves_the_ui_shell(self) -> None:
+        request = urllib.request.Request(f"{self.base_url}/oauth/callback?code=x&state=y")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            self.assertEqual(response.status, 200)
+            self.assertIn("text/html", response.headers["Content-Type"])
+            self.assertIn(b"TrustyClaw", response.read())
 
 
 if __name__ == "__main__":

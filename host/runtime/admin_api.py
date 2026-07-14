@@ -1,16 +1,20 @@
-"""Localhost admin API (127.0.0.1:7443), reached through SSH port forwarding.
+"""Localhost admin API (127.0.0.1:7443), reached through an operator endpoint.
+
+The supported endpoint paths are SSH port forwarding and the optional
+Cloudflare Tunnel. API routes require the admin bearer; only static admin/app
+assets and the side-effect-free OAuth callback shell are unauthenticated.
 
 Route handlers validate the documented protocol and update admin state in the
 local Postgres database (through the storage accessors in ``state``);
 running tasks through the selected agent runtime is delegated to
-``orchestrator``, which owns the worker pool and runtime process cache.
-Privileged operations
-(reboot, network policy replacement) go through narrow root-owned sudo
-helpers.
+``orchestrator``, which owns the worker pool and live task processes.
+Operations that require root or agent-user authority cross through fixed
+root-owned sudo helpers. Database-backed host state is updated directly under
+the admin database role.
 
 Authentication compares a SHA-256 hash of the presented bearer password
 against ``admin_password_sha256`` from the config table, so the cleartext
-password never exists on the host.
+password is never persisted on the host.
 """
 
 from __future__ import annotations
@@ -22,29 +26,37 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
-import pwd
 import re
 import shutil
 import socket
 import subprocess
 import threading
 import time
-from typing import Any
+from typing import Any, Callable, NamedTuple
 from urllib.parse import parse_qs, urlparse
 
 from host.config import AGENT_RUNTIMES, ConfigError, parse_network_controls
-from host.constants import ADMIN_API_PORT, LOOPBACK, PROXY_PORT
+from host.constants import ADMIN_API_PORT, LOOPBACK, MAX_REQUEST_BODY_BYTES, PROXY_PORT
+from host.session_options import session_config_error
+# app_backend_admin_api imports this module back to dispatch through route().
+# The cycle is safe with plain module imports: each side binds the module
+# object and reads its attributes only at request time, never during import.
 from host.runtime import (
+    app_api_proxy,
+    app_backend_admin_api,
     app_platform,
     claude_code,
     codex_app_server,
     github_credential,
     github_pending_push,
     github_repo_audit,
+    network_policy,
     orchestrator,
-    proxy_state_client,
     state,
     task_status,
+    tools_admin_api,
+    tools_host,
+    upgrade_check,
 )
 from host.runtime.orchestrator import agent_runtime_status
 from host.runtime.state import (
@@ -56,32 +68,46 @@ from host.runtime.state import (
     read_openai_account,
     utc_now,
 )
-from host.runtime.task_status import (
-    ACTIVE as ACTIVE_STATUSES,
-    CANCELLED,
-    FAILED,
-    QUEUED,
-    RUNNING,
-)
-from host.version import repo_version, version_status
+from host.runtime.task_status import CANCELLED, QUEUED, RUNNING
+from host.version import version_status
 
 
 HOST = LOOPBACK
 PORT = ADMIN_API_PORT
+RUNTIME_DIR = Path(__file__).parent
+TOOLS_DIR = RUNTIME_DIR.parent / "tools"
+
+
+def _tool_guide_assets() -> dict[str, tuple[Path, str]]:
+    routes: dict[str, tuple[Path, str]] = {}
+    for asset in sorted(TOOLS_DIR.glob("**/guide_assets/**/*.png")):
+        route = f"/guide-assets/{asset.name}"
+        if route in routes:
+            raise RuntimeError(f"duplicate tool guide asset filename: {asset.name}")
+        routes[route] = (asset, "image/png")
+    return routes
+
+
 UI_ASSETS = {
-    "/": ("admin_ui.html", "text/html; charset=utf-8"),
-    "/admin_ui.css": ("admin_ui.css", "text/css; charset=utf-8"),
-    "/favicon.ico": ("admin_favicon.svg", "image/svg+xml"),
-    "/favicon.svg": ("admin_favicon.svg", "image/svg+xml"),
+    "/": (RUNTIME_DIR / "admin_ui.html", "text/html; charset=utf-8"),
+    # The page the operator registers as the OAuth redirect URI for tool
+    # connect flows; the SPA reads the code/state query parameters on load.
+    "/oauth/callback": (RUNTIME_DIR / "admin_ui.html", "text/html; charset=utf-8"),
+    "/admin_ui.css": (RUNTIME_DIR / "admin_ui.css", "text/css; charset=utf-8"),
+    "/favicon.ico": (RUNTIME_DIR / "admin_favicon.svg", "image/svg+xml"),
+    "/favicon.svg": (RUNTIME_DIR / "admin_favicon.svg", "image/svg+xml"),
 }
 # The admin UI ships as native ES modules in host/runtime/admin_ui/. The
 # served set is fixed at startup from the files present, so any other
 # /admin_ui/ path stays a 404.
 UI_ASSETS.update({
-    f"/admin_ui/{module.name}": (f"admin_ui/{module.name}", "application/javascript; charset=utf-8")
-    for module in sorted((Path(__file__).parent / "admin_ui").glob("*.js"))
+    f"/admin_ui/{module.name}": (module, "application/javascript; charset=utf-8")
+    for module in sorted((RUNTIME_DIR / "admin_ui").glob("*.js"))
 })
-UI_ASSET_VERSION_PLACEHOLDER = "__TRUSTYCLAW_ASSET_VERSION__"
+# Provider setup screenshots live with their owning tool integration. They are
+# audited release assets and never load from provider domains in the operator's
+# browser. Public filenames are unique across tools so manifests stay portable.
+UI_ASSETS.update(_tool_guide_assets())
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; "
@@ -99,12 +125,8 @@ SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
 }
-IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 THREAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MESSAGE_LIMIT = 50_000
-MAX_REQUEST_BODY_BYTES = 1024 * 1024
-IDEMPOTENCY_RETENTION_SECONDS = 24 * 3600
-IDEMPOTENCY_ENTRY_LIMIT = 10_000
 MAINTENANCE_INTERVAL_SECONDS = 3600  # scheduled state cleanup cadence (not per-request)
 FINISHED_TASK_LIMIT = 100_000  # finished tasks kept as history before the oldest are pruned
 THREAD_TASK_LIMIT = 1000
@@ -114,23 +136,18 @@ THREAD_MAP_LIMIT = 100_000  # user thread -> runtime session mappings kept befor
 # pruned; steers queue until the worker delivers them). Both caps return 409.
 QUEUED_TASK_LIMIT = 1000
 PENDING_STEER_LIMIT = 20
-NETWORK_POLICY_LOCK_TIMEOUT_SECONDS = 5
 OAUTH_LOGIN_LOCK_TIMEOUT_SECONDS = 5
 # OAuth login can start while awaiting login or in error: error states (a
 # changed account, malformed local credentials) are recovered by simply
 # logging in again — resetting the linked account never has to fix them first.
 OAUTH_LOGIN_STATUSES = ("awaiting_login", "error")
-OAUTH_LOGIN_GATE_MESSAGES = {
-    "codex": "Codex OAuth login is only available while awaiting_login or in error",
-    "claude_code": "Claude OAuth login is only available while awaiting_login or in error",
-}
 REBOOT_HELPER_TIMEOUT_SECONDS = 10
 AGENT_FILE_HELPER_TIMEOUT_SECONDS = 10
 AGENT_FILE_HELPER_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/read-agent-file"]
 AGENT_AUTH_CLEAR_HELPER_TIMEOUT_SECONDS = 10
 AGENT_AUTH_CLEAR_HELPER_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/clear-agent-auth"]
-AGENT_CGROUP_ROOT = Path(os.environ.get("TRUSTYCLAW_AGENT_CGROUP_ROOT", "/sys/fs/cgroup/trustyclaw_agent.slice"))
-PROC_ROOT = Path(os.environ.get("TRUSTYCLAW_PROC_ROOT", "/proc"))
+AGENT_CGROUP_ROOT = Path("/sys/fs/cgroup/trustyclaw_agent.slice")
+PROC_ROOT = Path("/proc")
 AGENT_PROCESS_LIMIT = 1000
 APP_SCOPED_ID_SEPARATOR = "__"
 # Lock inventory for this module (each request runs on its own handler
@@ -140,31 +157,17 @@ APP_SCOPED_ID_SEPARATOR = "__"
 #   every admin-state write cycle. Held briefly; slow work (runtime spawns,
 #   helper subprocesses, process closes) always runs outside the mutation so
 #   reads and /v1/health never stall behind it. Reads are lock-free queries.
-# - NETWORK_POLICY_LOCK: serializes policy replacements end-to-end (validate +
-#   root helper run). Acquired with a timeout so a stuck helper returns 409 to
-#   later callers instead of piling up threads.
 # - OAUTH_LOGIN_LOCK: serializes device-login starts so two clicks cannot mint
-#   two device codes. Also timeout-guarded.
-# - IDEMPOTENCY_LOCK guards the in-memory idempotency store below. Keys act as
-#   a per-key mutex across retries: the in-flight reservation in
-#   _mutate_idempotently is claimed under the lock, the request body executes
-#   outside it, and the reservation is released on failure.
-NETWORK_POLICY_LOCK = threading.Lock()
+#   two device codes (the mint runs outside the mutation lock, so that lock
+#   alone cannot prevent a double mint, which would leak a login process).
+#   Timeout-guarded so a stuck mint returns 409 instead of piling up threads.
 OAUTH_LOGIN_LOCK = threading.Lock()
-# Idempotency replay records live in process memory, not the database: they
-# are a retry convenience with a 24-hour horizon, and a service restart —
-# which already fails in-flight tasks — simply resets them, so a retried key
-# re-executes at most once per process lifetime.
-IDEMPOTENCY_ENTRIES: dict[str, dict[str, Any]] = {}
-IDEMPOTENCY_LOCK = threading.Lock()
-REQUEST_CONTEXT = threading.local()
 
 
-class ApiError(Exception):
-    def __init__(self, status: HTTPStatus, message: str) -> None:
-        super().__init__(message)
-        self.status = status
-        self.message = message
+# ApiError is defined in a shared module so it is one class whether admin_api is
+# loaded as __main__ (the service) or as host.runtime.admin_api (by the modules
+# it dispatches to, e.g. tools_admin_api). See host/runtime/admin_errors.py.
+from host.runtime.admin_errors import ApiError
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -187,9 +190,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle(self, method: str) -> None:
         try:
-            REQUEST_CONTEXT.bearer = None
-            REQUEST_CONTEXT.bridge_app_id = None
-            REQUEST_CONTEXT.app_backend_id = None
             path = urlparse(self.path)
             if method == "GET" and path.path in UI_ASSETS:
                 self._send_ui_asset(path.path)
@@ -200,11 +200,10 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_app_ui_asset(*app_asset)
                     return
             self._authenticate()
-            REQUEST_CONTEXT.bridge_app_id = self.headers.get("X-TrustyClaw-App-Bridge", "") or None
-            if method in {"POST", "PUT", "DELETE"}:
-                response = self._mutate_idempotently(method, path)
-            else:
-                response = route(method, path.path, parse_qs(path.query), self._read_body())
+            bridge_app_id = self.headers.get("X-TrustyClaw-App-Bridge", "") or None
+            response = route(
+                method, path.path, parse_qs(path.query), self._read_body(), bridge_app_id=bridge_app_id
+            )
             self._send_json(HTTPStatus.OK, response)
         except ApiError as exc:
             self._send_json(exc.status, {"error": {"message": exc.message}})
@@ -213,25 +212,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": {"message": str(exc)}})
 
-    def _mutate_idempotently(self, method: str, path: Any) -> Any:
-        """Replays of the same Idempotency-Key for the same method and path
-        return the original response without re-executing the request."""
-        body = self._read_body()
-        return mutate_idempotently(
-            method,
-            path.path,
-            self.headers.get("Idempotency-Key", ""),
-            caller_id="admin",
-            execute=lambda: route(method, path.path, parse_qs(path.query), body),
-        )
-
     def _send_ui_asset(self, path: str) -> None:
-        filename, content_type = UI_ASSETS[path]
-        if path == "/":
-            html = (Path(__file__).parent / filename).read_text()
-            data = html.replace(UI_ASSET_VERSION_PLACEHOLDER, repo_version()).encode()
-        else:
-            data = (Path(__file__).parent / filename).read_bytes()
+        asset, content_type = UI_ASSETS[path]
+        data = asset.read_bytes()
         self.send_response(HTTPStatus.OK.value)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
@@ -294,7 +277,6 @@ class Handler(BaseHTTPRequestHandler):
         if auth.startswith("Bearer "):
             presented = hashlib.sha256(auth.removeprefix("Bearer ").encode()).hexdigest()
             if expected and hmac.compare_digest(presented, expected):
-                REQUEST_CONTEXT.bearer = auth.removeprefix("Bearer ")
                 return
             raise ApiError(HTTPStatus.UNAUTHORIZED, "missing or invalid admin password")
         raise ApiError(HTTPStatus.UNAUTHORIZED, "missing or invalid admin password")
@@ -325,7 +307,22 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> Any:
+def route(
+    method: str,
+    path: str,
+    query: dict[str, list[str]],
+    body: Any,
+    *,
+    bridge_app_id: str | None = None,
+    app_backend_id: str | None = None,
+) -> Any:
+    # A bridge-tagged request (the admin shell forwarding an app iframe's
+    # postMessage) may only target that app's own API surface — enforced here,
+    # before any route dispatch, so no host route is reachable through the
+    # bridge. Un-normalized dot-segment paths that pass the literal prefix
+    # check are proxied into the app's own backend, which 404s them.
+    if bridge_app_id is not None and not path.startswith(f"/v1/apps/{bridge_app_id}/api/"):
+        raise ApiError(HTTPStatus.FORBIDDEN, "app bridge requests may only target the app's own API")
     if method == "GET" and path == "/v1/health":
         return health()
     if method == "GET" and path == "/v1/agent-runtime/status":
@@ -339,10 +336,7 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> Any
     if path == "/v1/apps" and method == "GET":
         return list_apps()
     if path.startswith("/v1/apps/"):
-        from host.runtime import app_api_proxy
-
-        bridge_app_id = getattr(REQUEST_CONTEXT, "bridge_app_id", None)
-        return app_api_proxy.route_app_request(method, path, query, body, bridge_app_id=bridge_app_id)
+        return app_api_proxy.route_app_request(method, path, query, body)
     if path == "/v1/agent-runtime/codex-oauth-login":
         if method == "POST":
             return start_codex_oauth_login()
@@ -359,7 +353,7 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> Any
         return reset_linked_account(body)
     if path == "/v1/tasks":
         if method == "POST":
-            return create_task(body)
+            return create_task(body, app_backend_id=app_backend_id)
         if method == "GET":
             return list_tasks(_one(query, "last_seen_task_id"))
     if path.startswith("/v1/tasks/"):
@@ -374,17 +368,27 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> Any
             "events": page_agent_events_before(
                 _optional_non_negative_int(query, "before"),
                 limit=_event_page_limit(query),
-            ).items
+            )
         }
     if path == "/v1/network/policy":
         if method == "GET":
-            return proxy_state_client.network_policy_response()
+            return network_policy.network_policy_response()
         if method == "PUT":
             return replace_network_policy(body)
+    if path == "/v1/tools/events" and method == "GET":
+        _reject_query_keys(query, {"before", "limit"}, "tool event")
+        return {
+            "events": state.page_tool_events_before(
+                _optional_non_negative_int(query, "before"),
+                limit=_event_page_limit(query),
+            )
+        }
+    if path == "/v1/tools" or path.startswith("/v1/tools/"):
+        return tools_admin_api.tools_route(method, path, body)
     if path == "/v1/network/events" and method == "GET":
         _reject_query_keys(query, {"before", "decision", "limit"}, "network event")
         return {
-            "events": proxy_state_client.network_events_before(
+            "events": state.page_network_events_before(
                 _optional_non_negative_int(query, "before"),
                 decision=_network_event_decision(query),
                 limit=_event_page_limit(query),
@@ -488,10 +492,32 @@ def _credential_response(metadata: dict[str, Any]) -> dict[str, Any]:
     return metadata
 
 
-def _github_integration(policy: dict[str, Any]) -> dict[str, Any]:
-    integrations = policy.get("managed_network_integrations", {})
-    github = integrations.get("github") if isinstance(integrations, dict) else None
-    return github if isinstance(github, dict) else {}
+class HelperTimedOut(Exception):
+    """A root helper ran past its timeout. could_not_terminate means the
+    unprivileged kill of the sudo-spawned child failed too."""
+
+    def __init__(self, could_not_terminate: bool) -> None:
+        super().__init__("root helper timed out")
+        self.could_not_terminate = could_not_terminate
+
+
+def _run_root_helper(argv: list[str], timeout_seconds: int) -> "subprocess.CompletedProcess[str]":
+    """Run one sudo root helper; each caller maps returncodes and
+    HelperTimedOut to its own status policy."""
+    try:
+        return subprocess.run(
+            argv,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except (subprocess.TimeoutExpired, PermissionError) as exc:
+        # On timeout, subprocess.run kills the child — but the helper runs as
+        # root via sudo, so the unprivileged service user's kill raises
+        # PermissionError in place of TimeoutExpired.
+        raise HelperTimedOut(isinstance(exc, PermissionError)) from exc
 
 
 def reboot_host() -> dict[str, str]:
@@ -501,19 +527,13 @@ def reboot_host() -> dict[str, str]:
     silent "accepted" for a reboot that will never happen. The host goes down
     moments after the response is sent."""
     try:
-        proc = subprocess.run(
+        proc = _run_root_helper(
             ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/reboot-host"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=REBOOT_HELPER_TIMEOUT_SECONDS,
+            REBOOT_HELPER_TIMEOUT_SECONDS,
         )
-    except (subprocess.TimeoutExpired, PermissionError):
-        # On timeout, subprocess.run kills the child — but the helper runs as
-        # root via sudo, so the unprivileged service user's kill raises
-        # PermissionError in place of TimeoutExpired. Either way the reboot may
-        # already be in flight; report accepted rather than a false failure.
+    except HelperTimedOut:
+        # The reboot may already be in flight; report accepted rather than a
+        # false failure.
         return {"status": "accepted"}
     if proc.returncode != 0:
         raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, proc.stderr.strip() or "reboot helper failed")
@@ -530,24 +550,14 @@ def agent_file_read(path: str) -> dict[str, Any]:
 
 def _run_agent_file_helper(action: str, path: str) -> dict[str, Any]:
     try:
-        proc = subprocess.run(
-            [*AGENT_FILE_HELPER_COMMAND, action, path],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=AGENT_FILE_HELPER_TIMEOUT_SECONDS,
+        proc = _run_root_helper([*AGENT_FILE_HELPER_COMMAND, action, path], AGENT_FILE_HELPER_TIMEOUT_SECONDS)
+    except HelperTimedOut as exc:
+        message = (
+            "agent file helper timed out (the root helper could not be terminated)"
+            if exc.could_not_terminate
+            else "agent file helper timed out"
         )
-    except subprocess.TimeoutExpired as exc:
-        raise ApiError(HTTPStatus.GATEWAY_TIMEOUT, "agent file helper timed out") from exc
-    except PermissionError as exc:
-        # The timeout path kills the child, but the helper starts as root via
-        # sudo before demoting to the agent user, so the unprivileged service
-        # user's kill can raise PermissionError in place of TimeoutExpired.
-        raise ApiError(
-            HTTPStatus.GATEWAY_TIMEOUT,
-            "agent file helper timed out (the root helper could not be terminated)",
-        ) from exc
+        raise ApiError(HTTPStatus.GATEWAY_TIMEOUT, message) from exc
     if proc.returncode != 0:
         message = _helper_error_message(proc.stdout, proc.stderr)
         status = {
@@ -566,26 +576,25 @@ def _run_agent_file_helper(action: str, path: str) -> dict[str, Any]:
 
 
 def agent_processes() -> dict[str, Any]:
-    """Return a bounded process snapshot for the agent runtime slice."""
-    pid_scopes = _agent_slice_pids()
+    """Return a bounded process snapshot for the agent runtime slice — exactly
+    the fields the admin UI renders."""
+    pids = sorted(_agent_slice_pids())
     uptime = _proc_uptime()
     clk_tck = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
     processes: list[dict[str, Any]] = []
-    sorted_pids = sorted(pid_scopes.items())
-    for pid, scope in sorted_pids[:AGENT_PROCESS_LIMIT]:
-        process = _agent_process_info(pid, scope, uptime, clk_tck)
+    for pid in pids[:AGENT_PROCESS_LIMIT]:
+        process = _agent_process_info(pid, uptime, clk_tck)
         if process is not None:
             processes.append(process)
-    return {"processes": processes, "truncated": len(sorted_pids) > AGENT_PROCESS_LIMIT}
+    return {"processes": processes, "truncated": len(pids) > AGENT_PROCESS_LIMIT}
 
 
-def _agent_slice_pids() -> dict[int, str]:
+def _agent_slice_pids() -> set[int]:
     if not AGENT_CGROUP_ROOT.is_dir():
-        return {}
-    pid_scopes: dict[int, str] = {}
+        return set()
+    pids: set[int] = set()
     try:
         for proc_file in AGENT_CGROUP_ROOT.rglob("cgroup.procs"):
-            scope = _relative_scope(proc_file.parent)
             try:
                 lines = proc_file.read_text().splitlines()
             except (OSError, UnicodeDecodeError):
@@ -596,22 +605,13 @@ def _agent_slice_pids() -> dict[int, str]:
                 except ValueError:
                     continue
                 if pid > 0:
-                    pid_scopes[pid] = scope
+                    pids.add(pid)
     except OSError:
-        return {}
-    return pid_scopes
+        return set()
+    return pids
 
 
-def _relative_scope(path: Path) -> str:
-    try:
-        relative = path.relative_to(AGENT_CGROUP_ROOT)
-    except ValueError:
-        return "."
-    value = str(relative)
-    return "." if value == "." else value
-
-
-def _agent_process_info(pid: int, scope: str, uptime: float, clk_tck: int) -> dict[str, Any] | None:
+def _agent_process_info(pid: int, uptime: float, clk_tck: int) -> dict[str, Any] | None:
     proc_dir = PROC_ROOT / str(pid)
     try:
         stat = _proc_stat(proc_dir / "stat")
@@ -622,12 +622,9 @@ def _agent_process_info(pid: int, scope: str, uptime: float, clk_tck: int) -> di
     cmdline = _proc_cmdline(proc_dir / "cmdline") or f"[{name}]"
     result: dict[str, Any] = {
         "pid": pid,
-        "ppid": stat["ppid"],
-        "user": _uid_name(status.get("Uid")),
         "state": stat["state"],
         "name": name,
         "cmdline": cmdline,
-        "scope": scope,
     }
     rss_bytes = _rss_bytes(status.get("VmRSS"))
     if rss_bytes is not None:
@@ -647,7 +644,6 @@ def _proc_stat(path: Path) -> dict[str, Any]:
     return {
         "name": raw[left + 1 : right],
         "state": fields[0],
-        "ppid": int(fields[1]),
         "start_ticks": int(fields[19]),
     }
 
@@ -675,19 +671,6 @@ def _proc_uptime() -> float:
         return float((PROC_ROOT / "uptime").read_text().split()[0])
     except (OSError, ValueError, IndexError):
         return 0.0
-
-
-def _uid_name(uid_line: str | None) -> str:
-    if not uid_line:
-        return ""
-    try:
-        uid = int(uid_line.split()[0])
-    except (ValueError, IndexError):
-        return ""
-    try:
-        return pwd.getpwuid(uid).pw_name
-    except KeyError:
-        return str(uid)
 
 
 def _rss_bytes(rss_line: str | None) -> int | None:
@@ -735,7 +718,7 @@ def task_route(method: str, path: str, query: dict[str, list[str]], body: Any) -
     if len(parts) == 4 and parts[3] == "kill" and method == "POST":
         return kill_task(task_id)
     if len(parts) == 4 and parts[3] == "events" and method == "GET":
-        return {"events": page_task_events(task_id, _since(query)).items}
+        return {"events": page_task_events(task_id, _optional_non_negative_int(query, "since"))}
     raise ApiError(HTTPStatus.NOT_FOUND, "task route not found")
 
 
@@ -751,7 +734,7 @@ def thread_route(method: str, path: str, query: dict[str, list[str]]) -> Any:
 
 def health() -> dict[str, Any]:
     runtime = agent_runtime_status()
-    network_status = proxy_state_client.network_status()
+    network_status = network_policy.network_status()
     version = version_status()
     if network_status == "active" and not proxy_alive():
         network_status = "error"  # policy says active but nothing is enforcing it
@@ -764,6 +747,7 @@ def health() -> dict[str, Any]:
         "status": "degraded" if degraded else "ok",
         "agent_name": load_config().get("agent_name"),
         "version": version,
+        "upgrade": upgrade_check.status(),
         "agent_runtime": runtime,
         "network_controls": {"status": network_status},
         "host_runtime": host_metrics(),
@@ -781,84 +765,20 @@ def proxy_alive() -> bool:
         return False
 
 
-def prune_idempotency(entries: dict[str, Any], *, now: float, preserve_key: str | None = None) -> None:
-    for old_key in [
-        k
-        for k, v in entries.items()
-        if k != preserve_key and now - v.get("stored_at", now) > IDEMPOTENCY_RETENTION_SECONDS
-    ]:
-        del entries[old_key]
-    if len(entries) <= IDEMPOTENCY_ENTRY_LIMIT:
-        return
-    ordered = sorted(
-        ((k, v) for k, v in entries.items() if k != preserve_key),
-        key=lambda item: item[1].get("stored_at", 0.0),
-    )
-    for old_key, _ in ordered[: len(entries) - IDEMPOTENCY_ENTRY_LIMIT]:
-        del entries[old_key]
-
-
-def mutate_idempotently(method: str, path: str, key: str, *, caller_id: str, execute: Any) -> Any:
-    """Run a mutating request with process-local idempotency semantics."""
-    if not IDEMPOTENCY_RE.fullmatch(key):
-        raise ApiError(HTTPStatus.BAD_REQUEST, "missing or invalid Idempotency-Key")
-    with IDEMPOTENCY_LOCK:
-        now = time.time()
-        prune_idempotency(IDEMPOTENCY_ENTRIES, now=now)
-        stored = IDEMPOTENCY_ENTRIES.get(key)
-        if stored is not None:
-            if stored["method"] != method or stored["path"] != path:
-                raise ApiError(HTTPStatus.BAD_REQUEST, "Idempotency-Key was already used for a different request")
-            if stored.get("caller_id") != caller_id:
-                raise ApiError(HTTPStatus.BAD_REQUEST, "Idempotency-Key was already used by a different caller")
-            if stored.get("in_flight"):
-                raise ApiError(HTTPStatus.CONFLICT, "a request with this Idempotency-Key is already in progress")
-            if now - stored["stored_at"] <= IDEMPOTENCY_RETENTION_SECONDS:
-                return stored["response"]
-        IDEMPOTENCY_ENTRIES[key] = {
-            "method": method,
-            "path": path,
-            "caller_id": caller_id,
-            "in_flight": True,
-            "stored_at": now,
-        }
-        prune_idempotency(IDEMPOTENCY_ENTRIES, now=now, preserve_key=key)
-    try:
-        response = execute()
-    except BaseException:
-        with IDEMPOTENCY_LOCK:
-            entry = IDEMPOTENCY_ENTRIES.get(key)
-            if entry is not None and entry.get("in_flight"):
-                del IDEMPOTENCY_ENTRIES[key]
-        raise
-    with IDEMPOTENCY_LOCK:
-        now = time.time()
-        IDEMPOTENCY_ENTRIES[key] = {
-            "method": method,
-            "path": path,
-            "caller_id": caller_id,
-            "response": response,
-            "stored_at": now,
-        }
-        prune_idempotency(IDEMPOTENCY_ENTRIES, now=now, preserve_key=key)
-    return response
-
-
 def prune_state() -> None:
     """Bound admin-state growth: keep all active tasks plus the most recent
-    finished ones, cap the thread->session maps and the event log, and drop
-    expired/excess idempotency entries. Runs on a schedule (maintenance_loop),
-    never on the request path; the deletes are indexed and touch only rows
-    beyond the caps."""
+    finished ones and cap the thread->session maps. Runs on a schedule
+    (maintenance_loop), never on the request path; the deletes are indexed and
+    touch only rows beyond the caps. The audit logs prune themselves on their
+    own append cadence."""
     with state.mutation() as cur:
         state.prune_finished_tasks(cur, FINISHED_TASK_LIMIT)
-        # A dropped thread mapping is not an error — a later task on it just
-        # starts a fresh runtime conversation.
+        # Retained tasks keep their canonical thread; unreferenced mappings use
+        # the ordinary per-runtime LRU cap.
         state.prune_thread_sessions(cur, "codex", THREAD_MAP_LIMIT)
         state.prune_thread_sessions(cur, "claude_code", THREAD_MAP_LIMIT)
-        state.prune_agent_events(cur)
-    with IDEMPOTENCY_LOCK:
-        prune_idempotency(IDEMPOTENCY_ENTRIES, now=time.time())
+    # Approval expiry and history pruning use their own short mutations.
+    tools_host.maintain_approvals()
 
 
 def maintenance_loop() -> None:
@@ -870,81 +790,125 @@ def maintenance_loop() -> None:
             pass  # maintenance is best-effort; never crash the service
 
 
-def start_codex_oauth_login() -> dict[str, str]:
+def _mint_codex_login() -> tuple[dict[str, str], dict[str, str]]:
+    login = codex_app_server.start_device_login()
+    response = {
+        "status": "awaiting_login",
+        "device_code": login.user_code,
+        "login_url": login.verification_url,
+        "expires_at": _minutes_from_now(10),
+    }
+    return response, response | {"login_id": login.login_id}
+
+
+def _mint_claude_login() -> tuple[dict[str, str], dict[str, str]]:
+    login = claude_code.start_oauth_login()
+    response = {
+        "status": "awaiting_code",
+        "login_url": login.login_url,
+        "expires_at": _minutes_from_now(10),
+    }
+    return response, response
+
+
+class _OAuthLoginFlow(NamedTuple):
+    """One runtime's login flow: the codex and claude endpoints are the same
+    machine, differing only in these fields. mint returns (public response,
+    persisted record); close tears down a login whose gate re-check lost."""
+
+    runtime_type: str
+    # oauth_logins keys on the provider spelling ('claude'), not the runtime
+    # type ('claude_code'); orchestrator.mark_oauth_login_completed keys the
+    # same way.
+    oauth_key: str
+    display: str
+    provider: str
+    response_keys: tuple[str, ...]
+    mint: Callable[[], tuple[dict[str, str], dict[str, str]]]
+    close: Callable[[], None]
+
+
+_OAUTH_LOGIN_FLOWS = {
+    "codex": _OAuthLoginFlow(
+        runtime_type="codex",
+        oauth_key="codex",
+        display="Codex",
+        provider="OpenAI",
+        response_keys=("status", "device_code", "login_url", "expires_at"),
+        mint=_mint_codex_login,
+        close=lambda: codex_app_server.close_login_server(),
+    ),
+    "claude_code": _OAuthLoginFlow(
+        runtime_type="claude_code",
+        oauth_key="claude",
+        display="Claude",
+        provider="Claude",
+        response_keys=("status", "login_url", "expires_at"),
+        mint=_mint_claude_login,
+        close=lambda: claude_code.close_login_process(),
+    ),
+}
+
+
+def _require_oauth_login_available(flow: _OAuthLoginFlow) -> None:
+    if not orchestrator.runtime_network_enabled(flow.runtime_type):
+        raise ApiError(
+            HTTPStatus.CONFLICT,
+            f"{flow.display} OAuth login is unavailable while {flow.provider} provider access is disabled",
+        )
+    if orchestrator.runtime_status(flow.runtime_type) not in OAUTH_LOGIN_STATUSES:
+        raise ApiError(
+            HTTPStatus.CONFLICT,
+            f"{flow.display} OAuth login is only available while awaiting_login or in error",
+        )
+
+
+def _start_oauth_login(flow: _OAuthLoginFlow) -> dict[str, str]:
     if not OAUTH_LOGIN_LOCK.acquire(timeout=OAUTH_LOGIN_LOCK_TIMEOUT_SECONDS):
-        raise ApiError(HTTPStatus.CONFLICT, "Codex OAuth login is already starting")
+        raise ApiError(HTTPStatus.CONFLICT, f"{flow.display} OAuth login is already starting")
     try:
-        if not orchestrator.runtime_network_enabled("codex"):
-            raise ApiError(HTTPStatus.CONFLICT, "Codex OAuth login is unavailable while OpenAI provider access is disabled")
-        if orchestrator.runtime_status("codex") not in OAUTH_LOGIN_STATUSES:
-            raise ApiError(HTTPStatus.CONFLICT, OAUTH_LOGIN_GATE_MESSAGES["codex"])
-        oauth = state.oauth_login("codex")
+        _require_oauth_login_available(flow)
+        oauth = state.oauth_login(flow.oauth_key)
         if oauth:
-            return {key: oauth[key] for key in ("status", "device_code", "login_url", "expires_at")}
-        login = codex_app_server.start_device_login()
-        response = {
-            "status": "awaiting_login",
-            "device_code": login.user_code,
-            "login_url": login.verification_url,
-            "expires_at": _minutes_from_now(10),
-        }
+            return {key: oauth[key] for key in flow.response_keys}
+        response, persisted = flow.mint()
         with state.mutation() as cur:
-            if not orchestrator.runtime_network_enabled("codex") or orchestrator.runtime_status("codex") not in OAUTH_LOGIN_STATUSES:
-                codex_app_server.close_login_server()
-                raise ApiError(HTTPStatus.CONFLICT, OAUTH_LOGIN_GATE_MESSAGES["codex"])
-            state.set_oauth_login(cur, "codex", response | {"login_id": login.login_id})
+            # Re-check the gate inside the mutation: a policy disable or a
+            # completed refresh that raced the slow mint must not park a
+            # fresh login process, so the loser closes it here.
+            try:
+                _require_oauth_login_available(flow)
+            except ApiError:
+                flow.close()
+                raise
+            state.set_oauth_login(cur, flow.oauth_key, persisted)
         return response
     finally:
         OAUTH_LOGIN_LOCK.release()
+
+
+def _current_oauth_login_response(flow: _OAuthLoginFlow) -> dict[str, str]:
+    _require_oauth_login_available(flow)
+    oauth = state.oauth_login(flow.oauth_key)
+    if not oauth:
+        raise ApiError(HTTPStatus.NOT_FOUND, f"{flow.display} OAuth login has not been started")
+    return {key: oauth[key] for key in flow.response_keys}
+
+
+def start_codex_oauth_login() -> dict[str, str]:
+    return _start_oauth_login(_OAUTH_LOGIN_FLOWS["codex"])
 
 
 def current_codex_oauth_login() -> dict[str, str]:
-    if not orchestrator.runtime_network_enabled("codex"):
-        raise ApiError(HTTPStatus.CONFLICT, "Codex OAuth login is unavailable while OpenAI provider access is disabled")
-    if orchestrator.runtime_status("codex") not in OAUTH_LOGIN_STATUSES:
-        raise ApiError(HTTPStatus.CONFLICT, OAUTH_LOGIN_GATE_MESSAGES["codex"])
-    oauth = state.oauth_login("codex")
-    if not oauth:
-        raise ApiError(HTTPStatus.NOT_FOUND, "Codex OAuth login has not been started")
-    return {key: oauth[key] for key in ("status", "device_code", "login_url", "expires_at")}
+    return _current_oauth_login_response(_OAUTH_LOGIN_FLOWS["codex"])
 
 
 def start_claude_oauth_login() -> dict[str, str]:
-    if not OAUTH_LOGIN_LOCK.acquire(timeout=OAUTH_LOGIN_LOCK_TIMEOUT_SECONDS):
-        raise ApiError(HTTPStatus.CONFLICT, "Claude OAuth login is already starting")
-    try:
-        if not orchestrator.runtime_network_enabled("claude_code"):
-            raise ApiError(HTTPStatus.CONFLICT, "Claude OAuth login is unavailable while Claude provider access is disabled")
-        if orchestrator.runtime_status("claude_code") not in OAUTH_LOGIN_STATUSES:
-            raise ApiError(HTTPStatus.CONFLICT, OAUTH_LOGIN_GATE_MESSAGES["claude_code"])
-        oauth = state.oauth_login("claude")
-        if oauth is not None:
-            return {key: oauth[key] for key in ("status", "login_url", "expires_at")}
-        login = claude_code.start_oauth_login()
-        response = {
-            "status": "awaiting_code",
-            "login_url": login.login_url,
-            "expires_at": _minutes_from_now(10),
-        }
-        with state.mutation() as cur:
-            if not orchestrator.runtime_network_enabled("claude_code") or orchestrator.runtime_status("claude_code") not in OAUTH_LOGIN_STATUSES:
-                claude_code.close_login_process()
-                raise ApiError(HTTPStatus.CONFLICT, OAUTH_LOGIN_GATE_MESSAGES["claude_code"])
-            state.set_oauth_login(cur, "claude", response)
-        return response
-    finally:
-        OAUTH_LOGIN_LOCK.release()
+    return _start_oauth_login(_OAUTH_LOGIN_FLOWS["claude_code"])
 
 
 def current_claude_oauth_login() -> dict[str, str]:
-    if not orchestrator.runtime_network_enabled("claude_code"):
-        raise ApiError(HTTPStatus.CONFLICT, "Claude OAuth login is unavailable while Claude provider access is disabled")
-    if orchestrator.runtime_status("claude_code") not in OAUTH_LOGIN_STATUSES:
-        raise ApiError(HTTPStatus.CONFLICT, OAUTH_LOGIN_GATE_MESSAGES["claude_code"])
-    oauth = state.oauth_login("claude")
-    if oauth is None:
-        raise ApiError(HTTPStatus.NOT_FOUND, "Claude OAuth login has not been started")
-    return {key: oauth[key] for key in ("status", "login_url", "expires_at")}
+    return _current_oauth_login_response(_OAUTH_LOGIN_FLOWS["claude_code"])
 
 
 def complete_claude_oauth_login(body: Any) -> dict[str, str]:
@@ -1002,22 +966,16 @@ def reset_linked_account(body: Any) -> dict[str, str]:
 def _clear_local_agent_auth(runtime_type: str) -> None:
     helper_runtime = "claude" if runtime_type == "claude_code" else "codex"
     try:
-        proc = subprocess.run(
-            [*AGENT_AUTH_CLEAR_HELPER_COMMAND, helper_runtime],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=AGENT_AUTH_CLEAR_HELPER_TIMEOUT_SECONDS,
+        proc = _run_root_helper(
+            [*AGENT_AUTH_CLEAR_HELPER_COMMAND, helper_runtime], AGENT_AUTH_CLEAR_HELPER_TIMEOUT_SECONDS
         )
-    except subprocess.TimeoutExpired as exc:
-        message = f"{runtime_type} reset timed out clearing local auth files; retry reset"
+    except HelperTimedOut as exc:
+        message = (
+            f"{runtime_type} reset helper could not be terminated; retry reset"
+            if exc.could_not_terminate
+            else f"{runtime_type} reset timed out clearing local auth files; retry reset"
+        )
         raise ApiError(HTTPStatus.CONFLICT, message) from exc
-    except PermissionError as exc:
-        raise ApiError(
-            HTTPStatus.CONFLICT,
-            f"{runtime_type} reset helper could not be terminated; retry reset",
-        ) from exc
     if proc.returncode != 0:
         detail = _helper_error_message(proc.stdout, proc.stderr)
         message = f"{runtime_type} reset failed clearing local auth files; retry reset"
@@ -1084,119 +1042,28 @@ def _claude_account_is_operator_approved(account: dict[str, Any]) -> bool:
 
 
 def _account_response_metadata(account: dict[str, Any], runtime_type: str) -> dict[str, Any]:
+    # The runtime adapters sanitize account metadata at capture (typed
+    # scalars, known keys only) and every active refresh rewrites the stored
+    # row, so this only selects the public fields — no re-normalization.
     response: dict[str, Any] = {}
-    for key in ("account_id", "email"):
+    for key in ("account_id", "email", "plan_type"):
         value = account.get(key)
         if isinstance(value, str) and value:
             response[key] = value
-    plan_type = _normalize_plan_type(account)
-    if plan_type:
-        response["plan_type"] = plan_type
-    if runtime_type == "codex":
-        codex_usage = _normalize_codex_usage(account.get("codex_usage"))
-        if codex_usage:
-            response["codex_usage"] = codex_usage
-    if runtime_type == "claude_code":
-        claude_usage = _normalize_claude_usage(account.get("claude_usage"))
-        if claude_usage:
-            response["claude_usage"] = claude_usage
+    usage_key = "codex_usage" if runtime_type == "codex" else "claude_usage"
+    usage = account.get(usage_key)
+    if isinstance(usage, dict) and usage:
+        response[usage_key] = usage
     return response
 
 
-def _normalize_plan_type(account: dict[str, Any]) -> str | None:
-    for key in ("plan_type", "planType", "plan"):
-        value = account.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
-
-
-def _normalize_codex_usage(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-    result: dict[str, Any] = {}
-    last_checked_at = _public_metadata_scalar(value.get("last_checked_at"))
-    if isinstance(last_checked_at, str):
-        result["last_checked_at"] = last_checked_at
-    rate_limits = _normalize_rate_limit_snapshot(value.get("rate_limits"))
-    if rate_limits:
-        result["rate_limits"] = rate_limits
-    return result
-
-
-def _normalize_claude_usage(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-    result: dict[str, Any] = {}
-    for key in ("current_session_used_percent", "weekly_used_percent"):
-        scalar = _public_metadata_scalar(value.get(key))
-        if type(scalar) in (int, float):
-            result[key] = scalar
-    resets_at_text = value.get("weekly_resets_at_text")
-    if isinstance(resets_at_text, str) and resets_at_text:
-        result["weekly_resets_at_text"] = resets_at_text
-    last_checked_at = _public_metadata_scalar(value.get("last_checked_at"))
-    if isinstance(last_checked_at, str):
-        result["last_checked_at"] = last_checked_at
-    return result
-
-
-def _normalize_rate_limit_snapshot(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-    result: dict[str, Any] = {}
-    for key in ("primary", "secondary"):
-        window = _normalize_rate_limit_window(value.get(key))
-        if window:
-            result[key] = window
-    credits = _normalize_credits(value.get("credits"))
-    if credits:
-        result["credits"] = credits
-    return result
-
-
-def _normalize_rate_limit_window(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-    result: dict[str, Any] = {}
-    for key in ("used_percent", "window_duration_mins", "resets_at"):
-        scalar = _public_metadata_scalar(value.get(key))
-        if scalar is not None:
-            result[key] = scalar
-    return result
-
-
-def _normalize_credits(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-    result: dict[str, Any] = {}
-    for key in ("has_credits", "unlimited", "balance"):
-        scalar = _public_metadata_scalar(value.get(key))
-        if scalar is not None:
-            result[key] = scalar
-    return result
-
-
-def _public_metadata_scalar(value: Any) -> Any:
-    if isinstance(value, str):
-        return value or None
-    if isinstance(value, bool) or isinstance(value, int) or isinstance(value, float):
-        return value
-    return None
-
-
-def create_task(body: Any) -> dict[str, Any]:
+def create_task(body: Any, *, app_backend_id: str | None = None) -> dict[str, Any]:
     input_message = _message(body, "input_message")
     thread_id = _thread_id(body)
-    _validate_thread_id_not_reserved_by_app(thread_id)
-    agent_runtime = _agent_runtime(body)
+    _validate_thread_id_not_reserved_by_app(thread_id, app_backend_id)
     with state.mutation() as cur:
-        existing_runtime = state.thread_task_runtime(cur, thread_id) or state.thread_session_runtime(cur, thread_id)
-        if existing_runtime is not None and existing_runtime != agent_runtime:
-            raise ApiError(
-                HTTPStatus.CONFLICT,
-                f"thread_id is already used by {existing_runtime}; use that runtime or choose a new thread_id",
-            )
+        session_config = state.thread_session_config(cur, thread_id)
+        agent_runtime, model, effort = _resolve_task_session_config(body, session_config)
         if state.queued_task_count(cur) >= QUEUED_TASK_LIMIT:
             raise ApiError(
                 HTTPStatus.CONFLICT,
@@ -1204,10 +1071,22 @@ def create_task(body: Any) -> dict[str, Any]:
             )
         task_id = f"task_{state.allocate_task_number(cur)}"
         now = utc_now()
+        provider_session_id = session_config.get("provider_session_id") if session_config else None
+        state.save_thread_session(
+            cur,
+            agent_runtime,
+            thread_id,
+            provider_session_id,
+            now,
+            model,
+            effort,
+        )
         task = {
             "task_id": task_id,
             "status": QUEUED,
             "agent_runtime": agent_runtime,
+            "model": model,
+            "effort": effort,
             "thread_id": thread_id,
             "input_message": input_message,
             "created_at": now,
@@ -1231,34 +1110,13 @@ def list_tasks(last_seen_task_id: str | None) -> dict[str, Any]:
 
 
 def list_threads() -> dict[str, Any]:
-    threads = {summary["thread_id"]: summary for summary in state.thread_summaries()}
-    for runtime, thread_id, last_used_at in state.session_summaries():
-        _merge_thread_mapping(threads, thread_id, runtime, {"last_used_at": last_used_at})
+    threads = state.thread_summaries()
     ordered = sorted(
-        threads.values(),
+        threads,
         key=lambda item: (str(item["last_used_at"]), item["agent_runtime"], item["thread_id"]),
         reverse=True,
     )
     return {"threads": ordered}
-
-
-def _merge_thread_mapping(
-    threads: dict[str, dict[str, Any]], thread_id: str, runtime: str, mapping: Any
-) -> None:
-    if not isinstance(mapping, dict):
-        return
-    last_used_at = str(mapping.get("last_used_at", ""))
-    entry = threads.setdefault(
-        thread_id,
-        {
-            "thread_id": thread_id,
-            "agent_runtime": runtime,
-            "last_used_at": last_used_at,
-            "active_tasks": [],
-            "task_count": 0,
-        },
-    )
-    entry["last_used_at"] = max(str(entry["last_used_at"]), last_used_at)
 
 
 def list_thread_tasks(thread_id: str) -> dict[str, Any]:
@@ -1334,20 +1192,16 @@ def replace_network_policy(body: Any) -> dict[str, Any]:
     except ConfigError as exc:
         raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
     policy = parsed.to_json()
-    if not NETWORK_POLICY_LOCK.acquire(timeout=NETWORK_POLICY_LOCK_TIMEOUT_SECONDS):
-        raise ApiError(HTTPStatus.CONFLICT, "network policy update already in progress")
-    try:
-        # The validated policy goes straight to the database row the proxy
-        # reads (the proxy role cannot write it back). Only stored after
-        # parse_network_controls above accepted it — same validation the old
-        # root helper performed.
-        record = state.network_policy_record()
-        previous_policy = record["controls"] if record else {}
-        updated_at = utc_now()
-        state.save_network_policy(policy, updated_at)
-        orchestrator.reconcile_runtime_status_after_policy_change()
-    finally:
-        NETWORK_POLICY_LOCK.release()
+    # The validated policy goes straight to the database row the proxy reads
+    # (the proxy role cannot write it back); the write is atomic under the
+    # mutation lock. Two concurrent replacements are last-writer-wins — a
+    # single operator double-submitting — and the runtime reconcile below is
+    # idempotent and re-run by the poller either way.
+    record = state.network_policy_record()
+    previous_policy = record["controls"] if record else {}
+    updated_at = utc_now()
+    state.save_network_policy(policy, updated_at)
+    orchestrator.reconcile_runtime_status_after_policy_change()
     # Converge the installed GitHub credential to the published policy —
     # install on enable, remove on disable, with a fresh App mint on any
     # GitHub-integration change (an installation token only covers
@@ -1356,15 +1210,15 @@ def replace_network_policy(body: Any) -> dict[str, Any]:
     # stay separate concerns: a publish never fails on credential problems; a
     # failed mint or install records itself in the credential's validation
     # status, the working token is withdrawn (fail closed), and the poller
-    # retries. Outside the policy lock: minting can take seconds. The policy
-    # is already committed, so a transient convergence failure (e.g. a policy
-    # read racing a concurrent replace) must not turn this publish into an
-    # error — the poller retries convergence either way. Repository audits
+    # retries. The policy is already committed, so a transient convergence
+    # failure (e.g. a policy read racing a concurrent replace) must not turn
+    # this publish into an error — the poller retries convergence either way.
+    # Repository audits
     # follow with the published token (forced on a GitHub change, TTL-gated
     # otherwise); they warn, never gate, so the publish result does not
     # depend on them either.
     try:
-        github_changed = _github_integration(previous_policy) != _github_integration(policy)
+        github_changed = network_policy.managed_integration("github", previous_policy) != network_policy.managed_integration("github", policy)
         github_credential.reconcile(mint_fresh=github_changed)
         github_repo_audit.refresh(force=github_changed)
     except Exception:
@@ -1426,7 +1280,7 @@ def filesystem_metrics() -> dict[str, Any]:
         usage = _filesystem_usage(path)
         if usage is not None:
             mounts[name] = usage
-    return {**root, "mounts": mounts}
+    return {"mounts": mounts}
 
 
 def swap_metrics() -> dict[str, int]:
@@ -1449,6 +1303,8 @@ def public_task(task: dict[str, Any], queue_position: int | None = None) -> dict
         "task_id": task["task_id"],
         "status": task["status"],
         "agent_runtime": task["agent_runtime"],
+        "model": task["model"],
+        "effort": task["effort"],
         "thread_id": task["thread_id"],
         "input_message": task["input_message"],
         "created_at": task["created_at"],
@@ -1470,11 +1326,9 @@ def app_id_from_internal_thread_id(thread_id: str) -> str | None:
     return app_id if app_platform.app_by_id(app_id) is not None else None
 
 
-def _validate_thread_id_not_reserved_by_app(thread_id: str) -> None:
+def _validate_thread_id_not_reserved_by_app(thread_id: str, app_backend_id: str | None) -> None:
     app_id = app_id_from_internal_thread_id(thread_id)
-    if app_id is None:
-        return
-    if getattr(REQUEST_CONTEXT, "app_backend_id", None) == app_id:
+    if app_id is None or app_backend_id == app_id:
         return
     raise ApiError(
         HTTPStatus.BAD_REQUEST,
@@ -1533,6 +1387,56 @@ def _agent_runtime_value(value: str) -> str:
     return value
 
 
+def _session_config(body: Any, runtime: str) -> tuple[str, str]:
+    if not isinstance(body, dict):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "request body must be a JSON object")
+    model = body.get("model")
+    effort = body.get("effort")
+    error = session_config_error(runtime, model, effort)
+    if error is not None:
+        raise ApiError(HTTPStatus.BAD_REQUEST, error)
+    assert isinstance(model, str) and isinstance(effort, str)
+    return model, effort
+
+
+def _resolve_task_session_config(
+    body: Any,
+    session_config: dict[str, Any] | None,
+) -> tuple[str, str, str]:
+    stored = None
+    if session_config is not None:
+        stored = (
+            session_config["agent_runtime"],
+            session_config["model"],
+            session_config["effort"],
+        )
+
+    assert isinstance(body, dict)
+    fields = ("agent_runtime", "model", "effort")
+    supplied = [field for field in fields if field in body]
+    if stored is not None:
+        if supplied:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "agent_runtime, model, and effort must be omitted for an existing thread",
+            )
+        return stored
+    if not supplied:
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            "agent_runtime, model, and effort are required when starting a new thread",
+        )
+    if len(supplied) != len(fields):
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            "agent_runtime, model, and effort must be provided together",
+        )
+
+    agent_runtime = _agent_runtime(body)
+    model, effort = _session_config(body, agent_runtime)
+    return agent_runtime, model, effort
+
+
 def _one(query: dict[str, list[str]], key: str) -> str | None:
     values = query.get(key)
     if not values:
@@ -1551,19 +1455,6 @@ def _agent_file_path(query: dict[str, list[str]]) -> str:
     if len(value) > 4096:
         raise ApiError(HTTPStatus.BAD_REQUEST, "path is too long")
     return value
-
-
-def _since(query: dict[str, list[str]]) -> int | None:
-    value = _one(query, "since")
-    if value is None:
-        return None
-    try:
-        since = int(value)
-    except ValueError as exc:
-        raise ApiError(HTTPStatus.BAD_REQUEST, "since must be an integer") from exc
-    if since < 0:
-        raise ApiError(HTTPStatus.BAD_REQUEST, "since must be non-negative")
-    return since
 
 
 def _optional_non_negative_int(query: dict[str, list[str]], key: str) -> int | None:
@@ -1616,8 +1507,10 @@ def _minutes_from_now(minutes: int) -> str:
 def initialize_state() -> None:
     """Recover after a restart or reboot: a task that was mid-turn has no
     worker attached anymore, so fail it rather than leave it running forever.
-    (Idempotency replay records live in this process's memory, so a restart
-    already cleared them along with any in-flight reservations.)"""
+    (A pending push interrupted mid-resolve is still pending and the operator
+    approves or rejects it again.) The tools service applies the same policy to its own
+    interrupted state at its startup: an approval caught mid-execution is
+    marked failed, never re-executed (tools_host.recover_interrupted_approvals)."""
     error_message = "host runtime restarted while the task was running"
     with state.mutation() as cur:
         for task_id in state.fail_running_tasks(cur, error_message):
@@ -1632,15 +1525,16 @@ def main() -> int:
     # papered over.
     # Bind the port before touching state: the state lock is in-process only,
     # so the bind is the single-instance gate. A second instance must fail here
-    # rather than fail the live instance's running task and drop its in-flight
-    # idempotency reservations first.
-    from host.runtime import app_backend_admin_api
-
+    # rather than fail the live instance's running task first.
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     app_backend_httpd = app_backend_admin_api.create_app_backend_admin_server()
     initialize_state()
+    # The agent-facing tools socket and tool execution run in the dedicated
+    # trustyclaw-tools service (its own user, egress, and scoped DB role); the
+    # admin service only forwards operator operations to it.
     orchestrator.start_workers()
     threading.Thread(target=maintenance_loop, daemon=True).start()
+    threading.Thread(target=upgrade_check.poll, daemon=True).start()
     threading.Thread(target=app_backend_httpd.serve_forever, daemon=True).start()
     try:
         httpd.serve_forever()

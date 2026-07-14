@@ -28,7 +28,7 @@ decides what token (if any) the proxy injects, and ``validation`` reports
 only the credential's own health. The two meet in exactly one place:
 ``reconcile()`` keeps the working-token row present exactly while GitHub is
 enabled with a credential stored. It runs after every credential change and
-policy publish (``mint_fresh=True`` when the GitHub scope widened, because an
+policy publish (``mint_fresh=True`` when the GitHub integration changed, because an
 installation token only covers the repositories and App permissions granted
 at mint time) and from the orchestrator poller every cycle. Any failure —
 a mint, a row write — records itself in ``validation``, clears the working
@@ -37,9 +37,9 @@ published repository list must not stay injectable), and is retried on the
 next cycle. The working-token row is the only copy — there is no separate
 mint cache that could drift from it.
 
-Minting needs outbound network access, which the admin service does not have
-(nftables gives egress only to root and the proxy), so minting goes through a
-root helper (``mint-github-app-token``).
+Minting needs outbound network access, which the admin service does not have,
+so GitHub API calls go through the fixed root helper
+(``mint-github-app-token``).
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ import threading
 from typing import Any
 
 from host.runtime import state
-from host.runtime.network_policy import load_policy
+from host.runtime.network_policy import managed_integration
 
 MINT_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/mint-github-app-token"]
 HELPER_TIMEOUT_SECONDS = 60
@@ -114,7 +114,7 @@ def reconcile(mint_fresh: bool = False) -> None:
     is enabled and a credential is stored, absent otherwise. The row is the
     only copy of the working token — there is no separate mint cache to keep
     in step. ``mint_fresh`` forces a new App-mode mint (credential changes
-    and scope-widening policy publishes); the poller keeps the published
+    and any GitHub-integration change); the poller keeps the published
     token until it nears expiry. Never raises: any failure records itself in
     the credential's validation status, clears the working token (fail
     closed), and the next poller cycle retries."""
@@ -163,9 +163,7 @@ def _mint_app_token(credential: dict[str, Any]) -> tuple[str, str]:
 
 
 class HelperError(Exception):
-    def __init__(self, message: str, code: str | None = None) -> None:
-        super().__init__(message)
-        self.code = code
+    pass
 
 
 def _run_helper_json(
@@ -193,19 +191,14 @@ def _run_helper_json(
     if proc.returncode != 0:
         error = value.get("error", {}) if isinstance(value, dict) else {}
         message = error.get("message") if isinstance(error, dict) else None
-        code = error.get("code") if isinstance(error, dict) and isinstance(error.get("code"), str) else None
-        raise HelperError(message or proc.stderr.strip() or f"{command[-1]} failed", code=code)
+        raise HelperError(message or proc.stderr.strip() or f"{command[-1]} failed")
     if not isinstance(value, dict):
         raise HelperError(f"{command[-1]} returned invalid JSON")
     return value
 
 
 def _github_integration_enabled() -> bool:
-    integrations = load_policy().get("managed_network_integrations", {})
-    if not isinstance(integrations, dict):
-        return False
-    github = integrations.get("github")
-    return isinstance(github, dict) and github.get("enabled") is True
+    return managed_integration("github").get("enabled") is True
 
 
 def _token_stale(expires_at: Any) -> bool:

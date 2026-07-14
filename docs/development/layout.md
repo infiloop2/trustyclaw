@@ -1,84 +1,75 @@
 # Code Layout
 
-The runtime is pure Python 3 standard library — no third-party dependencies.
-Even the admin-state database is reached through an in-repo protocol client
-rather than a driver (pinned by a unit test that rejects non-stdlib imports).
+The production Python runtime uses only the standard library. PostgreSQL is
+reached through the in-repo wire client rather than a third-party driver, and a
+unit test rejects non-standard-library runtime imports.
 
-```
+```text
 host/
-  cli/                       # operator-side lifecycle and power commands
-  config.py                  # input config + network policy validation
-  constants.py               # shared admin/proxy port constants
+  apps/                     # bundled app packages; each manifest declares a stable host_slot
   bootstrap/
-    user_data.sh             # first-boot SSH/bootstrap access setup
-    bootstrap.sh             # full host bootstrap run over SSH as root
-    helpers/                 # root-owned sudo helper scripts installed on host
-  migrations/
-    NNNN_description.sql     # versioned admin-state schema migrations (up/down)
+    agent-home/             # immutable runtime instructions and harness settings
+    helpers/                # root-owned fixed sudo helpers installed on the host
+    user_data.sh            # minimal first-boot operator/deploy-key setup
+    bootstrap.sh            # full host bootstrap run over SSH as root
+  cli/                      # operator-side lifecycle and power commands
+  migrations/               # ordered admin-state SQL migrations with up/down sections
   runtime/
-    admin_api.py             # localhost admin API
-    orchestrator.py          # task worker pool + runtime session cache
-    admin_ui.html            # single-page admin UI shell served at GET /
-    admin_ui.css             # admin UI styling
-    admin_ui/                # admin UI behavior: native ES modules, one per feature
-                             # (app.js entry + api, helpers, health, threads,
-                             # files, processes, logs, network)
-    codex_app_server.py      # stdio JSON-RPC client for the Codex app-server
-    claude_code.py           # Claude Code CLI adapter + OAuth login process
-    network_proxy.py         # policy-enforcing HTTP(S)/WS(S) proxy
-    network_policy.py        # policy files, domain matching, request decisions
-    proxy_state_client.py    # admin-side client for proxy-state helpers
-    read_network_state.py    # proxy-owned state read helper entrypoint
-    db.py                    # Postgres connection pool/transactions for admin state
-    migrate.py               # schema migration runner (up/down/status)
-    pgclient.py              # minimal stdlib PostgreSQL wire-protocol client
-    state.py                 # admin-state storage + proxy JSON/JSONL file helpers
-    task_status.py           # task lifecycle transition helpers
-    write_config.py          # bootstrap helper: replace the config table from stdin
-    update_network_policy.py # proxy-owned policy writer entrypoint
-    update_provider_account.py # proxy-owned provider-pin writer entrypoint
-tests/                       # unit tests, local UI smoke, and live AWS tests
-  smoke/                     # manual smoke tests (NOT run in CI)
-  stage/                     # persistent staging tests (NOT run in CI)
-  smoke-ui/                  # local admin UI mock backend + browser smoke
-.github/                     # no-network CI plus admin-triggered live AWS workflows
+    admin_api.py            # localhost admin API, UI server, and route dispatcher
+    app_*.py                # app discovery, migrations, browser proxy, and backend socket
+    github_*.py             # credential convergence, audits, and held-push lifecycle
+    tools_*.py              # tools admin routes, service, socket, MCP shim, and HostAPI
+    orchestrator.py         # task workers, runtime status/account pollers, and convergence
+    codex_app_server.py     # Codex stdio JSON-RPC adapter
+    claude_code.py          # Claude Code stream-json adapter and login process
+    network_proxy.py        # policy-enforcing HTTP(S)/WS(S) proxy
+    network_policy.py       # policy expansion and request decisions
+    db.py                   # process-local Postgres pool and transactions
+    pgclient.py             # minimal PostgreSQL wire-protocol client
+    state.py                # normalized Postgres storage accessors
+    migrate.py              # admin-state migration runner
+  tools/                    # host-neutral tool contract and bundled tool packages
+  config.py                 # lifecycle input and network-policy validation
+  constants.py              # shared loopback port constants
+tests/
+  smoke/                    # fresh live AWS host checks
+  stage/                    # persistent, credentialed live AWS checks
+  smoke-ui/                 # deterministic local admin UI mock and browser smoke
+docs/                       # API, architecture, development, and commit-scoped audits
+.github/                    # no-network CI and admin-triggered live AWS workflows
 ```
 
-Important source files and the context that runs them:
+Important source areas and the context that runs them:
 
-| Module | Runs as | Purpose |
+| Source | Runs as | Responsibility |
 | --- | --- | --- |
-| `host/cli/` | operator's machine | Provisions, upgrades, recovers, and bootstraps the host. Never runs on the host. |
-| `host/config.py` | operator machine and host services | Input config and network policy validation. |
-| `host/bootstrap/user_data.sh` | root via EC2 user data | Minimal first-boot script: creates the operator account, installs the one-use deploy key, and opens the SSH bootstrap path. |
-| `host/bootstrap/bootstrap.sh` | root via SSH deploy | Full host bootstrap: mounts volumes, installs packages and CLIs, creates users including optional `cloudflared`, sets up the admin-state Postgres and applies schema migrations, installs helpers, configures nftables/systemd services, and creates an empty runtime network policy only when no preserved policy exists. |
-| `host/bootstrap/helpers/run-codex-app-server.sh` | root via sudo helper | Root-owned launcher that demotes to `trustyclaw-agent` and starts Codex with proxy/CA environment. |
-| `host/bootstrap/helpers/run-claude-code.sh` | root via sudo helper | Root-owned launcher that demotes to `trustyclaw-agent` and starts Claude Code with proxy/CA environment. |
-| `host/bootstrap/helpers/read-codex-account-id.sh` | root via sudo helper | Narrow helper that reads Codex auth as `trustyclaw-agent` and prints only the inferred OpenAI account id. |
-| `host/bootstrap/helpers/read-claude-account.sh` | root via sudo helper | Narrow helper that reads Claude auth as `trustyclaw-agent` and prints only account metadata plus the OAuth bearer hash. |
-| `host/bootstrap/helpers/clear-agent-auth.sh` | root via sudo helper | Narrow helper that clears Codex/Claude auth files as `trustyclaw-agent` during linked-account reset. |
-| `host/bootstrap/helpers/read-agent-file.sh` | root via sudo helper | Narrow helper that reads agent-home directories and bounded file previews as `trustyclaw-agent`. |
-| `host/bootstrap/helpers/mint-github-app-token.sh` | root via sudo helper | Mints installation-wide GitHub App tokens. |
-| `host/bootstrap/helpers/approve-github-push.sh` | root via sudo helper | Replays or rejects a `.github` push held in the proxy quarantine mirror. |
-| `host/bootstrap/helpers/reboot-host.sh` | root via sudo helper | Root-owned reboot helper used by the admin API. |
-| `host/runtime/admin_api.py` | `trustyclaw-admin` | Localhost admin API on `127.0.0.1:7443`. |
-| `host/runtime/orchestrator.py` | `trustyclaw-admin` | Task worker pool, runtime process cache, and runtime status poller. |
-| `host/runtime/admin_ui.html` | served by admin API | Single-page admin UI shell; a thin layer over the API. |
-| `host/runtime/admin_ui.css` | served by admin API | Admin UI styling. |
-| `host/runtime/admin_ui/` | served by admin API | Admin UI behavior and API calls as native ES modules, one per feature (`app.js` entry). |
-| `host/runtime/codex_app_server.py` | `trustyclaw-admin` | Stdio JSON-RPC client for the Codex app-server. |
-| `host/runtime/claude_code.py` | `trustyclaw-admin` | Claude Code CLI adapter and OAuth login process management. |
-| `host/runtime/network_proxy.py` | `trustyclaw-proxy` | Policy-enforcing HTTP(S)/WS(S) proxy on `127.0.0.1:7445`. |
-| `host/runtime/network_policy.py` | `trustyclaw-admin` and `trustyclaw-proxy` | Policy files, domain matching, request decisions, provider guards. |
-| `host/runtime/proxy_state_client.py` | `trustyclaw-admin` | Admin-side client for the proxy-state helpers. |
-| `host/runtime/read_network_state.py` | `trustyclaw-proxy` via root sudo helper | Narrow read helper for proxy-owned policy and network events. |
-| `host/runtime/db.py` | `trustyclaw-admin` | Postgres connection pool and transaction helper for admin state. |
-| `host/runtime/pgclient.py` | `trustyclaw-admin` | Minimal stdlib PostgreSQL wire-protocol client (Unix socket, peer auth, text format). |
-| `host/runtime/migrate.py` | `trustyclaw-admin` (bootstrap and service startup) | Applies versioned SQL migrations from `host/migrations/`. |
-| `host/runtime/state.py` | `trustyclaw-admin`; selected proxy helpers | Admin-state storage (Postgres) and proxy JSON/JSONL file helpers. |
-| `host/runtime/write_config.py` | `trustyclaw-admin` via bootstrap | Computes the effective host config (payload vs. carried-over credentials by operation mode), stores it in the config table, and echoes it for the root-only bootstrap steps. |
-| `host/runtime/task_status.py` | `trustyclaw-admin` | Shared task status transition helpers. |
-| `host/runtime/update_network_policy.py` | `trustyclaw-proxy` via root sudo helper | The only writer of the network policy files. |
-| `host/runtime/update_provider_account.py` | `trustyclaw-proxy` via root sudo helper | Narrow write helper for proxy-owned provider account pins. |
+| `host/cli/` | Operator machine | Validates lifecycle input; provisions, replaces, recovers, starts, or stops AWS resources; renders and runs bootstrap. |
+| `host/config.py` | Operator machine and host services | Validates lifecycle input and the stored/runtime network policy. |
+| `host/bootstrap/user_data.sh` | root through EC2 user data | Creates the operator account and installs only the single-use deploy SSH key. |
+| `host/bootstrap/bootstrap.sh` | root through lifecycle SSH | Mounts volumes, installs pinned dependencies, creates fixed users, configures PostgreSQL/nftables/systemd, applies migrations, and writes trusted host files. |
+| `host/bootstrap/helpers/` | root through exact `trustyclaw-admin` sudo rules | Launches runtimes as the agent user, reads or clears narrow agent-auth state, reads bounded agent files, reboots, and performs GitHub operations that need root egress. |
+| `host/apps/` | App users, plus bootstrap/admin readers | Contains app manifests, backend/UI/migration files, and stable `host_slot` declarations. See [Apps](../architecture/apps.md). |
+| `host/tools/` | `trustyclaw-tools` | Defines the host-neutral tool contract and bundled packages. Package discovery is directory-based; helper packages are explicitly excluded. |
+| `host/runtime/admin_api.py` | `trustyclaw-admin` | Serves `127.0.0.1:7443`, authenticates operator APIs, dispatches app/tool routes, owns task state, and starts workers and maintenance. |
+| `host/runtime/admin_ui*` | Browser, served by admin API | Implements the native-ES-module operator UI and its static assets. |
+| `host/runtime/admin_errors.py` | Admin route modules | Holds the shared `ApiError` class so the `__main__` service and imported route modules map status codes consistently. |
+| `host/runtime/app_platform.py` | Operator/bootstrap and admin API | Validates installed app manifests and derives host-owned users, roles, schemas, routes, services, and ports. |
+| `host/runtime/app_migrate.py` | App role for SQL; admin role for records | Applies replay-safe app SQL under the app schema and records versions in host-owned state. |
+| `host/runtime/app_api_proxy.py` | `trustyclaw-admin` | Proxies authenticated browser app requests to uid-firewalled loopback app ports without forwarding the raw admin bearer. |
+| `host/runtime/app_backend_admin_api.py` | `trustyclaw-admin` | Serves the peer-authenticated app-backend Unix socket and scopes allowlisted task/thread routes to the calling app. |
+| `host/runtime/orchestrator.py` | `trustyclaw-admin` | Runs the six task workers, runtime status/account pollers, credential convergence, and task lifecycle coordination. |
+| `host/runtime/codex_app_server.py` | Admin adapter controlling an agent child | Implements the Codex stdio JSON-RPC protocol and runtime lifecycle. |
+| `host/runtime/claude_code.py` | Admin adapter controlling an agent child | Implements Claude Code stream-json turns, steering, login, and status probes. |
+| `host/runtime/network_proxy.py` | `trustyclaw-proxy` | Serves `127.0.0.1:7445`, terminates/inspects proxied traffic, applies policy before upstream connections, and records network events. |
+| `host/runtime/network_policy.py` | Admin and proxy processes | Expands managed integrations and applies domain, method, path, provider, GitHub, and body guards. |
+| `host/runtime/db.py`, `pgclient.py` | Admin, proxy, tools, app/bootstrap clients | Implement peer-authenticated Unix-socket PostgreSQL connections, pooling, and transactions without a driver dependency. |
+| `host/runtime/state.py` | Admin, proxy, and tools processes under their OS roles | Implements per-operation normalized storage access. Database grants remain the cross-process authority boundary. |
+| `host/runtime/migrate.py` | `trustyclaw-admin` during bootstrap | Applies ordered admin-state migrations before application services start; the running admin service never migrates. |
+| `host/runtime/write_config.py` | `trustyclaw-admin` during bootstrap | Chooses replacement or carried-over operator config for the lifecycle mode, encrypts secrets, stores normalized rows, and returns the effective config to root bootstrap. |
+| `host/runtime/tools_admin_api.py` | `trustyclaw-admin` | Implements operator-facing tool listing, config, enablement, OAuth delegation, approvals, and audit routes. |
+| `host/runtime/tools_service.py`, `tools_api.py` | `trustyclaw-tools` | Own the tools socket, execute tool packages with scoped database access and direct HTTPS egress, and recover interrupted approvals. |
+| `host/runtime/tools_host.py` | Admin and tools processes | Implements tool discovery, manifest validation, config/credential views, single-use approvals, and tool audit events. |
+| `host/runtime/tools_mcp_shim.py` | `trustyclaw-agent`, spawned by each harness | Exposes the enabled tools over stdio MCP and forwards calls to the peer-authenticated tools socket. |
+| `host/runtime/github_*.py` | `trustyclaw-admin`, with fixed root helpers for egress | Converges the GitHub credential, derives repository warnings, queues `.github` pushes, and resolves operator decisions. |
 
-Develop against Python 3.11 (the Ubuntu 22.04 host runtime) to match CI.
+Develop against Python 3.11, the Ubuntu 22.04 host and CI runtime version.

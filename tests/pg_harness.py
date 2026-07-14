@@ -141,15 +141,16 @@ def ensure_database() -> None:
     os.environ["TRUSTYCLAW_DB_NAME"] = "trustyclaw_test"
     os.environ["TRUSTYCLAW_DB_USER"] = "postgres"
 
-    # The proxy role must exist before migrations run (the schema GRANTs it
-    # the network_events table). Tests connect as postgres either way.
-    subprocess.run(
-        [str(pg_bin / "createuser"), "-h", str(socket_dir), "-U", "postgres", "trustyclaw-proxy"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        check=True,
-        env=env,
-    )
+    # The proxy and tools roles must exist before migrations run (the schema
+    # GRANTs them their tables). Tests connect as postgres either way.
+    for role in ("trustyclaw-proxy", "trustyclaw-tools"):
+        subprocess.run(
+            [str(pg_bin / "createuser"), "-h", str(socket_dir), "-U", "postgres", role],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=True,
+            env=env,
+        )
     subprocess.run(
         [str(pg_bin / "createdb"), "-h", str(socket_dir), "-U", "postgres", "trustyclaw_test"],
         stdout=subprocess.DEVNULL,
@@ -170,8 +171,7 @@ def reset_database() -> None:
     ensure_database()
     from host.runtime import orchestrator
 
-    with orchestrator._RUNTIME_STATUS_LOCK:
-        orchestrator._RUNTIME_STATUSES.clear()
+    orchestrator._RUNTIME_STATUSES.clear()
     from host.runtime import db
 
     with db.transaction() as cur:

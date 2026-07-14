@@ -44,7 +44,7 @@ is the exact contract the app provides to the host.
 
 ```json
 {
-  "id": "<app_id>",
+  "host_slot": 0,
   "title": "<App Title>",
   "backend": {
     "entrypoint": "backend.py"
@@ -58,18 +58,25 @@ is the exact contract the app provides to the host.
 }
 ```
 
-`id` is the stable app identity. The host requires it to be unique across
-installed apps and to match the snake_case pattern
-`^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$`. The host uses this id to derive
-collision-proof names for the Linux user, database schema, database role,
-service unit, route prefix, and UI mount point.
+The package directory name is the stable app identity. The host requires it to
+match `^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$` and rejects every non-package directory
+under `host/apps/`. The manifest deliberately has no second `id` field that can
+drift from the package name. The host uses this id to derive collision-proof
+names for the Linux user, database schema, database role, service unit, route
+prefix, and UI mount point.
+
+`host_slot` is the package's stable integer from 0 through 99. The host derives
+the app UID, GID, and port offset from that one slot. Slots must be unique and
+must never change after release because numeric ownership survives host
+upgrades. Keeping the slot inside the package means adding an app requires only
+adding its directory; there is no root registry or bootstrap list to update.
 
 `title` is the human-readable name shown in app listings and diagnostics.
 
 `backend.entrypoint` is the app backend server code, relative to the app
 package. The app provides code only; the host chooses the port, local bind
 address, environment, service unit name, working directory, and run user. Port
-assignments are derived from stable app ids, not manifest scan order.
+assignments are derived from stable host slots, not manifest scan order.
 
 `database.migrations` is a directory of app migration SQL files, relative to the
 app package. The app does not choose its schema name or role name. The host
@@ -85,12 +92,13 @@ label.
 
 The host integrates an app by reading the manifest, validating every referenced
 path, and deriving all host-owned names from the app id. Duplicate ids,
-invalid ids, path traversal, and generated-name collisions are bootstrap
-errors. The first implementation caps the installed app registry at 100 apps so
-port assignment, provisioning, and admin UI mounting stay inside an intentionally
-bounded surface. Static UID/GID and port allocations live in the root-owned
-`host/apps/registry.json` file so bootstrap provisioning and `/v1/apps`
-metadata are generated from the same app list.
+invalid package directories, missing or extra manifest fields, path traversal,
+duplicate host slots, and generated-name collisions are validation errors. CI
+loads every package through this same validator, so these errors fail before
+merge rather than first appearing during a deploy. The first implementation
+caps installed apps at 100 so slot assignment, provisioning, and admin UI
+mounting stay inside an intentionally bounded surface. Bootstrap provisioning
+and `/v1/apps` metadata are generated from the validated package list.
 
 The host derives names from the app id:
 
@@ -131,7 +139,7 @@ uid-derived app id. This avoids storing a second app secret while keeping the
 browser-facing TCP admin API protected by the operator password, and prevents
 one app service user from impersonating another app over the shared socket.
 Server-to-server calls are then checked against an app-backend route allowlist.
-The first allowlist is intentionally narrow: it includes only task creation and
+The allowlist is intentionally narrow: it includes only task creation and
 task/thread lookup or control route shapes needed by app workflows. It does not
 allow broad host routes such as network policy, files, process inventory,
 runtime auth, app registry, or generic task/thread listing.
@@ -166,7 +174,9 @@ admin-proxy route, firewall reachability, and app-backend allowlist.
 The app service uid may still send established loopback responses for
 admin-proxied requests, but it cannot initiate arbitrary TCP loopback
 connections.
-External network access is still controlled by the host network controls.
+The app service uid has no direct external egress. An app can ask the host to
+run an agent task through its allowlisted socket routes, and that agent work is
+still subject to the host network controls.
 Operator access endpoints such as SSH forwarding and Cloudflare Access expose
 only the host admin API; app backend ports are not separately exposed.
 App service users also have loopback restrictions: they may answer established
@@ -203,7 +213,7 @@ rejecting any duplicate generated names.
 Apps store the workflow state they own instead of using host admin lists as
 their source of truth. For a chat-like workflow, that means app-owned thread
 records, related host task ids, and archive state. The app does not duplicate
-task transcripts or runtime execution data because those remain available
+task transcripts or thread runtime/model/effort because those remain available
 through allowlisted host admin API routes. This matters once multiple apps use
 the same host admin task API: each app can show the threads it started and hide
 or archive them according to its own product rules, without exposing unrelated
@@ -263,7 +273,7 @@ is designed around bad or compromised app assets:
   shapes and the socket boundary scopes task/thread names to the authenticated
   app id before the normal host route handlers run. App-specific credentials,
   broader route/capability scopes, explicit grants for non-task host objects,
-  and rate limits are future extensions.
+  and rate limits are not implemented.
   App service units run under `trustyclaw_app.slice` with a lower CPU weight
   than host services, so CPU loops in app code do not get equal priority with
   the admin plane under contention. This is not full resource containment:
@@ -298,32 +308,14 @@ Those threat cases drive the concrete controls:
   task-id operations are allowed only for tasks under that prefix.
 - External side effects require host integrations and host network enforcement.
 
-## Future App Capability Scoping
+## Current Capability Boundary
 
-The current app-backend credential is the app service user's Unix peer identity
-on the local admin API socket. It authenticates which installed app process made
-the request and then applies a route-shape allowlist. Task and thread routes are
-now app-scoped at this boundary: caller-provided thread ids are rewritten under
-the authenticated app id, task-id operations verify the target task's prefixed
-thread, and app responses hide the internal thread prefix. That prevents an app
-backend from reusing or controlling task/thread state created by another app or
-by the core admin UI through the app-backend socket.
+The app service user's Unix peer identity authenticates which installed app
+made a local admin API request. The host then applies a route-shape allowlist
+and app-scopes task and thread identifiers. The current boundary exposes no
+file, process, runtime-credential, network-policy, or cross-app grant routes to
+app backends. There are no app-specific rate limits or broader capability-grant
+model; adding either would require a new host-owned authorization contract.
 
-The hardening direction is an app-scoped host capability model:
-
-- Host-issued app backend credentials or peer-authenticated app identities map
-  to explicit capabilities by app id.
-- File, process, runtime credential, network-policy, and other host objects gain
-  app ownership or capability grants before any app-backend route can expose
-  them.
-- Host thread/session identifiers created through app backends stay app-scoped;
-  explicit cross-app or app-to-core grants would need a separate operator-owned
-  grant model.
-- Host admin API dispatch checks both route capability and object ownership
-  before returning or mutating data.
-- App backend permissions include rate limits and audit labels per app.
-- The UI bridge continues to forward only app-backend proxy calls; direct host
-  admin API calls remain outside the app UI surface.
-
-The host can make apps easy to install and run while staying the authority for
-execution, credentials, storage namespaces, network policy, and UI isolation.
+The UI bridge continues to forward only requests to that app's backend proxy
+route. Direct host admin API calls remain outside the app UI surface.

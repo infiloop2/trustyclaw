@@ -43,17 +43,23 @@ quarantine mirror with `git push --atomic` and per-ref
 `--force-with-lease=<ref>:<old>` checks. Rejecting a push invokes the same
 helper in cleanup mode and removes the pending refs.
 
-Only one approve or reject action can claim a pending push at a time. The admin
-UI shows both `pending` and `resolving` rows, so a stuck claim is visible without
-rewriting its state. Cleanup runs once as part of the action. If cleanup fails,
-the row is marked terminal with the cleanup detail so separate maintenance
-tooling can reclaim retained refs without keeping the push in the operator
-approval queue.
+Approve and reject actions serialize inside the admin service (the single
+resolver: only its role can update pending pushes, and the port bind keeps it
+single-instance); a concurrent duplicate action gets a conflict error. A crash
+mid-resolve leaves the row `pending`, so the operator simply approves or
+rejects again. Approving with no working GitHub token is refused and the row
+stays `pending` — fix the credential and approve again. If a replay fails, the
+row is marked `failed` with the failure detail; the recovery for every failure
+is the same — the agent pushes again, which starts a fresh gate round.
+Pending-ref cleanup is best-effort housekeeping of the proxy-private mirror:
+its failure never changes a resolution outcome (a reject is always
+`rejected`, an approval whose push landed is `approved`), and a leftover
+`refs/pending/*` ref is inert — it is never pushed anywhere.
 
 ## Failure Behavior
 
 The gate fails closed. If receive-pack parsing, quarantine indexing, mirror
-fetch, pending-row insertion, approval replay, or cleanup cannot complete, the
-push is not forwarded silently. A held push is marked with a terminal resolved
-state (`approved`, `rejected`, or `failed`); cleanup errors are recorded in
-`detail` for later maintenance.
+fetch, pending-row insertion, or approval replay cannot complete, the push is
+not forwarded silently. A held push is marked with a terminal resolved state
+(`approved`, `rejected`, or `failed`) with the failure recorded in `detail`;
+recovery from any failed resolution is a fresh agent push.

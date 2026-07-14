@@ -12,9 +12,28 @@ export function runtimeLabel(runtime) {
   return RUNTIME_PROVIDERS[runtime]?.label || runtime;
 }
 
-export function notice(message) {
-  $("notice").textContent = message || "";
-  if (message) setTimeout(() => { $("notice").textContent = ""; }, 8000);
+export function notice(message, kind) {
+  const node = $("notice");
+  node.textContent = message || "";
+  node.classList.toggle("error", kind === "error");
+  if (message) setTimeout(() => { node.textContent = ""; }, 8000);
+}
+
+const inlineMessageTimers = new WeakMap();
+
+export function inlineMessage(node, message, isError = false) {
+  if (!node) return;
+  const timer = inlineMessageTimers.get(node);
+  if (timer) clearTimeout(timer);
+  inlineMessageTimers.delete(node);
+  node.textContent = message || "";
+  node.classList.toggle("error", isError === true);
+  if (message && !isError) {
+    inlineMessageTimers.set(node, setTimeout(() => {
+      node.textContent = "";
+      inlineMessageTimers.delete(node);
+    }, 8000));
+  }
 }
 
 export function badge(value) { return `<span class="status ${value}">${value}</span>`; }
@@ -23,6 +42,15 @@ export function esc(value) {
   const div = document.createElement("div");
   div.textContent = value == null ? "" : String(value);
   return div.innerHTML;
+}
+
+// Catalog copy can mark short path names with backticks. Escape every segment
+// before wrapping those marked spans, so manifests cannot inject markup.
+export function inlineCode(value) {
+  return String(value == null ? "" : value)
+    .split("`")
+    .map((part, index) => index % 2 ? `<code>${esc(part)}</code>` : esc(part))
+    .join("");
 }
 
 export function formatNetworkReason(reason) {

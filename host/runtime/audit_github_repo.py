@@ -3,9 +3,8 @@
 Fetches the repository facts the admin service turns into operator warnings
 (see ``github_repo_audit``): visibility, the working token's own effective
 permissions, default-branch protection, Pages visibility, and the workflows
-with their triggers. It runs as root because only root (and the proxy, for
-policy-approved agent traffic) has outbound network access; the admin
-service that owns the audit table has none. Facts only — no judgments: the
+with their triggers. It runs as root because the admin service that owns the
+audit table has no outbound network access. Facts only — no judgments: the
 warning derivation lives admin-side so message changes never need a
 re-fetch.
 
@@ -66,14 +65,15 @@ def audit_repository(token: str, owner: str, repo: str) -> dict[str, Any]:
     has_pages = has_pages if isinstance(has_pages, bool) else None
     facts: dict[str, Any] = {
         "visibility": repository.get("visibility") or ("private" if repository.get("private") else "public"),
-        "has_pages": has_pages,
         "permissions": {
             name: value is True
             for name, value in (repository.get("permissions") or {}).items()
             if name in ("pull", "push", "admin", "maintain", "triage")
         },
-        "default_branch": repository.get("default_branch"),
     }
+    # pages_public is the one stored Pages fact, a tri-state: True (public
+    # site), False (no site, or a private one), None (unknown — the token
+    # could not read the Pages settings).
     if has_pages is False:
         # The repository response is authoritative for "no Pages site".
         facts["pages_public"] = False
@@ -85,9 +85,7 @@ def audit_repository(token: str, owner: str, repo: str) -> dict[str, Any]:
             # The repo says it has Pages but this token cannot read the
             # Pages settings (GitHub answers 403 or 404 for missing
             # permission): the visibility is recorded as unknown (null)
-            # rather than as private or as a failed audit. The key is always
-            # present — a stored row without it predates this fact and is
-            # re-audited (see github_repo_audit._stale).
+            # rather than as private or as a failed audit.
             if getattr(exc, "status", None) not in (403, 404):
                 raise
             facts["pages_public"] = None

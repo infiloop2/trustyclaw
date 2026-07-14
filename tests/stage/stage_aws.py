@@ -30,8 +30,13 @@ from tests.smoke.smoke_aws import SMOKE_RUNTIMES, AwsSmoke
 STAGE_AGENT_NAME = "trustyclaw-stage"
 
 # Selectable test suites. A provider suite runs that provider's checks plus the
-# shared preamble; "all" additionally runs the cross-runtime checks.
-STAGE_SUITES = ("all", "claude", "codex", "github")
+# shared preamble; "brave", "gmail", and "gcal" each run one bundled tool's live
+# check; "all" additionally runs the cross-runtime checks. A bundled-tool suite
+# you select explicitly fails its preflight when that tool's credential is not
+# configured on the stage host (like a provider suite requires that runtime
+# logged in); "all" instead self-skips whichever tools are unconfigured so it
+# stays useful mid-setup.
+STAGE_SUITES = ("all", "brave", "gmail", "gcal", "claude", "codex", "github")
 _RUNTIME_LABELS = {"codex": "Codex", "claude_code": "Claude Code"}
 
 # Environment variables (fed from CI secrets) that supply a GitHub App
@@ -44,8 +49,6 @@ STAGE_GITHUB_APP_ENV = {
     "installation_id": "STAGE_GITHUB_APP_INSTALLATION_ID",
     "private_key": "STAGE_GITHUB_APP_PRIVATE_KEY",
 }
-
-
 def _github_app_config_from_env() -> dict[str, str] | None:
     """Read the GitHub App credential and sandbox write repo from the stage
     secrets in the environment. Returns None when none are set (operator-config
@@ -94,9 +97,10 @@ def main(argv: list[str] | None = None) -> int:
         default="all",
         help=(
             "Which test suite to run. 'claude', 'codex', or 'github' run that provider's "
-            "checks only (plus the shared preamble); 'all' (default) also runs the "
-            "cross-runtime checks. Every suite first verifies the operator configuration "
-            "it needs is present, failing fast if not."
+            "checks only (plus the shared preamble); 'brave', 'gmail', and 'gcal' each run "
+            "one bundled tool's live check; 'all' (default) also runs the cross-runtime "
+            "checks. Every suite first verifies the operator configuration it needs is "
+            "present, failing fast if not."
         ),
     )
     args = parser.parse_args(argv)
@@ -107,6 +111,9 @@ def main(argv: list[str] | None = None) -> int:
     run_codex = suite in ("codex", "all")
     run_claude = suite in ("claude", "all")
     run_github = suite in ("github", "all")
+    run_brave = suite in ("brave", "all")
+    run_gmail = suite in ("gmail", "all")
+    run_gcal = suite in ("gcal", "all")
     run_cross = suite == "all"
     try:
         stage.open_tunnel()
@@ -124,6 +131,8 @@ def main(argv: list[str] | None = None) -> int:
         stage.check_agent_file_explorer()
         if run_cross:
             stage.check_both_runtimes_active()
+        if run_brave or run_gmail or run_gcal:
+            stage.check_tools_live(brave=run_brave, gmail=run_gmail, gcal=run_gcal)
         if run_codex:
             stage.agent_runtime = "codex"
             stage.check_task()
@@ -196,8 +205,25 @@ class StageAwsSmoke(AwsSmoke):
         github["write_repositories"] = ordered
         return policy
 
-    def task_body(self, input_message: str, thread_id: str, *, runtime: str | None = None) -> dict:
-        return super().task_body(input_message, self.thread_prefix + thread_id, runtime=runtime)
+    def task_body(
+        self,
+        input_message: str,
+        thread_id: str,
+        *,
+        runtime: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> dict:
+        return super().task_body(
+            input_message,
+            self.thread_prefix + thread_id,
+            runtime=runtime,
+            model=model,
+            effort=effort,
+        )
+
+    def follow_up_body(self, input_message: str, thread_id: str) -> dict:
+        return super().follow_up_body(input_message, self.thread_prefix + thread_id)
 
     def close_tunnel(self) -> None:
         if self.tunnel_open and self.result:
@@ -250,9 +276,9 @@ class StageAwsSmoke(AwsSmoke):
                 task_id = task["task_id"]
                 status = task["status"]
                 if status == "running":
-                    code, _ = self._api_status("POST", f"/v1/tasks/{task_id}/kill", idem=self._idem(f"baseline-kill-{task_id}"))
+                    code, _ = self._api_status("POST", f"/v1/tasks/{task_id}/kill")
                 elif status == "queued":
-                    code, _ = self._api_status("POST", f"/v1/tasks/{task_id}/cancel", idem=self._idem(f"baseline-cancel-{task_id}"))
+                    code, _ = self._api_status("POST", f"/v1/tasks/{task_id}/cancel")
                 else:
                     continue
                 if code not in {200, 202, 409, 404}:
@@ -280,7 +306,7 @@ class StageAwsSmoke(AwsSmoke):
             return ("codex",)
         if suite == "claude":
             return ("claude_code",)
-        if suite == "github":
+        if suite in ("github", "brave", "gmail", "gcal"):
             return ()
         return SMOKE_RUNTIMES
 
@@ -340,12 +366,37 @@ class StageAwsSmoke(AwsSmoke):
                 )
         if suite in ("github", "all"):
             failures.extend(self._github_config_failures())
+        # A bundled-tool suite you select explicitly must have its credential
+        # configured on the stage host, the same way a provider suite requires
+        # that runtime logged in; it fails here rather than silently skipping.
+        if suite in ("brave", "gmail", "gcal"):
+            failures.extend(self._tool_credential_failures(suite))
         if failures:
             listing = "".join(f"\n  - {item}" for item in failures)
             raise AssertionError(
                 f"stage host is missing configuration required for the {suite!r} suite:{listing}"
             )
         self._ok(f"required operator configuration present for the {suite!r} suite")
+
+    def _tool_credential_failures(self, suite: str) -> list[str]:
+        """Preflight credential check for a single bundled-tool suite. Returns a
+        remediation string when the tool's credential is not configured on the
+        stage host, or prints an [ok] line when it is. Read-only."""
+        if suite == "brave":
+            if os.environ.get("TRUSTYCLAW_STAGE_BRAVE_API_KEY", ""):
+                print("  [ok] Brave API key secret is set", flush=True)
+                return []
+            return ["Brave: set the TRUSTYCLAW_STAGE_BRAVE_API_KEY repository secret, then rerun"]
+        tool_id = "gmail" if suite == "gmail" else "google_calendar"
+        tools = {entry["tool_id"]: entry for entry in self._api("GET", "/v1/tools")["tools"]}
+        entry = tools.get(tool_id) or {}
+        if entry.get("enabled") and (entry.get("connection_status") or {}).get("connected"):
+            print(f"  [ok] {tool_id} is connected on the stage host", flush=True)
+            return []
+        return [
+            f"{tool_id}: connect the stage Google account in the admin UI Tools tab, then rerun "
+            "(one-time stage-host configuration)"
+        ]
 
     def _github_config_failures(self) -> list[str]:
         """GitHub configuration checks for the preflight. Returns remediation
@@ -438,6 +489,195 @@ class StageAwsSmoke(AwsSmoke):
                 f"{runtime} runtime is {status}; manually open the stage admin UI, complete OAuth, then rerun stage"
             )
 
+    def _shim_call(self, request: dict) -> dict:
+        """One MCP request through the tools shim, run exactly as an agent
+        harness would: as trustyclaw-agent against the tools socket."""
+        line = json.dumps(request)
+        output = self._ssh_code(
+            f"printf '%s\\n' {shlex.quote(line)} | "
+            "sudo -u trustyclaw-agent env PYTHONPATH=/opt/trustyclaw-host "
+            "python3 -m host.runtime.tools_mcp_shim"
+        )
+        try:
+            return json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f"tools shim returned non-JSON: {output!r}") from exc
+
+    def _shim_tool_result(self, name: str, arguments: dict) -> dict:
+        response = self._shim_call(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
+        )
+        result = response.get("result") or {}
+        text = (result.get("content") or [{}])[0].get("text", "")
+        if result.get("isError"):
+            raise AssertionError(f"{name} failed: {text}")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f"{name} returned non-JSON result text: {text!r}") from exc
+
+    def _autoconfigure_google_client(self) -> None:
+        """Set the shared Google OAuth client from stage secrets when present,
+        so the operator's one-time setup is reduced to the Connect step (the
+        OAuth sign-in still cannot be automated). A no-op without the secrets."""
+        client_id = os.environ.get("TRUSTYCLAW_STAGE_GOOGLE_OAUTH_CLIENT_ID", "")
+        client_secret = os.environ.get("TRUSTYCLAW_STAGE_GOOGLE_OAUTH_CLIENT_SECRET", "")
+        if bool(client_id) != bool(client_secret):
+            raise AssertionError(
+                "set both TRUSTYCLAW_STAGE_GOOGLE_OAUTH_CLIENT_ID and "
+                "TRUSTYCLAW_STAGE_GOOGLE_OAUTH_CLIENT_SECRET, or neither"
+            )
+        if not (client_id and client_secret):
+            return
+        # Config is scoped per tool, so set the shared Google client under each
+        # Google tool that will use it.
+        for tool_id in ("gmail", "google_calendar"):
+            self._api("PUT", f"/v1/tools/{tool_id}/config", {"key": "GOOGLE_OAUTH_CLIENT_ID", "value": client_id})
+            self._api("PUT", f"/v1/tools/{tool_id}/config", {"key": "GOOGLE_OAUTH_CLIENT_SECRET", "value": client_secret})
+            try:
+                self._api("POST", f"/v1/tools/{tool_id}/enable", {})
+            except Exception:
+                # Already enabled, or awaiting connect; enablement is idempotent.
+                pass
+
+    def check_tools_live(self, brave: bool = True, gmail: bool = True, gcal: bool = True) -> None:
+        """Bundled tools against real third-party services. The 'brave', 'gmail',
+        and 'gcal' suites each select one tool; 'all' runs every tool. Under a
+        dedicated tool suite the preflight has already required that tool's
+        credential (the Brave API key secret, or a connected Google account for
+        Gmail and Calendar), so it runs. Under 'all' a tool whose credential is
+        absent self-skips here, so stage stays useful mid-setup; there is no
+        separate per-tool opt-in switch."""
+        self._step("bundled tools against live third-party APIs")
+        # A per-run nonce keeps each run's draft/event title unique.
+        unique_title = f"TrustyClaw stage check {os.urandom(4).hex()}"
+        details: list[str] = []
+
+        if brave:
+            brave_key = os.environ.get("TRUSTYCLAW_STAGE_BRAVE_API_KEY", "")
+            if brave_key:
+                self._api("PUT", "/v1/tools/brave_search/config", {"key": "BRAVE_SEARCH_API_KEY", "value": brave_key})
+                self._api("POST", "/v1/tools/brave_search/enable", {})
+                search = self._shim_tool_result("brave_search_search_web", {"query": "TrustyClaw agent host"})
+                if not search.get("results"):
+                    raise AssertionError(f"live Brave search returned no results: {search}")
+                details.append(f"brave_search returned {len(search['results'])} results")
+            else:
+                print("  [skip] Brave: set the TRUSTYCLAW_STAGE_BRAVE_API_KEY secret to run the live search check", flush=True)
+
+        # Push the Google client config from stage secrets if present (a no-op
+        # otherwise), then run Gmail/Calendar only when the stage account is
+        # actually connected. Only fetch the listing when a Google tool is in scope.
+        tools: dict[str, dict] = {}
+        if gmail or gcal:
+            self._autoconfigure_google_client()
+            listing = self._api("GET", "/v1/tools")
+            tools = {entry["tool_id"]: entry for entry in listing["tools"]}
+
+        gmail_entry = tools.get("gmail") if gmail else None
+        if gmail_entry and gmail_entry["enabled"] and gmail_entry["connection_status"].get("connected"):
+            # Reads: search, labels, drafts.
+            messages = self._shim_tool_result("gmail_search_messages", {"query": "in:anywhere"})
+            labels = self._shim_tool_result("gmail_list_labels", {})
+            self._shim_tool_result("gmail_list_drafts", {})
+            # Write-approval round trip: create a draft, approve it, then delete
+            # the draft (also approval-gated) so the check leaves nothing behind
+            # and never sends a real email.
+            pending = self._shim_tool_result(
+                "gmail_draft_action",
+                {
+                    "action": "create",
+                    "to": "stage@example.com",
+                    "subject": unique_title,
+                    "blocks": [{"type": "paragraph", "text": "Stage draft round trip; safe to ignore."}],
+                },
+            )
+            approval_id = pending.get("approval_id")
+            if not approval_id:
+                raise AssertionError(f"gmail draft create did not queue an approval: {pending}")
+            created = self._api("POST", f"/v1/tools/gmail/approvals/{approval_id}/approve", {})
+            if created["approval"]["status"] != "executed":
+                raise AssertionError(f"approved gmail draft create did not execute: {created}")
+            # The approved-create message carries the new draft id, so cleanup can
+            # target exactly the object this run created.
+            draft_id = self._created_id_from_message(created.get("result"))
+            if not draft_id:
+                raise AssertionError(f"approved gmail draft create did not report a draft id: {created}")
+            cleanup = self._shim_tool_result("gmail_draft_action", {"action": "delete", "draft_id": draft_id})
+            cleanup_decision = self._api("POST", f"/v1/tools/gmail/approvals/{cleanup['approval_id']}/approve", {})
+            if cleanup_decision["approval"]["status"] != "executed":
+                raise AssertionError(f"approved gmail draft delete did not execute: {cleanup_decision}")
+            details.append(
+                f"gmail search returned {len(messages.get('messages', []))} messages, "
+                f"{len(labels.get('labels', []))} labels, draft round trip created and deleted {draft_id}"
+            )
+        elif gmail:
+            print("  [skip] Gmail: connect the stage Google account in the admin UI Tools tab to run this check", flush=True)
+
+        calendar = tools.get("google_calendar") if gcal else None
+        if calendar and calendar["enabled"] and calendar["connection_status"].get("connected"):
+            events = self._shim_tool_result("google_calendar_read_events", {})
+            if events.get("status") != "success_executed":
+                raise AssertionError(f"calendar read failed: {events}")
+
+            # Full single-use approval round trip against the real API:
+            # propose an event, approve it, then propose and approve deletion.
+            start = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() + 86400))
+            end = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() + 90000))
+            pending = self._shim_tool_result(
+                "google_calendar_event_change",
+                {"operation": "create", "summary": unique_title, "start_time": start, "end_time": end},
+            )
+            approval_id = pending.get("approval_id")
+            if not approval_id:
+                raise AssertionError(f"calendar write did not queue an approval: {pending}")
+            decision = self._api("POST", f"/v1/tools/google_calendar/approvals/{approval_id}/approve", {})
+            if decision["approval"]["status"] != "executed":
+                raise AssertionError(f"approved calendar create did not execute: {decision}")
+            # The approved-create message carries the new event id.
+            event_id = self._created_id_from_message(decision.get("result"))
+            if not event_id:
+                raise AssertionError(f"approved calendar create did not report an event id: {decision}")
+            checked = self._shim_tool_result(
+                "check_tool_approval", {"approval_id": approval_id}
+            )
+            if checked["approval_status"] != "executed":
+                raise AssertionError(f"check_tool_approval disagreed: {checked}")
+
+            cleanup = self._shim_tool_result(
+                "google_calendar_event_change", {"operation": "delete", "event_id": event_id}
+            )
+            cleanup_decision = self._api("POST", f"/v1/tools/google_calendar/approvals/{cleanup['approval_id']}/approve", {})
+            if cleanup_decision["approval"]["status"] != "executed":
+                raise AssertionError(f"approved calendar delete did not execute: {cleanup_decision}")
+            details.append(f"calendar approval round trip created and deleted event {event_id}")
+        elif gcal:
+            print("  [skip] Calendar: connect the stage Google account in the admin UI Tools tab to run this check", flush=True)
+
+        # Whenever any live tool ran, the dedicated tool audit log must have
+        # recorded it (calls and approval decisions), and it must page.
+        if details:
+            events = self._api("GET", "/v1/tools/events?limit=5")["events"]
+            if not events:
+                raise AssertionError("tool events log is empty after live tool activity")
+            seqs = [event["seq"] for event in events]
+            if seqs != sorted(seqs, reverse=True):
+                raise AssertionError(f"tool events are not newest-first: {seqs}")
+            details.append(f"tool audit log recorded {len(events)}+ events")
+
+        self._ok("; ".join(details) if details else "all live tool checks skipped (no stage tool credential present)")
+
+    @staticmethod
+    def _created_id_from_message(result: object) -> str:
+        """The created object's id from an approved-execution result. Approved
+        executions surface a user-visible message ending in the id (for example
+        "Created Gmail draft <id>." or "Created Google Calendar event <id>."), so
+        the id is the last whitespace token with the trailing period stripped."""
+        message = result.get("message") if isinstance(result, dict) else None
+        if not isinstance(message, str) or not message.strip():
+            return ""
+        return message.strip().rstrip(".").split()[-1]
+
     def check_agent_file_explorer(self) -> None:
         self._step("agent file explorer API on real agent home")
         directory_name = f".stage-file-explorer-{int(time.time())}"
@@ -522,7 +762,7 @@ class StageAwsSmoke(AwsSmoke):
         self._api("PUT", "/v1/network/policy", self.enforcement_policy())
         self.require_runtime_active("codex")
         for method in ("POST", "GET"):
-            code, _ = self._api_status(method, "/v1/agent-runtime/codex-oauth-login", idem=self._idem(f"oauth-{method}"))
+            code, _ = self._api_status(method, "/v1/agent-runtime/codex-oauth-login")
             if code != 409:
                 raise AssertionError(f"{method} codex-oauth-login while active returned {code}, expected 409")
         account = self._agent_account("codex")
@@ -561,7 +801,13 @@ class StageAwsSmoke(AwsSmoke):
 
         baseline_seq = max((event["seq"] for event in self._network_events()), default=0)
         prompt = "Use your web search tool to check today's date, then reply with the word DONE."
-        task = self._api("POST", "/v1/tasks", self.task_body(prompt, "codex-web"))
+        task = self._api(
+            "POST",
+            "/v1/tasks",
+            self.task_body(prompt, "codex-web", model="gpt-5.6-sol", effort="ultra"),
+        )
+        if (task.get("model"), task.get("effort")) != ("gpt-5.6-sol", "ultra"):
+            raise AssertionError(f"Codex task did not retain the selected session options: {task}")
         current = self._wait_for_task(task["task_id"], timeout=240)
         events = self._network_events(since=baseline_seq)
         chatgpt = [event for event in events if event["host"].endswith("chatgpt.com")]
@@ -573,7 +819,7 @@ class StageAwsSmoke(AwsSmoke):
             raise AssertionError(f"the guard denied agent ChatGPT turn traffic: {fatal}")
         if not any(event["decision"] == "allowed" for event in chatgpt):
             raise AssertionError(f"no allowed chatgpt.com traffic was observed for the task: {events}")
-        self._ok("web search task completed; account and live-search guards held")
+        self._ok("web search task completed; account and external URL request guards held")
 
     def check_claude_auth_and_task(self) -> None:
         self._step("Claude account guard + real task")
@@ -583,7 +829,7 @@ class StageAwsSmoke(AwsSmoke):
         self._api("PUT", "/v1/network/policy", self.enforcement_policy())
         self.require_runtime_active("claude_code")
         for method in ("POST", "GET"):
-            code, _ = self._api_status(method, "/v1/agent-runtime/claude-oauth-login", idem=self._idem(f"claude-oauth-{method}"))
+            code, _ = self._api_status(method, "/v1/agent-runtime/claude-oauth-login")
             if code != 409:
                 raise AssertionError(f"{method} claude-oauth-login while active returned {code}, expected 409")
         account = self._agent_account("claude_code")
@@ -617,7 +863,13 @@ class StageAwsSmoke(AwsSmoke):
 
         task_baseline_seq = max((event["seq"] for event in self._network_events()), default=0)
         prompt = "Reply with exactly the word CLAUDE_STAGE_OK and nothing else."
-        task = self._api("POST", "/v1/tasks", self.task_body(prompt, "claude"))
+        task = self._api(
+            "POST",
+            "/v1/tasks",
+            self.task_body(prompt, "claude", model="fable", effort="ultracode"),
+        )
+        if (task.get("model"), task.get("effort")) != ("fable", "ultracode"):
+            raise AssertionError(f"Claude task did not retain the selected session options: {task}")
         done = self._wait_for_task(task["task_id"], timeout=240)
         if done["status"] != "completed":
             raise AssertionError(f"Claude task ended {done['status']}: {self._task_failure_detail(task['task_id'])}")
@@ -638,7 +890,11 @@ class StageAwsSmoke(AwsSmoke):
             "Earlier in this Claude conversation you replied with one uppercase token. "
             "Reply with exactly that token again and nothing else."
         )
-        follow_up = self._api("POST", "/v1/tasks", self.task_body(follow_up_prompt, "claude"))
+        follow_up = self._api(
+            "POST",
+            "/v1/tasks",
+            self.follow_up_body(follow_up_prompt, "claude"),
+        )
         follow_up_done = self._wait_for_task(follow_up["task_id"], timeout=240)
         if follow_up_done["status"] != "completed":
             raise AssertionError(

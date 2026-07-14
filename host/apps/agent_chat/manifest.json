@@ -1,5 +1,5 @@
 {
-  "id": "agent_chat",
+  "host_slot": 0,
   "title": "Agent Chat",
   "backend": {
     "entrypoint": "backend.py"

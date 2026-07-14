@@ -18,7 +18,7 @@ OPENAI_PROVIDER_RULES: dict[str, dict[str, Any]] = {
     "api.openai.com": {
         "allow_http_methods": ("POST",),
         "openai_account_guard": True,
-        "openai_disable_live_web_search": True,
+        "openai_external_url_request_guard": True,
     },
     "auth.openai.com": {
         "allow_http_methods": ("GET", "POST"),
@@ -26,7 +26,7 @@ OPENAI_PROVIDER_RULES: dict[str, dict[str, Any]] = {
     "chatgpt.com": {
         "allow_http_methods": ("GET", "POST"),
         "openai_account_guard": True,
-        "openai_disable_live_web_search": True,
+        "openai_external_url_request_guard": True,
     },
 }
 CLAUDE_PROVIDER_RULES: dict[str, dict[str, Any]] = {
@@ -69,7 +69,7 @@ class ConfigError(ValueError):
 class DomainRule:
     allow_http_methods: tuple[str, ...]
     path_guards: tuple[str, ...]
-    openai_disable_live_web_search: bool | None = None
+    openai_external_url_request_guard: bool | None = None
     openai_account_guard: bool | None = None
     anthropic_account_guard: bool | None = None
     github_repo_guard: dict[str, Any] | None = None
@@ -80,8 +80,8 @@ class DomainRule:
         }
         if self.path_guards:
             value["path_guards"] = list(self.path_guards)
-        if self.openai_disable_live_web_search is not None:
-            value["openai_disable_live_web_search"] = self.openai_disable_live_web_search
+        if self.openai_external_url_request_guard is not None:
+            value["openai_external_url_request_guard"] = self.openai_external_url_request_guard
         if self.openai_account_guard is not None:
             value["openai_account_guard"] = self.openai_account_guard
         if self.anthropic_account_guard is not None:
@@ -96,7 +96,7 @@ class ManagedIntegration:
     enabled: bool
 
     def to_json(self) -> dict[str, Any]:
-        return {"enabled": True} if self.enabled else {"enabled": False}
+        return {"enabled": self.enabled}
 
 
 @dataclass(frozen=True)
@@ -170,21 +170,6 @@ class OperatorConnection:
     hostname: str | None = None
     tunnel_token_env: str | None = None
 
-    def to_input_json(self) -> dict[str, Any]:
-        if self.mode == "ssh":
-            return {
-                "mode": "ssh",
-                "ssh_public_key": self.ssh_public_key,
-            }
-        if self.mode == "cloudflare_access":
-            return {
-                "mode": "cloudflare_access",
-                "hostname": self.hostname,
-                "tunnel_token_env": self.tunnel_token_env,
-            }
-        raise ValueError(f"unsupported operator connection mode: {self.mode}")
-
-
 @dataclass(frozen=True)
 class RuntimeOperatorConnection:
     mode: str
@@ -213,6 +198,7 @@ class InputConfig:
     aws_region: str
     aws_access_key_id_env: str
     aws_secret_access_key_env: str
+    aws_session_token_env: str | None
     operator_connections: tuple[OperatorConnection, ...] | None
 
 
@@ -240,6 +226,7 @@ def parse_input_config(
         "aws_region",
         "aws_access_key_id_env",
         "aws_secret_access_key_env",
+        "aws_session_token_env",
     }
     if require_operator_connections:
         allowed_keys.add("operator_connections")
@@ -253,11 +240,17 @@ def parse_input_config(
     operator_connections: tuple[OperatorConnection, ...] | None = None
     if require_operator_connections:
         operator_connections = parse_operator_connections(_list(raw, "operator_connections"))
+    aws_session_token_env: str | None = None
+    if "aws_session_token_env" in raw:
+        aws_session_token_env = _string(raw, "aws_session_token_env")
+        if not ENV_NAME_RE.fullmatch(aws_session_token_env):
+            raise ConfigError("aws_session_token_env must be a valid environment variable name")
     return InputConfig(
         agent_name=agent_name,
         aws_region=aws_region,
         aws_access_key_id_env=_string(raw, "aws_access_key_id_env"),
         aws_secret_access_key_env=_string(raw, "aws_secret_access_key_env"),
+        aws_session_token_env=aws_session_token_env,
         operator_connections=operator_connections,
     )
 
@@ -448,7 +441,7 @@ def parse_github_write_repositories(raw: Any, context: str) -> tuple[GitHubRepos
     return tuple(repositories)
 
 
-def expand_network_controls(controls: NetworkControls | dict[str, Any]) -> dict[str, Any]:
+def expand_network_controls(controls: NetworkControls) -> dict[str, Any]:
     """Return the root-proxy enforcement shape for parsed network controls.
 
     Parsing/storage preserve the operator-facing config exactly. Expansion is
@@ -456,34 +449,20 @@ def expand_network_controls(controls: NetworkControls | dict[str, Any]) -> dict[
     accidentally leak back into config/bootstrap inputs that will be parsed
     again.
     """
-    parsed = controls if isinstance(controls, NetworkControls) else parse_network_controls(controls)
-    policy = parsed.to_json()
-    integrations = parsed.managed_network_integrations
+    policy = controls.to_json()
+    integrations = controls.managed_network_integrations
+    generated: dict[str, dict[str, Any]] = {}
     if integrations.openai.enabled:
-        policy["allowed_network_access"] = {
-            **policy["allowed_network_access"],
-            **_openai_provider_rules_json(),
-        }
+        generated.update(_provider_rules_json(OPENAI_PROVIDER_RULES))
     if integrations.claude.enabled:
-        policy["allowed_network_access"] = {
-            **policy["allowed_network_access"],
-            **_claude_provider_rules_json(),
-        }
+        generated.update(_provider_rules_json(CLAUDE_PROVIDER_RULES))
     if integrations.github.enabled:
-        policy["allowed_network_access"] = {
-            **policy["allowed_network_access"],
-            **_github_provider_rules_json(integrations.github),
-        }
+        generated.update(_github_provider_rules_json(integrations.github))
     if integrations.python_packages.enabled:
-        policy["allowed_network_access"] = {
-            **policy["allowed_network_access"],
-            **_provider_rules_json(PYTHON_PACKAGE_PROVIDER_RULES),
-        }
+        generated.update(_provider_rules_json(PYTHON_PACKAGE_PROVIDER_RULES))
     if integrations.npm_packages.enabled:
-        policy["allowed_network_access"] = {
-            **policy["allowed_network_access"],
-            **_provider_rules_json(NPM_PACKAGE_PROVIDER_RULES),
-        }
+        generated.update(_provider_rules_json(NPM_PACKAGE_PROVIDER_RULES))
+    policy["allowed_network_access"] = {**policy["allowed_network_access"], **generated}
     return policy
 
 
@@ -532,34 +511,17 @@ def managed_domain_owner(domain: str) -> str | None:
     return None
 
 
-def _openai_provider_rules_json() -> dict[str, dict[str, Any]]:
-    return {
-        domain: DomainRule(
-            allow_http_methods=tuple(rule["allow_http_methods"]),
-            path_guards=(),
-            openai_disable_live_web_search=rule.get("openai_disable_live_web_search"),
-            openai_account_guard=rule.get("openai_account_guard"),
-        ).to_json()
-        for domain, rule in OPENAI_PROVIDER_RULES.items()
-    }
-
-
-def _claude_provider_rules_json() -> dict[str, dict[str, Any]]:
-    return {
-        domain: DomainRule(
-            allow_http_methods=tuple(rule["allow_http_methods"]),
-            path_guards=tuple(rule.get("path_guards", ())),
-            anthropic_account_guard=rule.get("anthropic_account_guard"),
-        ).to_json()
-        for domain, rule in CLAUDE_PROVIDER_RULES.items()
-    }
-
-
 def _provider_rules_json(rules: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    # One builder for every provider rule set: DomainRule.to_json() omits
+    # unset guard fields, so rule sets without them (python/npm) emit exactly
+    # what a dedicated builder would.
     return {
         domain: DomainRule(
             allow_http_methods=tuple(rule["allow_http_methods"]),
             path_guards=tuple(rule.get("path_guards", ())),
+            openai_external_url_request_guard=rule.get("openai_external_url_request_guard"),
+            openai_account_guard=rule.get("openai_account_guard"),
+            anthropic_account_guard=rule.get("anthropic_account_guard"),
         ).to_json()
         for domain, rule in rules.items()
     }

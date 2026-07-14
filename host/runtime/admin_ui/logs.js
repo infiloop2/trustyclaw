@@ -1,4 +1,5 @@
-// The two audit logs (agent events, network events). Both share one model:
+// The three audit logs (agent events, network events, tool events), one tab
+// each. All share one model:
 // page 1 is a live tail refreshed while it is visible, deeper pages are
 // stable before-cursor snapshots fetched on demand (new inserts never shift
 // a snapshot, because its cursor pins it).
@@ -126,6 +127,25 @@ export const netLog = createPagedLog({
       <td class="mono">${esc(networkEventTarget(event))}</td>
       <td>${badge(event.decision)}</td>
       <td>${event.decision === "denied" && event.reason ? esc(formatNetworkReason(event.reason)) : ""}</td>
+    </tr>`,
+});
+
+export const toolLog = createPagedLog({
+  endpoint: "/v1/tools/events",
+  summaryId: "tool-page-summary",
+  tableId: "tool-events",
+  pagerId: "tool-event-pager",
+  pageAction: "tool-page",
+  columns: 4,
+  header: `<tr><th>time</th><th>tool</th><th>action</th><th>outcome</th></tr>`,
+  emptySummary: () => "No events",
+  emptyState: () => "No tool audit events yet.",
+  row: event => `
+    <tr>
+      <td class="muted time">${esc(formatDateTime(event.timestamp))}</td>
+      <td class="mono">${esc(event.tool_id)}</td>
+      <td class="mono">${esc(event.action_id)}</td>
+      <td>${badge(event.outcome)}${event.detail ? ` <span class="muted">${esc(event.detail)}</span>` : ""}</td>
     </tr>`,
 });
 
