@@ -3,7 +3,7 @@
 // with per-repository audits, and the GitHub credential controls.
 
 import { api } from "./api.js";
-import { $, badge, esc, inlineCode, inlineMessage, objectValue, setHtml } from "./helpers.js";
+import { $, badge, esc, informationIcon, inlineCode, inlineMessage, objectValue, replaceIntegrationRows, setHtml } from "./helpers.js";
 import { providerAccounts, refreshHealth, refreshProviderAccounts, runtimeRecords } from "./health.js";
 import { CUSTOM_DOMAIN_GUIDE, MANAGED_INTEGRATIONS, integrationInfo } from "./integration_catalog.js";
 
@@ -153,9 +153,11 @@ function renderManagedIntegrations() {
   // would destroy it (it was moved under the GitHub details on the previous
   // render).
   const expansion = $("github-expansion");
-  const container = $("managed-integrations");
-  if (container.contains(expansion)) container.after(expansion);
-  setHtml($("managed-integrations"), Object.entries(MANAGED_INTEGRATIONS).map(([name, meta]) => {
+  const toolContainer = $("tools");
+  if (expansion.closest(".integration-row")) toolContainer.after(expansion);
+  const integrations = Object.entries(MANAGED_INTEGRATIONS)
+    .sort(([, left], [, right]) => left.label.localeCompare(right.label, undefined, { sensitivity: "base" }));
+  const renderRows = entries => entries.map(([name, meta]) => {
     const enabled = objectValue(managed[name]).enabled === true;
     const expanded = expandedIntegrations.has(name);
     return `
@@ -167,7 +169,7 @@ function renderManagedIntegrations() {
           <div class="integration-title">
             <div class="preset-with-info">
               <h2>${esc(meta.label)}</h2>
-              <button class="info-button" data-action="toggle-integration-info" data-info="${esc(name)}" aria-label="${esc(meta.label)} overview and protections" aria-haspopup="dialog" aria-expanded="false">i</button>
+              <button class="info-button" data-action="toggle-integration-info" data-info="${esc(name)}" aria-label="${esc(meta.label)} overview and protections" aria-haspopup="dialog" aria-expanded="false">${informationIcon()}</button>
             </div>
             <div class="integration-subtitle">${esc(meta.summary)}</div>
           </div>
@@ -187,7 +189,12 @@ function renderManagedIntegrations() {
           ${integrationDetailsHtml(name, enabled)}
         </div>
       </section>`;
-  }).join(""));
+  }).join("");
+  const byName = new Map(integrations);
+  const inference = ["openai", "claude"].map(name => [name, byName.get(name)]);
+  const managedTools = integrations.filter(([name]) => name !== "openai" && name !== "claude");
+  setHtml($("ai-inference-integrations"), renderRows(inference));
+  replaceIntegrationRows(toolContainer, "[data-integration]", renderRows(managedTools));
   renderIntegrationAccounts();
   // The write-repository list and audits render in the GitHub details
   // dropdown: the static #github-expansion node (its input keeps state across
@@ -199,12 +206,30 @@ function renderManagedIntegrations() {
 
 function integrationDetailsHtml(name, enabled) {
   if (name === "openai" || name === "claude") {
-    return `
+    const accountCard = `
       <div class="detail-card">
         <div class="detail-card-head"><h3>Account</h3></div>
         <div class="integration-account" data-provider="${esc(name)}"></div>
         <div class="provider-oauth" data-provider-oauth="${esc(name)}"></div>
       </div>`;
+    if (name === "claude" && enabled) {
+      const webSearch = objectValue(objectValue(activeNetworkPolicy.managed_network_integrations).claude).web_search === true;
+      return `${accountCard}
+      <div class="detail-card">
+        <div class="detail-card-head">
+          <h3>Web search</h3>
+          <span class="seg">
+            <button data-action="enable-claude-web-search"${webSearch ? " disabled" : ""}>Enable</button>
+            <button data-action="disable-claude-web-search"${webSearch ? "" : " disabled"}>Disable</button>
+          </span>
+        </div>
+        <p class="muted">Anthropic's server-side web search runs off-box: the query and surrounding context go to Anthropic and its search partners.</p>
+        <span class="muted">${webSearch
+          ? "Enabled — Claude Code can run server-side web searches."
+          : "Disabled — the network proxy blocks web search."}</span>
+      </div>`;
+    }
+    return accountCard;
   }
   if (name === "github") {
     return `
@@ -262,7 +287,7 @@ export function renderIntegrationAccounts() {
       ${summary ? `<p class="connection-summary">${summary}</p>` : ""}
       ${guidance}
       <span class="provider-account-actions">
-        ${canLogin ? `<button class="primary sm" data-action="start-login" data-runtime="${esc(runtime)}">Start ${esc(runtimeLabel)} login</button>` : ""}
+        ${canLogin ? `<button class="sm" data-action="start-login" data-runtime="${esc(runtime)}">Start ${esc(runtimeLabel)} login</button>` : ""}
         ${identity ? `<button class="ghost sm" data-action="reset-linked-account" data-provider="${esc(provider)}">Disconnect</button>` : ""}
       </span>`);
     const oauth = document.querySelector(`[data-provider-oauth="${provider}"]`);
@@ -324,6 +349,15 @@ export async function setIntegrationEnabled(name, enabled) {
     if (enabled && name === "github") value.require_dot_github_approval = true;
     managed[name] = value;
   }, `${MANAGED_INTEGRATIONS[name].label} ${enabled ? "enabled" : "disabled"}.`);
+}
+
+export async function setClaudeWebSearch(webSearch) {
+  await publishPolicy("claude", policy => {
+    const managed = policy.managed_network_integrations;
+    const value = { ...objectValue(managed.claude), "enabled": true };
+    if (webSearch) value.web_search = true; else delete value.web_search;
+    managed.claude = value;
+  }, `Claude web search ${webSearch ? "enabled" : "disabled"}.`);
 }
 
 function githubRepositories(policy) {

@@ -489,7 +489,8 @@ def gmail_search_messages(access_token: str, query: str) -> list[JSONObject]:
         gmail_operation_request("users.messages.list", listing_parameters),
     )
     summaries: list[JSONObject] = []
-    for entry in cast(list[Any], listing.get("messages", [])):
+    raw_messages = listing.get("messages")
+    for entry in (raw_messages if isinstance(raw_messages, list) else [])[:GMAIL_READ_MAX_RESULTS]:
         if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
             continue
         message_id = cast(str, entry["id"])

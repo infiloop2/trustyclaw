@@ -20,9 +20,13 @@ from host.constants import APP_PORT_BASE
 
 APP_ROOT = Path(__file__).resolve().parents[1] / "apps"
 APP_ID_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+# Separates the app id from the app-visible thread id in host-internal thread
+# names (`<app_id>__<thread_id>`); the canonical constant for every consumer.
+APP_SCOPED_ID_SEPARATOR = "__"
 PATH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 POSTGRES_IDENTIFIER_LIMIT = 63
 MAX_INSTALLED_APPS = 100
+MAX_AGENT_INSTRUCTIONS_BYTES = 16 * 1024
 APP_UID_BASE = 48000
 APP_UID_MAX = APP_UID_BASE + MAX_INSTALLED_APPS - 1
 APP_PORT_OFFSET_MIN = 0
@@ -50,6 +54,14 @@ class AppManifest:
     ui_dir: Path
     port: int
     allocation: AppAllocation
+    # Static app-owned behavior and protocol guidance. The host attaches this
+    # at the runtime instruction boundary for every task created by the app;
+    # current user input and app state remain separate task content.
+    agent_instructions: str
+    # Opt-in agent-facing backend API: when true, agents working this app's
+    # tasks get the app_api tool, proxied to the backend's /agent/ routes by
+    # the trustyclaw-agent-app service (docs/architecture/apps/agent-app-api.md).
+    agent_api: bool = False
 
     @property
     def linux_user(self) -> str:
@@ -78,7 +90,7 @@ class AppManifest:
     def public(self) -> dict[str, Any]:
         # Only what the admin shell reads: the service unit, DB schema/role,
         # and localhost base URL are fixed derivations documented in
-        # docs/architecture/apps.md and never leave the host.
+        # docs/architecture/apps/apps.md and never leave the host.
         return {
             "id": self.id,
             "title": self.title,
@@ -173,7 +185,39 @@ def _load_manifest(path: Path) -> AppManifest:
     if not isinstance(data, dict):
         raise AppError(f"{path}: manifest must be an object")
     package_dir = path.parent
-    _require_exact_keys(data, {"host_slot", "title", "backend", "database", "ui"}, path, "manifest")
+    _require_exact_keys(
+        data, {"host_slot", "title", "backend", "database", "ui", "agent"}, path, "manifest",
+    )
+    agent_value = _required_object(data, "agent", path)
+    _require_exact_keys(agent_value, {"instructions", "api"}, path, "agent")
+    agent_api = agent_value["api"]
+    if not isinstance(agent_api, bool):
+        raise AppError(f"{path}: agent.api must be a boolean")
+    instructions_relative = _required_string(agent_value, "instructions", path)
+    if (package_dir / instructions_relative).is_symlink():
+        raise AppError(f"{path}: agent.instructions must be a regular non-symlink file")
+    instructions_path = _required_child(package_dir, agent_value, "instructions", path)
+    if not instructions_path.is_file():
+        raise AppError(f"{path}: agent.instructions does not exist")
+    if instructions_path.stat().st_size > MAX_AGENT_INSTRUCTIONS_BYTES:
+        raise AppError(
+            f"{path}: agent.instructions exceeds {MAX_AGENT_INSTRUCTIONS_BYTES} bytes"
+        )
+    try:
+        instruction_bytes = instructions_path.read_bytes()
+        agent_instructions = instruction_bytes.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise AppError(f"{path}: agent.instructions must be UTF-8") from exc
+    if not agent_instructions:
+        raise AppError(f"{path}: agent.instructions must not be empty")
+    if "\0" in agent_instructions:
+        raise AppError(f"{path}: agent.instructions must not contain NUL bytes")
+    # Defend against a file replacement between stat and read. App files are
+    # root-owned in production, but validation remains self-contained.
+    if len(instruction_bytes) > MAX_AGENT_INSTRUCTIONS_BYTES:
+        raise AppError(
+            f"{path}: agent.instructions exceeds {MAX_AGENT_INSTRUCTIONS_BYTES} bytes"
+        )
     app_id = package_dir.name
     host_slot = _required_int(data, "host_slot", path)
     if not APP_PORT_OFFSET_MIN <= host_slot <= APP_PORT_OFFSET_MAX:
@@ -212,6 +256,8 @@ def _load_manifest(path: Path) -> AppManifest:
         ui_dir=ui_dir,
         port=APP_PORT_BASE + allocation.port_offset,
         allocation=allocation,
+        agent_instructions=agent_instructions,
+        agent_api=agent_api,
     )
     _validate_postgres_identifier(app.db_schema, "database schema", path)
     _validate_postgres_identifier(app.db_role, "database role", path)
@@ -239,8 +285,10 @@ def _required_object(data: dict[str, Any], key: str, path: Path) -> dict[str, An
     return value
 
 
-def _require_exact_keys(data: dict[str, Any], expected: set[str], path: Path, label: str) -> None:
-    keys = set(data)
+def _require_exact_keys(
+    data: dict[str, Any], expected: set[str], path: Path, label: str, *, optional: set[str] | None = None
+) -> None:
+    keys = set(data) - (optional or set())
     if keys == expected:
         return
     missing = sorted(expected - keys)

@@ -47,14 +47,15 @@ DEFAULT_DB_NAME = "trustyclaw_admin"
 # over loopback; a couple of warm connections cover the request handler plus
 # the worker threads without holding dozens of server slots.
 POOL_LIMIT = 4
-# Cap on this process's *active* database sessions, set so the admin, proxy,
-# and tools processes together (3 x 18 = 54 worst case) stay below the server's
-# max_connections (80) with room for the currently bundled app, operator psql,
-# and the superuser reserve. Sessions are millisecond-lived (slow work happens
-# outside transactions), so a burst, such as the proxy's 64 concurrent handlers
-# each logging a decision, queues here briefly instead of failing at the server.
+# Cap on this process's *active* database sessions. The three core database
+# clients and two bundled apps use at most 5 x 14 = 70 of the server's 100
+# slots, leaving 30 for operator access, the superuser reserve, and deployment
+# work. Sessions are millisecond-lived (slow work happens outside
+# transactions), so a burst,
+# such as the proxy's 64 concurrent handlers each logging a decision, queues
+# here briefly instead of failing at the server.
 # Must be at least 2: a nested read inside a mutation holds a second session.
-MAX_ACTIVE_CONNECTIONS = 18
+MAX_ACTIVE_CONNECTIONS = 14
 CHECKOUT_TIMEOUT_SECONDS = 10
 _ACTIVE = threading.BoundedSemaphore(MAX_ACTIVE_CONNECTIONS)
 

@@ -11,6 +11,7 @@ from host.constants import APP_PORT_BASE
 
 RELEASED_APP_SLOTS = {
     "agent_chat": 0,
+    "mission_pursuit": 1,
 }
 
 
@@ -25,6 +26,8 @@ class AppPlatformTests(unittest.TestCase):
         self.assertEqual(agent_chat.db_role, "trustyclaw-app-agent_chat")
         self.assertEqual(agent_chat.service_name, "trustyclaw-app-agent_chat.service")
         self.assertEqual(agent_chat.port, APP_PORT_BASE)
+        self.assertIn("You are working in Agent Chat", agent_chat.agent_instructions)
+        self.assertFalse(agent_chat.agent_api)
         self.assertEqual(agent_chat.public()["ui"]["iframe_src"], "/v1/apps/agent_chat/ui/index.html")
         self.assertEqual(set(agent_chat.public()), {"id", "title", "backend", "ui"})
         self.assertEqual(set(agent_chat.public()["backend"]), {"api_route"})
@@ -35,6 +38,16 @@ class AppPlatformTests(unittest.TestCase):
         self.assertEqual(allocation.uid, 48000)
         self.assertEqual(allocation.gid, 48000)
         self.assertEqual(allocation.port_offset, 0)
+
+    def test_installed_mission_pursuit_manifest_owns_its_agent_protocol(self) -> None:
+        apps = {app.id: app for app in app_platform.installed_apps()}
+        mission = apps["mission_pursuit"]
+
+        self.assertTrue(mission.agent_api)
+        self.assertIn("You are the resident agent of Mission Pursuit", mission.agent_instructions)
+        self.assertIn('"path": "/agent/actions"', mission.agent_instructions)
+        self.assertIn('"type":"artifact_interaction"', mission.agent_instructions)
+        self.assertIn('"type": "button"', mission.agent_instructions)
 
     def test_installed_apps_have_unique_host_owned_names(self) -> None:
         apps = app_platform.installed_apps()
@@ -155,6 +168,12 @@ class AppPlatformTests(unittest.TestCase):
             with self.assertRaisesRegex(app_platform.AppError, "unsupported id"):
                 app_platform.installed_apps(root)
 
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_minimal_app(root, "legacy", extra={"agent_api": True})
+            with self.assertRaisesRegex(app_platform.AppError, "unsupported agent_api"):
+                app_platform.installed_apps(root)
+
     def test_ui_asset_resolves_only_inside_app_ui_directory(self) -> None:
         resolved = app_platform.ui_asset("/v1/apps/agent_chat/ui/index.html")
         self.assertIsNotNone(resolved)
@@ -194,6 +213,87 @@ class AppPlatformTests(unittest.TestCase):
             with self.assertRaisesRegex(app_platform.AppError, "PostgreSQL 63-byte identifier limit"):
                 app_platform.installed_apps(root)
 
+    def test_manifest_agent_contract_is_required_and_loads_bounded_instructions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_minimal_app(root, "plain", host_slot=0)
+            self._write_minimal_app(
+                root,
+                "agentic",
+                host_slot=1,
+                agent_instructions="Use the app API exactly as documented.",
+                agent_api=True,
+            )
+            apps = {app.id: app for app in app_platform.installed_apps(root)}
+            self.assertEqual(apps["plain"].agent_instructions, "Instructions for this app.")
+            self.assertFalse(apps["plain"].agent_api)
+            self.assertEqual(apps["agentic"].agent_instructions, "Use the app API exactly as documented.")
+            self.assertTrue(apps["agentic"].agent_api)
+            self.assertNotIn("agent", apps["agentic"].public())
+
+    def test_manifest_rejects_invalid_agent_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_minimal_app(root, "bad", agent_instructions=None)
+            with self.assertRaisesRegex(app_platform.AppError, "missing agent"):
+                app_platform.installed_apps(root)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_minimal_app(root, "bad", extra={"agent": "agent.md"})
+            with self.assertRaisesRegex(app_platform.AppError, "agent must be an object"):
+                app_platform.installed_apps(root)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_minimal_app(root, "bad", extra={"agent": {"instructions": "agent.md"}})
+            with self.assertRaisesRegex(app_platform.AppError, "missing api"):
+                app_platform.installed_apps(root)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_minimal_app(
+                root,
+                "bad",
+                extra={"agent": {"instructions": "agent.md", "api": "yes"}},
+            )
+            with self.assertRaisesRegex(app_platform.AppError, "agent.api must be a boolean"):
+                app_platform.installed_apps(root)
+
+    def test_manifest_rejects_missing_empty_oversized_and_symlinked_agent_instructions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_minimal_app(root, "missing", extra={"agent": {"instructions": "missing.md", "api": False}})
+            with self.assertRaisesRegex(app_platform.AppError, "agent.instructions does not exist"):
+                app_platform.installed_apps(root)
+
+        for label, content, error in (
+            ("empty", "", "must not be empty"),
+            ("nul", "before\0after", "must not contain NUL bytes"),
+            ("oversized", "x" * (app_platform.MAX_AGENT_INSTRUCTIONS_BYTES + 1), "exceeds 16384 bytes"),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                self._write_minimal_app(root, label, agent_instructions=content)
+                with self.assertRaisesRegex(app_platform.AppError, error):
+                    app_platform.installed_apps(root)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_minimal_app(root, "linked", agent_instructions="ignored")
+            instructions = root / "linked" / "agent.md"
+            instructions.unlink()
+            instructions.symlink_to(root / "linked" / "backend.py")
+            with self.assertRaisesRegex(app_platform.AppError, "regular non-symlink"):
+                app_platform.installed_apps(root)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_minimal_app(root, "binary", agent_instructions="placeholder")
+            (root / "binary" / "agent.md").write_bytes(b"\xff")
+            with self.assertRaisesRegex(app_platform.AppError, "must be UTF-8"):
+                app_platform.installed_apps(root)
+
     def _write_minimal_app(
         self,
         root: Path,
@@ -202,6 +302,8 @@ class AppPlatformTests(unittest.TestCase):
         host_slot: int = 0,
         title: str | None = None,
         extra: dict[str, object] | None = None,
+        agent_instructions: str | None = "Instructions for this app.",
+        agent_api: bool = False,
     ) -> None:
         app_dir = root / app_id
         app_dir.mkdir()
@@ -215,6 +317,9 @@ class AppPlatformTests(unittest.TestCase):
             "database": {"migrations": "migrations"},
             "ui": {"path": "ui"},
         }
+        if agent_instructions is not None:
+            (app_dir / "agent.md").write_text(agent_instructions)
+            manifest["agent"] = {"instructions": "agent.md", "api": agent_api}
         manifest.update(extra or {})
         (app_dir / "manifest.json").write_text(json.dumps(manifest))
 

@@ -132,7 +132,7 @@ def request_denial_reason(
         return "network policy denied request"
     return (
         openai_request_denied(policy, host, headers, body, path=path)
-        or anthropic_request_denied(policy, method, host, path, headers)
+        or anthropic_request_denied(policy, method, host, path, headers, body)
         or github_request_denied(policy, method, host, path, query, body)
     )
 

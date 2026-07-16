@@ -397,7 +397,7 @@ main { min-width: 0; }
   flex-direction: column;
   gap: 0.15rem;
   position: sticky;
-  top: 4.85rem;
+  top: 4.4rem;
 }
 
 .tab-button {
@@ -431,7 +431,6 @@ main { min-width: 0; }
   background: linear-gradient(90deg, var(--accent-soft), transparent 130%);
   border-color: rgba(69, 214, 196, 0.25);
   color: var(--accent);
-  font-weight: 700;
 }
 
 .tab-button.active-tab:hover { border-color: rgba(69, 214, 196, 0.25); }
@@ -508,10 +507,32 @@ h2 {
 
 /* ---------- Embedded apps ---------- */
 
+/* An active app tab owns the viewport, same contract as the connection
+   guide: the outer page never scrolls, the embedded app manages its own
+   scrolling, so the operator sees a single scrollbar instead of nested
+   page + iframe ones. */
+body.app-tab-open { overflow: hidden; }
+
+body.app-tab-open #app {
+  height: calc(100dvh - 3.4rem);
+  overflow: clip;
+}
+
+body.app-tab-open .shell { height: 100%; padding-bottom: 1rem; }
+
+body.app-tab-open main { min-height: 0; }
+
+.app-tab-panel {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  height: 100%;
+  min-height: 0;
+}
+
 .app-frame-section {
   background: var(--bg);
-  height: min(66rem, calc(100vh - 7rem));
-  min-height: 44rem;
+  height: 100%;
+  min-height: 0;
   overflow: hidden;
   padding: 0;
 }
@@ -819,9 +840,25 @@ button.danger.ghost { background: transparent; }
    summary line bows out instead of duplicating it. */
 .integration-row.expanded .integration-subtitle { display: none; }
 
-#managed-integrations {
+.integration-list {
   display: grid;
   gap: 0.8rem;
+}
+
+.network-group + .network-group { margin-top: 1.25rem; }
+
+.network-group-heading {
+  color: var(--text-dim);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  margin: 0 0 0.55rem 0.2rem;
+}
+
+.network-group-manual {
+  border-top: 1px solid var(--border);
+  margin-top: 1.6rem;
+  padding-top: 1.1rem;
 }
 
 .integration-row {
@@ -1039,21 +1076,38 @@ button.integration-chevron {
 .audit-banner.ok { background: var(--ok-soft); border-color: rgba(95, 214, 162, 0.35); }
 
 button.info-button {
+  align-items: center;
+  background: transparent;
+  border-color: transparent;
   border-radius: 999px;
   color: var(--text-dim);
+  display: inline-flex;
   flex: 0 0 auto;
   font-family: var(--font-mono);
   font-size: 0.72rem;
   height: 1.55rem;
+  justify-content: center;
   line-height: 1;
   padding: 0;
   text-align: center;
   width: 1.55rem;
 }
 
+button.info-button:hover {
+  background: transparent;
+  border-color: transparent;
+  color: var(--accent);
+}
+
+.integration-info-icon {
+  display: block;
+  height: 1rem;
+  width: 1rem;
+}
+
 button.info-button[aria-expanded="true"] {
-  background: var(--accent-soft);
-  border-color: rgba(109, 163, 255, 0.5);
+  background: transparent;
+  border-color: transparent;
   color: var(--accent);
 }
 
@@ -1157,9 +1211,14 @@ body.connection-guide-open main, #panel-connection-guide { min-height: 0; }
 .connection-guide-picker { display: none; }
 
 .connection-guide-index {
-  align-self: start;
+  align-content: start;
+  align-self: stretch;
   display: grid;
   gap: 0.2rem;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .connection-guide-index button {
@@ -1300,6 +1359,8 @@ body.connection-guide-open main, #panel-connection-guide { min-height: 0; }
 
 .guide-step-copy a { color: var(--accent); display: inline-block; font-size: 0.78rem; margin-top: 0.35rem; }
 
+.guide-step-copy p a { display: inline; font-size: inherit; margin-top: 0; }
+
 .guide-steps figure { margin: 0; }
 
 .guide-steps img {
@@ -1383,19 +1444,59 @@ body.connection-guide-open main, #panel-connection-guide { min-height: 0; }
 .guide-config { display: grid; gap: 0.45rem; margin-top: 0.2rem; }
 
 .guide-callback {
-  align-items: baseline;
+  margin-top: 0.8rem;
+}
+
+.guide-callback-label {
+  color: var(--text-dim);
+  display: block;
+  font-size: 0.7rem;
+  margin-bottom: 0.35rem;
+}
+
+.guide-callback-value {
+  align-items: center;
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   display: grid;
-  gap: 0.2rem 0.65rem;
-  grid-template-columns: auto minmax(0, 1fr);
-  padding: 0.55rem 0.65rem;
+  gap: 0.5rem;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 0.4rem 0.45rem 0.4rem 0.65rem;
+  position: relative;
 }
 
-.guide-callback span { color: var(--text-dim); font-size: 0.76rem; }
-
 .guide-callback code { color: var(--accent); font-size: 0.76rem; overflow-wrap: anywhere; }
+
+button.guide-copy-button {
+  align-items: center;
+  border-color: rgba(148, 163, 184, 0.24);
+  border-radius: 0.45rem;
+  color: var(--text-dim);
+  display: inline-flex;
+  height: 1.8rem;
+  justify-content: center;
+  padding: 0;
+  width: 1.8rem;
+}
+
+button.guide-copy-button:hover { border-color: rgba(69, 214, 196, 0.42); color: var(--accent); }
+
+.guide-copy-button svg { display: block; height: 0.95rem; width: 0.95rem; }
+
+.guide-copy-feedback {
+  background: var(--surface-3);
+  border: 1px solid var(--border-strong);
+  border-radius: 0.45rem;
+  box-shadow: var(--shadow);
+  color: var(--text);
+  font-size: 0.72rem;
+  padding: 0.28rem 0.48rem;
+  position: absolute;
+  right: 0;
+  top: calc(100% + 0.35rem);
+  z-index: 12;
+}
 
 .guide-config > div {
   align-items: baseline;
@@ -1844,22 +1945,26 @@ a:hover { text-decoration: underline; }
 @media (max-width: 860px) {
   body { font-size: 14px; padding-top: 0; }
 
-  body.connection-guide-open {
+  body.connection-guide-open,
+  body.app-tab-open {
     display: flex;
     flex-direction: column;
     height: 100dvh;
   }
 
-  body.connection-guide-open .topbar { flex: 0 0 auto; }
+  body.connection-guide-open .topbar,
+  body.app-tab-open .topbar { flex: 0 0 auto; }
 
-  body.connection-guide-open #app {
+  body.connection-guide-open #app,
+  body.app-tab-open #app {
     flex: 1 1 auto;
     height: auto;
     min-height: 0;
     width: 100%;
   }
 
-  body.connection-guide-open .shell {
+  body.connection-guide-open .shell,
+  body.app-tab-open .shell {
     height: 100%;
     min-height: 0;
     padding-bottom: 0.8rem;
@@ -1996,8 +2101,6 @@ a:hover { text-decoration: underline; }
 
   .guide-config > div { grid-template-columns: 1fr; }
 
-  .guide-callback { grid-template-columns: 1fr; }
-
   .integration-row { padding: 0.75rem 0.8rem; }
 
   /* Give identity/status and actions their own lines. A connected account
@@ -2068,8 +2171,7 @@ a:hover { text-decoration: underline; }
 
 /* -- tools ---------------------------------------------------------------- */
 
-/* Tool rows are integration-row sections, matching #managed-integrations. */
-#tools { display: grid; gap: 0.8rem; }
+/* Tool rows and managed tool integrations share the same sorted list. */
 
 .tool-config { display: grid; gap: 0.6rem; }
 
@@ -2110,6 +2212,12 @@ a:hover { text-decoration: underline; }
 .tool-approvals-table details summary { color: var(--text-dim); cursor: pointer; font-size: 0.78rem; }
 
 .tool-approvals-table details summary:hover { color: var(--text); }
+
+#tool-events .tool-event-arguments summary { color: var(--text-dim); cursor: pointer; font-size: 0.78rem; }
+
+#tool-events .tool-event-arguments summary:hover { color: var(--text); }
+
+#tool-events .tool-event-arguments pre.metadata { max-width: 30rem; overflow-x: auto; }
 
 /* Approve/Deny sit on one line; the decision column hugs its content so the
    proposed-action column does not crowd it into wrapping. */

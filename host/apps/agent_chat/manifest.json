@@ -1,6 +1,10 @@
 {
   "host_slot": 0,
   "title": "Agent Chat",
+  "agent": {
+    "instructions": "agent.md",
+    "api": false
+  },
   "backend": {
     "entrypoint": "backend.py"
   },

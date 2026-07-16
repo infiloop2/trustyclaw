@@ -205,8 +205,8 @@ ready for a fresh operator login that links an account again.
 one account-status entry per runtime.
 `POST /v1/agent-runtime/refresh` accepts `{}` to refresh all runtimes, or
 `{"agent_runtime": "codex"}` / `{"agent_runtime": "claude_code"}` to refresh one.
-It runs the same provider status refresh used by the background status loop and
-may invoke the provider CLI. It returns the same response shape as
+It forces a provider check instead of reusing a remembered live-validation
+verdict. It returns the same response shape as
 `GET /v1/agent-runtime/account`.
 
 Agent runtime status response:
@@ -320,7 +320,7 @@ Agent account response fields:
 | `accounts[].claude_usage.weekly_resets_at` | number | optional | Unix timestamp when the Claude Code weekly window resets. |
 | `accounts[].claude_usage.fable_weekly_used_percent` | number | optional | Percent used for the Fable-specific weekly window. |
 | `accounts[].claude_usage.fable_weekly_resets_at` | number | optional | Unix timestamp when the Fable-specific weekly window resets. |
-| `accounts[].claude_usage.last_checked_at` | string | optional | UTC timestamp of the last refresh that fetched fresh Claude usage. Active runtimes are rechecked every 300 seconds; a refresh that cannot fetch fresh usage keeps the previous snapshot and its timestamp. |
+| `accounts[].claude_usage.last_checked_at` | string | optional | UTC timestamp of the provider read that produced this Claude usage snapshot. Active runtimes are rechecked every 300 seconds; the explicit refresh endpoint forces an immediate provider read. If no usage window parses, `claude_usage` is absent rather than stale. |
 
 Codex OAuth login response:
 
@@ -434,11 +434,11 @@ Create task request fields:
 
 | Field | Required | Type | Meaning |
 | --- | --- | --- | --- |
-| `agent_runtime` | New thread | enum | Runtime to execute the task: `codex` or `claude_code`. Must be supplied together with `model` and `effort`, or all three omitted for an existing thread. |
+| `agent_runtime` | New thread | enum | Runtime to execute the task: `codex` or `claude_code`. Supply it together with `model` and `effort`. An existing thread accepts all three when they exactly match its fixed configuration, or none of them. |
 | `model` | New thread | enum | Model for this session. Codex accepts `gpt-5.6-terra`, `gpt-5.6-sol`, or `gpt-5.6-luna`; Claude Code accepts `opus`, `fable`, or `sonnet`. Must be supplied together with `agent_runtime` and `effort`. |
 | `effort` | New thread | enum | Effort for this session. Codex accepts `high`, `max`, or `ultra`, except Luna accepts only `high` or `max`. Claude Code accepts `high`, `max`, or `ultracode`; `ultracode` enables its xhigh effort plus dynamic workflow orchestration. Must be supplied together with `agent_runtime` and `model`. |
 | `input_message` | Yes | string | Task message for the agent runtime. Must be 1 to 50,000 characters. |
-| `thread_id` | Yes | string | Client-generated conversation id this task belongs to. Must be 1 to 64 characters of `A-Z`, `a-z`, `0-9`, `-`, or `_`. The first task requires and fixes the runtime, model, and effort on the thread. Later tasks must omit all three and use that stored configuration; sending any of them for an existing thread returns `400`. Omitting them for an unknown thread also returns `400`. Thread rows referenced by retained tasks are preserved; otherwise the host retains the 100,000 most recently used mappings per runtime. Once a thread is no longer retained, supplying a configuration starts a fresh provider conversation. |
+| `thread_id` | Yes | string | Client-generated conversation id this task belongs to. Must be 1 to 64 characters of `A-Z`, `a-z`, `0-9`, `-`, or `_`. The first task requires and fixes the runtime, model, and effort on the thread. Later tasks may omit all three or repeat the complete matching triple; a partial or conflicting configuration returns `400`. Omitting them for an unknown thread also returns `400`. Thread rows referenced by retained tasks are preserved; otherwise the host retains the 100,000 most recently used mappings per runtime. Once a thread is no longer retained, supplying a configuration starts a fresh provider conversation. |
 
 Follow-up task request:
 
@@ -1163,7 +1163,7 @@ response of at most 1 MiB. The browser app bridge pins a request to its own `app
 attempting to bridge to another app returns `403`. App backend failures are
 returned through the standard error envelope. App-backend-to-host calls use a
 separate peer-authenticated Unix socket and narrow task/thread allowlist,
-documented in [Apps architecture](../architecture/apps.md).
+documented in [Apps architecture](../architecture/apps/apps.md).
 
 ## Tools
 
@@ -1180,6 +1180,7 @@ GET  /v1/tools/{tool_id}/approvals/{approval_id}
 POST /v1/tools/{tool_id}/approvals/{approval_id}/approve
 POST /v1/tools/{tool_id}/approvals/{approval_id}/deny
 GET  /v1/tools/events
+GET  /v1/tools/events/{seq}
 ```
 
 Bundled tool packages the agent can call once the operator enables them; see
@@ -1203,6 +1204,7 @@ Tool endpoints:
 | `POST` | `/v1/tools/{tool_id}/approvals/{approval_id}/approve` | none | `{"approval", "result"}` | Approves a pending approval and immediately executes the recorded payload exactly once; the response carries the terminal approval record (`executed` or `failed`) and the execution result. `404` when `{approval_id}` is not an approval of `{tool_id}`; `409` when it is not pending. |
 | `POST` | `/v1/tools/{tool_id}/approvals/{approval_id}/deny` | none | `{"approval"}` | Denies a pending approval; terminal. `404` when `{approval_id}` is not an approval of `{tool_id}`; `409` when it is not pending. |
 | `GET` | `/v1/tools/events` | `?before=&limit=` | `{"events": [...]}` | The tool audit log, newest first: tool calls, approval decisions, connect/disconnect, enable/disable, and config set/clear events. Pages with the same `before` (an event `seq`) and `limit` cursor model as `/v1/events` and `/v1/network/events`. |
+| `GET` | `/v1/tools/events/{seq}` | none | `{"event": {...}}` | Loads one tool event with its exact action `arguments`. The paginated list returns only `has_arguments`, so live refreshes do not repeatedly transfer up to 64 KiB per event. `404` when `{seq}` does not exist. |
 
 Tool list response:
 
@@ -1346,7 +1348,7 @@ surface; the pending call response carries the token-bearing `approval_id`, whic
 another agent process cannot enumerate old approvals by guessing sequential ids.
 Only these admin endpoints decide approvals.
 
-Tool event (from `/v1/tools/events`):
+Tool event summary (from `/v1/tools/events`):
 
 ```json
 {
@@ -1356,7 +1358,8 @@ Tool event (from `/v1/tools/events`):
   "tool_id": "example_tool",
   "action_id": "send_item",
   "outcome": "executed",
-  "detail": "approval_7"
+  "detail": "approval_7",
+  "has_arguments": true
 }
 ```
 
@@ -1369,6 +1372,17 @@ Tool event (from `/v1/tools/events`):
 | `action_id` | string | The manifest action id (`ActionSpec.id`) for a call; `oauth_connect` for a connect/disconnect, `enablement` for an enable/disable, or `config` for a config change. |
 | `outcome` | string | For a tool call: `executed`, `pending_approval`, or `failed`. For an approval decision: `executed`, `failed`, or `denied`. For a connection change: `connected` or `disconnected`. For an enablement change: `enabled` or `disabled`. For a config change: `set` or `cleared`. |
 | `detail` | string | Short context string: an error message, the related `approval_id`, the connected account label, or the config key that changed. May be empty. |
+| `has_arguments` | boolean | `true` for an accepted tool call or approval decision, including calls whose exact argument object is `{}`. `false` for config, enablement, and connection lifecycle events. |
+
+`GET /v1/tools/events/{seq}` returns the same fields plus `arguments`, either
+the exact schema-validated tool input, the exact approved/denied payload, or
+`null` for a lifecycle event. Argument objects are capped at 64 KiB. They are
+stored in the local Postgres `tool_events.arguments` column. The tools service
+writes tool-call, approval, and OAuth events through its scoped database role;
+the admin service writes config and enablement events and reads the table for
+the Tool Audit Log. The UI loads arguments only after the operator expands an
+event. Tool config values and OAuth callback parameters are never stored as
+event arguments.
 
 ## Host Runtime
 

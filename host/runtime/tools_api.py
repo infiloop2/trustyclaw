@@ -9,13 +9,17 @@ scoped to exactly one peer: the agent uid gets the MCP surface
 delegation routes (``POST /operator/...``) — neither can call the other's
 routes, no admin password involved and none required.
 
-The agent-facing HTTP surface is two routes, both JSON:
+The agent-facing HTTP surface is four routes:
 
 - ``GET /tools`` — the callable tool actions for the enabled tools, named
   ``<tool_id>_<action>``, plus the built-in ``check_tool_approval``.
 - ``POST /call`` — ``{"name": ..., "input": {...}}`` executes one action and
   returns the result shape from ``tools_host`` (``executed`` /
   ``pending_approval`` / ``failed``).
+- ``POST /assets/video``: raw MP4/MOV bytes streamed by the MCP shim, with
+  bounded metadata in headers; returns an opaque tool-scoped asset id.
+- ``POST /assets/image``: raw JPEG/PNG/WebP bytes streamed by the MCP shim,
+  with the same private, bounded, tool-scoped storage contract.
 Approval status checks are a built-in action invoked through ``POST /call``,
 so the agent can resume after the operator decides in the admin UI.
 
@@ -35,9 +39,11 @@ import re
 import socket
 import struct
 import threading
-from typing import Any
+import time
+from typing import Any, BinaryIO, cast
+from urllib.parse import unquote
 
-from host.runtime import state, tools_host
+from host.runtime import state, tool_assets, tools_host
 
 DEFAULT_SOCKET_PATH = "/run/trustyclaw-tools/tools.sock"
 SOCKET_PATH = os.environ.get("TRUSTYCLAW_TOOLS_SOCKET", DEFAULT_SOCKET_PATH)
@@ -49,11 +55,14 @@ SOCKET_PATH = os.environ.get("TRUSTYCLAW_TOOLS_SOCKET", DEFAULT_SOCKET_PATH)
 AGENT_PEER_USER = "trustyclaw-agent"
 ADMIN_PEER_USER = "trustyclaw-admin"
 MAX_REQUEST_BODY_BYTES = 256 * 1024
+MAX_VIDEO_BODY_BYTES = tool_assets.MAX_VIDEO_BYTES
+MAX_IMAGE_BODY_BYTES = tool_assets.MAX_IMAGE_BYTES
 # Tool calls block a handler thread on third-party requests (30s timeouts in
 # the packages), so cap concurrency instead of letting a runaway agent stack
 # threads.
 MAX_CONCURRENT_CALLS = 8
 _CALL_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_CALLS)
+_UPLOAD_SLOTS = threading.BoundedSemaphore(2)
 # The world-connectable socket parses the request line and headers before the
 # handler's peer-credential check runs, so a local peer that connects and stalls
 # mid-request would otherwise pin a handler thread indefinitely. A read timeout
@@ -64,6 +73,7 @@ _CALL_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_CALLS)
 # every peer on the box is a known service uid, so that costs nothing worth
 # defending against.
 REQUEST_READ_TIMEOUT_SECONDS = 30
+ASSET_CLEANUP_INTERVAL_SECONDS = 3600
 
 CHECK_APPROVAL_TOOL = {
     "name": "check_tool_approval",
@@ -131,7 +141,11 @@ def _resolve_action(name: str) -> tuple[str, str] | None:
     return None
 
 
-def call_action(name: Any, tool_input: Any) -> dict[str, Any]:
+def call_action(
+    name: Any,
+    tool_input: Any,
+    asset_store: tool_assets.ToolAssetStore | None = None,
+) -> dict[str, Any]:
     if not isinstance(name, str):
         raise tools_host.ToolCallError("Tool name must be a string.")
     if name == "check_tool_approval":
@@ -141,7 +155,7 @@ def call_action(name: Any, tool_input: Any) -> dict[str, Any]:
     resolved = _resolve_action(name)
     if resolved is None:
         raise tools_host.ToolCallError(f"Unknown tool: {name}.")
-    return tools_host.execute_action(resolved[0], resolved[1], tool_input)
+    return tools_host.execute_action(resolved[0], resolved[1], tool_input, asset_store)
 
 
 def _list_bundled_tools() -> dict[str, Any]:
@@ -219,30 +233,34 @@ def _operator_connect_flow(tool_id: str, *, require_enabled: bool = True) -> Any
     return flow
 
 
-def _operator_start_connect(tool_id: str, body: Any) -> dict[str, Any]:
+def _operator_start_connect(
+    tool_id: str, body: Any, asset_store: tool_assets.ToolAssetStore | None = None
+) -> dict[str, Any]:
     flow = _operator_connect_flow(tool_id)
     if not isinstance(body, dict) or not isinstance(body.get("redirect_uri"), str) or not body["redirect_uri"]:
         raise OperatorError(HTTPStatus.BAD_REQUEST, "redirect_uri is required")
-    api = tools_host.host_api_for(tools_host.bundled_tool(tool_id))
+    api = tools_host.host_api_for(tools_host.bundled_tool(tool_id), asset_store)
     try:
         return flow.start_connect({"redirect_uri": body["redirect_uri"]}, api)
-    except (ValueError, KeyError) as exc:
+    except (ValueError, KeyError, tools_host.ToolConfigKeyUnsetError) as exc:
         raise OperatorError(HTTPStatus.BAD_REQUEST, str(exc) or "invalid connect request") from exc
     except Exception as exc:  # noqa: BLE001 - tool packages redact their messages
         raise OperatorError(HTTPStatus.BAD_GATEWAY, str(exc) or "tool connect flow failed") from exc
 
 
-def _operator_complete_connect(tool_id: str, body: Any) -> dict[str, Any]:
+def _operator_complete_connect(
+    tool_id: str, body: Any, asset_store: tool_assets.ToolAssetStore | None = None
+) -> dict[str, Any]:
     flow = _operator_connect_flow(tool_id)
     if not isinstance(body, dict):
         raise OperatorError(HTTPStatus.BAD_REQUEST, "body must be a JSON object")
     params = {key: body.get(key) for key in ("code", "redirect_uri", "state")}
     if not all(isinstance(value, str) and value for value in params.values()):
         raise OperatorError(HTTPStatus.BAD_REQUEST, "code, redirect_uri, and state are required")
-    api = tools_host.host_api_for(tools_host.bundled_tool(tool_id))
+    api = tools_host.host_api_for(tools_host.bundled_tool(tool_id), asset_store)
     try:
         result = flow.complete_connect(params, api)
-    except (ValueError, KeyError) as exc:
+    except (ValueError, KeyError, tools_host.ToolConfigKeyUnsetError) as exc:
         raise OperatorError(HTTPStatus.BAD_REQUEST, str(exc) or "invalid connect request") from exc
     except Exception as exc:  # noqa: BLE001 - tool packages redact their messages
         raise OperatorError(HTTPStatus.BAD_GATEWAY, str(exc) or "tool connect flow failed") from exc
@@ -252,10 +270,12 @@ def _operator_complete_connect(tool_id: str, body: Any) -> dict[str, Any]:
     return result
 
 
-def _operator_disconnect(tool_id: str) -> dict[str, Any]:
+def _operator_disconnect(
+    tool_id: str, asset_store: tool_assets.ToolAssetStore | None = None
+) -> dict[str, Any]:
     # Disconnect skips the enabled gate so stored tokens can always be revoked.
     flow = _operator_connect_flow(tool_id, require_enabled=False)
-    api = tools_host.host_api_for(tools_host.bundled_tool(tool_id))
+    api = tools_host.host_api_for(tools_host.bundled_tool(tool_id), asset_store)
     try:
         flow.disconnect(api)
     except Exception as exc:  # noqa: BLE001 - tool packages redact their messages
@@ -264,32 +284,43 @@ def _operator_disconnect(tool_id: str) -> dict[str, Any]:
     return {"tool_id": tool_id, "connected": False}
 
 
-def _operator_decide(tool_id: str, approval_id: str, decision: str) -> dict[str, Any]:
+def _operator_decide(
+    tool_id: str,
+    approval_id: str,
+    decision: str,
+    asset_store: tool_assets.ToolAssetStore | None = None,
+) -> dict[str, Any]:
     # The approval is addressed under its tool, so reject a decision whose tool
     # does not own the approval before spending it.
     if state.tool_approval(approval_id, tool_id=tool_id) is None:
         raise OperatorError(HTTPStatus.NOT_FOUND, "unknown approval")
     try:
-        return tools_host.decide_approval(approval_id, decision)
+        return tools_host.decide_approval(approval_id, decision, asset_store)
     except tools_host.ToolCallError as exc:
         raise OperatorError(HTTPStatus.CONFLICT, str(exc)) from exc
 
 
-def handle_operator(path: str, body: Any) -> dict[str, Any]:
+def handle_operator(
+    path: str,
+    body: Any,
+    asset_store: tool_assets.ToolAssetStore | None = None,
+) -> dict[str, Any]:
     """Dispatch one admin-delegated operator operation. Raises OperatorError
     with the HTTP status the admin service should return."""
     start = OPERATOR_START_RE.fullmatch(path)
     if start:
-        return _operator_start_connect(start.group(1), body)
+        return _operator_start_connect(start.group(1), body, asset_store)
     complete = OPERATOR_COMPLETE_RE.fullmatch(path)
     if complete:
-        return _operator_complete_connect(complete.group(1), body)
+        return _operator_complete_connect(complete.group(1), body, asset_store)
     disconnect = OPERATOR_DISCONNECT_RE.fullmatch(path)
     if disconnect:
-        return _operator_disconnect(disconnect.group(1))
+        return _operator_disconnect(disconnect.group(1), asset_store)
     decide = OPERATOR_DECIDE_RE.fullmatch(path)
     if decide:
-        return _operator_decide(decide.group(1), decide.group(2), decide.group(3))
+        return _operator_decide(
+            decide.group(1), decide.group(2), decide.group(3), asset_store
+        )
     raise OperatorError(HTTPStatus.NOT_FOUND, "unknown path")
 
 
@@ -384,7 +415,8 @@ class ToolsRequestHandler(BaseHTTPRequestHandler):
         if not is_operator and not self._peer_is_agent():
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "Peer not allowed."})
             return
-        if not is_operator and self.path != "/call":
+        asset_kind = {"/assets/video": "video", "/assets/image": "image"}.get(self.path)
+        if not is_operator and self.path not in {"/call", "/assets/video", "/assets/image"}:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Unknown path."})
             return
         try:
@@ -395,8 +427,16 @@ class ToolsRequestHandler(BaseHTTPRequestHandler):
         if length < 0:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Malformed Content-Length."})
             return
-        if length > MAX_REQUEST_BODY_BYTES:
+        max_length = (
+            MAX_VIDEO_BODY_BYTES if asset_kind == "video"
+            else MAX_IMAGE_BODY_BYTES if asset_kind == "image"
+            else MAX_REQUEST_BODY_BYTES
+        )
+        if length > max_length:
             self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "Request too large."})
+            return
+        if asset_kind is not None:
+            self._stage_asset(length, cast(tool_assets.AssetKind, asset_kind))
             return
         if is_operator:
             # Operator routes are operator-initiated and low volume, so they do not
@@ -406,7 +446,7 @@ class ToolsRequestHandler(BaseHTTPRequestHandler):
             if body is None:
                 return
             try:
-                result = handle_operator(self.path, body)
+                result = handle_operator(self.path, body, self.server.asset_store)
             except OperatorError as exc:
                 self._send_json(exc.status, {"error": exc.message})
                 return
@@ -421,7 +461,9 @@ class ToolsRequestHandler(BaseHTTPRequestHandler):
             body = self._read_json_object_body(length)
             if body is None:
                 return
-            result = call_action(body.get("name"), body.get("input"))
+            result = call_action(
+                body.get("name"), body.get("input"), self.server.asset_store
+            )
         except tools_host.ToolCallError as exc:
             result = {"status": "failed", "error": str(exc), "reconnect_required": False}
         except Exception:
@@ -432,13 +474,90 @@ class ToolsRequestHandler(BaseHTTPRequestHandler):
             _CALL_SLOTS.release()
         self._send_json(HTTPStatus.OK, result)
 
+    def _stage_asset(self, length: int, kind: tool_assets.AssetKind) -> None:
+        """Receive raw media bytes from the agent-side shim into private,
+        tools-owned storage. Metadata comes from bounded headers; a pathname
+        is never accepted by this service."""
+        if not _UPLOAD_SLOTS.acquire(blocking=False):
+            self._send_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {"error": "Too many concurrent asset uploads."},
+            )
+            return
+        try:
+            tool_id = self.headers.get("X-TrustyClaw-Tool") or ""
+            allowed_tools = {"runway", "instagram"} if kind == "video" else {"runway"}
+            if tool_id not in allowed_tools:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": f"{kind.title()} destination tool is invalid."},
+                )
+                return
+            # Refuse to stage into a disabled tool: otherwise the agent could
+            # fill the bounded asset store with uploads for a tool the
+            # operator never enabled and can never use.
+            if tool_id not in state.enabled_tool_ids():
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "The destination tool is not enabled."},
+                )
+                return
+            encoded_filename = self.headers.get("X-TrustyClaw-Filename") or ""
+            if len(encoded_filename) > 1024:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST, {"error": f"{kind.title()} filename is too long."}
+                )
+                return
+            try:
+                filename = unquote(encoded_filename, errors="strict")
+            except (UnicodeDecodeError, ValueError):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"{kind.title()} filename is invalid."})
+                return
+            media_type = (self.headers.get("Content-Type") or "").lower()
+            try:
+                metadata = self.server.asset_store.stage(
+                    kind=kind,
+                    tool_id=tool_id,
+                    filename=filename,
+                    media_type=media_type,
+                    size_bytes=length,
+                    source=cast(BinaryIO, self.rfile),
+                )
+            except tool_assets.AssetError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except Exception:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": f"{kind.title()} staging failed."},
+                )
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    f"{kind}_asset_id": metadata.asset_id,
+                    "filename": metadata.filename,
+                    "media_type": metadata.media_type,
+                    "size_bytes": metadata.size_bytes,
+                    "sha256": metadata.sha256,
+                    "expires_at": metadata.expires_at,
+                    "for_tool": tool_id,
+                },
+            )
+        finally:
+            _UPLOAD_SLOTS.release()
+
 
 class ToolsServer(ThreadingHTTPServer):
     address_family = socket.AF_UNIX
     daemon_threads = True
 
     def __init__(
-        self, socket_path: str, agent_uids: frozenset[int], admin_uids: frozenset[int] | None = None
+        self,
+        socket_path: str,
+        agent_uids: frozenset[int],
+        admin_uids: frozenset[int] | None = None,
+        asset_root: Path | None = None,
     ) -> None:
         # Strictly path-scoped peers: agent_uids reach the agent MCP routes,
         # admin_uids reach the operator delegation routes, nothing overlaps by
@@ -446,6 +565,10 @@ class ToolsServer(ThreadingHTTPServer):
         # developer's uid).
         self.agent_uids = agent_uids
         self.admin_uids = admin_uids if admin_uids is not None else admin_peer_uids()
+        self.asset_store = tool_assets.ToolAssetStore(
+            asset_root or Path(socket_path).parent / "assets", clean_start=True
+        )
+        self._next_asset_cleanup = time.monotonic() + ASSET_CLEANUP_INTERVAL_SECONDS
         # typeshed models HTTPServer addresses as (host, port) tuples only;
         # with address_family = AF_UNIX the address is the socket path.
         super().__init__(socket_path, ToolsRequestHandler)  # type: ignore[arg-type]
@@ -458,8 +581,20 @@ class ToolsServer(ThreadingHTTPServer):
         # check above is the authentication.
         path.chmod(0o666)
 
+    def service_actions(self) -> None:
+        """Delete expired staged media hourly even when no tool call touches it."""
+        now = time.monotonic()
+        if now < self._next_asset_cleanup:
+            return
+        self._next_asset_cleanup = now + ASSET_CLEANUP_INTERVAL_SECONDS
+        self.asset_store.cleanup_expired()
+
 
 def serve_forever(socket_path: str = SOCKET_PATH) -> None:
     """Bind the tools socket and serve it in the foreground (the dedicated
     trustyclaw-tools service entry point)."""
-    ToolsServer(socket_path, agent_peer_uids()).serve_forever()
+    ToolsServer(
+        socket_path,
+        agent_peer_uids(),
+        asset_root=tool_assets.DEFAULT_ASSET_ROOT,
+    ).serve_forever()

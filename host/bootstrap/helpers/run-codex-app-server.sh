@@ -8,7 +8,22 @@ cd /mnt/trustyclaw-agent/agent-home
 # lifecycle coupling the cgroup move removed: when the admin API service
 # stops, restarts, or crashes, systemd stops the scope too, so no orphaned
 # runtime keeps mutating agent-home after its task was recovered as failed.
+#
+# A leading "--thread-scope <thread_id>" pair names the scope
+# trustyclaw-agent-thread-<thread_id>.scope. The agent-app service derives app
+# ownership from the host-reserved app prefix in that kernel-owned scope name,
+# so the name comes from this root helper and is validated as a host thread id.
+unit_args=()
+if [ "${1:-}" = "--thread-scope" ]; then
+  if ! [[ "${2:-}" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+    echo "invalid --thread-scope thread id: ${2:-<missing>}" >&2
+    exit 64
+  fi
+  unit_args=(--unit "trustyclaw-agent-thread-$2")
+  shift 2
+fi
 exec systemd-run --quiet --collect --scope --slice=trustyclaw_agent.slice \
+  "${unit_args[@]}" \
   --property=BindsTo=trustyclaw-admin-api.service \
   /usr/sbin/runuser -u trustyclaw-agent -- env \
   HOME=/mnt/trustyclaw-agent/agent-home \

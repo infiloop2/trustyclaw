@@ -91,8 +91,16 @@ class ClaudeCodeSession:
     are persisted on disk.
     """
 
-    def __init__(self, command: list[str] | None = None) -> None:
+    def __init__(self, command: list[str] | None = None, thread_id: str | None = None) -> None:
         self._command = command or DEFAULT_COMMAND
+        self._thread_id = thread_id
+        # The orchestrator sets this only for an app-created task. Claude's
+        # append-system-prompt keeps it distinct from the app's current user
+        # message and alongside the host's immutable CLAUDE.md instructions.
+        self.app_instructions: str | None = None
+        # Task turns run inside a systemd scope named after the host thread.
+        # Keep the id separate from the command because the launcher's required
+        # web-search decision must remain its first argument.
         self._proc: subprocess.Popen[str] | None = None
         self._messages: queue.Queue[dict[str, Any]] = queue.Queue()
         self._stderr_tail: deque[str] = deque(maxlen=20)
@@ -134,8 +142,21 @@ class ClaudeCodeSession:
         on_message: Callable[[str], None],
         steer_delivered: Callable[[str], None],
     ) -> tuple[str, str]:
+        # State the operator's web-search decision to the launcher as its
+        # required first argument; the launcher translates it into the WebSearch
+        # deny (see host/bootstrap/helpers/run-claude-code.sh). The orchestrator
+        # is the only side with a database role, so it reads the toggle here; the
+        # proxy enforces the same toggle independently.
+        from host.runtime import state
+
+        enabled = state.read_claude_web_search()
         argv = [
             *self._command,
+            f"web-search={'on' if enabled else 'off'}",
+        ]
+        if self._thread_id is not None:
+            argv.extend(["--thread-scope", self._thread_id])
+        argv.extend([
             "-p",
             "--input-format",
             "stream-json",
@@ -158,7 +179,9 @@ class ClaudeCodeSession:
             "--strict-mcp-config",
             "--mcp-config",
             TOOLS_MCP_CONFIG,
-        ]
+        ])
+        if self.app_instructions:
+            argv.extend(["--append-system-prompt", self.app_instructions])
         if session_id:
             argv.extend(["--resume", session_id])
         self._messages = queue.Queue()
@@ -247,8 +270,10 @@ class ClaudeLoginProcess:
         self._proc: subprocess.Popen[str] | None = None
 
     def start(self) -> ClaudeLogin:
+        # Login runs no model turn; pass the launcher's required decision as
+        # off (immaterial here, keeps the deny-by-default posture).
         self._proc = subprocess.Popen(
-            [*self._command, "auth", "login", "--claudeai"],
+            [*self._command, "web-search=off", "auth", "login", "--claudeai"],
             cwd=_subprocess_cwd(self._command),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -320,7 +345,9 @@ class ClaudeLoginProcess:
 def account_status() -> tuple[str, str | None, dict[str, Any] | None]:
     try:
         proc = subprocess.run(
-            [*DEFAULT_COMMAND, "auth", "status", "--json"],
+            # No model turn here; the launcher requires the decision, and off
+            # keeps the deny-by-default posture (immaterial for a status check).
+            [*DEFAULT_COMMAND, "web-search=off", "auth", "status", "--json"],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -353,7 +380,9 @@ def read_claude_usage(command: list[str] | None = None) -> dict[str, Any]:
     usage_command = command or DEFAULT_COMMAND
     try:
         proc = subprocess.run(
-            [*usage_command, "-p", "/usage", "--output-format", "json"],
+            # /usage runs no agent turn; pass the launcher's required decision
+            # as off (immaterial here, keeps the deny-by-default posture).
+            [*usage_command, "web-search=off", "-p", "/usage", "--output-format", "json"],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

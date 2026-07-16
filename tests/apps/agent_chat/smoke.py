@@ -82,12 +82,12 @@ def desktop_smoke(page: Any) -> None:
     expect(frame.locator("#threads")).to_contain_text("website-redesign")
 
     frame.locator("#threads .thread-item", has_text="website-redesign").click()
-    expect(frame.locator("#thread-detail")).to_contain_text("website-redesign")
+    expect(frame.locator(".thread-title")).to_have_text("website-redesign")
     expect(frame.locator("#thread-detail")).to_contain_text("denied by policy")
-    expect(frame.locator("#thread-detail .task-card").nth(0)).to_contain_text("Audit the marketing site")
+    expect(frame.locator("#thread-detail .turn").nth(0)).to_contain_text("Audit the marketing site")
 
-    frame.get_by_role("button", name="+ New thread").click()
-    expect(frame.locator("#thread-detail .thread-title")).to_have_text("New thread")
+    frame.get_by_role("button", name="New thread").click()
+    expect(frame.locator(".thread-title")).to_have_text("New thread")
     frame.locator("#new-task").fill("agent app smoke task")
     frame.locator("#new-task-thread").fill("agent-app-smoke")
     frame.locator("#new-task-runtime").select_option("codex")
@@ -96,16 +96,17 @@ def desktop_smoke(page: Any) -> None:
     expect(frame.locator("#new-task-effort option")).to_have_count(2)
     expect(frame.locator("#new-task-effort")).not_to_contain_text("Ultra")
     frame.locator("#new-task-effort").select_option("max")
-    frame.get_by_role("button", name="Create task").click()
-    expect(frame.locator("#thread-detail")).to_contain_text("agent-app-smoke")
+    frame.get_by_role("button", name="Send").click()
+    expect(frame.locator(".thread-title")).to_have_text("agent-app-smoke")
     expect(frame.locator("#thread-detail")).to_contain_text("agent app smoke task")
     expect(frame.locator("#thread-detail")).to_contain_text("task_")
     frame.locator("#new-task").fill("agent app smoke follow up")
-    frame.get_by_role("button", name="Create task").click()
+    frame.get_by_role("button", name="Send").click()
     expect(frame.locator("#thread-detail")).to_contain_text("agent app smoke follow up")
     frame.get_by_role("button", name="Archive").click()
-    expect(frame.locator("#thread-detail .thread-title")).to_have_text("New thread")
+    expect(frame.locator(".thread-title")).to_have_text("New thread")
     expect(frame.locator("#threads")).not_to_contain_text("agent-app-smoke")
+    _assert_single_scroll(page, frame, "agent_chat app (desktop)")
 
 
 def mobile_smoke(page: Any) -> None:
@@ -118,10 +119,17 @@ def mobile_smoke(page: Any) -> None:
     expect(page.locator("#nav-backdrop")).to_be_hidden()
     expect(page.locator("#panel-app-agent_chat")).to_be_visible()
     frame = page.frame_locator('iframe[title="Agent Chat"]')
+    # The thread list sits behind a drawer on narrow viewports; while closed
+    # it is off-canvas and must stay out of the tab order (inert).
+    expect(frame.locator(".thread-pane")).to_have_js_property("inert", True)
+    frame.get_by_role("button", name="Show thread list").click()
+    expect(frame.locator(".thread-pane")).to_have_js_property("inert", False)
     expect(frame.locator("#threads")).to_contain_text("website-redesign")
     frame.locator("#threads .thread-item", has_text="website-redesign").click()
+    expect(frame.locator(".thread-pane")).to_have_js_property("inert", True)
     expect(frame.locator("#thread-detail")).to_contain_text("denied by policy")
     _assert_frame_no_horizontal_overflow(frame, "agent_chat app")
+    _assert_single_scroll(page, frame, "agent_chat app (mobile)")
 
 
 def _list_threads(host_api: HostApi) -> list[dict[str, Any]]:
@@ -173,6 +181,22 @@ def _require_agent_chat_thread(
     thread = AGENT_CHAT_THREADS.get(thread_id)
     if thread is None or (thread["archived"] and not include_archived):
         raise api_error(HTTPStatus.NOT_FOUND, "thread not found")
+
+
+def _assert_single_scroll(page: Any, frame: Any, label: str) -> None:
+    """With an app tab open, neither the outer page nor the iframe document
+    may scroll vertically — only the app's internal panes do. This guards the
+    nested page + iframe double-scrollbar regression."""
+    outer = page.evaluate(
+        "() => document.documentElement.scrollHeight - document.documentElement.clientHeight"
+    )
+    if outer > 1:
+        raise AssertionError(f"{label}: outer page scrolls vertically by {outer}px with an app tab open")
+    inner = frame.locator("html").evaluate(
+        "() => document.documentElement.scrollHeight - document.documentElement.clientHeight"
+    )
+    if inner > 1:
+        raise AssertionError(f"{label}: app iframe document scrolls vertically by {inner}px")
 
 
 def _assert_frame_no_horizontal_overflow(frame: Any, label: str) -> None:

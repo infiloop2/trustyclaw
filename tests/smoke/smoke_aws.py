@@ -10,6 +10,9 @@ login-dependent runtime checks live in ``tests/stage/stage_aws.py``.
   - the bootstrap on real Ubuntu 22.04 (apt, npm, user/permission setup,
     nftables, systemd, the proxy CA)
   - the admin API answering over the SSH tunnel (health, network policy)
+  - the real admin UI in headless Chrome: login, app navigation, Mission
+    Pursuit popovers and settings, first-message task creation, and the clear
+    pre-provider-login failure shown back in the workspace
   - admin API contract edge cases over the tunnel: auth rejection, the task
     lifecycle and its 4xx responses,
     policy validation (including managed OpenAI and Claude provider schema),
@@ -95,6 +98,8 @@ sys.path.insert(0, str(REPO_ROOT))
 from host.config import load_input_config
 from host.constants import ADMIN_API_PORT as ADMIN_PORT, PROXY_PORT
 from host.runtime.state import PRUNE_EVERY
+from host.runtime.tools_host import BUNDLED_TOOLS
+from tests.smoke.cdp_browser import ChromeBrowser
 
 # Region the smoke deploys into. Keep in sync with the region scoped in
 # tests/smoke/iam_policy_smoke.json — change both together.
@@ -123,6 +128,94 @@ SMOKE_MANAGED_DOMAINS = (
     "github-cloud.githubusercontent.com",
     "release-assets.githubusercontent.com",
 )
+SMOKE_TOOL_CALLS: dict[str, tuple[tuple[str, dict], ...]] = {
+    "brave_search": (("search_web", {"query": "TrustyClaw"}),),
+    "gmail": (
+        ("search_messages", {}),
+        ("read_message", {"message_id": "smoke-message"}),
+        ("read_thread", {"thread_id": "smoke-thread"}),
+        ("list_labels", {}),
+        ("list_drafts", {}),
+        (
+            "send_email",
+            {
+                "to": "stage@example.com",
+                "subject": "TrustyClaw smoke",
+                "blocks": [{"type": "paragraph", "text": "Smoke test; never sent."}],
+            },
+        ),
+        ("message_action", {"action": "mark_read", "message_ids": ["smoke-message"]}),
+        ("label_action", {"action": "create", "name": "trustyclaw-smoke"}),
+        (
+            "draft_action",
+            {
+                "action": "create",
+                "to": "stage@example.com",
+                "subject": "TrustyClaw smoke draft",
+                "blocks": [{"type": "paragraph", "text": "Smoke test draft."}],
+            },
+        ),
+    ),
+    "google_calendar": (
+        ("read_events", {}),
+        (
+            "event_change",
+            {
+                "operation": "create",
+                "summary": "TrustyClaw smoke",
+                "start_time": "2099-01-01T00:00:00+00:00",
+                "end_time": "2099-01-01T01:00:00+00:00",
+            },
+        ),
+    ),
+    "ibkr": (
+        ("get_positions", {}),
+        ("get_account_summary", {}),
+        ("get_trades", {"days": "1"}),
+    ),
+    "instagram": (
+        ("get_profile", {}),
+        ("get_recent_media", {"limit": "1"}),
+        ("get_publishing_limit", {}),
+        ("post_reel", {"video_asset_id": "$INSTAGRAM_VIDEO"}),
+    ),
+    "instagram_discovery": (
+        ("search_reels", {"query": "TrustyClaw", "limit": "1"}),
+        ("get_trending_reels", {"limit": "1"}),
+        ("search_hashtag", {"hashtag": "ai", "limit": "1"}),
+        ("get_reels_by_audio", {"audio_id": "1", "limit": "1"}),
+        ("get_reel_details", {"url": "https://www.instagram.com/reel/ABC123/"}),
+    ),
+    "linkedin": (
+        ("get_profile", {}),
+        ("create_post", {"text": "TrustyClaw smoke; never published."}),
+    ),
+    "linkedin_discovery": (
+        ("search_posts", {"query": "TrustyClaw", "limit": "1"}),
+    ),
+    # The remaining Polymarket actions need a live market/token from this
+    # run's listing. check_tools_surface derives those after these three calls.
+    "polymarket": (
+        ("list_markets", {"limit": "10"}),
+        ("list_events", {"limit": "1"}),
+        ("search", {"query": "bitcoin", "limit_per_type": "1"}),
+    ),
+    "runway": (
+        ("generate_video", {"prompt": "TrustyClaw smoke", "image_asset_id": "$RUNWAY_IMAGE"}),
+        ("edit_video", {"prompt": "TrustyClaw smoke", "video_asset_id": "$RUNWAY_VIDEO"}),
+        ("generate_image", {"prompt": "TrustyClaw smoke"}),
+        ("generate_speech", {"text": "TrustyClaw smoke"}),
+        ("get_task", {"task_id": "trustyclaw-smoke-missing"}),
+    ),
+    "twitter": (
+        ("search_tweets", {"query": "TrustyClaw", "max_results": "10"}),
+        ("read_tweet", {"tweet_id": "1"}),
+        ("user_tweets", {"username": "trustyclaw", "max_results": "5"}),
+        ("get_trends", {"max_trends": "1"}),
+        ("get_personalized_trends", {}),
+        ("post_tweet", {"text": "TrustyClaw smoke; never published."}),
+    ),
+}
 
 
 def managed_integrations(providers: dict[str, bool]) -> dict:
@@ -155,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
         smoke.check_ui_page()
         smoke.check_admin_auth()
         smoke.check_initial_disabled_provider_deploy()
+        smoke.check_mission_pursuit_no_login_ui()
         smoke.check_network_policy()
         smoke.check_policy_validation_and_concurrency()
         smoke.check_task_lifecycle()
@@ -829,7 +923,10 @@ class AwsSmoke:
             'data-action="reset-linked-account"',
             'Disconnect</button>',
             "usageRing",
-            'id="managed-integrations"',
+            'id="ai-inference-integrations"',
+            'id="tools"',
+            "AI Inference",
+            "Manual",
             'id="github-repos"',
             'id="domain-rules"',
             'id="github-repo"',
@@ -876,9 +973,9 @@ class AwsSmoke:
             "recheckGithubAudit",
             "audit-banner",
             "/v1/network-tools/github-audit",
-            "Signs Codex in through OAuth so it can use your OpenAI subscription",
-            "Signs Claude Code in through OAuth so it can use your Anthropic subscription",
-            "Web search is live, not cached",
+            "Connect your OpenAI subscription and let your agent use Codex for tasks and cached web search.",
+            "Connect your Anthropic subscription and let your agent use Claude Code for tasks. Web search is optional and off by default.",
+            "OpenAI's cached web search",
             "Reads can reach any public repository",
             "api.openai.com",
             "auth.openai.com",
@@ -943,6 +1040,171 @@ class AwsSmoke:
             if removed in page:
                 raise AssertionError(f"UI page still contains removed finished-task path {removed!r}")
         self._ok("static UI page served unauthenticated; thread history and network policy controls present; API routes still require auth")
+
+    def check_mission_pursuit_no_login_ui(self) -> None:
+        """Drive the fresh workspace through the real admin shell and app UI.
+
+        A fresh smoke deliberately has no provider login. That still proves
+        the complete operator path through task creation and its clear
+        fail-fast result, without granting the smoke a provider account.
+        """
+        self._step("Mission Pursuit browser flow before provider login")
+        for runtime in SMOKE_RUNTIMES:
+            status = self._wait_for_runtime_status({"awaiting_login"}, runtime=runtime, timeout=180)
+            if status != "awaiting_login":
+                raise AssertionError(f"fresh {runtime} runtime settled at {status}, expected awaiting_login")
+
+        password = json.dumps(self.result["admin_password"])
+        message = "Build a practical launch plan for a neighborhood repair cafe."
+        with ChromeBrowser(f"http://127.0.0.1:{ADMIN_PORT}/") as browser:
+            browser.wait_for(
+                "document.getElementById('login') && !document.getElementById('login').hidden",
+                description="the admin login screen",
+            )
+            browser.evaluate(
+                f"document.getElementById('password').value={password};"
+                "document.querySelector('[data-action=login]').click(); true"
+            )
+            browser.wait_for(
+                "document.getElementById('app') && !document.getElementById('app').hidden",
+                description="admin login to succeed",
+            )
+            browser.wait_for(
+                "document.getElementById('app-tabs').textContent.includes('Mission Pursuit')",
+                description="Mission Pursuit app discovery",
+            )
+            browser.evaluate("document.getElementById('tab-app-mission_pursuit').click(); true")
+            app = browser.target("/v1/apps/mission_pursuit/ui/index.html")
+            app.wait_for(
+                "document.getElementById('hero') && !document.getElementById('hero').hidden",
+                description="the fresh Mission Pursuit workspace",
+            )
+            if app.evaluate("document.querySelectorAll('#info-close').length") != 0:
+                raise AssertionError("How it works unexpectedly has a close button")
+
+            app.evaluate("document.getElementById('info-toggle').click(); true")
+            app.wait_for(
+                "!document.getElementById('info-popover').hidden",
+                description="How it works popover to open",
+            )
+            info_text = app.evaluate("document.getElementById('info-popover').innerText")
+            for expected in (
+                "Set the mission together",
+                "Work through artifacts",
+                "Keep moving while you are away",
+            ):
+                if expected not in str(info_text):
+                    raise AssertionError(f"How it works is missing {expected!r}: {info_text!r}")
+            app.evaluate("document.body.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true})); true")
+            app.wait_for(
+                "document.getElementById('info-popover').hidden",
+                description="How it works to dismiss outside",
+            )
+
+            bounds = (
+                "JSON.stringify((() => { const r=document.getElementById('hero').getBoundingClientRect();"
+                "return [r.x,r.y,r.width,r.height]; })())"
+            )
+            before = app.evaluate(bounds)
+            app.evaluate("document.getElementById('agent-settings-toggle').click(); true")
+            app.wait_for(
+                "!document.getElementById('agent-settings-popover').hidden",
+                description="agent settings to open",
+            )
+            after = app.evaluate(bounds)
+            if before != after:
+                raise AssertionError(f"opening agent settings shifted the workspace: {before} -> {after}")
+            app.evaluate(
+                "document.getElementById('agent-runtime').value='claude_code';"
+                "document.getElementById('agent-runtime')"
+                ".dispatchEvent(new Event('change',{bubbles:true})); true"
+            )
+            app.wait_for(
+                "document.getElementById('agent-runtime').value === 'claude_code' && "
+                "!document.getElementById('agent-settings-apply').disabled",
+                description="Claude Code draft settings",
+            )
+            app.evaluate("document.getElementById('agent-settings-apply').click(); true")
+            app.wait_for(
+                "document.getElementById('agent-settings-popover').hidden && "
+                "document.getElementById('agent-settings-toggle').textContent.includes('Claude Code')",
+                description="Claude Code draft settings to apply",
+            )
+
+            app.evaluate(
+                f"document.getElementById('hero-input').value={json.dumps(message)};"
+                "document.getElementById('hero-send').click(); true"
+            )
+            app.wait_for(
+                "!document.getElementById('workspace').hidden && "
+                f"document.getElementById('feed').innerText.includes({json.dumps(message)})",
+                description="the first mission message to appear",
+            )
+            app.wait_for(
+                "document.getElementById('feed').innerText.includes('Agent turn failed:') && "
+                "document.getElementById('feed').innerText.includes('awaiting_login') && "
+                "document.getElementById('busy-bar').hidden",
+                timeout=120,
+                description="the no-login turn to fail clearly",
+            )
+            headings = app.evaluate(
+                "[...document.querySelectorAll('.conversation-head h2, .rail-card .rail-head h2')]"
+                ".map(element => element.textContent.trim())"
+            )
+            expected_headings = ["Conversation", "Artifacts", "Schedules", "Memory", "Tools"]
+            if headings != expected_headings:
+                raise AssertionError(
+                    f"Mission Pursuit workspace headings are {headings!r}, expected {expected_headings!r}"
+                )
+            empty_surfaces = app.evaluate(
+                "[document.getElementById('artifacts').textContent,"
+                " document.getElementById('memories').textContent,"
+                " document.getElementById('tools').textContent]"
+            )
+            for actual, expected in zip(
+                empty_surfaces,
+                ("No artifacts yet", "Nothing remembered yet", "No tools recorded"),
+                strict=True,
+            ):
+                if expected not in str(actual):
+                    raise AssertionError(f"fresh Mission Pursuit surface is missing {expected!r}: {actual!r}")
+            if not app.evaluate(
+                "Boolean(document.getElementById('hero-send').querySelector('svg') && "
+                "document.getElementById('chat-send').querySelector('svg'))"
+            ):
+                raise AssertionError("Mission Pursuit send controls are not integrated icon buttons")
+
+            app.evaluate("document.getElementById('agent-settings-toggle').click(); true")
+            app.wait_for(
+                "!document.getElementById('agent-settings-popover').hidden",
+                description="persisted agent settings to open",
+            )
+            app.evaluate(
+                "document.getElementById('agent-runtime').value='codex';"
+                "document.getElementById('agent-runtime')"
+                ".dispatchEvent(new Event('change',{bubbles:true})); true"
+            )
+            app.wait_for(
+                "!document.getElementById('agent-settings-warning').hidden && "
+                "!document.getElementById('agent-settings-apply').disabled",
+                description="short-term-memory warning for a runtime switch",
+            )
+            app.evaluate("document.getElementById('agent-settings-apply').click(); true")
+            app.wait_for(
+                "document.getElementById('agent-settings-popover').hidden && "
+                "document.getElementById('agent-settings-toggle').textContent.includes('Codex') && "
+                "document.getElementById('feed').innerText.includes('Switched to Codex')",
+                description="the persisted runtime switch",
+            )
+
+        snapshot = self._app_api("GET", "/v1/apps/mission_pursuit/api/workspace")
+        if snapshot.get("workspace", {}).get("agent_runtime") != "codex":
+            raise AssertionError(f"Mission Pursuit did not persist the UI runtime switch: {snapshot}")
+        if not any(item.get("content") == message for item in snapshot.get("messages", [])):
+            raise AssertionError(f"Mission Pursuit did not persist the browser message: {snapshot}")
+        if snapshot.get("busy"):
+            raise AssertionError(f"Mission Pursuit left the failed no-login turn busy: {snapshot['busy']}")
+        self._ok("real browser covered login, app navigation, popovers, settings, first turn, and fail-fast UI")
 
     @staticmethod
     def _assert_admin_ui_security_headers(headers) -> None:
@@ -1879,15 +2141,18 @@ class AwsSmoke:
         )
 
     def check_tools_surface(self) -> None:
-        """Bundled tools without third-party credentials: manifest listing,
-        enablement (not gated on config), the agent-facing MCP shim over the tools
-        socket (including its peer-credential guard), the tools-service egress
-        for a tool API call (and that the admin uid has none), and the OAuth
-        connect start URL."""
+        """Every bundled action on a fresh host with no tool configuration.
+
+        Credentialed actions and OAuth starts must fail closed; all six public
+        Polymarket reads must execute. The same pass covers MCP discovery,
+        local image/video upload, exact audit arguments, approvals, peer
+        credentials, and the tools-service-only egress boundary.
+        """
         self._step("bundled tools: listing, enablement, agent shim, approvals surface")
         listing = self._api("GET", "/v1/tools")
         tool_ids = sorted(entry["tool_id"] for entry in listing["tools"])
-        if tool_ids != ["brave_search", "gmail", "google_calendar"]:
+        expected_tool_ids = sorted(BUNDLED_TOOLS)
+        if tool_ids != expected_tool_ids:
             raise AssertionError(f"unexpected bundled tools: {tool_ids}")
         gmail = next(entry for entry in listing["tools"] if entry["tool_id"] == "gmail")
         if gmail["enabled"] or gmail["connection_status"] != {"connected": False}:
@@ -1897,8 +2162,6 @@ class AwsSmoke:
         enabled = self._api("POST", "/v1/tools/brave_search/enable", {})
         if enabled != {"tool_id": "brave_search", "enabled": True}:
             raise AssertionError(f"brave_search enable without config should succeed: {enabled}")
-        # Set an (invalid) key so the live call below exercises the tools-service egress.
-        self._api("PUT", "/v1/tools/brave_search/config", {"key": "BRAVE_SEARCH_API_KEY", "value": "smoke-invalid-key"})
 
         # The agent-facing path end to end: the MCP shim runs as
         # trustyclaw-agent and reaches the tools socket by peer credentials.
@@ -1906,6 +2169,35 @@ class AwsSmoke:
             "sudo -u trustyclaw-agent env PYTHONPATH=/opt/trustyclaw-host "
             "python3 -m host.runtime.tools_mcp_shim"
         )
+        next_request_id = 10
+
+        def shim_tool_call(name: str, arguments: dict) -> tuple[dict, object]:
+            nonlocal next_request_id
+            request = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": next_request_id,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                }
+            )
+            next_request_id += 1
+            response_text = self._ssh_code(
+                f"printf '%s\\n' {shlex.quote(request)} | {shim_command}"
+            )
+            rpc = json.loads(response_text)
+            result = rpc.get("result")
+            if not isinstance(result, dict):
+                raise AssertionError(f"{name} returned an invalid MCP response: {rpc}")
+            content = result.get("content")
+            text = content[0].get("text", "") if isinstance(content, list) and content and isinstance(content[0], dict) else ""
+            parsed: object = None
+            if not result.get("isError"):
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise AssertionError(f"{name} returned non-JSON success text: {text!r}") from exc
+            return result, parsed
         list_request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         shim_listing = self._ssh_code(f"printf '%s\\n' {shlex.quote(list_request)} | {shim_command}")
         print(f"  shim tools/list -> {shim_listing[:200]!r}", flush=True)
@@ -1958,22 +2250,6 @@ class AwsSmoke:
         if "trustyclaw-tools" not in socket_owner:
             raise AssertionError(f"tools socket must be owned by trustyclaw-tools: {socket_owner!r}")
 
-        # A live tool call: the invalid key must be rejected by Brave (or fail on
-        # the network), proving the tool-call path and the tools-service egress
-        # rules without real credentials.
-        call_request = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {"name": "brave_search_search_web", "arguments": {"query": "trustyclaw"}},
-            }
-        )
-        call_response = self._ssh_code(f"printf '%s\\n' {shlex.quote(call_request)} | {shim_command}")
-        print(f"  shim tools/call -> {call_response[:200]!r}", flush=True)
-        if '"isError": true' not in call_response or "Brave Search API" not in call_response:
-            raise AssertionError(f"invalid-key Brave call did not fail cleanly: {call_response!r}")
-
         # Peers are scoped strictly by path: other service users are rejected
         # outright, and even the admin uid is rejected on the agent MCP routes
         # (it holds only the /operator/... delegation routes).
@@ -1992,29 +2268,208 @@ class AwsSmoke:
                     f"tools socket must reject {probe_user} on agent routes, got {peer_probe!r}"
                 )
 
-        # OAuth connect start builds the Google URL from deployment config
-        # without any third-party call; approvals start empty.
-        self._api("PUT", "/v1/tools/gmail/config", {"key": "GOOGLE_OAUTH_CLIENT_ID", "value": "smoke-client"})
-        self._api("PUT", "/v1/tools/gmail/config", {"key": "GOOGLE_OAUTH_CLIENT_SECRET", "value": "smoke-secret"})
-        self._api("POST", "/v1/tools/gmail/enable", {})
-        connect = self._api(
-            "POST", "/v1/tools/gmail/oauth_connect/start",
-            {"redirect_uri": f"http://127.0.0.1:{ADMIN_PORT}/oauth/callback"},
-        )
-        if "accounts.google.com" not in connect["authorization_url"] or "smoke-client" not in connect["authorization_url"]:
-            raise AssertionError(f"gmail oauth_connect/start returned unexpected URL: {connect}")
+        # The fresh host starts with no approvals or tool config whatsoever.
         approvals = self._api("GET", "/v1/tools/gmail/approvals")
         if approvals["approvals"]:
             raise AssertionError(f"expected no approvals on a fresh host: {approvals}")
         status, body = self._api_status("POST", "/v1/tools/gmail/approvals/approval_1/approve", {})
         if status != 404:
             raise AssertionError(f"deciding a missing approval must 404, got {status} {body}")
-        for tool_id in ("brave_search", "gmail"):
+
+        # Enable every package without setting even a dummy value. OAuth starts
+        # must fail locally on the absent client config; they never contact the
+        # provider or create a connection.
+        for tool_id in BUNDLED_TOOLS:
+            self._api("POST", f"/v1/tools/{tool_id}/enable", {})
+        empty_config_listing = self._api("GET", "/v1/tools")["tools"]
+        for entry in empty_config_listing:
+            configured = [item["key"] for item in entry.get("config", []) if item.get("set")]
+            if configured:
+                raise AssertionError(
+                    f"fresh smoke must not configure {entry['tool_id']}, found {configured}"
+                )
+            if entry.get("connection") == "oauth":
+                if (entry.get("connection_status") or {}).get("connected") is True:
+                    raise AssertionError(f"fresh smoke unexpectedly connected {entry['tool_id']}: {entry}")
+                status, body = self._api_status(
+                    "POST",
+                    f"/v1/tools/{entry['tool_id']}/oauth_connect/start",
+                    {"redirect_uri": f"http://127.0.0.1:{ADMIN_PORT}/oauth/callback"},
+                )
+                if status != 400 or "not set" not in str(body).lower():
+                    raise AssertionError(
+                        f"{entry['tool_id']} OAuth start without config must fail locally: {status} {body}"
+                    )
+
+        all_listed = self._ssh_code(f"printf '%s\\n' {shlex.quote(list_request)} | {shim_command}")
+        all_tool_names = {
+            entry["name"] for entry in json.loads(all_listed)["result"]["tools"]
+        }
+        expected_actions = {
+            f"{tool_id}_{action.id}"
+            for tool_id, tool in BUNDLED_TOOLS.items()
+            for action in tool.manifest.actions
+        }
+        missing_actions = expected_actions - all_tool_names
+        if missing_actions:
+            raise AssertionError(f"MCP shim omitted bundled actions: {sorted(missing_actions)}")
+        if not {"stage_image", "stage_video"}.issubset(all_tool_names):
+            raise AssertionError(f"MCP shim omitted media staging actions: {sorted(all_tool_names)}")
+
+        # Exercise both local media uploads without provider config. The files
+        # live in the agent workspace, are opened by the agent-side shim, and
+        # are removed immediately after the private tool-scoped copies exist.
+        media_root = "/mnt/trustyclaw-agent/agent-home"
+        image_path = f"{media_root}/trustyclaw-smoke.png"
+        video_path = f"{media_root}/trustyclaw-smoke.mp4"
+        create_media = (
+            "umask 077; "
+            f"dd if=/dev/zero of={shlex.quote(image_path)} bs=512 count=1 status=none; "
+            f"dd if=/dev/zero of={shlex.quote(video_path)} bs=512 count=1 status=none"
+        )
+        self._ssh_code(f"sudo -u trustyclaw-agent sh -c {shlex.quote(create_media)}")
+        try:
+            _, image_stage = shim_tool_call(
+                "stage_image", {"path": image_path, "for_tool": "runway"}
+            )
+            _, runway_video_stage = shim_tool_call(
+                "stage_video", {"path": video_path, "for_tool": "runway"}
+            )
+            _, instagram_video_stage = shim_tool_call(
+                "stage_video", {"path": video_path, "for_tool": "instagram"}
+            )
+        finally:
+            self._ssh_code(
+                "sudo -u trustyclaw-agent rm -f "
+                f"{shlex.quote(image_path)} {shlex.quote(video_path)}"
+            )
+        if (
+            not isinstance(image_stage, dict)
+            or not isinstance(runway_video_stage, dict)
+            or not isinstance(instagram_video_stage, dict)
+        ):
+            raise AssertionError("local media staging returned an invalid result")
+        asset_ids = {
+            "$RUNWAY_IMAGE": image_stage.get("image_asset_id"),
+            "$RUNWAY_VIDEO": runway_video_stage.get("video_asset_id"),
+            "$INSTAGRAM_VIDEO": instagram_video_stage.get("video_asset_id"),
+        }
+        if not all(isinstance(value, str) and value for value in asset_ids.values()):
+            raise AssertionError(f"local media staging returned missing asset ids: {asset_ids}")
+
+        spool = "/mnt/trustyclaw-admin/tools-state/assets"
+        spool_mode = self._ssh_code(f"sudo stat -c '%U:%G:%a' {spool}")
+        if spool_mode.strip() != "trustyclaw-tools:trustyclaw-tools:700":
+            raise AssertionError(f"tool asset spool has unsafe ownership or mode: {spool_mode!r}")
+        for label, asset_id in asset_ids.items():
+            if not isinstance(asset_id, str):
+                raise AssertionError(f"local media staging returned invalid {label}: {asset_id!r}")
+            asset_stat = self._ssh_code(
+                f"sudo stat -c '%U:%G:%a:%s' {shlex.quote(f'{spool}/{asset_id}')}"
+            )
+            if asset_stat.strip() != "trustyclaw-tools:trustyclaw-tools:600:512":
+                raise AssertionError(
+                    f"staged media is not private on the admin volume: {asset_stat!r}"
+                )
+
+        # Invoke every declared action. Credentialed packages must fail closed
+        # on absent config/connection, while the public Polymarket package must
+        # execute. Static Polymarket listing supplies ids for its three
+        # dependent reads below.
+        triggered_actions: set[str] = set()
+        public_results: dict[str, dict] = {}
+        for tool_id, calls in SMOKE_TOOL_CALLS.items():
+            for action_id, arguments_template in calls:
+                arguments = {
+                    key: asset_ids.get(value, value) if isinstance(value, str) else value
+                    for key, value in arguments_template.items()
+                }
+                name = f"{tool_id}_{action_id}"
+                response, parsed = shim_tool_call(name, arguments)
+                if tool_id == "polymarket":
+                    if response.get("isError") or not isinstance(parsed, dict) or parsed.get("status") != "success_executed":
+                        raise AssertionError(f"credential-free {name} failed: {response} {parsed}")
+                    public_results[action_id] = parsed
+                else:
+                    content = response.get("content") or [{}]
+                    text = str(content[0].get("text", "")) if isinstance(content[0], dict) else ""
+                    if not response.get("isError") or not any(
+                        phrase in text.lower() for phrase in ("not set", "not connected", "reconnect")
+                    ):
+                        raise AssertionError(
+                            f"{name} without config/connection did not fail closed: {response}"
+                        )
+                triggered_actions.add(name)
+
+        markets = public_results.get("list_markets", {}).get("markets")
+        market = next(
+            (
+                item for item in markets if isinstance(item, dict)
+                and item.get("id") and item.get("clob_token_ids")
+            ),
+            None,
+        ) if isinstance(markets, list) else None
+        if not isinstance(market, dict):
+            raise AssertionError(f"Polymarket listing returned no usable active market: {markets}")
+        try:
+            token_ids = json.loads(str(market["clob_token_ids"]))
+        except (json.JSONDecodeError, KeyError) as exc:
+            raise AssertionError(f"Polymarket returned invalid token ids: {market}") from exc
+        token_id = next(
+            (value for value in token_ids if isinstance(value, str) and value.isdigit()),
+            None,
+        ) if isinstance(token_ids, list) else None
+        if token_id is None:
+            raise AssertionError(f"Polymarket returned no decimal outcome token id: {market}")
+        dependent_public_calls = (
+            ("get_market", {"market_id": market["id"]}),
+            ("get_order_book", {"token_id": token_id}),
+            ("price_history", {"token_id": token_id, "interval": "1d"}),
+        )
+        for action_id, arguments in dependent_public_calls:
+            name = f"polymarket_{action_id}"
+            response, parsed = shim_tool_call(name, arguments)
+            if response.get("isError") or not isinstance(parsed, dict) or parsed.get("status") != "success_executed":
+                raise AssertionError(f"credential-free {name} failed: {response} {parsed}")
+            triggered_actions.add(name)
+
+        if triggered_actions != expected_actions:
+            raise AssertionError(
+                "fresh smoke did not trigger every bundled action: "
+                f"missing={sorted(expected_actions - triggered_actions)}, "
+                f"extra={sorted(triggered_actions - expected_actions)}"
+            )
+
+        # Every action call, including local failures, is recorded with
+        # expandable exact arguments in the tool audit log.
+        events = self._api("GET", "/v1/tools/events?limit=100")["events"]
+        action_events = {
+            f"{event['tool_id']}_{event['action_id']}": event
+            for event in events
+            if f"{event['tool_id']}_{event['action_id']}" in expected_actions
+        }
+        if set(action_events) != expected_actions:
+            raise AssertionError(
+                f"tool audit log missed actions: {sorted(expected_actions - set(action_events))}"
+            )
+        if not all(event.get("has_arguments") is True for event in action_events.values()):
+            raise AssertionError("tool audit log did not mark every action's arguments as expandable")
+        brave_event = action_events["brave_search_search_web"]
+        brave_detail = self._api("GET", f"/v1/tools/events/{brave_event['seq']}")["event"]
+        if brave_detail.get("arguments") != {"query": "TrustyClaw"}:
+            raise AssertionError(f"tool audit detail lost exact arguments: {brave_detail}")
+
+        for tool_id in BUNDLED_TOOLS:
+            pending = self._api("GET", f"/v1/tools/{tool_id}/approvals")["approvals"]
+            if pending:
+                raise AssertionError(f"{tool_id} queued an approval without credentials: {pending}")
+
+        for tool_id in BUNDLED_TOOLS:
             self._api("POST", f"/v1/tools/{tool_id}/disable", {})
         self._ok(
-            "tools listed with manifests, enablement gated on config, MCP shim listed and "
-            "called tools as the agent user, non-agent peer rejected, connect URL built, "
-            "approval surface empty and guarded"
+            "every bundled action listed, triggered, and audited with no tool config; OAuth starts and "
+            "credentialed actions failed closed, all public Polymarket reads completed, local image/video "
+            "uploads worked, non-agent peers were rejected, and no approval was queued"
         )
 
     def check_both_runtimes_active(self) -> None:
@@ -2519,6 +2974,19 @@ class AwsSmoke:
             print(f"  (admin API unreachable: {reason}; reopening tunnel and retrying)", flush=True)
             self._reopen_tunnel()
             return attempt()
+
+    def _app_api(self, method: str, path: str, body: dict | None = None) -> dict:
+        """Call an app route through the same scoped bridge the UI uses."""
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{ADMIN_PORT}{path}", data=data, method=method
+        )
+        request.add_header("Authorization", f"Bearer {self.result['admin_password']}")
+        request.add_header("X-TrustyClaw-App-Bridge", "mission_pursuit")
+        if body is not None:
+            request.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read())
 
     def _api_status(
         self, method: str, path: str, body: dict | None = None, *,

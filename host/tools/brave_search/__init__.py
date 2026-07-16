@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
-import urllib.error
-import urllib.request
+import urllib.parse
 from typing import Any, cast
 
 from host.tools.json_types import JSONObject, JSONValue
@@ -19,6 +17,7 @@ from host.tools.manifest import (
 )
 from host.tools.results import ActionExecuted, ActionFailed, ActionResult, ApprovalResult
 from host.tools.host_api import ApprovalRecord, HostAPI
+from host.tools.shared.web import WebRequestError, json_request
 
 BRAVE_LLM_CONTEXT_ENDPOINT = "https://api.search.brave.com/res/v1/llm/context"
 DEFAULT_COUNT = 8
@@ -31,19 +30,23 @@ MAX_SEARCH_QUERY_CHARS = 400
 MANIFEST = ToolManifest(
     tool_id="brave_search",
     display_name="Brave Search",
-    description="Read-only web search grounding via the Brave Search API.",
+    description="Lets your agent search the public web with Brave Search.",
     connection="enable_only",
     data_summary=DataSummary(
         cards=(
             DataSummaryCard(
                 title="What leaves this host",
-                description="Only the search query (trimmed to length caps) and fixed result-size options. Nothing else on this host is sent.",
+                description=(
+                    "Only the search query (shortened to a maximum length), fixed result-size options, and the API key that "
+                    "authenticates the request. Nothing else on this host is sent."
+                ),
             ),
             DataSummaryCard(
                 title="Where it can go",
                 description=(
                     "Queries go only to Brave's Search API service, and results come back from Brave's own search index. "
-                    "Brave does not expose your queries anywhere else."
+                    "The query text is received and logged like any other request, so what the agent searches for is itself "
+                    "data sent to Brave, which does not expose it anywhere else."
                 ),
             ),
             DataSummaryCard(
@@ -75,7 +78,7 @@ MANIFEST = ToolManifest(
             ),
             input_schema={
                 "type": "object",
-                "properties": {"query": {"type": "string"}},
+                "properties": {"query": {"type": "string", "description": "Public-web search text; supports Brave operators such as site:, quotes, and exclusions."}},
                 "additionalProperties": False,
             },
             output_schema={
@@ -102,7 +105,7 @@ MANIFEST = ToolManifest(
     ),
     config=(ConfigRequirement(key="BRAVE_SEARCH_API_KEY", description="Brave Search API subscription key for the hosting deployment."),),
     protections=(
-        "Only the search query is sent to Brave. The API key stays in write-only host config and is never returned to the agent.",
+        "Only the search query and the API key that authenticates the request are sent to Brave. The API key stays in write-only host config and is never returned to the agent.",
         "The tool is read-only, and its requests do not require operator approval.",
     ),
     setup_steps=(
@@ -131,6 +134,26 @@ def _string_value(value: JSONValue | None) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _result_url(value: object) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > 2_048:
+        return ""
+    url = value.strip()
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None and not 1 <= port <= 65_535
+    ):
+        return ""
+    return url
+
+
 def _extract_search_query(tool_input: JSONObject) -> str:
     query = _string_value(tool_input.get("query"))
     if not query:
@@ -152,33 +175,22 @@ def _request_payload(tool_input: JSONObject) -> JSONObject:
 
 
 def _post_brave_context(api_key: str, payload: JSONObject) -> dict[str, Any]:
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    request = urllib.request.Request(
-        BRAVE_LLM_CONTEXT_ENDPOINT,
-        data=body,
-        headers={
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "X-Subscription-Token": api_key,
-        },
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            decoded = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        status_code = exc.code
-        message = f"Brave Search API returned HTTP {status_code}."
-        if status_code in {401, 403}:
+        return json_request(
+            "POST",
+            BRAVE_LLM_CONTEXT_ENDPOINT,
+            body=payload,
+            headers={"x-subscription-token": api_key},
+            failure_message="Brave Search API request failed.",
+            invalid_response_message="Brave Search API returned an invalid response.",
+        )
+    except WebRequestError as exc:
+        message = f"Brave Search API returned HTTP {exc.status}." if exc.status else str(exc)
+        if exc.status in {401, 403}:
             message = "Brave Search API rejected the configured API key."
-        elif status_code == 429:
+        elif exc.status == 429:
             message = "Brave Search API rate limit was reached."
         raise RuntimeError(message) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError("Brave Search API request failed.") from exc
-    if not isinstance(decoded, dict):
-        raise RuntimeError("Brave Search API returned an invalid response.")
-    return decoded
 
 
 def _string_list(value: Any, *, max_items: int = 4) -> list[JSONValue]:
@@ -202,7 +214,7 @@ def _grounding_results(raw_response: dict[str, Any]) -> list[JSONObject]:
     for item in generic[:MAX_COUNT]:
         if not isinstance(item, dict):
             continue
-        url = _string_value(cast(JSONValue | None, item.get("url")))
+        url = _result_url(item.get("url"))
         title = _string_value(cast(JSONValue | None, item.get("title")))
         if not url and not title:
             continue

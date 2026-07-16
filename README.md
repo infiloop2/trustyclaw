@@ -21,12 +21,19 @@ access or broad access to host state.
   broad host-state access, unapproved data leaks, and unexpected internet
   actions.
 - **Controlled tools:** bundled tool packages (Gmail, Google Calendar, Brave
-  Search) connect agents to third-party services through deterministic data
-  paths, with operator approval required for sensitive actions such as sending
-  email ([tools architecture](docs/architecture/tools/README.md)).
-- **Workflow apps:** the bundled Agent Chat app provides an isolated,
-  purpose-built UI backed by app-owned state and host-scoped task access
-  ([apps architecture](docs/architecture/apps.md)).
+  Search, X/Twitter, LinkedIn, LinkedIn Discovery, Instagram, Instagram
+  Discovery, Polymarket, Interactive Brokers, Runway media generation) connect agents to third-party
+  services through deterministic data paths, with operator approval required
+  for outward-facing actions such as sending email or publishing a post
+  ([tools architecture](docs/architecture/tools/README.md)).
+- **Installed apps:** purpose-built product surfaces with richer UX than a
+  terminal chat loop, running behind the same host boundaries. These are
+  **Agent Chat** (threaded conversations over host tasks) and **Mission
+  Pursuit** (a persistent workspace one agent furnishes with a goal, artifacts,
+  memory, and scheduled runs). The platform contract for adding more apps is in
+  [docs/architecture/apps/apps.md](./docs/architecture/apps/apps.md); each app has its
+  own doc under
+  [docs/architecture/apps/](./docs/architecture/apps/).
 
 These choices follow from a broader set of beliefs about running AI agents.
 See [PHILOSOPHY.md](./PHILOSOPHY.md).
@@ -273,7 +280,7 @@ The host uses three EBS volumes:
 | Volume | Lifecycle | Contents |
 | --- | --- | --- |
 | Root | Recreated on redeploy and deleted on instance termination | Ubuntu 22.04, system packages, Node.js, Python, Codex CLI, Claude Code CLI, nftables, OpenSSL, curl, jq, CA certificates, and swap. |
-| Admin | Preserved on redeploy and marked not to delete on instance termination | Postgres state for the admin API, apps, tools, tasks, audit logs, network policy, credentials, and provider pins; proxy CA/certificate and queued-push state. |
+| Admin | Preserved on redeploy and marked not to delete on instance termination | Postgres state for the admin API, apps, tools, tasks, audit logs, network policy, credentials, and provider pins; proxy CA/certificate, queued-push state, and a bounded temporary tool-media spool. |
 | Agent | Preserved on redeploy and marked not to delete on instance termination | Agent home directory, provider auth/session files, CLI caches, and workspace data. |
 
 Every AWS resource deploy creates is tagged so it can be found and cleaned up:

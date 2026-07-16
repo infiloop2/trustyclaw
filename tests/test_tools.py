@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import base64
 import copy
+from contextlib import contextmanager
+import hashlib
+import io
 import unittest
 import urllib.error
 from dataclasses import dataclass, field
 from typing import Any, cast
 from unittest.mock import patch
 
-from host.tools.host_api import ApprovalRecord
+from host.tools.host_api import ApprovalRecord, AssetMetadata
 from host.tools.json_types import JSONObject
 from host.tools.manifest import (
     ActionSpec,
@@ -27,6 +30,7 @@ from host.tools.gmail import api as gmail_api
 from host.tools.google_calendar import GoogleCalendarTool
 from host.tools import google_calendar
 from host.tools.shared import google as google_shared
+from host.tools.shared.web import WebRequestError
 
 
 FRESH_EXPIRES_AT = 2_000_000_000
@@ -53,12 +57,25 @@ class MemoryCredentials:
     def clear(self) -> None:
         self.record = None
 
-def default_config() -> dict[str, str]:
-    return {
-        "BRAVE_SEARCH_API_KEY": "brave-key",
-        "GOOGLE_OAUTH_CLIENT_ID": "google-client",
-        "GOOGLE_OAUTH_CLIENT_SECRET": "google-secret",
-    }
+class _ConfigView(dict[str, str]):
+    """Mirror the production config view (tools_host._ToolConfigView): reading an
+    unset key raises a RuntimeError with the operator-actionable message tools
+    surface verbatim, not a bare KeyError, so tests exercise the real path."""
+
+    def __missing__(self, key: str) -> str:
+        raise RuntimeError(
+            f"Tool config {key} is not set. The operator must set it in the admin UI's Tools tab."
+        )
+
+
+def default_config() -> "_ConfigView":
+    return _ConfigView(
+        {
+            "BRAVE_SEARCH_API_KEY": "brave-key",
+            "GOOGLE_OAUTH_CLIENT_ID": "google-client",
+            "GOOGLE_OAUTH_CLIENT_SECRET": "google-secret",
+        }
+    )
 
 
 class MemoryApprovals:
@@ -97,11 +114,48 @@ class MemoryApprovals:
         return approved
 
 
+class MemoryAssets:
+    def __init__(self) -> None:
+        self.records: dict[str, tuple[AssetMetadata, bytes]] = {}
+
+    def add(
+        self,
+        asset_id: str = "asset_abcdefghijklmnopqrstuvwxyz123456",
+        *,
+        filename: str = "video.mp4",
+        media_type: str = "video/mp4",
+        data: bytes = b"video bytes",
+    ) -> str:
+        self.records[asset_id] = (
+            AssetMetadata(
+                asset_id=asset_id,
+                filename=filename,
+                media_type=media_type,
+                size_bytes=len(data),
+                sha256=hashlib.sha256(data).hexdigest(),
+                expires_at=2_000_000_000,
+            ),
+            data,
+        )
+        return asset_id
+
+    def describe(self, asset_id: str) -> AssetMetadata:
+        return self.records[asset_id][0]
+
+    @contextmanager
+    def open(self, asset_id: str):
+        yield io.BytesIO(self.records[asset_id][1])
+
+    def delete(self, asset_id: str) -> None:
+        self.records.pop(asset_id, None)
+
+
 @dataclass(frozen=True)
 class FakeHostAPI:
     credentials: MemoryCredentials = field(default_factory=MemoryCredentials)
     config: dict[str, str] = field(default_factory=default_config)
     approvals: MemoryApprovals = field(default_factory=MemoryApprovals)
+    assets: MemoryAssets = field(default_factory=MemoryAssets)
 
 
 def connected_google_api(tool_id: str, scopes: frozenset[str]) -> FakeHostAPI:
@@ -170,6 +224,16 @@ class ToolTests(unittest.TestCase):
                 data_summary=EXAMPLE_DATA_SUMMARY,
                 actions=(),
                 protections=("",),
+            )
+        with self.assertRaisesRegex(ValueError, "technical_details"):
+            ToolManifest(
+                tool_id="bad_technical_detail",
+                display_name="Bad",
+                description="Bad technical detail.",
+                connection="enable_only",
+                data_summary=EXAMPLE_DATA_SUMMARY,
+                actions=(),
+                technical_details=("",),
             )
         with self.assertRaisesRegex(ValueError, "link_url and link_label"):
             ToolManifest(
@@ -266,7 +330,7 @@ class ToolTests(unittest.TestCase):
         assert gmail_search is not None
         assert calendar_read is not None
         self.assertIn("start_time/end_time", gmail_search.data_policy)
-        self.assertIn("timeMin/timeMax", calendar_read.data_policy)
+        self.assertIn("requested time range", calendar_read.data_policy)
 
     def test_brave_search_uses_host_config_and_mocked_third_party(self) -> None:
         api = FakeHostAPI()
@@ -299,6 +363,45 @@ class ToolTests(unittest.TestCase):
         result = BraveSearchTool().execute("write_web", {"query": "x"}, FakeHostAPI())
         self.assertIsInstance(result, ActionFailed)
         self.assertEqual(result.error, "Unsupported Brave Search action.")
+
+    def test_brave_request_uses_hardened_json_boundary(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def fake_json_request(method: str, url: str, **kwargs: Any) -> JSONObject:
+            captured.update(method=method, url=url, **kwargs)
+            return {"grounding": {"generic": []}}
+
+        with patch.object(brave_search, "json_request", side_effect=fake_json_request):
+            response = brave_search._post_brave_context("secret", {"q": "safe"})
+
+        self.assertEqual(response, {"grounding": {"generic": []}})
+        self.assertEqual(captured["url"], brave_search.BRAVE_LLM_CONTEXT_ENDPOINT)
+        self.assertEqual(captured["headers"], {"x-subscription-token": "secret"})
+        self.assertEqual(captured["body"], {"q": "safe"})
+
+    def test_brave_request_maps_hardened_http_errors(self) -> None:
+        with patch.object(
+            brave_search,
+            "json_request",
+            side_effect=WebRequestError("failed", status=401),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "rejected the configured API key"):
+                brave_search._post_brave_context("secret", {"q": "safe"})
+
+    def test_brave_results_drop_active_and_credentialed_urls(self) -> None:
+        results = brave_search._grounding_results(
+            {
+                "grounding": {
+                    "generic": [
+                        {"title": "x" * 1_000, "url": "javascript:alert(1)"},
+                        {"title": "credentialed", "url": "https://user:pass@example.com/private"},
+                        {"title": "safe", "url": "https://example.com/result"},
+                    ]
+                }
+            }
+        )
+        self.assertEqual([result["url"] for result in results], ["", "", "https://example.com/result"])
+        self.assertEqual(len(str(results[0]["title"])), 1_000)
 
     def test_gmail_credential_flow_stores_tokens_and_connection_status(self) -> None:
         api = FakeHostAPI()
@@ -505,6 +608,22 @@ class ToolTests(unittest.TestCase):
         # The read action promises locations and descriptions, so surface them.
         self.assertEqual(event["location"], "Room 4")
         self.assertEqual(event["description"], "Roadmap sync")
+
+    def test_google_calendar_bounds_untrusted_provider_event_count(self) -> None:
+        api = connected_google_api(google_calendar.MANIFEST.tool_id, google_calendar.REQUIRED_CALENDAR_SCOPES)
+        provider_events = [
+            {"id": str(index), "summary": "x" * 2_000, "description": "y" * 8_000}
+            for index in range(20)
+        ]
+        with patch.object(google_calendar, "google_json_request", return_value={"items": provider_events}):
+            result = GoogleCalendarTool().execute("read_events", {}, api)
+
+        assert isinstance(result, ActionExecuted)
+        events = result.result["events"]
+        assert isinstance(events, list)
+        self.assertEqual(len(events), google_calendar.CALENDAR_READ_MAX_EVENTS)
+        self.assertEqual(len(str(events[0]["summary"])), 2_000)
+        self.assertEqual(len(str(events[0]["description"])), 8_000)
 
     def test_google_calendar_write_queues_then_executes_after_approval(self) -> None:
         api = connected_google_api(google_calendar.MANIFEST.tool_id, google_calendar.REQUIRED_CALENDAR_SCOPES)
@@ -969,7 +1088,7 @@ class ToolTests(unittest.TestCase):
 
     def test_gmail_thread_truncation_reports_index_counts(self) -> None:
         messages = [{"id": f"m{i}", "threadId": "t1"} for i in range(105)]
-        with patch.object(gmail, "execute_gmail_api_request", return_value={"id": "t1", "messages": messages}):
+        with patch.object(gmail, "execute_gmail_api_request", return_value={"id": "t1", "messages": messages, "attacker": {"nested": "payload"}}):
             result = gmail.GmailTool()._execute_read("read_thread", {"thread_id": "t1"}, "token")
         thread = cast(dict, result["thread"])
         self.assertEqual(len(cast(list, thread["messages"])), 100)
@@ -977,6 +1096,36 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(thread["messageIndexLimit"], 100)
         self.assertEqual(thread["messageIndexOriginalCount"], 105)
         self.assertEqual(thread["messageIndexOmittedCount"], 5)
+        self.assertNotIn("attacker", thread)
+
+    def test_gmail_provider_lists_cannot_trigger_unbounded_followup_reads(self) -> None:
+        message_calls: list[str] = []
+
+        def fake_message_request(access_token: str, request: JSONObject) -> JSONObject:
+            del access_token
+            operation = cast(str, request["operation"])
+            message_calls.append(operation)
+            if operation == "users.messages.list":
+                return {"messages": [{"id": f"m{index}"} for index in range(100)]}
+            return {"id": "message", "threadId": "thread"}
+
+        with patch.object(gmail_api, "execute_gmail_api_request", side_effect=fake_message_request):
+            summaries = gmail_api.gmail_search_messages("token", "query")
+        self.assertEqual(len(summaries), gmail_api.GMAIL_READ_MAX_RESULTS)
+        self.assertEqual(message_calls.count("users.messages.get"), gmail_api.GMAIL_READ_MAX_RESULTS)
+
+        with (
+            patch.object(
+                gmail,
+                "execute_gmail_api_request",
+                return_value={"drafts": [{"id": f"d{index}"} for index in range(100)]},
+            ),
+            patch.object(gmail, "gmail_draft_preview", return_value={"draftId": "d"}) as preview,
+        ):
+            result = gmail.GmailTool()._execute_read("list_drafts", {}, "token")
+        drafts = cast(dict, result["drafts"])
+        self.assertEqual(len(cast(list, drafts["drafts"])), gmail.DEFAULT_DRAFT_PAGE_LIMIT)
+        self.assertEqual(preview.call_count, gmail.DEFAULT_DRAFT_PAGE_LIMIT)
 
     def test_calendar_create_summary_includes_all_accepted_fields(self) -> None:
         proposal = {
@@ -1127,43 +1276,31 @@ class ToolTests(unittest.TestCase):
         self.assertIn("Inline body text.", body.text)
 
     def test_google_api_401_surfaces_the_reconnect_flow(self) -> None:
-        import io
-        import urllib.error
-
         api = connected_google_api(gmail.MANIFEST.tool_id, gmail.REQUIRED_GMAIL_SCOPES)
-        unauthorized = urllib.error.HTTPError(
-            "https://gmail.googleapis.com/x", 401, "Unauthorized", {}, io.BytesIO(b"{}")
-        )
-        self.urlopen_guard.stop()
-        try:
-            with patch("urllib.request.urlopen", side_effect=unauthorized):
-                result = GmailTool().execute("list_labels", {}, api)
-        finally:
-            self.urlopen_guard.start()
+        with patch.object(
+            google_shared,
+            "json_request",
+            side_effect=WebRequestError("unauthorized", status=401),
+        ):
+            result = GmailTool().execute("list_labels", {}, api)
         self.assertIsInstance(result, ActionFailed)
         self.assertTrue(result.reconnect_required)
         self.assertIn("reconnect", result.error.lower())
 
     def test_google_userinfo_401_surfaces_the_reconnect_flow(self) -> None:
-        import io
-        import urllib.error
-
         api = connected_google_api(gmail.MANIFEST.tool_id, gmail.REQUIRED_GMAIL_SCOPES)
-        unauthorized = urllib.error.HTTPError(
-            google_shared.GOOGLE_USERINFO_URL, 401, "Unauthorized", {}, io.BytesIO(b"{}")
-        )
-        self.urlopen_guard.stop()
-        try:
-            with patch("urllib.request.urlopen", side_effect=unauthorized):
-                # Write proposals refresh the bound identity first, so the
-                # revoked token must surface reconnect_required here too.
-                result = GmailTool().execute(
-                    "send_email",
-                    {"to": "a@b.c", "subject": "Hi", "blocks": [{"type": "paragraph", "text": "Body"}]},
-                    api,
-                )
-        finally:
-            self.urlopen_guard.start()
+        with patch.object(
+            google_shared,
+            "json_request",
+            side_effect=WebRequestError("unauthorized", status=401),
+        ):
+            # Write proposals refresh the bound identity first, so the
+            # revoked token must surface reconnect_required here too.
+            result = GmailTool().execute(
+                "send_email",
+                {"to": "a@b.c", "subject": "Hi", "blocks": [{"type": "paragraph", "text": "Body"}]},
+                api,
+            )
         self.assertIsInstance(result, ActionFailed)
         self.assertTrue(result.reconnect_required)
 

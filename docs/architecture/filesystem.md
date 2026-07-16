@@ -69,6 +69,7 @@ redeploys.
 | `/mnt/trustyclaw-admin/proxy-state/network_proxy_ca.crt` | mode 644, but behind proxy-state traversal controls | Proxy CA certificate copied into the system trust store for agent/runtime use. |
 | `/mnt/trustyclaw-admin/proxy-state/generated-certs/` | proxy only | Per-host leaf certificates minted by the proxy. |
 | `/mnt/trustyclaw-admin/proxy-state/github-quarantine/` | proxy only | Bare per-repository Git mirrors and `refs/pending/...` objects for `.github` pushes held for operator approval. |
+| `/mnt/trustyclaw-admin/tools-state/assets/` | tools only | Bounded temporary image/video copies for tool calls. Cleared on tools-service start; expired files are swept hourly. |
 | `/mnt/trustyclaw-admin/admin-home/` | admin only | Admin service home directory. |
 
 ## Agent volume

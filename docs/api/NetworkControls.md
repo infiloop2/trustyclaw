@@ -396,7 +396,7 @@ construction; package publishing is not part of it. Package names and versions
 do appear in request URLs — we trust these first-party registry domains not to
 be a data-exfiltration sink for those URL paths.
 
-## npm Packages Integration
+## NPM Packages Integration
 
 When `managed_network_integrations.npm_packages.enabled` is `true`, the host
 expands, in memory:

@@ -44,6 +44,14 @@ export function esc(value) {
   return div.innerHTML;
 }
 
+export function informationIcon() {
+  return `<svg class="integration-info-icon" viewBox="0 0 20 20" aria-hidden="true">
+    <circle cx="10" cy="10" r="7.25" fill="none" stroke="currentColor" stroke-width="1.5"/>
+    <circle cx="10" cy="6.55" r="1" fill="currentColor"/>
+    <path d="M10 9.35v4.1" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round"/>
+  </svg>`;
+}
+
 // Catalog copy can mark short path names with backticks. Escape every segment
 // before wrapping those marked spans, so manifests cannot inject markup.
 export function inlineCode(value) {
@@ -74,6 +82,25 @@ export function setHtml(el, html) {
   if (el.__lastHtml === html) return;
   el.__lastHtml = html;
   el.innerHTML = html;
+}
+
+// Managed and bundled tool rows are rendered by separate modules into one
+// operator-facing list. Replace only the caller's rows, then sort the shared
+// list by its visible names.
+export function replaceIntegrationRows(container, selector, html) {
+  for (const child of [...container.children]) {
+    if (child.matches(selector)) child.remove();
+  }
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  container.append(template.content);
+  const rows = [...container.children].filter(child => child.matches(".integration-row"));
+  rows.sort((left, right) => {
+    const leftLabel = left.querySelector("h2")?.textContent || "";
+    const rightLabel = right.querySelector("h2")?.textContent || "";
+    return leftLabel.localeCompare(rightLabel, undefined, { sensitivity: "base" });
+  });
+  for (const row of rows) container.append(row);
 }
 
 export function gib(bytes) { return (bytes / 1073741824).toFixed(1); }

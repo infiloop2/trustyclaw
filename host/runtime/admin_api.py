@@ -149,7 +149,7 @@ AGENT_AUTH_CLEAR_HELPER_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trusty
 AGENT_CGROUP_ROOT = Path("/sys/fs/cgroup/trustyclaw_agent.slice")
 PROC_ROOT = Path("/proc")
 AGENT_PROCESS_LIMIT = 1000
-APP_SCOPED_ID_SEPARATOR = "__"
+APP_SCOPED_ID_SEPARATOR = app_platform.APP_SCOPED_ID_SEPARATOR
 # Lock inventory for this module (each request runs on its own handler
 # thread, so every handler is concurrent with every other and with the
 # orchestrator's workers):
@@ -252,6 +252,7 @@ class Handler(BaseHTTPRequestHandler):
             f"font-src 'self' {asset_origin} data:; "
             "form-action 'none'; "
             "frame-ancestors 'self'; "
+            "frame-src 'none'; "
             f"img-src 'self' {asset_origin} data:; "
             "navigate-to 'self'; "
             "object-src 'none'; "
@@ -383,6 +384,14 @@ def route(
                 limit=_event_page_limit(query),
             )
         }
+    tool_event_match = re.fullmatch(r"/v1/tools/events/([1-9][0-9]*)", path)
+    if tool_event_match and method == "GET":
+        if query:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "tool event detail does not accept query parameters")
+        event = state.tool_event(int(tool_event_match.group(1)))
+        if event is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, "tool event not found")
+        return {"event": event}
     if path == "/v1/tools" or path.startswith("/v1/tools/"):
         return tools_admin_api.tools_route(method, path, body)
     if path == "/v1/network/events" and method == "GET":
@@ -701,7 +710,12 @@ def _helper_error_message(stdout: str, stderr: str) -> str:
     return stderr.strip()
 
 
-def task_route(method: str, path: str, query: dict[str, list[str]], body: Any) -> Any:
+def task_route(
+    method: str,
+    path: str,
+    query: dict[str, list[str]],
+    body: Any,
+) -> Any:
     parts = path.strip("/").split("/")
     if len(parts) < 3:
         raise ApiError(HTTPStatus.NOT_FOUND, "task route not found")
@@ -1004,7 +1018,7 @@ def refresh_agent_runtime_accounts(body: Any) -> dict[str, Any]:
     else:
         raise ApiError(HTTPStatus.BAD_REQUEST, "request body must be an object")
     for runtime_type in runtime_types:
-        orchestrator.refresh_runtime_status(runtime_type)
+        orchestrator.refresh_runtime_status(runtime_type, force_provider_probe=True)
     return current_agent_accounts()
 
 
@@ -1057,7 +1071,11 @@ def _account_response_metadata(account: dict[str, Any], runtime_type: str) -> di
     return response
 
 
-def create_task(body: Any, *, app_backend_id: str | None = None) -> dict[str, Any]:
+def create_task(
+    body: Any,
+    *,
+    app_backend_id: str | None = None,
+) -> dict[str, Any]:
     input_message = _message(body, "input_message")
     thread_id = _thread_id(body)
     _validate_thread_id_not_reserved_by_app(thread_id, app_backend_id)
@@ -1151,7 +1169,8 @@ def steer_task(task_id: str, body: Any) -> dict[str, str]:
                 f"task already has {PENDING_STEER_LIMIT} undelivered steer messages; wait for delivery",
             )
         state.append_task_steer(cur, task_id, steer_message)
-        task["updated_at"] = utc_now()
+        now = utc_now()
+        task["updated_at"] = now
         state.save_task(cur, task)
         state.append_agent_event(cur, "task.message", task_id, {"message": steer_message, "source": "user"})
     return {"status": "accepted"}
@@ -1319,16 +1338,11 @@ def public_task(task: dict[str, Any], queue_position: int | None = None) -> dict
     return value
 
 
-def app_id_from_internal_thread_id(thread_id: str) -> str | None:
-    app_id, separator, _visible_thread_id = thread_id.partition(APP_SCOPED_ID_SEPARATOR)
-    if not separator or not app_id:
-        return None
-    return app_id if app_platform.app_by_id(app_id) is not None else None
-
-
 def _validate_thread_id_not_reserved_by_app(thread_id: str, app_backend_id: str | None) -> None:
-    app_id = app_id_from_internal_thread_id(thread_id)
-    if app_id is None or app_backend_id == app_id:
+    app_id, separator, visible_thread_id = thread_id.partition(APP_SCOPED_ID_SEPARATOR)
+    if not separator:
+        return
+    if app_backend_id == app_id and visible_thread_id:
         return
     raise ApiError(
         HTTPStatus.BAD_REQUEST,
@@ -1415,12 +1429,22 @@ def _resolve_task_session_config(
     fields = ("agent_runtime", "model", "effort")
     supplied = [field for field in fields if field in body]
     if stored is not None:
-        if supplied:
+        if not supplied:
+            return stored
+        if len(supplied) != len(fields):
             raise ApiError(
                 HTTPStatus.BAD_REQUEST,
-                "agent_runtime, model, and effort must be omitted for an existing thread",
+                "agent_runtime, model, and effort must be provided together",
             )
-        return stored
+        requested_runtime = _agent_runtime(body)
+        requested_model, requested_effort = _session_config(body, requested_runtime)
+        requested = (requested_runtime, requested_model, requested_effort)
+        if requested != stored:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "agent_runtime, model, and effort must match the existing thread configuration",
+            )
+        return requested
     if not supplied:
         raise ApiError(
             HTTPStatus.BAD_REQUEST,

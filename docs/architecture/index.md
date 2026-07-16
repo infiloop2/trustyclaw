@@ -18,11 +18,14 @@ so operators and contributors can jump to the trust boundary they need.
 | [Agent provider lifecycle](agent-provider-lifecycle.md) | Runtime status lifecycle, refresh triggers, live credential validation, account anchoring, proxy pinning, and operator recovery. |
 | [Runtime harness dependencies](harness-dependencies.md) | Codex and Claude Code interfaces, auth files, request shapes, and upgrade review points. |
 | [Admin API architecture](admin-api.md) | Local API security, task orchestration, and maintenance. |
-| [Apps](apps.md) | App services, storage and migrations, embedded admin UI surfaces, and app security boundaries. |
+| [Apps](apps/apps.md) | App services, storage and migrations, embedded admin UI surfaces, and app security boundaries. |
+| [App: Agent Chat](apps/agent-chat.md) | The threaded chat app: thread index, task references, and its display-only agent surface. |
+| [App: Mission Pursuit](apps/mission-pursuit.md) | The agent-furnished workspace app: action protocol, scheduling, artifacts, memory, and its structured agent boundary. |
+| [Agent App API](apps/agent-app-api.md) | The `app_api` tool: kernel-attributed agent → app backend calls through the dedicated agent-app service. |
 | [Network controls](network-controls.md) | nftables, proxy policy, managed integration guards (AI providers, GitHub, packages), internal guard fields, and fail-closed behavior. |
 | [GitHub write-path controls](github-write-path-controls.md) | The implemented `.github` push-inspection, quarantine, approval, replay, and failure model. |
 | [Tools](tools/README.md) | Bundled tool framework: the host-neutral tool contract, this host's integration, approvals, and the bundled tool packages. |
-| [Local sockets](local-sockets.md) | Peer-credentialed Unix-domain sockets (tools, app-backend, Postgres) and their trust boundaries. |
+| [Local sockets](local-sockets.md) | Peer-credentialed Unix-domain sockets (tools, agent-app, app-backend, Postgres) and their trust boundaries. |
 | [IAM policy notes](iam-policy.md) | Why each deploy IAM statement exists and why its scope is constrained. |
 
 ## Overview

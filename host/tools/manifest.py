@@ -142,6 +142,9 @@ class ToolManifest:
     config: tuple[ConfigRequirement, ...] = ()
     # Short, concrete safeguards for the summary popover and full guide.
     protections: tuple[str, ...] = ()
+    # Implementation details shown only in Integration Guides. Keep summary
+    # popovers operator-facing; put protocol and payload mechanics here.
+    technical_details: tuple[str, ...] = ()
     # Ordered provider-side and TrustyClaw setup. Empty when enablement is the
     # only step.
     setup_steps: tuple[SetupStep, ...] = ()
@@ -169,6 +172,9 @@ class ToolManifest:
         for index, protection in enumerate(self.protections):
             if not protection.strip():
                 raise ValueError(f"ToolManifest.protections[{index}] must be non-empty for {self.tool_id}.")
+        for index, detail in enumerate(self.technical_details):
+            if not detail.strip():
+                raise ValueError(f"ToolManifest.technical_details[{index}] must be non-empty for {self.tool_id}.")
         for index, step in enumerate(self.setup_steps):
             if not step.title.strip() or not step.description.strip():
                 raise ValueError(f"ToolManifest.setup_steps[{index}] must have a title and description for {self.tool_id}.")

@@ -361,6 +361,26 @@ class StateStorageTests(unittest.TestCase):
             save_openai_account({"account_id": "acct-2", "operator_approval": "codex_device_login"})
         self.assertEqual(read_openai_account()["account_id"], "acct-1")
 
+    def test_network_policy_round_trips_claude_web_search(self) -> None:
+        controls = {
+            "managed_network_integrations": {"claude": {"enabled": True, "web_search": True}},
+            "allowed_network_access": {},
+        }
+        state.save_network_policy(controls, "2026-06-08T00:00:00Z")
+        record = state.network_policy_record()
+        assert record is not None
+        self.assertEqual(record["controls"], controls)
+        self.assertTrue(state.read_claude_web_search())
+        # Disabling web search clears the row and the read helper reports off.
+        state.save_network_policy(
+            {"managed_network_integrations": {"claude": {"enabled": True}}, "allowed_network_access": {}},
+            "2026-06-08T00:00:01Z",
+        )
+        self.assertFalse(state.read_claude_web_search())
+        record = state.network_policy_record()
+        assert record is not None
+        self.assertNotIn("web_search", record["controls"]["managed_network_integrations"]["claude"])
+
     def test_network_policy_round_trips_integrations_and_github_repos(self) -> None:
         controls = {
             "managed_network_integrations": {

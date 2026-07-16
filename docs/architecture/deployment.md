@@ -111,7 +111,7 @@ contracts:
   It holds the admin-state Postgres data directory (task history,
   thread/session mappings, provider account metadata, config, network state,
   tool state, and app migration records) plus proxy CA, generated certificate,
-  and held-Git-push files.
+  held-Git-push files, and the bounded temporary tool-media spool.
 - **Agent state drive**: durable data volume mounted at `/mnt/trustyclaw-agent`.
   It holds the agent user's home directory, provider auth/session files, CLI
   caches, and workspace data.

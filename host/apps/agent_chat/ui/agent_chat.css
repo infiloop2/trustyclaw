@@ -1,380 +1,463 @@
-html { height: 100%; }
+/* Agent Chat, styled after the Codex web/mobile chat: a flat thread sidebar,
+   a centered conversation column (user bubbles right, agent text plain), and
+   a rounded composer docked at the bottom. The app owns exactly one scroll
+   region per pane — the document itself never scrolls, so the host iframe
+   shows no second scrollbar. */
 
-:root {
-  --tc-coral: #ef4d3d;
-  --tc-coral-strong: #d94335;
-  --tc-orange: #ff8b5f;
-  --tc-teal: #0f9f9a;
-  --tc-signal: #8ee8ff;
-  --tc-coral-soft: rgba(239, 77, 61, 0.15);
-  --tc-teal-soft: rgba(15, 159, 154, 0.15);
-  --tc-navy: #142033;
-}
+html, body { height: 100%; }
 
 body {
-  background:
-    radial-gradient(38rem 22rem at 12% -6%, rgba(239, 77, 61, 0.13), transparent 62%),
-    radial-gradient(34rem 20rem at 98% 4%, rgba(15, 159, 154, 0.13), transparent 64%),
-    linear-gradient(180deg, rgba(16, 21, 29, 0.96), var(--bg) 42%);
-  min-height: 100%;
+  background: var(--bg);
+  margin: 0;
+  overflow: hidden;
   padding: 0;
 }
 
-.app-shell {
-  align-content: start;
-  display: grid;
-  gap: 0.85rem;
-  grid-template-rows: auto minmax(0, 1fr);
-  min-height: 100vh;
-  padding: 0.95rem;
+.chat-app { display: flex; height: 100%; }
+
+/* ---------- Thread sidebar ---------- */
+
+.thread-pane {
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex: 0 0 16rem;
+  flex-direction: column;
+  gap: 0.55rem;
+  min-height: 0;
+  min-width: 0;
+  padding: 0.7rem;
 }
 
-.app-frame-head {
+.pane-head {
   align-items: center;
-  background:
-    linear-gradient(135deg, rgba(239, 77, 61, 0.13), transparent 34%),
-    radial-gradient(22rem 10rem at 92% 0%, rgba(15, 159, 154, 0.13), transparent 60%),
-    linear-gradient(180deg, rgba(26, 34, 48, 0.96), rgba(16, 21, 29, 0.96));
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035), var(--shadow);
   display: flex;
-  gap: 0.85rem;
   justify-content: space-between;
-  min-width: 0;
-  padding: 0.8rem 0.9rem;
-}
-
-.app-title-group,
-.app-frame-actions {
-  align-items: center;
-  display: flex;
-  gap: 0.65rem;
-  min-width: 0;
-}
-
-.app-frame-actions { flex: 0 0 auto; }
-
-.app-mark {
-  align-items: center;
-  background: linear-gradient(135deg, rgba(239, 77, 61, 0.22), rgba(255, 139, 95, 0.12));
-  border: 1px solid rgba(239, 77, 61, 0.42);
-  border-radius: var(--radius-sm);
-  color: var(--tc-orange);
-  display: grid;
-  flex: 0 0 2.15rem;
-  height: 2.15rem;
-  place-items: center;
-  width: 2.15rem;
+  min-height: 2rem;
+  padding: 0 0.25rem;
 }
 
 .app-frame-title {
   color: var(--text);
-  font-size: 1rem;
-  font-weight: 760;
-  line-height: 1.1;
-  margin: 0;
-  text-transform: none;
+  font-size: 0.85rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
 }
 
-.app-status {
-  background: rgba(239, 77, 61, 0.14);
-  border: 1px solid var(--border);
-  border-color: rgba(239, 77, 61, 0.38);
-  border-radius: var(--radius-sm);
-  color: #ff9a91;
-  font-family: var(--font-mono);
-  font-size: 0.74rem;
-  line-height: 1.4;
-  overflow: hidden;
-  padding: 0.5rem 0.65rem;
-  text-overflow: ellipsis;
-  white-space: normal;
+.new-thread-button {
+  align-items: center;
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+  padding: 0.45rem 0.7rem;
+  width: 100%;
 }
 
-.agent-layout {
-  align-items: stretch;
-  display: grid;
-  gap: 0.9rem;
-  grid-template-columns: minmax(14rem, 17rem) minmax(0, 1fr);
-  min-height: 0;
-}
+.new-thread-button:hover { background: var(--surface-2); }
 
-.thread-pane,
-.thread-view {
-  background: linear-gradient(180deg, rgba(21, 27, 37, 0.98), rgba(14, 18, 26, 0.98));
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025);
-  min-height: 0;
-}
-
-.thread-pane {
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  padding: 0.78rem;
-}
-
-.pane-head {
-  border-bottom: 1px solid var(--border);
-  margin: 0 -0.1rem 0.65rem;
-  padding: 0 0.1rem 0.62rem;
-}
+.new-thread-button svg { height: 15px; width: 15px; }
 
 .thread-list {
   display: flex;
   flex-direction: column;
-  gap: 0.42rem;
-  max-height: none;
+  gap: 2px;
+  margin: 0 -0.25rem;
   min-height: 0;
   overflow-y: auto;
-  padding-right: 0.12rem;
+  overscroll-behavior: contain;
+  padding: 0 0.25rem;
 }
 
 button.thread-item {
-  background: rgba(10, 13, 19, 0.44);
-  border-color: var(--border);
-  border-radius: var(--radius-sm);
-  min-height: 4.35rem;
-  padding: 0.62rem 0.7rem;
-  position: relative;
-}
-
-button.thread-item::before {
   background: transparent;
-  border-radius: 999px;
-  bottom: 0.7rem;
-  content: "";
-  position: absolute;
-  right: 0.65rem;
-  top: 0.7rem;
-  width: 3px;
+  border: 0;
+  border-radius: 10px;
+  display: grid;
+  gap: 2px;
+  padding: 0.5rem 0.6rem;
+  text-align: left;
 }
 
-button.thread-item:hover { background: var(--surface-3); }
+button.thread-item:hover { background: var(--surface-2); }
 
-button.thread-item.selected {
-  background: linear-gradient(90deg, rgba(239, 77, 61, 0.2), rgba(20, 32, 51, 0.62));
-  border-color: rgba(239, 77, 61, 0.48);
-}
-
-button.thread-item.selected::before {
-  background: linear-gradient(180deg, var(--tc-coral), var(--tc-teal));
-}
+button.thread-item.selected { background: var(--surface-3); }
 
 .thread-name {
+  align-items: center;
   color: var(--text);
-  font-size: 0.82rem;
-  font-weight: 700;
+  display: flex;
+  font-size: 0.84rem;
+  font-weight: 620;
+  gap: 0.45rem;
+  min-width: 0;
 }
 
-.thread-meta { font-size: 0.7rem; }
-
-.thread-view {
-  display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
-  min-height: 36rem;
+.thread-name > span {
+  min-width: 0;
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.thread-history {
-  align-content: start;
-  display: grid;
-  gap: 0.75rem;
-  overflow: auto;
-  padding: 0.88rem;
+/* Small activity dot for threads with queued/running tasks; reuses the
+   admin palette and the shared pulse animation keyframes. */
+.thread-dot {
+  background: var(--warn);
+  border-radius: 999px;
+  flex: 0 0 auto;
+  height: 7px;
+  width: 7px;
 }
 
-.thread-head {
-  align-items: baseline;
-  background:
-    linear-gradient(90deg, rgba(239, 77, 61, 0.11), transparent 52%),
-    rgba(10, 13, 19, 0.34);
+.thread-dot.running { animation: pulse 1.4s ease infinite; }
+
+.thread-meta {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-empty {
+  color: var(--text-dim);
+  font-size: 0.78rem;
+  padding: 0.5rem 0.6rem;
+}
+
+/* ---------- Chat pane ---------- */
+
+.chat-main {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.chat-head {
+  align-items: center;
   border-bottom: 1px solid var(--border);
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.38rem 0.65rem;
-  margin: -0.88rem -0.88rem 0;
-  padding: 0.8rem 0.88rem;
+  flex: 0 0 auto;
+  gap: 0.6rem;
+  min-height: 3rem;
+  padding: 0.5rem 0.9rem;
 }
 
-.thread-kicker {
-  color: var(--tc-coral);
-  flex: 0 0 100%;
-  font-size: 0.68rem;
-  font-weight: 760;
-  letter-spacing: 0.14em;
-  line-height: 1;
-  text-transform: uppercase;
+.chat-head-title {
+  display: grid;
+  flex: 1 1 auto;
+  line-height: 1.3;
+  min-width: 0;
 }
 
 .thread-title {
   color: var(--text);
-  font-family: var(--font-ui);
-  font-size: 1.16rem;
-  font-weight: 720;
+  font-size: 0.95rem;
+  font-weight: 650;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.thread-empty { padding: 2.3rem 1rem; }
-
-.task-card {
-  background: linear-gradient(180deg, rgba(16, 21, 29, 0.86), rgba(10, 13, 19, 0.66));
-  border-color: var(--border);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025);
-  gap: 0.62rem;
-  padding: 0.78rem 0.82rem;
+.thread-subtitle {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.task-head {
-  border-bottom: 1px solid var(--border);
-  margin: -0.05rem 0 0;
-  padding-bottom: 0.5rem;
+button.icon-button.quiet {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-dim);
 }
 
-.msg {
-  border-radius: 8px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+button.icon-button.quiet:hover {
+  background: var(--surface-2);
+  color: var(--text);
 }
 
-.msg.user {
-  background: linear-gradient(135deg, rgba(239, 77, 61, 0.18), rgba(255, 139, 95, 0.1));
-  border-color: rgba(239, 77, 61, 0.42);
+button.icon-button.quiet svg { height: 18px; width: 18px; }
+
+#sidebar-open, #sidebar-close, .sidebar-backdrop { display: none; }
+
+/* ---------- Conversation ---------- */
+
+.chat-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
-.msg.agent {
-  background: rgba(20, 32, 51, 0.72);
-}
-
-.composer {
-  background:
-    linear-gradient(90deg, rgba(15, 159, 154, 0.035), transparent 48%),
-    rgba(10, 13, 19, 0.72);
-  border-top: 1px solid var(--border);
+.chat-column {
   display: grid;
-  gap: 0.65rem;
-  padding: 0.85rem;
+  gap: 1.35rem;
+  margin: 0 auto;
+  max-width: 48rem;
+  padding: 1.25rem 1rem 0.75rem;
 }
 
-.composer textarea {
-  min-height: 5.4rem;
-  resize: vertical;
+.chat-hero {
+  display: grid;
+  gap: 0.5rem;
+  justify-items: center;
+  padding: 16vh 1rem 2rem;
+  text-align: center;
 }
 
-.composer-controls {
-  align-items: end;
+.chat-hero h2 {
+  color: var(--text);
+  font-size: 1.3rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  margin: 0;
+  text-transform: none;
+}
+
+.chat-hero p {
+  color: var(--text-dim);
+  font-size: 0.85rem;
+  margin: 0;
+  max-width: 28rem;
+}
+
+.turn { display: grid; gap: 0.55rem; }
+
+.turn pre {
+  font: inherit;
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.turn-user { display: flex; justify-content: flex-end; }
+
+.turn-user .bubble {
+  background: var(--surface-3);
+  border-radius: 16px;
+  color: var(--text);
+  max-width: min(85%, 36rem);
+  padding: 0.55rem 0.85rem;
+}
+
+.turn-meta {
+  align-items: center;
+  color: var(--text-dim);
   display: flex;
   flex-wrap: wrap;
-  gap: 0.6rem;
+  font-size: 0.72rem;
+  gap: 0.3rem 0.55rem;
+  justify-content: flex-end;
 }
 
-.composer-controls .field { flex: 1 1 9rem; }
-#thread-field,
-#model-field { flex-basis: 12rem; }
-.composer-controls button { flex: 0 0 auto; }
+.turn-agent {
+  color: var(--text);
+  font-size: 0.92rem;
+  line-height: 1.65;
+}
 
-.composer:not(.new-thread) .composer-controls {
-  justify-content: end;
+.turn-error {
+  background: var(--danger-soft);
+  border: 1px solid rgba(240, 112, 138, 0.35);
+  border-radius: 10px;
+  color: var(--danger);
+  font-size: 0.85rem;
+  padding: 0.55rem 0.8rem;
 }
 
 .task-steer {
-  display: grid;
+  display: flex;
   gap: 0.5rem;
-  grid-template-columns: minmax(0, 1fr) auto;
 }
 
-.time { margin-left: auto; }
+.task-steer-input {
+  border-radius: 999px;
+  flex: 1 1 auto;
+  font-size: 0.85rem;
+  min-width: 0;
+  padding: 0.4rem 0.85rem;
+}
 
-.empty-state {
-  align-items: center;
-  background: rgba(10, 13, 19, 0.24);
-  border: 1px dashed var(--border-strong);
+/* ---------- Composer ---------- */
+
+.composer-dock {
+  flex: 0 0 auto;
+  padding: 0.35rem 1rem calc(0.85rem + env(safe-area-inset-bottom));
+}
+
+.composer-dock > * {
+  margin: 0 auto;
+  max-width: 48rem;
+}
+
+.composer-dock .app-status { margin-bottom: 0.5rem; }
+
+.app-status {
+  background: var(--danger-soft);
+  border: 1px solid rgba(240, 112, 138, 0.38);
   border-radius: var(--radius-sm);
-  color: var(--text-dim);
+  color: var(--danger);
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  line-height: 1.4;
+  padding: 0.5rem 0.65rem;
+}
+
+.composer {
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 20px;
   display: grid;
-  min-height: 6rem;
-  place-items: center;
+  gap: 0.3rem;
+  padding: 0.6rem 0.6rem 0.5rem 0.95rem;
 }
 
-button.primary {
-  background: linear-gradient(135deg, rgba(239, 77, 61, 0.72), rgba(15, 159, 154, 0.72));
-  border-color: rgba(255, 255, 255, 0.08);
-  color: #fff;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
+.composer:focus-within { border-color: rgba(148, 163, 184, 0.5); }
+
+.composer textarea {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  max-height: 12.5rem;
+  min-height: 1.6rem;
+  padding: 0.15rem 0.3rem 0.15rem 0;
+  resize: none;
+  white-space: pre-wrap;
 }
 
-button.primary:hover {
-  background: linear-gradient(135deg, rgba(239, 77, 61, 0.82), rgba(15, 159, 154, 0.82));
-  filter: none;
+.composer textarea:focus-visible {
+  box-shadow: none;
+  outline: none;
 }
 
-button.ghost:hover {
-  border-color: rgba(239, 77, 61, 0.36);
-  color: #fff;
+.composer-bar {
+  align-items: center;
+  display: flex;
+  gap: 0.5rem;
 }
 
-.status.completed,
-.status.ok,
-.status.active {
-  background: var(--tc-teal-soft);
-  border-color: rgba(15, 159, 154, 0.38);
-  color: #72efe4;
+.composer-options {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  min-width: 0;
 }
 
-.status.failed,
-.status.denied,
-.status.error {
-  background: rgba(239, 77, 61, 0.14);
-  border-color: rgba(239, 77, 61, 0.38);
-  color: #ff9a91;
+.composer-pill {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-dim);
+  font-size: 0.76rem;
+  padding: 0.22rem 0.65rem;
+  transition: border-color 0.15s ease, color 0.15s ease;
+  width: auto;
 }
 
-@media (max-width: 760px) {
-  .app-shell {
-    gap: 0.7rem;
-    padding: 0.7rem;
-  }
+.composer-pill:hover,
+.composer-pill:focus {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
 
-  .app-frame-head {
-    align-items: stretch;
-    flex-direction: column;
-  }
+input.thread-input {
+  font-family: var(--font-mono);
+  width: 9.5rem;
+}
 
-  .app-frame-actions {
-    justify-content: space-between;
-  }
+.send-button {
+  align-items: center;
+  background: var(--text);
+  border: 0;
+  border-radius: 999px;
+  color: var(--bg);
+  display: inline-flex;
+  flex: 0 0 auto;
+  height: 2.1rem;
+  justify-content: center;
+  margin-left: auto;
+  padding: 0;
+  width: 2.1rem;
+}
 
-  .app-status { max-width: none; }
+.send-button svg { height: 17px; width: 17px; }
 
-  .agent-layout { grid-template-columns: 1fr; }
+.send-button:hover { background: #fff; }
 
+.send-button:disabled {
+  background: var(--surface-3);
+  color: var(--text-dim);
+}
+
+.composer-hint {
+  color: var(--text-dim);
+  font-size: 0.68rem;
+  margin: 0.45rem 0 0;
+  text-align: center;
+}
+
+/* ---------- Mobile: sidebar becomes a slide-in drawer ---------- */
+
+@media (max-width: 720px) {
   .thread-pane {
-    min-height: 10.5rem;
+    bottom: 0;
+    box-shadow: 24px 0 60px rgba(0, 0, 0, 0.45);
+    left: 0;
+    position: fixed;
+    top: 0;
+    transform: translateX(-105%);
+    transition: transform 160ms ease;
+    width: min(19rem, 85vw);
+    z-index: 30;
   }
 
-  .thread-list {
-    flex-direction: row;
-    overflow-x: auto;
-    overflow-y: hidden;
-    padding: 0 0 0.25rem;
+  .chat-app.sidebar-open .thread-pane { transform: translateX(0); }
+
+  .sidebar-backdrop {
+    backdrop-filter: blur(2px);
+    background: rgba(3, 5, 9, 0.62);
+    border: 0;
+    border-radius: 0;
+    display: block;
+    inset: 0;
+    padding: 0;
+    position: fixed;
+    z-index: 25;
   }
 
-  button.thread-item {
-    flex: 0 0 12.5rem;
-    max-width: 12.5rem;
-    min-height: 4.25rem;
+  #sidebar-open, #sidebar-close { display: inline-flex; }
+
+  .chat-head { padding: 0.45rem 0.6rem; }
+
+  .chat-column { padding: 0.9rem 0.8rem 0.5rem; }
+
+  .turn-user .bubble { max-width: 88%; }
+
+  .composer-dock { padding: 0.3rem 0.6rem calc(0.65rem + env(safe-area-inset-bottom)); }
+
+  .composer-hint { display: none; }
+
+  /* 16px fields so iOS does not zoom the page when a control is focused,
+     and thumb-sized primary targets. */
+  .composer textarea, .composer-pill, .task-steer-input { font-size: 16px; }
+
+  .composer-pill { min-height: 2.35rem; }
+
+  .send-button {
+    height: 2.75rem;
+    width: 2.75rem;
   }
 
-  .thread-view { min-height: 34rem; }
+  .new-thread-button { min-height: 2.6rem; }
 
-  .composer-controls,
-  .composer:not(.new-thread) .composer-controls {
-    align-items: stretch;
-    flex-direction: column;
-    justify-content: stretch;
-  }
-
-  .composer-controls .field { flex-basis: auto; }
-
-  .composer-controls button { width: 100%; }
+  button.thread-item { padding: 0.7rem 0.75rem; }
 }

@@ -8,6 +8,61 @@ import { CUSTOM_DOMAIN_GUIDE, MANAGED_INTEGRATIONS } from "./integration_catalog
 
 let selectedGuideId = "openai";
 let loadedGuides = [];
+let copyFeedbackTimer = null;
+let copyFeedbackGeneration = 0;
+
+function hideCallbackCopyFeedback() {
+  if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer);
+  copyFeedbackTimer = null;
+  for (const feedback of document.querySelectorAll("[data-callback-copy-feedback]")) {
+    feedback.hidden = true;
+  }
+}
+
+export function dismissCallbackCopyFeedback() {
+  copyFeedbackGeneration += 1;
+  hideCallbackCopyFeedback();
+}
+
+function legacyCopy(value) {
+  const input = document.createElement("textarea");
+  input.value = value;
+  input.setAttribute("readonly", "");
+  input.style.position = "fixed";
+  input.style.opacity = "0";
+  document.body.append(input);
+  input.select();
+  const copied = document.execCommand("copy");
+  input.remove();
+  if (!copied) throw new Error("Copy failed");
+}
+
+export async function copyCallbackUri(button) {
+  const value = button.dataset.copyValue || "";
+  const feedback = button.parentElement?.querySelector("[data-callback-copy-feedback]");
+  const generation = ++copyFeedbackGeneration;
+  hideCallbackCopyFeedback();
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(value);
+    } else {
+      legacyCopy(value);
+    }
+    if (generation !== copyFeedbackGeneration) return;
+    if (feedback) {
+      feedback.textContent = "Copied";
+      feedback.hidden = false;
+    }
+    copyFeedbackTimer = setTimeout(dismissCallbackCopyFeedback, 2500);
+  } catch (_error) {
+    if (generation !== copyFeedbackGeneration) return;
+    if (feedback) {
+      feedback.textContent = "Copy failed";
+      feedback.hidden = false;
+      copyFeedbackTimer = setTimeout(dismissCallbackCopyFeedback, 2500);
+    }
+  }
+}
 
 function toolGuide(tool) {
   const oauth = tool.connection === "oauth";
@@ -17,6 +72,7 @@ function toolGuide(tool) {
     summary: tool.description,
     callbackUrl: oauth ? `${location.origin}/oauth/callback` : "",
     protections: Array.isArray(tool.protections) ? tool.protections : [],
+    technicalDetails: Array.isArray(tool.technical_details) ? tool.technical_details : [],
     setupSteps: (tool.setup_steps || []).map(step => ({
       title: step.title,
       description: step.description,
@@ -41,13 +97,6 @@ function toolGuide(tool) {
         links: card.links.map(link => ({ label: link.label, url: link.url })),
       })),
     },
-    controls: [
-      "Enable and Disable apply immediately to this tool only.",
-      oauth
-        ? "Disconnect revokes the provider token when possible and deletes the stored credential even if the tool is disabled."
-        : "Clear a configured secret by saving the field blank; the tool fails closed when required configuration is missing.",
-      "Every call, connection change, configuration change, and approval decision is recorded in the Tool audit log.",
-    ],
     config: tool.config || [],
     networkScope: [],
   };
@@ -56,7 +105,8 @@ function toolGuide(tool) {
 function allGuides(tools) {
   const managed = Object.entries(MANAGED_INTEGRATIONS).map(([id, guide]) => ({ id, ...guide }));
   const bundled = tools.map(toolGuide);
-  return [...managed, ...bundled, CUSTOM_DOMAIN_GUIDE];
+  return [...managed, ...bundled, CUSTOM_DOMAIN_GUIDE]
+    .sort((left, right) => left.label.localeCompare(right.label, undefined, { sensitivity: "base" }));
 }
 
 export async function refreshConnectionGuide() {
@@ -136,6 +186,20 @@ function renderPolicyPoints(points) {
   </div>`;
 }
 
+function setupLinkIsInline(step) {
+  return Boolean(step.linkUrl && step.linkLabel && String(step.description || "").includes(step.linkLabel));
+}
+
+function renderSetupDescription(step) {
+  const description = String(step.description || "");
+  if (!setupLinkIsInline(step)) return inlineCode(description);
+  const index = description.indexOf(step.linkLabel);
+  const before = description.slice(0, index);
+  const after = description.slice(index + step.linkLabel.length);
+  const link = `<a href="${esc(step.linkUrl)}" target="_blank" rel="noopener noreferrer">${esc(step.linkLabel)}</a>`;
+  return `${inlineCode(before)}${link}${inlineCode(after)}`;
+}
+
 // The callback URI and configuration keys render inside the step that needs
 // them, so the operator sees each value at the moment the provider asks for it.
 function renderSetup(guide) {
@@ -146,10 +210,19 @@ function renderSetup(guide) {
       <li>
         <div class="guide-step-copy">
           <h4>${esc(step.title)}</h4>
-          <p>${esc(step.description)}</p>
-          ${step.showCallback && guide.callbackUrl ? `<div class="guide-callback"><span>Callback URI for this host</span><code>${esc(guide.callbackUrl)}</code></div>` : ""}
+          <p>${renderSetupDescription(step)}</p>
+          ${step.showCallback && guide.callbackUrl ? `<div class="guide-callback">
+            <span class="guide-callback-label">Callback URI for this host</span>
+            <div class="guide-callback-value">
+              <code>${esc(guide.callbackUrl)}</code>
+              <button class="guide-copy-button" data-action="copy-callback-uri" data-copy-value="${esc(guide.callbackUrl)}" aria-label="Copy callback URI" title="Copy callback URI">
+                <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="6.5" y="6.5" width="8" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M5 13.5H4.5A1.5 1.5 0 0 1 3 12V4.5A1.5 1.5 0 0 1 4.5 3H11a1.5 1.5 0 0 1 1.5 1.5V5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+              </button>
+              <span class="guide-copy-feedback" data-callback-copy-feedback role="status" hidden>Copied</span>
+            </div>
+          </div>` : ""}
           ${step.showConfig ? renderConfig(guide.config) : ""}
-          ${step.linkUrl ? `<a href="${esc(step.linkUrl)}" target="_blank" rel="noopener noreferrer">${esc(step.linkLabel)}</a>` : ""}
+          ${step.linkUrl && !setupLinkIsInline(step) ? `<a href="${esc(step.linkUrl)}" target="_blank" rel="noopener noreferrer">${esc(step.linkLabel)}</a>` : ""}
         </div>
         ${step.imagePath ? `<figure><img src="${esc(step.imagePath)}" alt="${esc(step.imageAlt)}" loading="lazy"></figure>` : ""}
       </li>`).join("")}
@@ -188,12 +261,15 @@ function renderDataSummary(summary) {
 }
 
 function renderTechnicalDetails(guide) {
+  const notes = [...(guide.technicalDetails || []), ...(guide.controls || [])];
+  const hasNetworkScope = Boolean(guide.networkScope && guide.networkScope.length);
+  if (!notes.length && !hasNetworkScope) return "";
   return `
     <section class="guide-section guide-technical-details">
-      <h3>Technical details</h3>
-      <div class="guide-protections">
-        <ul>${[...guide.protections, ...guide.controls].map(item => `<li>${inlineCode(item)}</li>`).join("")}</ul>
-      </div>
+      <h3>Technical notes</h3>
+      ${notes.length ? `<div class="guide-protections">
+        <ul>${notes.map(item => `<li>${inlineCode(item)}</li>`).join("")}</ul>
+      </div>` : ""}
       ${renderNetworkScope(guide.networkScope)}
     </section>`;
 }

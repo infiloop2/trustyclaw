@@ -38,6 +38,9 @@ for line in sys.stdin:
     elif method == "thread/resume":
         assert msg["params"]["threadId"] == "thread_existing"
         assert msg["params"]["model"] == "gpt-5.6-sol"
+        assert msg["params"]["developerInstructions"].endswith(
+            "App instructions:\nUse only /agent/workspace."
+        )
         assert "effort" not in msg["params"]
         send({"id": msg["id"], "result": {"thread": {"id": "thread_existing"}}})
     elif method == "turn/start":
@@ -333,6 +336,7 @@ class CodexAppServerTests(unittest.TestCase):
         *,
         rate_limits_error: bool = False,
         refresh_error: str | None = None,
+        force_provider_probe: bool = False,
     ) -> tuple[str, str | None, dict[str, Any] | None]:
         previous = codex_app_server_module.DEFAULT_COMMAND
         codex_app_server_module.DEFAULT_COMMAND = [
@@ -347,9 +351,23 @@ class CodexAppServerTests(unittest.TestCase):
             ),
         ]
         try:
-            return codex_app_server_module.account_status()
+            return codex_app_server_module.account_status(force_provider_probe=force_provider_probe)
         finally:
             codex_app_server_module.DEFAULT_COMMAND = previous
+
+    def test_thread_id_becomes_a_thread_scope_argument_pair(self) -> None:
+        # The helper consumes the pair and names the systemd scope after the
+        # host thread; non-task servers (status probes, logins) add nothing.
+        server = codex_app_server_module.CodexAppServer(
+            command=["/bin/echo"], thread_id="mission_pursuit__ws-3"
+        )
+        self.assertEqual(
+            server._command,
+            ["/bin/echo", "--thread-scope", "mission_pursuit__ws-3"],
+        )
+        self.assertEqual(
+            codex_app_server_module.CodexAppServer(command=["/bin/echo"])._command, ["/bin/echo"]
+        )
 
     def test_initialize_sends_client_name_and_version(self) -> None:
         self.assertEqual(
@@ -454,6 +472,33 @@ class CodexAppServerTests(unittest.TestCase):
             codex_app_server_module.clear_live_validation_failure()
             self.assertEqual(
                 self.account_status_with_result(result, rate_limits_error=True),
+                (
+                    "active",
+                    None,
+                    {"account_id": "acct_123", "email": "dev@example.com", "plan_type": "pro"},
+                ),
+            )
+
+    def test_explicit_refresh_bypasses_failed_credential_refresh_memo(self) -> None:
+        result = {"account": {"email": "dev@example.com", "planType": "pro", "type": "chatgpt"}}
+        with (
+            patch("host.runtime.codex_app_server.read_codex_account_id", return_value="acct_123"),
+            patch("host.runtime.codex_app_server.read_proxy_openai_account_id", return_value="acct_123"),
+        ):
+            self.assertEqual(
+                self.account_status_with_result(
+                    result,
+                    rate_limits_error=True,
+                    refresh_error="401 Invalid authentication credentials",
+                ),
+                ("awaiting_login", None, None),
+            )
+            self.assertEqual(
+                self.account_status_with_result(
+                    result,
+                    rate_limits_error=True,
+                    force_provider_probe=True,
+                ),
                 (
                     "active",
                     None,
@@ -824,8 +869,27 @@ class CodexAppServerTests(unittest.TestCase):
         self.assertEqual(messages, ["Hello", "Final answer"])
         self.assertEqual(output, "Final answer")
 
-    def test_run_turn_passes_model_when_resuming_a_thread(self) -> None:
+    def test_new_app_thread_receives_manifest_instructions_as_developer_instructions(self) -> None:
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        class RecordingServer:
+            app_instructions = "Use only /agent/workspace."
+
+            def call(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+                calls.append((method, params))
+                return {"thread": {"id": "thread_1"}}
+
+        thread = codex_app_server_module._start_thread(RecordingServer(), "gpt-5.6-sol")  # type: ignore[arg-type]
+
+        self.assertEqual(thread["id"], "thread_1")
+        self.assertEqual(calls[0][0], "thread/start")
+        instructions = calls[0][1]["developerInstructions"]
+        self.assertIn("You are running inside TrustyClaw", instructions)
+        self.assertIn("App instructions:\nUse only /agent/workspace.", instructions)
+
+    def test_run_turn_refreshes_instructions_and_model_when_resuming_a_thread(self) -> None:
         with CodexAppServer([sys.executable, "-u", "-c", FAKE_APP_SERVER]) as server:
+            server.app_instructions = "Use only /agent/workspace."
             thread_id, output = run_turn(
                 server,
                 "continue",

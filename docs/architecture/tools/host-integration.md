@@ -12,7 +12,9 @@ are partitioned by `tool_id`.
 
 ## Where tool code runs, and its internet access
 
-Tool packages make outbound HTTPS calls to third parties (Google, Brave) and
+Tool packages make outbound HTTPS calls to third parties (Google, Brave, X,
+LinkedIn, SerpApi, Meta/Instagram, ScrapeCreators, Polymarket, Interactive
+Brokers, and Runway) and
 parse their responses, so unlike other host code they need direct egress and are
 the host code most exposed to attacker-influenced data. They run in a **dedicated
 `trustyclaw-tools` service** — its own Linux user, running
@@ -63,14 +65,24 @@ Agents speak MCP, so the host bridges MCP to the tool runtime with a shim:
   no secrets. A **`tools/call`** failure — including the tools service being
   unavailable — is forwarded to the agent as a normal MCP result with
   `isError: true` and a sanitized message, so the agent sees the error and can
-  react. Only **`tools/list`** falls back to an empty list when the socket is
-  unavailable, rather than erroring: an error at list time can make a harness
-  disable the MCP server for the whole session, so returning zero tools keeps the
-  session healthy and a later list picks the tools back up once the service is up.
+  react. Only **`tools/list`** falls back to the stable `app_api` declaration
+  when the tools socket is unavailable, rather than erroring: an error at list
+  time can make a harness disable the MCP server for the whole session, so the
+  fallback keeps the session healthy and a later list picks the bundled tools
+  back up once the service is up.
+- The same shim always serves the **`app_api`** tool,
+  forwarded to the separate agent-app socket
+  (`/run/trustyclaw-agent-app/agent-app.sock`) rather than the tools socket.
+  Listing it grants no authority. On every call the service attributes the
+  session to a running app task with an agent API; there is nothing to
+  configure and no secret involved because attribution comes from the
+  caller's cgroup. See
+  [`../apps/agent-app-api.md`](../apps/agent-app-api.md).
 - The socket service authenticates by kernel peer credentials (`SO_PEERCRED`),
   the same OS-identity pattern as Postgres peer auth, and scopes each peer
   strictly by path: only the `trustyclaw-agent` uid reaches the MCP routes
-  (`GET /tools`, `POST /call`) and only the `trustyclaw-admin` uid reaches the
+  (`GET /tools`, `POST /call`, `POST /assets/video`, `POST /assets/image`) and only the
+  `trustyclaw-admin` uid reaches the
   `/operator/...` delegation routes — neither can call the other's routes. No
   admin password is involved, so the agent gains exactly this tool surface and
   nothing else. Unix sockets are
@@ -78,8 +90,7 @@ Agents speak MCP, so the host bridges MCP to the tool runtime with a shim:
   untouched. See [`../local-sockets.md`](../local-sockets.md) for the full local-socket inventory.
 
 The listed actions are the enabled tools' manifest actions, named
-`<tool_id>_<action>` (e.g. `gmail_search_messages`), plus two built-ins that are
-always listed:
+`<tool_id>_<action>` (e.g. `gmail_search_messages`), plus host actions:
 
 - **`list_bundled_tools`** returns the full bundled catalog — `tool_id`, display
   name, description, connection type, `enabled`, and action ids — from manifests
@@ -95,6 +106,59 @@ always listed:
   the terminal execution result — so another agent process cannot enumerate old
   approvals by guessing sequential ids. Direct-action results are returned inline
   on the call.
+- **`stage_video` and `stage_image`** live in the MCP shim because that process
+  has the agent's filesystem access. They open a regular, non-symlink MP4/MOV
+  or JPEG/PNG/WebP as the agent, bound it to 512 bytes–200 MB, and stream raw
+  bytes to the matching `POST /assets/video` or `POST /assets/image` route.
+  The shim stores no copy. It streams the opened descriptor over
+  `/run/trustyclaw-tools/tools.sock`; the socket's kernel peer credentials
+  authenticate the `trustyclaw-agent` UID, then the separate
+  `trustyclaw-tools` process writes the bytes as its own UID under
+  `/mnt/trustyclaw-admin/tools-state/assets`.
+  The tools service separately reads and writes its scoped Postgres tool
+  tables, whose database files live on the persistent admin volume at
+  `/mnt/trustyclaw-admin`; staged media bytes never enter those tables. The
+  service code itself is installed on the instance root volume.
+  The shim opens the file with `O_NOFOLLOW`, then checks the opened descriptor
+  with `fstat`; this rejects a symlink at the final path component plus
+  directories, devices, sockets, and FIFOs. Streaming continues from that
+  descriptor, so replacing the pathname after open cannot switch the source.
+  Parent directories follow normal OS path resolution and cannot grant access
+  beyond the `trustyclaw-agent` user's permissions. The tools service never
+  uses the supplied filename as a path: it writes the bytes to a random,
+  exclusive-create, mode-0600 file in its mode-0700 asset directory.
+  The tools service accepts only the authenticated agent peer, receives
+  filename/type/length but no pathname, and stores a mode-0600 private copy in
+  its mode-0700 asset directory. The returned random id is scoped to either
+  Runway or Instagram. Instagram deletes its copy after the approved publishing
+  attempt; Runway deletes its copy after Runway accepts the generation or editing task.
+  Otherwise the id expires after about 26 hours. The next staging/access check
+  removes it immediately after expiry, and an hourly service sweep removes it
+  even when no later call touches the store. A tools-service restart deletes
+  every remaining file and forgets every id. No asset metadata enters
+  Postgres, and startup does not reconcile pending approvals against lost
+  assets. An approval created near expiry can outlive its asset too. Approving
+  either one later fails and the upload must be retried. At most 20 assets and
+  1 GB total are staged across both media types. This private spool preserves
+  the Instagram approval boundary: Meta receives no video bytes until approval.
+
+  One process lock owns every index and quota transition. An upload reserves
+  its declared count and bytes under that lock, then streams outside it so a
+  slow agent cannot block reads or cleanup; the reservation is not readable
+  until its hash and file are complete. Cleanup and deletion remove the index
+  entry under the same lock. A reader either opens the file first and keeps
+  using that Unix file descriptor after an unlink, or loses the race and fails
+  closed before sending bytes to a provider.
+
+  Staging is a separate built-in action because bundled tool packages execute
+  as `trustyclaw-tools`, without access to the agent filesystem. Giving package
+  code a local path would either be unusable or give internet-facing tool code
+  read access to agent files. It would also force large media through JSON tool
+  arguments and the audit log. The built-in action streams bytes once and gives
+  package code only an opaque, tool-scoped id. That same stable private copy can
+  survive an Instagram approval wait, while one shared host implementation
+  enforces size, count, lifetime, destination, and cleanup limits for every
+  media-consuming package.
 
 **Concurrency cap.** Each agent tool call blocks one handler thread on a
 third-party request, so the agent's in-flight tool calls are capped at
@@ -144,11 +208,21 @@ pull request check before it can reach a host.
   maintenance pass), decided records are kept as bounded history pruned to
   `APPROVAL_HISTORY_LIMIT = 10,000`, and an approval caught mid-execution by a
   service restart is marked failed at startup (an unknown outcome spends it).
+- **Assets.** Ephemeral files under
+  `/mnt/trustyclaw-admin/tools-state/assets`, indexed only in the tools service
+  process and exposed to packages as tool-scoped metadata/open-stream/delete
+  operations. They never enter Postgres. The service clears the directory on
+  every start and sweeps expired files hourly; it does not rewrite approval
+  state to reconcile files lost across a restart.
 - **Audit** — every tool call, approval decision, connect/disconnect, enable/
   disable, and config change is recorded in the `tool_events` table
-  (`tool_id`, `action_id`, `outcome`, `detail`),
+  (`tool_id`, `action_id`, `outcome`, `detail`, and the exact bounded action
+  `arguments` for calls and approval decisions),
   the tool-side peer of the agent and network event logs. `GET /v1/tools/events`
-  pages it newest-first with the same `before`/`limit` cursor model.
+  pages summaries newest-first with the same `before`/`limit` cursor model;
+  `GET /v1/tools/events/<seq>` loads one event's arguments only when the
+  operator expands it. Config values and OAuth callback parameters never enter
+  the argument field.
 
 ## Operator flow
 

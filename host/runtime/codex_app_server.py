@@ -101,8 +101,19 @@ class CodexAppServer:
     cross-thread call is close() from the kill-task path; the driver then surfaces
     the dead process as an error on its next call."""
 
-    def __init__(self, command: list[str] | None = None) -> None:
+    def __init__(self, command: list[str] | None = None, thread_id: str | None = None) -> None:
         self._command = command or DEFAULT_COMMAND
+        # The orchestrator sets this only for an app-created task. It is kept
+        # separate from the task's user input and applied when a provider
+        # thread is created as subordinate developer instructions.
+        self.app_instructions: str | None = None
+        # Task turns run inside a systemd scope named after the host thread:
+        # the helper consumes this pair and turns it into systemd-run --unit,
+        # which lets the agent-app service derive an app from the trusted
+        # thread prefix (see agent_app_api). Non-task servers (status probes,
+        # logins) pass no thread id and keep systemd's generated scope name.
+        if thread_id is not None:
+            self._command = [*self._command, "--thread-scope", thread_id]
         self._next_id = 1
         self._proc: subprocess.Popen[str] | None = None
         self._messages: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -258,7 +269,7 @@ def _client_info() -> dict[str, dict[str, str]]:
     return {"clientInfo": {"name": "trustyclaw-host", "version": CLIENT_VERSION}}
 
 
-def account_status() -> tuple[str, str | None, dict[str, Any] | None]:
+def account_status(*, force_provider_probe: bool = False) -> tuple[str, str | None, dict[str, Any] | None]:
     """Return (status, detail, account metadata). detail is set only for "error"."""
     # Bounded timeouts: only the background poller calls this, but a Codex
     # app-server that cannot start (e.g. its startup traffic is denied by a
@@ -267,12 +278,12 @@ def account_status() -> tuple[str, str | None, dict[str, Any] | None]:
     # a cold Node start on a small instance.
     login_server = _current_login_server()
     if login_server is not None:
-        return _login_server_status(login_server)
+        return _login_server_status(login_server, force_provider_probe=force_provider_probe)
 
     server = CodexAppServer()
     try:
         server.start(init_timeout=45)
-        return _account_status_from_server(server)
+        return _account_status_from_server(server, force_provider_probe=force_provider_probe)
     except CodexAppServerError as exc:
         return _codex_status_error(exc, server)
     finally:
@@ -292,12 +303,14 @@ def _current_login_server() -> "CodexAppServer | None":
     return None
 
 
-def _login_server_status(server: "CodexAppServer") -> tuple[str, str | None, dict[str, Any] | None]:
+def _login_server_status(
+    server: "CodexAppServer", *, force_provider_probe: bool = False
+) -> tuple[str, str | None, dict[str, Any] | None]:
     # The status poller is the only reader of the parked login server, so it also
     # drains the account/login/completed notifications that
     # read_completed_device_login_account_id later looks up. collect is
     # destructive, so record whatever completed before returning.
-    status = _account_status_from_server(server)
+    status = _account_status_from_server(server, force_provider_probe=force_provider_probe)
     completed = server.collect_completed_logins()
     if completed:
         # Fresh credentials were just written, so the remembered verdict about
@@ -321,7 +334,9 @@ def _login_server_status(server: "CodexAppServer") -> tuple[str, str | None, dic
     return status
 
 
-def _account_status_from_server(server: "CodexAppServer") -> tuple[str, str | None, dict[str, Any] | None]:
+def _account_status_from_server(
+    server: "CodexAppServer", *, force_provider_probe: bool = False
+) -> tuple[str, str | None, dict[str, Any] | None]:
     try:
         result = server.call("account/read", {"refreshToken": False}, timeout=15)
         if not isinstance(result, dict):
@@ -343,7 +358,9 @@ def _account_status_from_server(server: "CodexAppServer") -> tuple[str, str | No
                     if _live_validation_failure is None and read_proxy_openai_account_id() is None:
                         rate_limits = {}
                     else:
-                        return _validated_status_after_usage_failure(server, account_id)
+                        return _validated_status_after_usage_failure(
+                            server, account_id, force_provider_probe=force_provider_probe
+                        )
                 if rate_limits:
                     account_metadata["codex_usage"] = rate_limits
                 return "active", None, account_metadata
@@ -354,21 +371,22 @@ def _account_status_from_server(server: "CodexAppServer") -> tuple[str, str | No
 
 
 def _validated_status_after_usage_failure(
-    server: "CodexAppServer", account_id: str
+    server: "CodexAppServer", account_id: str, *, force_provider_probe: bool = False
 ) -> tuple[str, str | None, dict[str, Any] | None]:
     """Validate a pinned credential whose live usage read failed.
 
     The rate-limit read authenticates live, so its failure can mean the cached
     credential is stale. Ask Codex, which owns the refresh token, to validate
     or refresh through the unpinned auth endpoint before reporting connected.
-    The verdict is remembered: an authentication failure stays awaiting_login
-    with no further provider traffic until an operator login completes or the
-    linked account is reset, and any other failure is retried at most every
-    LIVE_VALIDATION_RETRY_SECONDS. Without that memory the five-second
-    non-active poll would force a token refresh on every cycle."""
+    The verdict is remembered: automatic checks keep an authentication failure
+    at awaiting_login until an operator login completes or the linked account
+    is reset, and retry any other failure at most every
+    LIVE_VALIDATION_RETRY_SECONDS. An explicit operator refresh bypasses that
+    memory. Without it the five-second non-active poll would force a token
+    refresh on every cycle."""
     global _live_validation_failure
     failure = _live_validation_failure
-    if failure is not None and (
+    if not force_provider_probe and failure is not None and (
         failure[0] == "awaiting_login" or time.monotonic() - failure[2] < LIVE_VALIDATION_RETRY_SECONDS
     ):
         return failure[0], failure[1], None
@@ -628,8 +646,14 @@ def run_turn(
             thread = server.call(
                 "thread/resume",
                 # Codex 0.144.0 exposes effort only on turn/start; its
-                # thread/resume schema accepts the sticky model but no effort.
-                {"threadId": thread_id, "cwd": AGENT_CWD, "model": model},
+                # thread/resume schema accepts the sticky model and refreshed
+                # developer instructions, but no effort.
+                {
+                    "threadId": thread_id,
+                    "cwd": AGENT_CWD,
+                    "model": model,
+                    "developerInstructions": _developer_instructions(server),
+                },
                 timeout=30,
             )["thread"]
         except CodexAppServerError:
@@ -709,10 +733,18 @@ def _start_thread(server: CodexAppServer, model: str) -> dict[str, Any]:
             # Effort is a turn/start field in the pinned app-server protocol,
             # not a thread/start field.
             "model": model,
-            "developerInstructions": (
-                "You are running inside TrustyClaw. Complete the operator task and "
-                "return a concise final result."
-            ),
+            "developerInstructions": _developer_instructions(server),
         },
         timeout=30,
     )["thread"]
+
+
+def _developer_instructions(server: CodexAppServer) -> str:
+    """Current host and app contract, refreshed on start and every resume."""
+    developer_instructions = (
+        "You are running inside TrustyClaw. Complete the operator task and "
+        "return a concise final result."
+    )
+    if server.app_instructions:
+        developer_instructions += f"\n\nApp instructions:\n{server.app_instructions}"
+    return developer_instructions

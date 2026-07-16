@@ -25,6 +25,8 @@ POSTGRES_UID=47745
 POSTGRES_GID=47745
 TRUSTYCLAW_TOOLS_UID=47746
 TRUSTYCLAW_TOOLS_GID=47746
+TRUSTYCLAW_AGENT_APP_UID=47747
+TRUSTYCLAW_AGENT_APP_GID=47747
 @APP_UID_GID_CONSTANTS@
 PROXY_PORT=@PROXY_PORT@
 @APP_PORT_CONSTANTS@
@@ -154,6 +156,7 @@ ensure_group trustyclaw-proxy "$TRUSTYCLAW_PROXY_GID"
 ensure_group trustyclaw-agent "$TRUSTYCLAW_AGENT_GID"
 ensure_group cloudflared "$CLOUDFLARED_GID"
 ensure_group trustyclaw-tools "$TRUSTYCLAW_TOOLS_GID"
+ensure_group trustyclaw-agent-app "$TRUSTYCLAW_AGENT_APP_GID"
 @APP_ENSURE_GROUPS@
 ensure_user trustyclaw-admin "$TRUSTYCLAW_ADMIN_UID" trustyclaw-admin /mnt/trustyclaw-admin/admin-home
 ensure_user trustyclaw-proxy "$TRUSTYCLAW_PROXY_UID" trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state
@@ -162,6 +165,9 @@ ensure_user cloudflared "$CLOUDFLARED_UID" cloudflared /nonexistent
 # The tools service holds no durable state of its own (its state lives in the
 # tool tables, reached with a scoped Postgres role), so it needs no home.
 ensure_user trustyclaw-tools "$TRUSTYCLAW_TOOLS_UID" trustyclaw-tools /nonexistent
+# The agent-app service derives authority from kernel-owned thread scopes and
+# keeps no durable state of its own, so it also needs no home.
+ensure_user trustyclaw-agent-app "$TRUSTYCLAW_AGENT_APP_UID" trustyclaw-agent-app /nonexistent
 @APP_ENSURE_USERS@
 # The postgres account is created here, before the postgresql packages would
 # create it with a dynamic system uid: the preserved cluster files on the
@@ -224,6 +230,7 @@ def recreate_directory(path: Path) -> None:
 admin_mount = Path("/mnt/trustyclaw-admin")
 admin_state = admin_mount / "admin-state"
 proxy_state = admin_mount / "proxy-state"
+tools_state = admin_mount / "tools-state"
 agent_home = Path("/mnt/trustyclaw-agent/agent-home")
 pgdata = admin_mount / "postgres" / os.environ["PG_MAJOR"] / "main"
 for directory in (
@@ -238,12 +245,14 @@ for directory in (
     pgdata.parent,
     pgdata,
     proxy_state,
+    tools_state,
     agent_home,
     agent_home / ".codex",
     agent_home / ".claude",
 ):
     ensure_directory(directory)
 recreate_directory(proxy_state / "generated-certs")
+recreate_directory(tools_state / "assets")
 
 for path in (
     admin_state / "version.json",
@@ -399,19 +408,18 @@ fi
 # peer auth maps OS users to database roles, so access control is the host's
 # user model. trustyclaw-admin (owner of the admin database), the scoped
 # trustyclaw-proxy and trustyclaw-tools roles, and the postgres superuser
-# (operators, via sudo) can connect; every other user — including the agent
-# user — matches only the final reject rule.
+# (operators, via sudo) can connect; every other user —
+# including the agent user — matches only the final reject rule.
 cat > "$PGDATA_DIR/postgresql.conf" <<PGCONF
 # Managed by TrustyClaw bootstrap; rewritten on every deploy.
 listen_addresses = ''
 unix_socket_directories = '/var/run/postgresql'
 # Each service process bounds its own active sessions client-side
-# (db.MAX_ACTIVE_CONNECTIONS = 18). Three long-running services now use this
-# database (admin, proxy, and tools), so their combined worst case is
-# 3 x 18 = 54 sessions. The cap also fits the currently bundled app's pool,
-# operator psql, and the superuser reserve; bursts beyond a process's cap queue
-# client-side instead of immediately failing at the server.
-max_connections = 80
+# (db.MAX_ACTIVE_CONNECTIONS = 14). The three core database clients plus two
+# bundled apps use at most 5 x 14 = 70 sessions, leaving 30 slots for operator
+# psql, the superuser reserve, and deployment work. Bursts beyond a process's cap
+# queue client-side instead of immediately failing at the server.
+max_connections = 100
 log_destination = 'stderr'
 PGCONF
 cat > "$PGDATA_DIR/pg_hba.conf" <<'PGHBA'
@@ -492,14 +500,15 @@ runuser -u postgres -- psql -d trustyclaw_admin -v ON_ERROR_STOP=1 --quiet \
   -c "GRANT CONNECT ON DATABASE trustyclaw_admin TO \"trustyclaw-proxy\";" \
   -c "GRANT CONNECT ON DATABASE trustyclaw_admin TO \"trustyclaw-tools\";" \
 @APP_POSTGRES_CONNECT_GRANTS@
-# The PUBLIC revoke also stripped the proxy and tools roles' inherited CONNECT,
-# so it is granted back explicitly; without it the proxy cannot log network
-# decisions (and, being fail-closed, would fail every agent request) and the
-# tools service cannot reach any tool state. PostgreSQL 14 ships the public
-# schema creatable by every connecting role, so CREATE is revoked there too and
+# The PUBLIC revoke also stripped the proxy and tools roles'
+# inherited CONNECT, so it is granted back explicitly; without it the proxy
+# cannot log network decisions (and, being fail-closed, would fail every agent
+# request), and the tools service cannot reach any tool state. PostgreSQL 14 ships the public schema
+# creatable by every connecting role, so CREATE is revoked there too and
 # granted back to exactly the schema-owning admin role: a compromised proxy or
-# tools service can use only its granted tables, not mint new objects. The
-# owning trustyclaw-admin role keeps its database privileges implicitly.
+# tools service can use only its granted tables, not mint new
+# objects. The owning trustyclaw-admin role keeps its database privileges
+# implicitly.
 
 # Apply schema migrations, then compute and store the effective host config.
 # Both run as trustyclaw-admin: migrations are owned by the same role the
@@ -614,8 +623,13 @@ else
 fi
 
 # Managed Codex policy: restrict the agent to cached web search and disable
-# Codex-hosted app/plugin connector surfaces. The network proxy is the second
-# layer for web search: it denies live web_search payloads on OpenAI domains.
+# Codex-hosted app/plugin/browse surfaces so the agent does not even attempt a
+# tool the proxy would deny. `cached` is the only allowed web-search mode, which
+# structurally excludes both `live` and `indexed` (server-approved external URL
+# fetch) and keeps `open_page`/`find_in_page` reading OpenAI's index rather than
+# fetching live — so no separate knob is needed for those. The network proxy is
+# the ultimate layer: it denies any non-cached web/browse tool on OpenAI domains
+# regardless of what the client requests.
 mkdir -p /etc/codex
 chmod 755 /etc/codex
 cat > /etc/codex/requirements.toml <<'EOF'
@@ -626,6 +640,9 @@ apps = false
 plugins = false
 tool_search = false
 tool_suggest = false
+computer_use = false
+remote_plugin = false
+plugin_sharing = false
 EOF
 chmod 644 /etc/codex/requirements.toml
 
@@ -721,6 +738,10 @@ chmod 700 /mnt/trustyclaw-agent/agent-home
 install -d -m 700 -o trustyclaw-agent -g trustyclaw-agent "$AGENT_HOME_PATH/.codex" "$AGENT_HOME_PATH/.claude"
 chown trustyclaw-proxy:trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state
 chmod 700 /mnt/trustyclaw-admin/proxy-state
+chown trustyclaw-tools:trustyclaw-tools /mnt/trustyclaw-admin/tools-state
+chmod 700 /mnt/trustyclaw-admin/tools-state
+chown trustyclaw-tools:trustyclaw-tools /mnt/trustyclaw-admin/tools-state/assets
+chmod 700 /mnt/trustyclaw-admin/tools-state/assets
 chown trustyclaw-proxy:trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state/generated-certs
 chmod 700 /mnt/trustyclaw-admin/proxy-state/generated-certs
 chown trustyclaw-proxy:trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state/network_proxy_ca.key /mnt/trustyclaw-admin/proxy-state/network_proxy_ca.crt
@@ -779,7 +800,10 @@ fi
 # HTTPS because the bundled tool packages run inside it and call their
 # third-party APIs directly; the admin service holds no internet egress at all,
 # so a compromised tool package cannot exfiltrate admin state, and the agent's
-# fail-closed proxy path is unaffected.
+# fail-closed proxy path is unaffected. The trustyclaw-agent-app service gets
+# no egress rule at all: its only network reach is the per-app loopback port
+# accepts generated below, so it can proxy agent calls to app backends and
+# nothing else.
 python3 - <<'PY'
 import json, pathlib
 config = json.loads(pathlib.Path('/tmp/trustyclaw_effective_config.json').read_text())
@@ -820,6 +844,7 @@ $(cat /tmp/trustyclaw_cloudflare_rules)
     oif lo tcp dport @PROXY_PORT@ meta skuid "trustyclaw-agent" accept
     oif lo meta skuid "trustyclaw-agent" drop
 @APP_NFTABLES_RULES@
+    oif lo meta skuid "trustyclaw-agent-app" drop
     oif lo accept
     ct state established,related accept
     meta skuid 0 accept
@@ -925,11 +950,39 @@ RestartSec=3
 WantedBy=multi-user.target
 UNIT
 
+# The dedicated agent-app service proxies agent app_api calls to app backend
+# ports (the one uid besides trustyclaw-admin that nftables allows to open new
+# connections to them). It derives app ownership from the caller's trusted
+# thread scope and needs no database access.
+# RuntimeDirectory stays world-traversable (0755) so the agent can connect;
+# the socket peer-credential check plus cgroup thread attribution are the
+# authentication.
+cat > /etc/systemd/system/trustyclaw-agent-app.service <<'UNIT'
+[Unit]
+Description=TrustyClaw Agent App Service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=trustyclaw-agent-app
+UMask=0077
+RuntimeDirectory=trustyclaw-agent-app
+RuntimeDirectoryMode=0755
+Environment=PYTHONPATH=/opt/trustyclaw-host
+ExecStart=/usr/bin/python3 -m host.runtime.agent_app_service
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 cat > /etc/systemd/system/trustyclaw-admin-api.service <<'UNIT'
 [Unit]
 Description=TrustyClaw Admin API
-After=network-online.target trustyclaw-network-proxy.service trustyclaw-postgres.service trustyclaw-tools.service
-Wants=network-online.target trustyclaw-network-proxy.service trustyclaw-postgres.service trustyclaw-tools.service
+After=network-online.target trustyclaw-network-proxy.service trustyclaw-postgres.service trustyclaw-tools.service trustyclaw-agent-app.service
+Wants=network-online.target trustyclaw-network-proxy.service trustyclaw-postgres.service trustyclaw-tools.service trustyclaw-agent-app.service
 StartLimitIntervalSec=0
 
 [Service]
@@ -976,6 +1029,7 @@ fi
 systemctl daemon-reload
 systemctl enable --now trustyclaw-network-proxy.service
 systemctl enable --now trustyclaw-tools.service
+systemctl enable --now trustyclaw-agent-app.service
 systemctl enable --now trustyclaw-admin-api.service
 if [ "$cloudflare_connection_count" -gt 0 ]; then
   systemctl enable --now trustyclaw-cloudflared.service
