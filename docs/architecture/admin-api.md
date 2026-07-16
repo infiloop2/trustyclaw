@@ -42,11 +42,13 @@ Each live-validation verdict is remembered in process memory, so validation
 generates provider traffic at most once per scheduled recheck even though
 loading or awaiting-login runtimes are polled every five seconds and Claude
 tasks re-check runtime status at claim (the full lifecycle is in
-[Agent provider lifecycle](agent-provider-lifecycle.md)). An authentication failure is final
-for that credential: the runtime stays `awaiting_login` with no further
-provider traffic until an operator login or account reset replaces the
-credential. Any other validation failure surfaces as `error` and is retried
-on the next scheduled recheck. When a new or rotated Claude token is
+[Agent provider lifecycle](agent-provider-lifecycle.md)). The operator refresh
+endpoint bypasses this memory and performs an immediate provider check. An
+authentication failure is final for automatic checks: the runtime stays
+`awaiting_login` with no background provider traffic until an explicit refresh
+rechecks it or an operator login or account reset replaces the credential. Any
+other validation failure surfaces as `error` and is retried on the next
+scheduled recheck. When a new or rotated Claude token is
 validated by attestation, the same refresh reads usage once right after it
 publishes the token's proxy pin, so usage appears immediately after login.
 

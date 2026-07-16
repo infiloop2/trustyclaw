@@ -63,8 +63,8 @@ Expected methods:
 | `account/read` | Accepts a `refreshToken` boolean and returns a JSON object with an `account` field. Normal status reads pass `false`; if the live usage probe fails for a pinned account, TrustyClaw retries with `true` so Codex validates or refreshes its credential before the UI reports connected. A ChatGPT account contains `email` and `planType`; any provider-specific account type is intentionally ignored. A falsey account means login is still required. |
 | `account/rateLimits/read` | Returns Codex usage-limit snapshots. TrustyClaw exposes only the default `rateLimits` snapshot in admin API responses; per-limit `rateLimitsByLimitId` entries and duplicated snapshot identity fields are intentionally not returned. Rate-limit windows contain `usedPercent`, `windowDurationMins`, and `resetsAt`; the default snapshot may contain `credits`. |
 | `account/login/start` | Accepts `{"type": "chatgptDeviceCode"}` and returns `type`, `loginId`, `verificationUrl`, and `userCode`. |
-| `thread/start` | Accepts `cwd`, `approvalPolicy`, `sandbox`, developer instructions, and the selected `model`. Returns `thread.id`. |
-| `thread/resume` | Accepts `threadId`, `cwd`, and the selected `model`. Returns a resumed `thread.id`, or fails when the thread cannot be resumed. |
+| `thread/start` | Accepts `cwd`, `approvalPolicy`, `sandbox`, developer instructions, and the selected `model`. TrustyClaw appends the validated app manifest instructions for app-scoped threads. Returns `thread.id`. |
+| `thread/resume` | Accepts `threadId`, `cwd`, the selected `model`, and refreshed developer instructions. Returns a resumed `thread.id`, or fails when the thread cannot be resumed. |
 | `turn/start` | Accepts `threadId`, text input, and the selected `model` and `effort`. Returns `turn.id`. It may emit notifications before the response. |
 | `turn/steer` | Accepts `threadId`, `expectedTurnId`, and text input. A `no active turn` error is treated as transient during startup. |
 
@@ -169,18 +169,28 @@ request shapes:
   account id inferred from local auth files.
 - Data-plane request bodies expose OpenAI tool declarations in parseable JSON
   when web search is requested.
-- Cached web search uses `{"type": "web_search", "external_web_access": false}`,
-  or on the standalone Codex search endpoints a body with
-  `settings.external_web_access: false`.
-- Live web search uses `web_search_preview` (including dated variants),
-  `web_search` with external access enabled or omitted, Chat Completions
-  `web_search_options`/search models, or a standalone search request without
-  the cached setting, so the proxy can deny it.
+- Cached web search uses `{"type": "web_search", "external_web_access": false}`
+  with `indexed_web_access` false or absent, or on the standalone Codex search
+  endpoints a body with `settings.external_web_access: false` and no
+  `settings.indexed_web_access: true`. This is the only web-tool shape forwarded;
+  everything else is denied (fail-closed).
+- Non-cached web access — `web_search` with `external_web_access` enabled or
+  omitted, `indexed_web_access: true` (Codex `indexed` mode: OpenAI fetches
+  server-approved external URLs), `web_search_preview` (including dated
+  variants), a bare `web`/`web_fetch`/`browser`/`computer_use`/`code_interpreter`
+  tool, any tool carrying a truthy `*_web_access` flag, Chat Completions
+  `web_search_options`/search models, or a standalone search request without the
+  cached setting — is denied by the proxy. New or renamed web tools fail closed:
+  a Codex upgrade that adds a web/browse tool type not matched here still needs a
+  guard re-audit, but is denied by default rather than forwarded.
 - Remote MCP tools are declared as parseable `type: mcp` tool objects (with a
   `server_url` or hosted `connector_id`), so the proxy can deny them.
 
 Bootstrap also installs `/etc/codex/requirements.toml` to pin Codex web search
-behavior to cached search and disable Codex app/plugin connector surfaces, plus
+to cached (`allowed_web_search_modes = ["cached"]`, which excludes `live` and
+`indexed`) and disable Codex app/plugin/browse feature surfaces (`apps`,
+`plugins`, `tool_search`, `tool_suggest`, `computer_use`, `remote_plugin`,
+`plugin_sharing`) so the agent does not attempt a proxy-denied tool, plus
 `/mnt/trustyclaw-agent/agent-home/.codex/config.toml` from
 `host/bootstrap/agent-home/.codex/config.toml`. That file must set
 `approval_policy = "never"`, `sandbox_mode = "danger-full-access"`, and trust
@@ -202,7 +212,8 @@ TrustyClaw starts one Claude Code process per task turn through:
 claude -p --input-format stream-json --output-format stream-json --verbose \
   --model <model> --effort <effort> \
   --setting-sources user --strict-mcp-config \
-  --mcp-config <inline JSON for the bundled tools MCP shim>
+  --mcp-config <inline JSON for the bundled tools MCP shim> \
+  [--append-system-prompt <validated app instructions>]
 ```
 
 TrustyClaw passes the session selection on every new and resumed process.
@@ -211,13 +222,44 @@ Claude Code `2.1.206` accepts the exposed model aliases `opus`, `fable`, and
 effort. `ultracode` combines xhigh effort with dynamic workflow orchestration,
 so an older CLI that silently ignores that value is not compatible.
 
-Bootstrap also installs `/mnt/trustyclaw-agent/agent-home/.claude/settings.json`
-from `host/bootstrap/agent-home/.claude/settings.json`. That file must set
-`permissions.defaultMode = "bypassPermissions"` and
-`skipDangerousModePermissionPrompt = true`. Bootstrap installs it root-owned,
-readable, and immutable; `--setting-sources user` keeps stale local or project
-settings out of the task harness while still allowing `CLAUDE.md` instructions
-to load.
+Bootstrap installs `/mnt/trustyclaw-agent/agent-home/.claude/settings.json`
+from `host/bootstrap/agent-home/.claude/settings.json` (root-owned, readable,
+immutable). It sets `permissions.defaultMode = "bypassPermissions"` and
+`skipDangerousModePermissionPrompt = true`; `--setting-sources user` keeps stale
+local or project settings out of the task harness while still allowing
+`CLAUDE.md` instructions to load, and makes this file the only loaded settings
+source.
+
+WebSearch availability follows the operator's
+`managed_network_integrations.claude.web_search` toggle (default off) and is
+applied at launch, not written to disk. The orchestrator — the only side with a
+database role — reads the toggle in `run()` and states the decision to the
+launcher as its required first argument (`web-search=on`/`web-search=off`). The
+launcher (`host/bootstrap/helpers/run-claude-code.sh`) is authoritative for the
+enforcement: on `web-search=off` it appends
+`--settings '{"permissions":{"deny":["WebSearch"]}}'` to the Claude invocation
+itself, so the deny is built and verifiable in one place rather than trusted
+from its caller. That CLI settings override is always loaded regardless of
+`--setting-sources`, a `deny` rule applies in every mode (including
+`bypassPermissions`) and wins first-match, and the agent cannot influence the
+launched command — so there is no file for the agent to tamper with and no way
+to re-enable the tool. Non-agent maintenance calls (auth, usage) run no model
+turn, so they pass `web-search=off` and keep the deny-by-default posture.
+`WebFetch`
+and `Bash` stay enabled — their egress is client-side and already gated by the
+domain allow-list. The launcher also sets
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (telemetry/feedback/auto-update
+suppression; it does not affect WebSearch/WebFetch) for every invocation except
+the host-owned `/usage` probe. Claude Code `2.1.206` classifies its account-limit
+fetch as nonessential, so the probe must omit this environment variable or it
+exits successfully without returning any usage windows.
+
+The network proxy is the ultimate layer and enforces the same toggle
+independently: `anthropic_external_url_request_guard` on `api.anthropic.com`
+always denies server-side `web_fetch`/`code_execution`/remote-MCP declarations,
+and denies `web_search` unless `anthropic_allow_web_search` (expanded from the
+toggle) is set. So even if the harness settings layer were bypassed, web search
+stays off unless the operator enabled it.
 
 `--strict-mcp-config` plus the inline `--mcp-config` make the bundled tools
 shim (`host.runtime.tools_mcp_shim`, spawned as `trustyclaw-agent`) the only
@@ -301,12 +343,14 @@ The probe's verdict is memoized per token hash. Active runtimes are rechecked
 every five minutes and immediately before each Claude task, but only a
 recheck whose memo has expired runs the probe, so the pre-task check is
 normally memory-only. An `awaiting_login` verdict never expires: that token
-is rejected, no background retry can fix it, and the only recovery is an
-operator login (which mints a new token) or an account reset. An `error`
+is rejected and no background retry can fix it. An explicit refresh probes
+once; an operator login (which mints a new token) or an account reset replaces
+the credential. An `error`
 verdict expires with the memo, so infrastructure failures recover on the next
 scheduled recheck. Attestation results are memoized per token hash the same
 way: a token's attested identity never changes, so one successful profile
-fetch answers every later recheck of that token.
+fetch answers every later recheck of that token. The explicit operator refresh
+bypasses verdict memory and probes immediately.
 
 Login starts with:
 
@@ -412,9 +456,8 @@ when its reset time parses, `resets_at`. Reset times are Unix timestamps;
 TrustyClaw converts the provider's UTC text while capturing the snapshot; a
 reset in any other timezone label drops only that window's `resets_at`. A line
 that does not match contributes nothing, and the snapshot keeps whatever did
-parse. When a refresh yields no fresh usage at all, TrustyClaw keeps the
-previously captured `claude_usage` snapshot (and its `last_checked_at`)
-instead of guessing or blanking known limits.
+parse. When no usage window parses, `claude_usage` is absent; TrustyClaw never
+presents percentages from an older provider read as the current snapshot.
 
 TrustyClaw therefore cannot recreate Claude Code auth files from admin state.
 Doing that would require storing refresh/access tokens or equivalent provider

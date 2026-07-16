@@ -20,7 +20,7 @@ from host.config import ConfigError, parse_input_config
 from host.cli import lifecycle as deploy
 from host.cli import lifecycle_aws
 from host.cli import power
-from host.runtime import app_platform
+from host.runtime import app_platform, db
 
 
 
@@ -1228,6 +1228,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("ensure_user trustyclaw-proxy \"$TRUSTYCLAW_PROXY_UID\" trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state", bootstrap)
         self.assertIn("ensure_user cloudflared \"$CLOUDFLARED_UID\" cloudflared /nonexistent", bootstrap)
         self.assertIn("ensure_user trustyclaw-app-agent_chat \"$TRUSTYCLAW_APP_AGENT_CHAT_UID\" trustyclaw-app-agent_chat /nonexistent", bootstrap)
+        self.assertIn("ensure_user trustyclaw-app-mission_pursuit \"$TRUSTYCLAW_APP_MISSION_PURSUIT_UID\" trustyclaw-app-mission_pursuit /nonexistent", bootstrap)
         self.assertNotIn("usermod -a -G trustyclaw-admin trustyclaw-proxy", bootstrap)
         self.assertNotIn("--groups trustyclaw-admin", bootstrap)
         self.assertIn('--no-create-home --shell /usr/sbin/nologin "$name"', bootstrap)
@@ -1251,12 +1252,20 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("User=trustyclaw-proxy", bootstrap)
         self.assertIn("User=cloudflared", bootstrap)
         self.assertIn("User=trustyclaw-app-agent_chat", bootstrap)
+        self.assertIn("User=trustyclaw-app-mission_pursuit", bootstrap)
         self.assertIn("Slice=trustyclaw_app.slice", bootstrap)
         self.assertIn("trustyclaw-app-agent_chat.service", bootstrap)
+        self.assertIn("trustyclaw-app-mission_pursuit.service", bootstrap)
         self.assertIn("python3 -m host.runtime.app_migrate pending agent_chat", bootstrap)
+        self.assertIn("python3 -m host.runtime.app_migrate pending mission_pursuit", bootstrap)
         self.assertIn(
             "runuser -u trustyclaw-app-agent_chat -- env PYTHONPATH=/opt/trustyclaw-host "
             'python3 -m host.runtime.app_migrate apply-sql agent_chat "$app_migration_version"',
+            bootstrap,
+        )
+        self.assertIn(
+            "runuser -u trustyclaw-app-mission_pursuit -- env PYTHONPATH=/opt/trustyclaw-host "
+            'python3 -m host.runtime.app_migrate apply-sql mission_pursuit "$app_migration_version"',
             bootstrap,
         )
         self.assertIn(
@@ -1264,8 +1273,15 @@ class DeployUnitTests(unittest.TestCase):
             'python3 -m host.runtime.app_migrate record agent_chat "$app_migration_version"',
             bootstrap,
         )
+        self.assertIn(
+            "runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host "
+            'python3 -m host.runtime.app_migrate record mission_pursuit "$app_migration_version"',
+            bootstrap,
+        )
         self.assertNotIn('GRANT \\"trustyclaw-app-agent_chat\\" TO \\"trustyclaw-admin\\"', bootstrap)
+        self.assertNotIn('GRANT \\"trustyclaw-app-mission_pursuit\\" TO \\"trustyclaw-admin\\"', bootstrap)
         self.assertIn("CREATE SCHEMA IF NOT EXISTS app_agent_chat AUTHORIZATION", bootstrap)
+        self.assertIn("CREATE SCHEMA IF NOT EXISTS app_mission_pursuit AUTHORIZATION", bootstrap)
         self.assertIn("trustyclaw-app-agent_chat", bootstrap)
         # Credential carry-over (payload for deploy/reconfigure, stored config
         # for upgrade/recover) lives in host.runtime.write_config now; bootstrap
@@ -1297,16 +1313,35 @@ class DeployUnitTests(unittest.TestCase):
         self.assertNotIn('oif lo tcp dport 7443 meta skuid "trustyclaw-app-agent_chat" accept', bootstrap)
         self.assertNotIn('oif lo tcp dport 7445 meta skuid "trustyclaw-app-agent_chat" accept', bootstrap)
         # App backend TCP listeners are loopback-only and reachable only from
-        # the admin API service uid. Other local users hit the explicit drop
+        # the admin API service uid (browser bridge) and the agent-app service
+        # uid (agent app_api proxy). Other local users hit the explicit drop
         # before the broad loopback accept.
         self.assertIn('oif lo tcp dport $APP_AGENT_CHAT_PORT meta skuid "trustyclaw-admin" accept', bootstrap)
+        self.assertIn('oif lo tcp dport $APP_AGENT_CHAT_PORT meta skuid "trustyclaw-agent-app" accept', bootstrap)
         self.assertIn("oif lo tcp dport $APP_AGENT_CHAT_PORT drop", bootstrap)
         self.assertLess(
             bootstrap.index('oif lo tcp dport $APP_AGENT_CHAT_PORT meta skuid "trustyclaw-admin" accept'),
             bootstrap.index("oif lo tcp dport $APP_AGENT_CHAT_PORT drop"),
         )
         self.assertLess(
+            bootstrap.index('oif lo tcp dport $APP_AGENT_CHAT_PORT meta skuid "trustyclaw-agent-app" accept'),
             bootstrap.index("oif lo tcp dport $APP_AGENT_CHAT_PORT drop"),
+        )
+        self.assertLess(
+            bootstrap.index("oif lo tcp dport $APP_AGENT_CHAT_PORT drop"),
+            bootstrap.index("oif lo accept"),
+        )
+        # The agent-app service gets no egress rule of its own: its only
+        # network reach is the per-app port accepts above.
+        self.assertNotIn('meta skuid "trustyclaw-agent-app" tcp dport 443 accept', bootstrap)
+        self.assertNotIn('meta skuid "trustyclaw-agent-app" udp dport 53 accept', bootstrap)
+        self.assertIn('oif lo meta skuid "trustyclaw-agent-app" drop', bootstrap)
+        self.assertLess(
+            bootstrap.index('oif lo tcp dport $APP_AGENT_CHAT_PORT meta skuid "trustyclaw-agent-app" accept'),
+            bootstrap.index('oif lo meta skuid "trustyclaw-agent-app" drop'),
+        )
+        self.assertLess(
+            bootstrap.index('oif lo meta skuid "trustyclaw-agent-app" drop'),
             bootstrap.index("oif lo accept"),
         )
         # The dedicated tools service runs the bundled tool packages, so it gets
@@ -1387,6 +1422,9 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("queued for approval as push-<id>", agent_instructions)
         self.assertIn("github_dot_github_rest_write_denied", agent_instructions)
         self.assertIn("TrustyClaw admin UI", agent_instructions)
+        self.assertIn("always exposes `app_api`", agent_instructions)
+        self.assertIn("listing the tool grants no app access", agent_instructions)
+        self.assertIn("do not guess or probe routes", agent_instructions)
         self.assertIn("GitHub GraphQL requests are denied by policy", agent_instructions)
         self.assertIn("equivalent REST endpoint with `gh api`", agent_instructions)
         self.assertNotIn("alternate transports", agent_instructions)
@@ -1420,6 +1458,26 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("ExecStart=/usr/bin/python3 -m host.runtime.tools_service", bootstrap)
         self.assertIn("RuntimeDirectory=trustyclaw-tools\n", bootstrap)
         self.assertIn("RuntimeDirectoryMode=0755", bootstrap)
+        self.assertIn('tools_state = admin_mount / "tools-state"', bootstrap)
+        self.assertIn('recreate_directory(tools_state / "assets")', bootstrap)
+        self.assertIn(
+            "chown trustyclaw-tools:trustyclaw-tools /mnt/trustyclaw-admin/tools-state/assets",
+            bootstrap,
+        )
+        self.assertIn("chmod 700 /mnt/trustyclaw-admin/tools-state/assets", bootstrap)
+        # The dedicated agent-app service has its own user and runtime
+        # directory for the agent-facing socket, with no database access.
+        self.assertIn('ensure_user trustyclaw-agent-app "$TRUSTYCLAW_AGENT_APP_UID" trustyclaw-agent-app /nonexistent', bootstrap)
+        self.assertIn("TRUSTYCLAW_AGENT_APP_UID=47747", bootstrap)
+        self.assertIn("ExecStart=/usr/bin/python3 -m host.runtime.agent_app_service", bootstrap)
+        self.assertIn("User=trustyclaw-agent-app", bootstrap)
+        self.assertIn("RuntimeDirectory=trustyclaw-agent-app\n", bootstrap)
+        self.assertIn("systemctl enable --now trustyclaw-agent-app.service", bootstrap)
+        self.assertIn(
+            "Wants=network-online.target trustyclaw-network-proxy.service trustyclaw-postgres.service "
+            "trustyclaw-tools.service trustyclaw-agent-app.service",
+            bootstrap,
+        )
         # The bootstrap runs with umask 077: the npm-installed CLI and the
         # managed config directory must be opened up so the agent can use
         # them, and the deploy verifies the agent can actually run both CLIs.
@@ -1471,6 +1529,15 @@ class DeployUnitTests(unittest.TestCase):
             # The scope must not outlive the admin API: stopping, restarting,
             # or crashing the admin service stops the agent scopes with it.
             self.assertIn("--property=BindsTo=trustyclaw-admin-api.service", launch_source)
+            # Task turns run in a scope named after the host thread id, whose
+            # reserved app prefix is the kernel-owned app identity. The root
+            # helper validates the id (it becomes a unit name) and never
+            # forwards the pair to the CLI.
+            self.assertIn('if [ "${1:-}" = "--thread-scope" ]; then', launch_source)
+            self.assertIn('if ! [[ "${2:-}" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then', launch_source)
+            self.assertIn('unit_args=(--unit "trustyclaw-agent-thread-$2")', launch_source)
+            self.assertIn("shift 2", launch_source)
+            self.assertIn('"${unit_args[@]}"', launch_source)
         # App backends are long-running services, so bootstrap creates a
         # separate top-level slice and each generated app service joins it.
         # The lower CPU weight is soft: apps can use idle cores, but the admin
@@ -1573,6 +1640,7 @@ class DeployUnitTests(unittest.TestCase):
                 ui_dir=ui,
                 port=7457,
                 allocation=app_platform.AppAllocation(uid=48007, gid=48007, port_offset=7),
+                agent_instructions="Test app instructions.",
             )
 
             with patch("host.cli.lifecycle_bootstrap.app_platform.installed_apps", return_value=[app]):
@@ -1624,12 +1692,13 @@ class DeployUnitTests(unittest.TestCase):
         # roles only, and an explicit reject for everyone else (the agent user
         # has no role and no pg_hba rule that admits it).
         self.assertIn("listen_addresses = ''", bootstrap)
-        # Server cap sized above the three DB-using services' combined client
-        # caps (3 x db.MAX_ACTIVE_CONNECTIONS = 54) plus reserve/psql/app
-        # headroom, so a burst queues client-side rather than losing a proxied
-        # request's event insert to connection exhaustion.
-        self.assertIn("max_connections = 80", bootstrap)
+        # The three core DB clients plus every bundled app fit below the server
+        # cap with explicit room for operator, superuser, and deploy sessions.
+        self.assertIn("max_connections = 100", bootstrap)
+        self.assertEqual(db.MAX_ACTIVE_CONNECTIONS, 14)
+        self.assertEqual((3 + len(app_platform.installed_apps())) * db.MAX_ACTIVE_CONNECTIONS, 70)
         self.assertIn("local  trustyclaw_admin  trustyclaw-admin  peer", bootstrap)
+        self.assertNotIn("local  trustyclaw_admin  trustyclaw-agent-app  peer", bootstrap)
         self.assertIn("local  all               postgres          peer", bootstrap)
         self.assertIn("local  all               all               reject", bootstrap)
         self.assertIn('CREATE ROLE "trustyclaw-admin" LOGIN;', bootstrap)
@@ -1644,6 +1713,9 @@ class DeployUnitTests(unittest.TestCase):
         # schema migration (0007), the same pattern as the proxy role's grants.
         self.assertIn('GRANT CONNECT ON DATABASE trustyclaw_admin TO \\"trustyclaw-tools\\";', bootstrap)
         self.assertNotIn('GRANT SELECT ON enabled_tools', bootstrap)
+        # Thread-scope attribution needs no agent-app database identity.
+        self.assertNotIn('CREATE ROLE "trustyclaw-agent-app" LOGIN;', bootstrap)
+        self.assertNotIn('GRANT CONNECT ON DATABASE trustyclaw_admin TO \\"trustyclaw-agent-app\\";', bootstrap)
         migration = (Path(__file__).resolve().parents[1] / "host" / "migrations" / "0007_tool_state.sql").read_text()
         # Read-only on enablement and config (operator-written by the admin
         # API); the REVOKE first drops broader grants from earlier iterations.
@@ -1667,7 +1739,8 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("/etc/systemd/system/trustyclaw-postgres.service", bootstrap)
         self.assertIn("systemctl enable --now trustyclaw-postgres.service", bootstrap)
         self.assertIn(
-            "After=network-online.target trustyclaw-network-proxy.service trustyclaw-postgres.service",
+            "After=network-online.target trustyclaw-network-proxy.service trustyclaw-postgres.service "
+            "trustyclaw-tools.service trustyclaw-agent-app.service",
             bootstrap,
         )
         # Schema migrations and config seeding run as trustyclaw-admin, after
@@ -1745,6 +1818,66 @@ class DeployUnitTests(unittest.TestCase):
                 script_path = handle.name
             self.addCleanup(lambda path=script_path: Path(path).unlink(missing_ok=True))
             subprocess.run(["bash", "-n", script_path], check=True)
+
+    def test_run_claude_code_launcher_combines_web_search_and_thread_scope(self) -> None:
+        # The launcher — not its caller — translates the operator's web-search
+        # decision into the WebSearch deny. Neutralize the parts that need root
+        # and host paths so we can observe exactly what it forwards to claude.
+        raw = Path("host/bootstrap/helpers/run-claude-code.sh").read_text().replace("@PROXY_PORT@", "7445")
+        harness = raw.replace(
+            "cd /mnt/trustyclaw-agent/agent-home", "cd /"
+        ).replace("exec systemd-run", "exec echo systemd-run")
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".sh") as handle:
+            handle.write(harness)
+            script_path = handle.name
+        self.addCleanup(lambda: Path(script_path).unlink(missing_ok=True))
+
+        def forwarded(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["bash", script_path, *args], capture_output=True, text=True, check=False
+            )
+
+        off = forwarded(
+            "web-search=off",
+            "--thread-scope",
+            "mission_pursuit__ws-3",
+            "-p",
+            "hello",
+        )
+        self.assertEqual(off.returncode, 0)
+        self.assertIn('--settings', off.stdout)
+        self.assertIn('{"permissions":{"deny":["WebSearch"]}}', off.stdout)
+        # The decision arg is consumed, not forwarded; the rest passes through.
+        self.assertIn("-p", off.stdout)
+        self.assertIn("hello", off.stdout)
+        self.assertNotIn("web-search=off", off.stdout)
+        self.assertIn("--unit trustyclaw-agent-thread-mission_pursuit__ws-3", off.stdout)
+        self.assertNotIn("--thread-scope", off.stdout)
+        self.assertIn("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1", off.stdout)
+
+        on = forwarded("web-search=on", "-p", "hello")
+        self.assertEqual(on.returncode, 0)
+        self.assertNotIn("--settings", on.stdout)
+        self.assertNotIn("WebSearch", on.stdout)
+        self.assertIn("hello", on.stdout)
+        self.assertIn("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1", on.stdout)
+
+        # Pinned Claude Code hides every account-limit window when this flag
+        # is set. /usage is host-owned maintenance, so it alone runs without
+        # the suppression while retaining the WebSearch deny.
+        usage = forwarded("web-search=off", "-p", "/usage", "--output-format", "json")
+        self.assertEqual(usage.returncode, 0)
+        self.assertIn("/usage", usage.stdout)
+        self.assertIn("WebSearch", usage.stdout)
+        self.assertNotIn("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", usage.stdout)
+
+        missing = forwarded("auth", "login")
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("web-search=on or web-search=off", missing.stderr)
+
+        invalid_scope = forwarded("web-search=off", "--thread-scope", "not/valid", "-p", "hello")
+        self.assertNotEqual(invalid_scope.returncode, 0)
+        self.assertIn("invalid --thread-scope thread id", invalid_scope.stderr)
 
     def test_upgrade_helper_has_one_fixed_bounded_source(self) -> None:
         helper = Path("host/bootstrap/helpers/check-for-upgrade.sh").read_text()

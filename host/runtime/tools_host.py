@@ -20,7 +20,7 @@ from pathlib import Path
 import time
 from typing import Any, Mapping, cast
 
-from host.runtime import state
+from host.runtime import state, tool_assets
 import host.tools
 from host.tools import (
     ActionExecuted,
@@ -35,7 +35,10 @@ from host.tools import (
     Tool,
     ToolManifest,
 )
+from host.tools.host_api import AssetMetadata
 from host.tools.manifest import TOOL_ID_RE
+
+_DEFAULT_ASSET_STORE = tool_assets.ToolAssetStore(tool_assets.DEFAULT_ASSET_ROOT)
 
 # Host approval policy: a pending decision is spent after 24 hours (swept by
 # the admin API's hourly maintenance pass), and decided records are kept as
@@ -209,6 +212,23 @@ class HostApprovals:
         return _approval_record(record)
 
 
+class HostAssets:
+    """Tool-scoped view of the tools service's private staged assets."""
+
+    def __init__(self, tool_id: str, store: tool_assets.ToolAssetStore) -> None:
+        self._tool_id = tool_id
+        self._store = store
+
+    def describe(self, asset_id: str) -> AssetMetadata:
+        return self._store.describe(self._tool_id, asset_id)
+
+    def open(self, asset_id: str) -> Any:
+        return self._store.open(self._tool_id, asset_id)
+
+    def delete(self, asset_id: str) -> None:
+        self._store.delete(self._tool_id, asset_id)
+
+
 def _approval_record(record: dict[str, Any]) -> ApprovalRecord:
     status: ApprovalStatus = record["status"]
     return ApprovalRecord(
@@ -229,6 +249,7 @@ class HostToolAPI:
     credentials: HostCredentials
     config: Mapping[str, str]
     approvals: HostApprovals
+    assets: HostAssets
 
 
 class _ToolConfigView(dict[str, str]):
@@ -243,13 +264,17 @@ class _ToolConfigView(dict[str, str]):
         )
 
 
-def host_api_for(tool: Tool) -> HostToolAPI:
+def host_api_for(tool: Tool, asset_store: tool_assets.ToolAssetStore | None = None) -> HostToolAPI:
     manifest = tool.manifest
     config = state.tool_config_values(manifest.tool_id, [entry.key for entry in manifest.config])
     return HostToolAPI(
         credentials=HostCredentials(manifest.tool_id),
         config=_ToolConfigView(config),
         approvals=HostApprovals(manifest),
+        assets=HostAssets(
+            manifest.tool_id,
+            asset_store or _DEFAULT_ASSET_STORE,
+        ),
     )
 
 
@@ -274,7 +299,12 @@ def enabled_tool(tool_id: str) -> Tool:
 # -- action execution ----------------------------------------------------------
 
 
-def execute_action(tool_id: str, action: str, tool_input: Any) -> dict[str, Any]:
+def execute_action(
+    tool_id: str,
+    action: str,
+    tool_input: Any,
+    asset_store: tool_assets.ToolAssetStore | None = None,
+) -> dict[str, Any]:
     """Run one agent-initiated action call end to end: resolve the enabled
     tool, schema-validate the input, invoke the package, audit, and return
     the JSON shape of the result."""
@@ -289,19 +319,29 @@ def execute_action(tool_id: str, action: str, tool_input: Any) -> dict[str, Any]
     schema_error = validate_against_schema(tool_input, spec.input_schema)
     if schema_error:
         raise ToolCallError(f"Invalid input for {tool_id}.{action}: {schema_error}")
+    # Snapshot the exact JSON before tool code runs. Besides enforcing one
+    # storage bound across every manifest, the round trip prevents a package
+    # from mutating the audit record through a shared nested object.
     try:
-        result = tool.execute(action, tool_input, host_api_for(tool))
+        serialized_input = _ensure_json_object(tool_input, what="Tool input", max_bytes=PAYLOAD_MAX_BYTES)
+    except ValueError as exc:
+        raise ToolCallError(str(exc)) from exc
+    audit_arguments = cast(JSONObject, json.loads(serialized_input))
+    try:
+        result = tool.execute(action, audit_arguments, host_api_for(tool, asset_store))
     except (ApprovalBackpressureError, ToolConfigKeyUnsetError) as exc:
         result = ActionFailed(str(exc))
     except Exception:
         result = ActionFailed("Tool call failed.")
     result_json = _result_json(result)
     result_json = _validate_output(tool_id, action, spec, result_json)
-    _audit(tool_id, action, result_json)
+    _audit(tool_id, action, result_json, arguments=audit_arguments)
     return result_json
 
 
-def _execute_approved(record: dict[str, Any]) -> dict[str, Any]:
+def _execute_approved(
+    record: dict[str, Any], asset_store: tool_assets.ToolAssetStore | None = None
+) -> dict[str, Any]:
     """Run one approved action and audit the outcome. Never raises: any
     failure (tool disabled since queueing, config unset, tool exception)
     becomes a failed result so the approval always reaches a terminal state.
@@ -309,7 +349,9 @@ def _execute_approved(record: dict[str, Any]) -> dict[str, Any]:
     tool_id, action, approval_id = record["tool_id"], record["action_id"], record["approval_id"]
     try:
         tool = enabled_tool(tool_id)
-        result: Any = tool.execute_approved(_approval_record(record), host_api_for(tool))
+        result: Any = tool.execute_approved(
+            _approval_record(record), host_api_for(tool, asset_store)
+        )
     except (ToolCallError, ToolConfigKeyUnsetError) as exc:
         result = ActionFailed(str(exc))
     except Exception:
@@ -318,7 +360,13 @@ def _execute_approved(record: dict[str, Any]) -> dict[str, Any]:
         # The contract forbids this; treat it as a failed execution.
         result = ActionFailed("Tool returned a pending result for an approved action.")
     result_json = _result_json(result)
-    _audit(tool_id, action, result_json, detail=_approval_audit_detail(approval_id, result_json))
+    _audit(
+        tool_id,
+        action,
+        result_json,
+        detail=_approval_audit_detail(approval_id, result_json),
+        arguments=cast(JSONObject, record["payload"]),
+    )
     return result_json
 
 
@@ -362,19 +410,30 @@ def _approval_audit_detail(approval_id: str, result_json: dict[str, Any]) -> str
     return f"{approval_id}: {error}" if error else approval_id
 
 
-def _audit(tool_id: str, action: str, result_json: dict[str, Any], *, detail: str | None = None) -> None:
+def _audit(
+    tool_id: str,
+    action: str,
+    result_json: dict[str, Any],
+    *,
+    detail: str | None = None,
+    arguments: JSONObject | None = None,
+) -> None:
     outcome = result_json["status"]
     if detail is None:
         detail = result_json.get("error") or result_json.get("approval_id") or ""
     if not isinstance(detail, str):
         detail = ""
-    state.record_tool_event(tool_id, action, outcome, detail)
+    state.record_tool_event(tool_id, action, outcome, detail, arguments)
 
 
 # -- approval lifecycle --------------------------------------------------------
 
 
-def decide_approval(approval_id: str, decision: str) -> dict[str, Any]:
+def decide_approval(
+    approval_id: str,
+    decision: str,
+    asset_store: tool_assets.ToolAssetStore | None = None,
+) -> dict[str, Any]:
     """Apply an operator decision. Approving runs ``execute_approved`` at most
     once and records the terminal outcome; denying is terminal immediately.
     Raises ToolCallError when the record is absent or already decided."""
@@ -386,13 +445,17 @@ def decide_approval(approval_id: str, decision: str) -> dict[str, Any]:
         if not state.transition_tool_approval(approval_id, "pending", "denied", now):
             raise ToolCallError(f"Approval {approval_id} is not pending.")
         # Deny has no execute_approved call to audit, so record it here.
-        state.record_tool_event(record["tool_id"], record["action_id"], "denied", approval_id)
+        state.record_tool_event(
+            record["tool_id"], record["action_id"], "denied", approval_id, cast(JSONObject, record["payload"])
+        )
         return {"approval": state.tool_approval(approval_id)}
     if not state.transition_tool_approval(approval_id, "pending", "approved", now):
         raise ToolCallError(f"Approval {approval_id} is not pending.")
     # The transition above is the at-most-once gate; the record handed to the
     # tool carries the state the transition just wrote.
-    result_json = _execute_approved(record | {"status": "approved", "decided_at": now})
+    result_json = _execute_approved(
+        record | {"status": "approved", "decided_at": now}, asset_store
+    )
     outcome = "executed" if result_json["status"] == "executed" else "failed"
     # The stored result is the outcome's single text per the contract: the
     # user-visible message when the approved action executed, the error when

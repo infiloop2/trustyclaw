@@ -202,8 +202,52 @@ class ToolRegistryTests(unittest.TestCase):
         # These ids key persisted config, credentials, approvals, and audit
         # records. New packages need no edit here; released ids may not vanish.
         self.assertTrue(
-            {"brave_search", "gmail", "google_calendar"}.issubset(tools_host.BUNDLED_TOOLS)
+            {
+                "brave_search",
+                "gmail",
+                "google_calendar",
+                "ibkr",
+                "instagram",
+                "instagram_discovery",
+                "linkedin",
+                "linkedin_discovery",
+                "polymarket",
+                "runway",
+                "twitter",
+            }.issubset(tools_host.BUNDLED_TOOLS)
         )
+
+    def test_bundled_action_inputs_are_self_describing(self) -> None:
+        for tool_id, tool in tools_host.BUNDLED_TOOLS.items():
+            for action in tool.manifest.actions:
+                properties = action.input_schema.get("properties", {})
+                if not isinstance(properties, dict):
+                    self.fail(f"{tool_id}.{action.id}.input_schema.properties must be an object")
+                for name, schema in properties.items():
+                    with self.subTest(tool_id=tool_id, action=action.id, property=name):
+                        if not isinstance(schema, dict):
+                            self.fail(f"{tool_id}.{action.id}.{name} must be a schema object")
+                        self.assertTrue(str(schema.get("description", "")).strip())
+
+    def test_bundled_tools_have_complete_operator_guides(self) -> None:
+        for tool_id, tool in tools_host.BUNDLED_TOOLS.items():
+            manifest = tool.manifest
+            with self.subTest(tool_id=tool_id):
+                self.assertTrue(manifest.protections)
+                self.assertTrue(manifest.setup_steps)
+                self.assertEqual(len(manifest.data_summary.cards), 4)
+                self.assertEqual(manifest.data_summary.cards[0].title, "What leaves this host")
+                self.assertEqual(manifest.data_summary.cards[1].title, "Where it can go")
+                self.assertTrue(all(step.title and step.description for step in manifest.setup_steps))
+                self.assertTrue(all(card.title and (card.description or card.points) for card in manifest.data_summary.cards))
+                self.assertTrue(
+                    any(
+                        "privacy" in f"{link.label}".lower() or "policy" in f"{link.label}".lower()
+                        for card in manifest.data_summary.cards
+                        for link in card.links
+                    ),
+                    f"{tool_id} must link an authoritative privacy policy",
+                )
 
     def test_tool_package_directory_requires_an_init_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -359,6 +403,9 @@ class ExecuteActionTests(ToolsHostTestCase):
         self.assertEqual(events[0]["tool_id"], "fake_notes")
         self.assertEqual(events[0]["action_id"], "read_note")
         self.assertEqual(events[0]["outcome"], "executed")
+        self.assertTrue(events[0]["has_arguments"])
+        self.assertNotIn("arguments", events[0])
+        self.assertEqual(state.tool_event(events[0]["seq"])["arguments"], {})
 
     def test_call_needing_unset_config_reaches_the_tool_and_fails(self) -> None:
         # Config is not gated: an enabled tool with no config still takes the call,
@@ -392,6 +439,12 @@ class ExecuteActionTests(ToolsHostTestCase):
         self.assertIsNone(state.tool_approval(number))
         self.assertIsNone(state.tool_approval(number + ".wrong-token"))
 
+    def test_action_arguments_are_capped_before_execution_or_audit(self) -> None:
+        self.prepare_fake_tool()
+        with self.assertRaisesRegex(tools_host.ToolCallError, "Tool input exceeds 65536 bytes"):
+            tools_host.execute_action("fake_notes", "write_note", {"text": "x" * 70_000})
+        self.assertEqual(state.page_tool_events_before(None), [])
+
     def test_pending_approvals_are_capped(self) -> None:
         self.prepare_fake_tool()
         with patch("host.runtime.tools_host.PENDING_APPROVAL_LIMIT", 2):
@@ -424,6 +477,7 @@ class ExecuteActionTests(ToolsHostTestCase):
         self.assertEqual(events[0]["action_id"], "crash_note")
         self.assertEqual(events[0]["outcome"], "failed")
         self.assertEqual(events[0]["detail"], "Tool call failed.")
+        self.assertEqual(state.tool_event(events[0]["seq"])["arguments"], {})
 
     def test_executed_output_must_match_manifest_output_schema(self) -> None:
         with patch.dict(tools_host.BUNDLED_TOOLS, {"bad_output_tool": BadOutputTool()}):
@@ -469,6 +523,8 @@ class ApprovalLifecycleTests(ToolsHostTestCase):
         ])
         self.assertEqual(events[0]["detail"], approval_id)
         self.assertEqual(events[1]["detail"], approval_id)
+        self.assertEqual(state.tool_event(events[0]["seq"])["arguments"], {"text": "hello"})
+        self.assertEqual(state.tool_event(events[1]["seq"])["arguments"], {"text": "hello"})
 
     def test_tool_events_paginate_newest_first(self) -> None:
         self.prepare_fake_tool()

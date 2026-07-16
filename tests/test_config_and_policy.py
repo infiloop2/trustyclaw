@@ -265,6 +265,24 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(disabled.to_json()["managed_network_integrations"], {})
         self.assertEqual(expand_network_controls(disabled)["allowed_network_access"], {})
 
+    def test_claude_web_search_toggle_expands_guard(self) -> None:
+        off = expand_network_controls(parse_network_controls(
+            {"managed_network_integrations": {"claude": {"enabled": True}}, "allowed_network_access": {}}))
+        rule = off["allowed_network_access"]["api.anthropic.com"]
+        self.assertTrue(rule["anthropic_account_guard"])
+        self.assertTrue(rule["anthropic_external_url_request_guard"])
+        self.assertNotIn("anthropic_allow_web_search", rule)
+        on = expand_network_controls(parse_network_controls(
+            {"managed_network_integrations": {"claude": {"enabled": True, "web_search": True}}, "allowed_network_access": {}}))
+        on_rule = on["allowed_network_access"]["api.anthropic.com"]
+        self.assertTrue(on_rule["anthropic_external_url_request_guard"])
+        self.assertTrue(on_rule["anthropic_allow_web_search"])
+
+    def test_claude_web_search_requires_enabled(self) -> None:
+        with self.assertRaisesRegex(ConfigError, r"web_search requires enabled"):
+            parse_network_controls(
+                {"managed_network_integrations": {"claude": {"enabled": False, "web_search": True}}, "allowed_network_access": {}})
+
     def test_disabled_github_rejects_write_repositories(self) -> None:
         # A disabled integration carries no other state: write repositories (or
         # require_dot_github_approval) require the integration to be enabled. An

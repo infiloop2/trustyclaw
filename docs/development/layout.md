@@ -48,7 +48,7 @@ Important source areas and the context that runs them:
 | `host/bootstrap/user_data.sh` | root through EC2 user data | Creates the operator account and installs only the single-use deploy SSH key. |
 | `host/bootstrap/bootstrap.sh` | root through lifecycle SSH | Mounts volumes, installs pinned dependencies, creates fixed users, configures PostgreSQL/nftables/systemd, applies migrations, and writes trusted host files. |
 | `host/bootstrap/helpers/` | root through exact `trustyclaw-admin` sudo rules | Launches runtimes as the agent user, reads or clears narrow agent-auth state, reads bounded agent files, reboots, and performs GitHub operations that need root egress. |
-| `host/apps/` | App users, plus bootstrap/admin readers | Contains app manifests, backend/UI/migration files, and stable `host_slot` declarations. See [Apps](../architecture/apps.md). |
+| `host/apps/` | App users, plus bootstrap/admin readers | Contains app manifests, agent instructions, backend/UI/migration files, and stable `host_slot` declarations. See [Apps](../architecture/apps/apps.md). |
 | `host/tools/` | `trustyclaw-tools` | Defines the host-neutral tool contract and bundled packages. Package discovery is directory-based; helper packages are explicitly excluded. |
 | `host/runtime/admin_api.py` | `trustyclaw-admin` | Serves `127.0.0.1:7443`, authenticates operator APIs, dispatches app/tool routes, owns task state, and starts workers and maintenance. |
 | `host/runtime/admin_ui*` | Browser, served by admin API | Implements the native-ES-module operator UI and its static assets. |

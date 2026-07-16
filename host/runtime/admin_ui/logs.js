@@ -28,6 +28,7 @@ function createPagedLog(config) {
       return Array.isArray(response.events) ? response.events : [];
     },
     async showFirstPage() {
+      if (config.pauseWhileOpen && document.querySelector(config.pauseWhileOpen)) return;
       const events = await log.fetchPage(null);
       log.pages = [events];
       log.page = 1;
@@ -136,8 +137,9 @@ export const toolLog = createPagedLog({
   tableId: "tool-events",
   pagerId: "tool-event-pager",
   pageAction: "tool-page",
-  columns: 4,
-  header: `<tr><th>time</th><th>tool</th><th>action</th><th>outcome</th></tr>`,
+  pauseWhileOpen: "#tool-events .tool-event-arguments[open]",
+  columns: 5,
+  header: `<tr><th>time</th><th>tool</th><th>action</th><th>outcome</th><th>arguments</th></tr>`,
   emptySummary: () => "No events",
   emptyState: () => "No tool audit events yet.",
   row: event => `
@@ -146,8 +148,28 @@ export const toolLog = createPagedLog({
       <td class="mono">${esc(event.tool_id)}</td>
       <td class="mono">${esc(event.action_id)}</td>
       <td>${badge(event.outcome)}${event.detail ? ` <span class="muted">${esc(event.detail)}</span>` : ""}</td>
+      <td>${event.has_arguments ? `<details class="tool-event-arguments" data-tool-event-seq="${esc(event.seq)}"><summary class="muted">view</summary><pre class="metadata"></pre></details>` : ""}</td>
     </tr>`,
 });
+
+// Argument objects can each be up to 64 KiB. Audit pages therefore return only
+// has_arguments and load one exact object when the operator expands it, instead
+// of transferring up to 100 payloads on every five-second live refresh.
+document.addEventListener("toggle", async event => {
+  const details = event.target;
+  if (!(details instanceof HTMLDetailsElement) || !details.open || !details.matches(".tool-event-arguments")) return;
+  const seq = details.dataset.toolEventSeq;
+  const pre = details.querySelector("pre.metadata");
+  if (!seq || !pre || pre.dataset.filled === "1") return;
+  pre.dataset.filled = "1";
+  try {
+    const response = await api("GET", `/v1/tools/events/${encodeURIComponent(seq)}`);
+    pre.textContent = JSON.stringify(response.event.arguments, null, 2);
+  } catch (error) {
+    pre.textContent = `(could not load arguments: ${error.message})`;
+    pre.dataset.filled = "";
+  }
+}, true);
 
 export function toggleNetDeniedFilter() {
   netEventFilter = netEventFilter === "denied" ? "all" : "denied";

@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import socket
 import socketserver
 import stat
@@ -154,11 +155,16 @@ def route_app_backend_request(
     body: Any,
 ) -> Any:
     _require_app_backend_route(method, path)
-
     internal_path = _internal_path(app_id, method, path)
     internal_body = _internal_body(app_id, method, path, body)
     _require_app_task_scope(app_id, method, path)
-    response = admin_api.route(method, internal_path, query, internal_body, app_backend_id=app_id)
+    response = admin_api.route(
+        method,
+        internal_path,
+        query,
+        internal_body,
+        app_backend_id=app_id,
+    )
     return _visible_response(app_id, response)
 
 

@@ -154,6 +154,7 @@ def _tool_entry(tool: Any, enabled_ids: set[str], configured_keys: set[str]) -> 
             for requirement in manifest.config
         ],
         "protections": list(manifest.protections),
+        "technical_details": list(manifest.technical_details),
         "setup_steps": [
             {
                 "title": step.title,

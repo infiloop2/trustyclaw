@@ -179,13 +179,14 @@ pipeline finds. Per state, the work and the provider traffic are:
 | `awaiting_login`, no credential | Claude: `claude auth status` (reads the local credential file). Codex: `account/read {"refreshToken": false}` on the app-server (local account state); while a device login is in flight, drain its completion notifications. | None from the refresh itself. A parked Codex device login polls the provider's device-code endpoint on its own — that is the OAuth device flow the Codex CLI owns, bounded by the login's expiry, not part of the refresh. |
 | `awaiting_login`, operator login in flight | Same local reads; the poll additionally drains the parked Codex login server's completion notifications (local IPC). The pending login record backs the UI's login card. | None from the refresh. The parked Codex server polls the provider's device-code endpoint until the login is approved or its code expires (the provider-prescribed device flow); Claude's browser flow makes no provider calls until the operator submits the code. |
 | `awaiting_login`, login expired unfinished | The expired login record is dropped the next time anything reads it (the poll's login capture, or the UI's card fetch, which then shows Start login again); status is unchanged. | None; the device-code polling ends with the code's expiry. Starting a new login replaces the old parked flow. |
-| `awaiting_login`, rejected credential still cached | Same local reads; the verdict memory answers without probing. | None, ever, until an operator login or reset replaces the credential. |
+| `awaiting_login`, rejected credential still cached | Same local reads; the verdict memory answers without probing. | None from automatic checks. An explicit operator refresh probes once; login or reset replaces the credential. |
 | `awaiting_login` → login just completed | Same local reads discover the new credential; Codex also reads the completed login's provider-signed account id (local helper). | One Claude profile attestation (root egress) to bind the new token to its account; Codex validates on its next recheck through the usage read. |
 | `active` (five-minute recheck) | Policy read, local account read, credential hash re-read, commit. | Exactly one authenticated round trip: Claude runs `claude -p /usage` (the CLI may additionally call its OAuth token endpoint if the access token expired — that refresh is the point); Codex runs `account/rateLimits/read`. A Codex failure on a pinned account adds one `account/read {"refreshToken": true}`. A detected Claude rotation adds one profile attestation and one post-commit usage read. |
 | `error` | Same local reads; the verdict memory answers until it expires. | None while the verdict holds; one normal live validation when it expires. |
 
-Pre-task Claude refreshes and the operator refresh button run this same table;
-within the verdict memory's window they are the memory-only rows.
+Pre-task Claude refreshes run this same table and stay memory-only within the
+verdict window. The operator refresh button deliberately bypasses verdict
+memory and performs the provider check immediately.
 
 ## How a login lands
 
@@ -213,13 +214,13 @@ and the refresh is what converts its completion into an anchor, a pin, and
 
 Every live-validation verdict is remembered in process memory, keyed by the
 credential it judged, so validation generates provider traffic at most once
-per scheduled recheck regardless of how often the five-second poll, the
-operator refresh button, or task claims re-enter the refresh:
+per scheduled recheck regardless of how often the five-second poll or task
+claims re-enter the refresh. An explicit operator refresh bypasses this memory:
 
-- An **authentication failure is final** for that credential: the runtime
-  stays `awaiting_login` with zero further provider traffic. Recovery is an
-  operator login (which mints a new credential and therefore a new verdict)
-  or an account reset; both clear the verdict.
+- An **authentication failure is final for automatic checks**: the runtime
+  stays `awaiting_login` with zero background provider traffic. An explicit
+  refresh probes once; an operator login or account reset replaces the
+  credential and clears the verdict.
 - Any **other failure** is `error` and expires after four minutes, under the
   five-minute recheck, so infrastructure failures recover on the next
   scheduled poll without a five-second retry loop.
@@ -253,4 +254,4 @@ Codex has no per-task convergence and its cached status decides.
   agent auth files are wiped, live processes close, running tasks fail, and
   remembered verdicts are dropped. The next login re-anchors from scratch.
 - **Refresh** (`POST /v1/agent-runtime/refresh`): re-derives status through
-  the pipeline; memory-only while verdicts are fresh.
+  the pipeline and forces the provider probe instead of reusing a verdict.

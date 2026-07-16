@@ -9,9 +9,17 @@ on:
         default: all
         options:
           - all
-          - brave
+          - brave_search
           - gmail
-          - gcal
+          - google_calendar
+          - ibkr
+          - instagram
+          - instagram_discovery
+          - linkedin
+          - linkedin_discovery
+          - polymarket
+          - runway
+          - twitter
           - claude
           - codex
           - github
@@ -193,12 +201,21 @@ jobs:
           STAGE_GITHUB_APP_ID: ${{ secrets.TRUSTYCLAW_STAGE_GITHUB_APP_ID }}
           STAGE_GITHUB_APP_INSTALLATION_ID: ${{ secrets.TRUSTYCLAW_STAGE_GITHUB_APP_INSTALLATION_ID }}
           STAGE_GITHUB_APP_PRIVATE_KEY: ${{ secrets.TRUSTYCLAW_STAGE_GITHUB_APP_PRIVATE_KEY }}
-          # The brave/gmail/gcal (and all) suites run the bundled-tool checks.
-          # A dedicated brave/gmail/gcal suite requires its credential (this Brave
-          # key secret, or a connected Google account for gmail/gcal) and fails
-          # if it is not configured; the all suite self-skips unconfigured tools.
+          # Each bundled tool is an individual suite. Enable-only config keys
+          # use the uniform TRUSTYCLAW_STAGE_<KEY> secret name. OAuth tools use
+          # only the enabled, configured, connected state already stored on the
+          # persistent stage host. The all suite requires and runs every tool.
           # See docs/development/persistent-aws-stage.md.
-          TRUSTYCLAW_STAGE_BRAVE_API_KEY: ${{ secrets.TRUSTYCLAW_STAGE_BRAVE_API_KEY }}
+          TRUSTYCLAW_STAGE_BRAVE_SEARCH_API_KEY: ${{ secrets.TRUSTYCLAW_STAGE_BRAVE_SEARCH_API_KEY }}
+          TRUSTYCLAW_STAGE_IBKR_OAUTH_CONSUMER_KEY: ${{ secrets.TRUSTYCLAW_STAGE_IBKR_OAUTH_CONSUMER_KEY }}
+          TRUSTYCLAW_STAGE_IBKR_OAUTH_ACCESS_TOKEN: ${{ secrets.TRUSTYCLAW_STAGE_IBKR_OAUTH_ACCESS_TOKEN }}
+          TRUSTYCLAW_STAGE_IBKR_OAUTH_ACCESS_TOKEN_SECRET: ${{ secrets.TRUSTYCLAW_STAGE_IBKR_OAUTH_ACCESS_TOKEN_SECRET }}
+          TRUSTYCLAW_STAGE_IBKR_SIGNATURE_KEY: ${{ secrets.TRUSTYCLAW_STAGE_IBKR_SIGNATURE_KEY }}
+          TRUSTYCLAW_STAGE_IBKR_ENCRYPTION_KEY: ${{ secrets.TRUSTYCLAW_STAGE_IBKR_ENCRYPTION_KEY }}
+          TRUSTYCLAW_STAGE_IBKR_DH_PRIME: ${{ secrets.TRUSTYCLAW_STAGE_IBKR_DH_PRIME }}
+          TRUSTYCLAW_STAGE_SCRAPECREATORS_API_KEY: ${{ secrets.TRUSTYCLAW_STAGE_SCRAPECREATORS_API_KEY }}
+          TRUSTYCLAW_STAGE_SERPAPI_API_KEY: ${{ secrets.TRUSTYCLAW_STAGE_SERPAPI_API_KEY }}
+          TRUSTYCLAW_STAGE_RUNWAY_API_SECRET: ${{ secrets.TRUSTYCLAW_STAGE_RUNWAY_API_SECRET }}
         run: |
           set -euo pipefail
           python3 tests/stage/stage_aws.py \

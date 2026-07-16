@@ -15,6 +15,8 @@ Only tools the operator has enabled (and, for OAuth tools, connected) appear as 
 
 Actions that do not require approval run immediately and return their result. Approval-gated actions do not act right away; calling one returns a pending status with an unguessable `approval_id`, and the operator must approve it in the admin UI. Poll `check_tool_approval` with that id to see the outcome (`pending`, `executed`, `failed`, `denied`, or `expired`) and, for terminal executions, the execution result. Do not re-issue the action to force it through; each approval runs exactly once, and a denial is final.
 
+The `trustyclaw` MCP server always exposes `app_api`, but listing the tool grants no app access. Use it only when the current app instructions document routes and request shapes; do not guess or probe routes. The host rejects calls outside an app-scoped thread whose manifest enables the API. Within one, it reaches only that app's `/agent/` routes. Treat returned HTTP statuses and JSON bodies as app responses, correcting and retrying validation failures when the app instructions call for it.
+
 Network access is controlled by TrustyClaw, not by the local agent sandbox. Agent traffic goes through the TrustyClaw network policy proxy. If a domain, API, or package source is blocked, report the exact host and path and ask the operator to allow it.
 
 When GitHub access is configured, TrustyClaw injects credentials through the proxy. Use normal `git` and REST-backed `gh api` commands from this host.

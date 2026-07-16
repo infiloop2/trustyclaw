@@ -52,6 +52,26 @@ class ActionListingTests(ToolsApiTestCase):
         self.assertIn("Fake Notes", read_note["description"])
         self.assertEqual(read_note["input_schema"]["type"], "object")
 
+    def test_exposes_every_bundled_action_contract_as_agent_context(self) -> None:
+        with patch.object(state, "enabled_tool_ids", return_value=set(tools_host.BUNDLED_TOOLS)):
+            by_name = {entry["name"]: entry for entry in tools_api.action_listing()}
+
+        for tool_id, tool in tools_host.BUNDLED_TOOLS.items():
+            for action in tool.manifest.actions:
+                with self.subTest(tool_id=tool_id, action=action.id):
+                    listed = by_name[f"{tool_id}_{action.id}"]
+                    self.assertEqual(
+                        listed["description"],
+                        f"{tool.manifest.display_name}: {action.description}",
+                    )
+                    self.assertEqual(listed["input_schema"], action.input_schema)
+
+        self.assertIn("individual tradable questions", by_name["polymarket_list_markets"]["description"])
+        self.assertIn("umbrella topics", by_name["polymarket_list_events"]["description"])
+        self.assertIn("not public-post", by_name["instagram_get_recent_media"]["description"])
+        self.assertIn("not an objective global ranking", by_name["instagram_discovery_get_trending_reels"]["description"])
+        self.assertIn("not a LinkedIn feed", by_name["linkedin_discovery_search_posts"]["description"])
+
     def test_list_bundled_tools_reports_the_catalog_with_enablement(self) -> None:
         # Enabled and disabled bundled tools both appear, distinguished by the
         # enabled flag, so the agent can ask the operator to enable an existing
@@ -131,7 +151,14 @@ class ToolsSocketTests(ToolsApiTestCase):
         connection = UnixHTTPConnection(socket_path)
         try:
             payload = json.dumps(body).encode() if body is not None else None
-            connection.request(method, path, body=payload)
+            try:
+                connection.request(method, path, body=payload)
+            except BrokenPipeError:
+                # Early responses close the connection before the body is fully
+                # sent: the pre-body 429 on the agent call cap races the client's
+                # body write. The response already delivered on the AF_UNIX
+                # socket stays readable, so fall through and read it.
+                pass
             response = connection.getresponse()
             return response.status, json.loads(response.read())
         finally:
@@ -163,6 +190,29 @@ class ToolsSocketTests(ToolsApiTestCase):
             f"Content-Length: {len(payload)}\r\n\r\n"
         ).encode() + payload
         return self.raw_http(socket_path, request)
+
+    def test_server_sweeps_expired_assets_once_per_hour(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server = tools_api.ToolsServer(
+                str(root / "tools.sock"),
+                frozenset({os.getuid()}),
+                asset_root=root / "assets",
+            )
+            self.addCleanup(server.server_close)
+            server._next_asset_cleanup = 999.0
+            with (
+                patch("host.runtime.tools_api.time.monotonic", return_value=1_000.0),
+                patch.object(server.asset_store, "cleanup_expired") as cleanup,
+            ):
+                server.service_actions()
+                server.service_actions()
+
+            cleanup.assert_called_once_with()
+            self.assertEqual(
+                server._next_asset_cleanup,
+                1_000.0 + tools_api.ASSET_CLEANUP_INTERVAL_SECONDS,
+            )
 
     def test_serves_listing_and_calls_over_the_socket(self) -> None:
         socket_path = self.start_server()
@@ -196,8 +246,11 @@ class ToolsSocketTests(ToolsApiTestCase):
         )
         status, _ = self.http(agent_only, "GET", "/tools")
         self.assertEqual(status, 200)
-        status, body = self.http(
-            agent_only, "POST", "/operator/tools/fake_notes/oauth_connect/disconnect", {}
+        status, body = self.raw_http(
+            agent_only,
+            b"POST /operator/tools/fake_notes/oauth_connect/disconnect HTTP/1.1\r\n"
+            b"Host: local\r\n"
+            b"Content-Length: 0\r\n\r\n",
         )
         self.assertEqual(status, 403)
         self.assertIn("admin peer", body["error"])
@@ -209,7 +262,12 @@ class ToolsSocketTests(ToolsApiTestCase):
         status, body = self.http(admin_only, "GET", "/tools")
         self.assertEqual(status, 403)
         self.assertIn("Peer not allowed", body["error"])
-        status, body = self.http(admin_only, "POST", "/call", {"name": "fake_notes_read_note", "input": {}})
+        status, body = self.raw_http(
+            admin_only,
+            b"POST /call HTTP/1.1\r\n"
+            b"Host: local\r\n"
+            b"Content-Length: 0\r\n\r\n",
+        )
         self.assertEqual(status, 403)
         self.assertIn("Peer not allowed", body["error"])
         status, _ = self.http(
@@ -334,6 +392,10 @@ class McpShimTests(ToolsApiTestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
+        # Enable runway so its actions list (which makes both media staging
+        # actions advertised) and staging into it passes the enablement gate.
+        with state.mutation() as cur:
+            state.set_tool_enabled(cur, "runway", True)
         shim = self.start_shim(socket_path)
 
         initialized = self.rpc(shim, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
@@ -347,7 +409,67 @@ class McpShimTests(ToolsApiTestCase):
         self.assertIn("fake_notes_read_note", names)
         self.assertIn("list_bundled_tools", names)
         self.assertIn("check_tool_approval", names)
+        self.assertIn("stage_image", names)
+        self.assertIn("stage_video", names)
+        self.assertIn("app_api", names)
         self.assertTrue(all("inputSchema" in tool for tool in listed["result"]["tools"]))
+
+        video = Path(socket_dir.name) / "clip.mp4"
+        video.write_bytes(b"x" * 512)
+        staged = self.rpc(
+            shim,
+            {
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "stage_video",
+                    "arguments": {"path": str(video), "for_tool": "runway"},
+                },
+            },
+        )
+        self.assertFalse(staged["result"]["isError"])
+        staged_result = json.loads(staged["result"]["content"][0]["text"])
+        metadata = server.asset_store.describe("runway", staged_result["video_asset_id"])
+        self.assertEqual(metadata.filename, "clip.mp4")
+        self.assertEqual(metadata.size_bytes, 512)
+        self.assertNotIn(str(video), staged["result"]["content"][0]["text"])
+
+        image = Path(socket_dir.name) / "frame.png"
+        image.write_bytes(b"i" * 512)
+        staged_image = self.rpc(
+            shim,
+            {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "stage_image",
+                    "arguments": {"path": str(image), "for_tool": "runway"},
+                },
+            },
+        )
+        self.assertFalse(staged_image["result"]["isError"])
+        image_result = json.loads(staged_image["result"]["content"][0]["text"])
+        image_metadata = server.asset_store.describe("runway", image_result["image_asset_id"])
+        self.assertEqual(image_metadata.filename, "frame.png")
+        self.assertEqual(image_metadata.media_type, "image/png")
+
+        symlink = Path(socket_dir.name) / "linked.mp4"
+        symlink.symlink_to(video)
+        rejected = self.rpc(
+            shim,
+            {
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "stage_video",
+                    "arguments": {"path": str(symlink), "for_tool": "runway"},
+                },
+            },
+        )
+        self.assertTrue(rejected["result"]["isError"])
 
         catalog = self.rpc(shim, {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "list_bundled_tools", "arguments": {}}})
         self.assertFalse(catalog["result"]["isError"])
@@ -372,10 +494,10 @@ class McpShimTests(ToolsApiTestCase):
         unknown = self.rpc(shim, {"jsonrpc": "2.0", "id": 6, "method": "bogus/method"})
         self.assertEqual(unknown["error"]["code"], -32601)
 
-    def test_shim_lists_no_tools_when_the_socket_is_missing(self) -> None:
+    def test_shim_lists_only_stable_app_api_when_tools_socket_is_missing(self) -> None:
         shim = self.start_shim("/nonexistent/tools.sock")
         listed = self.rpc(shim, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
-        self.assertEqual(listed["result"]["tools"], [])
+        self.assertEqual([tool["name"] for tool in listed["result"]["tools"]], ["app_api"])
         called = self.rpc(shim, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "x", "arguments": {}}})
         self.assertTrue(called["result"]["isError"])
 

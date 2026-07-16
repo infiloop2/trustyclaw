@@ -30,6 +30,7 @@ flowchart LR
             admin["trustyclaw-admin<br/>Admin API/UI + orchestrator<br/>127.0.0.1:7443<br/>no internet egress"]
             proxy["trustyclaw-proxy<br/>Network proxy<br/>127.0.0.1:7445<br/>DNS + TCP 80/443 only"]
             tools["trustyclaw-tools<br/>Tool packages + tools.sock<br/>DNS + TCP 443 only"]
+            agentapp["trustyclaw-agent-app<br/>app_api proxy + agent-app.sock<br/>loopback to app ports only"]
             apps["trustyclaw-app-*<br/>App backends<br/>host-slot uid, port, schema<br/>no egress"]
             agent["trustyclaw-agent<br/>Codex + Claude Code<br/>no sudo, DB role, or direct egress"]
             db["postgres<br/>trustyclaw_admin<br/>Unix socket only, peer auth"]
@@ -39,7 +40,7 @@ flowchart LR
         subgraph storage["storage"]
             direction TB
             rootvol["Root EBS, 16 GiB, replaceable<br/>OS, trusted code, systemd, nftables, helpers<br/>root-owned trust boundary"]
-            adminvol["Admin EBS, 16 GiB, durable<br/>Postgres data, admin-home, proxy CA/certs, Git quarantine<br/>service-owned private subtrees"]
+            adminvol["Admin EBS, 16 GiB, durable<br/>Postgres data, admin-home, proxy CA/certs, Git quarantine, temporary tool media<br/>service-owned private subtrees"]
             agentvol["Agent EBS, 8 GiB, durable<br/>agent-home auth, sessions, caches, workspaces<br/>root-owned managed config"]
         end
     end
@@ -68,11 +69,15 @@ flowchart LR
     admin -->|"reverse proxy to assigned loopback ports"| apps
     apps -->|"app-backend.sock task/thread allowlist, peer uid"| admin
 
+    agent -->|"app_api via agent-app.sock, cgroup thread attribution"| agentapp
+    agentapp -->|"reverse proxy to owning app's /agent/ routes"| apps
+
     admin -->|"owner role, all host tables"| db
     admin -->|"admin-home + disk version"| adminvol
     proxy -->|"enforcement reads, event/push writes, working token"| db
     proxy -->|"CA keypair, leaf certs, Git quarantine"| adminvol
     tools -->|"tool tables + secret key only"| db
+    tools -->|"bounded temporary media"| adminvol
     apps -->|"own app schema only"| db
     db -->|"PGDATA"| adminvol
     agent -->|"agent-home, sessions, caches, workspaces"| agentvol

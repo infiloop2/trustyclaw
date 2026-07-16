@@ -33,6 +33,15 @@ from host.runtime.state import (
 # of declaring a Responses web_search tool). The request must opt into cached
 # retrieval via settings.external_web_access; the server default is live.
 OPENAI_SEARCH_PATHS = {"/backend-api/codex/alpha/search", "/v1/alpha/search"}
+# Hosted tools that make the upstream reach the open web, run server-side code
+# with network egress, or drive a remote browser, but whose ``type`` does not
+# begin with ``web``. They have no cache-backed form here and are denied
+# outright, like ``web_search_preview``. code_interpreter is included because
+# OpenAI's hosted container can egress; Codex runs code in its own local
+# sandbox and never declares it, so denying it costs nothing and fails closed.
+_DENIED_HOSTED_TOOL_TYPES = frozenset(
+    {"browser", "computer_use", "computer_use_preview", "code_interpreter"}
+)
 ANTHROPIC_PRE_PIN_BOOTSTRAP_GET_PATHS = {
     "/api/oauth/profile",
     "/api/oauth/claude_cli/roles",
@@ -188,16 +197,29 @@ def anthropic_request_denied(
     host: str,
     path: str,
     headers: list[tuple[str, str]],
+    body: bytes = b"",
 ) -> str | None:
-    """Apply Claude/Anthropic account controls.
+    """Apply Claude/Anthropic account and server-tool controls.
 
     Claude Code OAuth requests to api.anthropic.com use opaque bearer tokens and
     do not carry an OpenAI-style account header. The enforceable pin is
     therefore the bearer credential hash read from the agent user's Claude
     credentials after login. A tiny unauthenticated readiness path is allowed
     before the pin because Claude Code probes it during startup.
+
+    Separately, Messages API requests may declare Anthropic server-side tools
+    that run on Anthropic's infrastructure and reach external URLs with request
+    data — web search (``web_search_*``), server-side web fetch (``web_fetch_*``),
+    code execution (``code_execution_*``), and remote MCP servers. The client's
+    WebFetch/Bash egress is already gated by the domain allow-list, but these
+    execute off-box, so the only enforcement point is the request that declares
+    them; ``anthropic_external_url_request_guard`` denies them structurally.
     """
     rule = find_domain_rule(policy, host) or {}
+    if rule.get("anthropic_external_url_request_guard"):
+        reason = _anthropic_server_tool_denial(headers, body, bool(rule.get("anthropic_allow_web_search")))
+        if reason is not None:
+            return reason
     if not rule.get("anthropic_account_guard"):
         return None
     if method.upper() == "GET" and path == "/api/hello":
@@ -218,6 +240,62 @@ def anthropic_request_denied(
         return "Claude bearer token is required for this domain"
     if any(hashlib.sha256(value.encode()).hexdigest() != expected_hash for value in presented):
         return "Claude bearer token does not match the configured account"
+    return None
+
+
+def _anthropic_server_tool_denial(
+    headers: list[tuple[str, str]], body: bytes, allow_web_search: bool
+) -> str | None:
+    """Deny a Messages API request that declares an Anthropic server-side tool
+    reaching an external URL or running code off-box. Mirrors the OpenAI body
+    guard: decode, confirm the body parses as JSON, then enforce structurally.
+    Web search is allowed only when the operator opted in (``allow_web_search``);
+    server web fetch, code execution, and remote MCP are always denied. A body
+    that cannot be decoded or parsed as declared fails closed."""
+    if not body:
+        return None
+    header_map = {key.lower(): value for key, value in headers}
+    decoded = _decode_body(body, header_map.get("content-encoding", ""))
+    if decoded is None:
+        return "request body could not be decoded for web tool inspection"
+    body = decoded
+    content_type = header_map.get("content-type", "").split(";", 1)[0].strip().lower()
+    looks_json = content_type == "application/json" or body.lstrip().startswith((b"{", b"["))
+    if not looks_json:
+        return None
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "request body is not valid JSON"
+    return _anthropic_tool_violation(payload, allow_web_search)
+
+
+def _anthropic_tool_violation(payload: Any, allow_web_search: bool) -> str | None:
+    """The Messages API declares tools in a top-level ``tools`` array and remote
+    MCP servers in a top-level ``mcp_servers`` array. Deny the server-side,
+    off-box tool families by ``type`` prefix (dated variants such as
+    ``web_search_20260209`` share the prefix); client-executed built-ins
+    (``bash_*``, ``text_editor_*``, ``memory_*``) and user-defined tools (which
+    carry a ``name`` but no ``type``) do not match and pass. ``web_search`` is
+    permitted only when the operator enabled it; the others are always denied."""
+    if not isinstance(payload, dict):
+        return None
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            tool_type = tool.get("type")
+            if not isinstance(tool_type, str):
+                continue
+            if tool_type.startswith("web_search"):
+                if not allow_web_search:
+                    return "web search is disabled by operator policy for this deployment"
+            elif tool_type.startswith(("web_fetch", "code_execution")):
+                return f"server-side {tool_type} tool is disabled for this domain"
+    mcp_servers = payload.get("mcp_servers")
+    if isinstance(mcp_servers, list) and mcp_servers:
+        return "remote MCP servers are disabled for this domain"
     return None
 
 
@@ -610,29 +688,32 @@ def _external_url_request_denial(
 
     if path is not None and _normalized_path(path).rstrip("/") in OPENAI_SEARCH_PATHS:
         settings = payload.get("settings") if isinstance(payload, dict) else None
-        external_web_access = settings.get("external_web_access") if isinstance(settings, dict) else None
-        if external_web_access is not False:
+        if not isinstance(settings, dict):
+            settings = {}
+        if settings.get("external_web_access") is not False:
             return "live web search is disabled for this domain (external_web_access must be false)"
+        if settings.get("indexed_web_access") not in (False, None):
+            return "indexed web search is disabled for this domain (indexed_web_access must be false)"
     return None
 
 
 def _external_url_request_violation(payload: Any) -> str | None:
     """The upstream must never reach an external URL with request data. Web
-    content may be retrieved cache-backed only: a web-search-family tool must be
-    exactly ``web_search`` with ``external_web_access`` exactly false; preview
-    and dated variants ignore that setting and always browse live, so they
-    always fail the rule. Chat Completions search (``web_search_options``,
-    ``*-search*`` models) has no cached form and is denied outright. Remote MCP
-    tools (``type: mcp``, by ``server_url`` or hosted ``connector_id``) make the
-    upstream call an external server and are denied outright."""
+    content may be retrieved cache-backed only: the sole permitted web tool is
+    exactly ``web_search`` with ``external_web_access`` false *and*
+    ``indexed_web_access`` false or absent. Everything else this collects is
+    denied, so the rule fails closed: ``web_search_preview`` and dated variants
+    (they browse live), a bare ``web`` / ``web_fetch`` tool, ``browser`` /
+    ``computer_use`` (a driven browser), ``code_interpreter`` (a hosted
+    container that can egress), any tool object carrying a truthy
+    ``*_web_access`` flag under a different type — a renamed web tool — and
+    remote MCP tools (``type: mcp``, by ``server_url`` or hosted
+    ``connector_id``). Chat Completions search (``web_search_options``,
+    ``*-search*`` models) has no cached form and is denied outright."""
     for tool in _iter_tool_objects(payload):
-        tool_type = tool.get("type")
-        if tool_type == "mcp":
-            return "remote MCP tools are disabled for this domain"
-        if tool_type != "web_search":
-            return "web_search_preview is disabled for this domain"
-        if tool.get("external_web_access") is not False:
-            return "live web search is disabled for this domain (external_web_access must be false)"
+        reason = _tool_object_violation(tool)
+        if reason is not None:
+            return reason
     if _contains_key(payload, "server_url"):
         return "remote MCP tools are disabled for this domain"
     if _contains_key(payload, "web_search_options"):
@@ -640,6 +721,37 @@ def _external_url_request_violation(payload: Any) -> str | None:
     model = payload.get("model") if isinstance(payload, dict) else None
     if isinstance(model, str) and "-search" in model:
         return "web search models are disabled for this domain"
+    return None
+
+
+def _tool_object_violation(tool: dict[str, Any]) -> str | None:
+    """Decide a single guarded tool object. Only the cached ``web_search`` shape
+    passes; any other collected tool is denied, so a renamed or newly added
+    web/browse tool fails closed instead of being forwarded."""
+    tool_type = tool.get("type")
+    if tool_type == "mcp":
+        return "remote MCP tools are disabled for this domain"
+    if tool_type != "web_search":
+        # web_search_preview and dated variants keep their historical reason; a
+        # bare web/web_fetch/browser/computer_use/code_interpreter tool, or one
+        # that only
+        # matched on a *_web_access flag, has no cache-backed form here.
+        if isinstance(tool_type, str) and tool_type.startswith("web_search"):
+            return "web_search_preview is disabled for this domain"
+        label = tool_type if isinstance(tool_type, str) and tool_type else "web browsing"
+        return f"{label} tool is disabled for this domain (only cached web_search is allowed)"
+    if tool.get("external_web_access") is not False:
+        return "live web search is disabled for this domain (external_web_access must be false)"
+    if tool.get("indexed_web_access") not in (False, None):
+        return "indexed web search is disabled for this domain (indexed_web_access must be false)"
+    for key, value in tool.items():
+        if (
+            isinstance(key, str)
+            and key.endswith("_web_access")
+            and key not in ("external_web_access", "indexed_web_access")
+            and value not in (False, None)
+        ):
+            return f"{key} is disabled for this domain (must be false)"
     return None
 
 
@@ -654,22 +766,40 @@ def _contains_key(payload: Any, key: str) -> bool:
 
 
 def _iter_tool_objects(payload: Any) -> list[dict[str, Any]]:
-    """Collect every web-search-family and remote-MCP tool object anywhere in
-    the request, so a tool nested under any key is still inspected. The prefix
-    match covers dated variants such as web_search_preview_2025_03_11.
-    web_search_call is excluded: it is a history item replaying an earlier
-    search, not a tool declaration, and appears in legitimate cached-search
-    requests; mcp_call and mcp_list_tools history item types do not match
-    either."""
+    """Collect every guarded tool object anywhere in the request, so a tool
+    nested under any key is still inspected. Guarded means: a remote-MCP tool
+    (``type: mcp``); a web/browse tool named by its type — any ``type`` starting
+    with ``web`` (covering ``web_search``, dated ``web_search_preview`` variants,
+    and a bare ``web``/``web_fetch``) or a ``_DENIED_HOSTED_TOOL_TYPES`` member
+    (``browser``/``computer_use``/``code_interpreter``); or, so
+    a renamed web tool still fails closed, any typed object that carries a
+    *truthy* ``*_web_access`` flag (a false/absent flag grants no access, so a
+    safe tool is not swept in). web_search_call is excluded: it is a history item
+    replaying an earlier search, not a tool declaration, and appears in
+    legitimate cached-search requests; mcp_call and mcp_list_tools history item
+    types do not match either. A ``type``-less object such as the standalone
+    search ``settings`` block is not collected here — the endpoint check in
+    _external_url_request_denial covers it."""
     matches: list[dict[str, Any]] = []
+
+    def is_guarded(node: dict[str, Any]) -> bool:
+        type_value = node.get("type")
+        if not isinstance(type_value, str) or type_value == "web_search_call":
+            return False
+        if type_value == "mcp" or type_value.startswith("web") or type_value in _DENIED_HOSTED_TOOL_TYPES:
+            return True
+        # A renamed web tool: guarded only if it actually requests access via a
+        # truthy ``*_web_access`` flag. A false/default flag on an otherwise safe
+        # tool (e.g. a function tool that carries ``external_web_access: false``)
+        # grants nothing and must not be swept in and then denied for its type.
+        return any(
+            isinstance(key, str) and key.endswith("_web_access") and value not in (False, None)
+            for key, value in node.items()
+        )
 
     def walk(node: Any) -> None:
         if isinstance(node, dict):
-            type_value = node.get("type")
-            if isinstance(type_value, str) and (
-                type_value == "mcp"
-                or (type_value.startswith("web_search") and type_value != "web_search_call")
-            ):
+            if is_guarded(node):
                 matches.append(node)
             for value in node.values():
                 walk(value)

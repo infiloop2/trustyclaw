@@ -9,8 +9,11 @@ Codex or Claude OAuth; login-dependent runtime checks live in the persistent
 stage test.
 
 The smoke covers subnet/SG/IMDSv2/SSH provisioning, bootstrap on real Ubuntu,
-admin API access over the SSH tunnel, auth rejection, task lifecycle edge cases,
-policy validation, event pagination, concurrent policy replaces,
+admin API access over the SSH tunnel, auth rejection, and the real admin UI in
+headless Chrome. The browser logs in, opens Mission Pursuit, clicks its
+popovers and agent settings, submits a first mission, verifies the expected
+pre-provider-login failure, and switches the workspace runtime. The remaining
+checks cover task lifecycle edge cases, policy validation, event pagination, concurrent policy replaces,
 proxy protocol edge cases, live network enforcement, managed provider policy
 validation, tool-service/socket boundaries, credential-free tool calls, and
 the network event prune race.

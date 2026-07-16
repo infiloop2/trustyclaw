@@ -19,7 +19,7 @@ audited — is provided by the host behind the **host API**.
 agent / chat / MCP gateway
         │  action calls
         ▼
-host  (host API: credentials · config · approvals)
+host  (host API: credentials · config · approvals · staged assets)
         │  Tool.execute(action, input, api)
         ▼
 tool package
@@ -29,8 +29,8 @@ third-party APIs
 ```
 
 Every `HostAPI` handed to a tool call is already **scoped to one tool on one
-host**. Credentials and approval records are implicitly partitioned by `tool_id`;
-a tool can never address another tool's data.
+host**. Credentials, approval records, and staged assets are implicitly
+partitioned by `tool_id`; a tool can never address another tool's data.
 
 ## The tool: `Tool`
 
@@ -242,10 +242,40 @@ class HostAPI(Protocol):
     def config(self) -> Mapping[str, str]: ...          # this tool's declared config keys
     @property
     def approvals(self) -> Approvals: ...               # host-owned approval workflow
+    @property
+    def assets(self) -> Assets: ...                     # opaque, tool-scoped staged bytes
 ```
 
 Host implementations validate every argument: invalid types, formats, or
 size-limit violations raise `ValueError`; a missing config key raises `KeyError`.
+
+### Staged assets
+
+`Assets` is the narrow binary-data exception to the JSON action contract. A
+host-specific ingress streams bytes into host-owned storage and returns an
+opaque id; no caller pathname enters the tool process. The host scopes that id
+to one tool and exposes metadata plus an already-open binary stream:
+
+```python
+@dataclass(frozen=True)
+class AssetMetadata:
+    asset_id: str
+    filename: str
+    media_type: str
+    size_bytes: int
+    sha256: str
+    expires_at: int
+
+class Assets(Protocol):
+    def describe(self, asset_id: str) -> AssetMetadata: ...
+    def open(self, asset_id: str) -> AbstractContextManager[BinaryIO]: ...
+    def delete(self, asset_id: str) -> None: ...
+```
+
+Tool packages receive neither a storage path nor cross-tool lookup. An
+approval payload that references an asset binds its filename, encoded byte
+size, and SHA-256; execution verifies those values before data-out. Assets are
+ephemeral inputs, not durable tool state.
 
 ### Credentials
 
@@ -397,8 +427,10 @@ surface as `ActionFailed(reconnect_required=True)`.
    unexpected exceptions to generic messages.
 6. **Stateless across calls.** No in-process state between calls, so the same
    package works on this host or another interchangeably.
-7. **Host-owned audit.** The host records every call; tools do not write audit
-   records.
+7. **Host-owned audit.** The host records every accepted call with its exact
+   bounded arguments and outcome; tools do not write audit records. Approval
+   decisions record the exact payload handed to `execute_approved`. Operator
+   lifecycle events such as config and OAuth changes carry no action arguments.
 8. **The tool verifies bound state before executing an approval.** The world can
    change between proposal and approval, so `execute_approved` must re-check the
    preconditions the tool captured at proposal time before touching third-party

@@ -29,11 +29,10 @@ OPENAI_PROVIDER_RULES: dict[str, dict[str, Any]] = {
         "openai_external_url_request_guard": True,
     },
 }
+# platform.claude.com is static; api.anthropic.com is built per-integration in
+# _claude_provider_rules_json because its web-search guard depends on the
+# operator's web_search toggle.
 CLAUDE_PROVIDER_RULES: dict[str, dict[str, Any]] = {
-    "api.anthropic.com": {
-        "allow_http_methods": ("GET", "POST"),
-        "anthropic_account_guard": True,
-    },
     "platform.claude.com": {
         "allow_http_methods": ("GET", "POST"),
         "path_guards": ("^/v1/oauth(?:/.*)?$",),
@@ -72,6 +71,8 @@ class DomainRule:
     openai_external_url_request_guard: bool | None = None
     openai_account_guard: bool | None = None
     anthropic_account_guard: bool | None = None
+    anthropic_external_url_request_guard: bool | None = None
+    anthropic_allow_web_search: bool | None = None
     github_repo_guard: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
@@ -86,6 +87,10 @@ class DomainRule:
             value["openai_account_guard"] = self.openai_account_guard
         if self.anthropic_account_guard is not None:
             value["anthropic_account_guard"] = self.anthropic_account_guard
+        if self.anthropic_external_url_request_guard is not None:
+            value["anthropic_external_url_request_guard"] = self.anthropic_external_url_request_guard
+        if self.anthropic_allow_web_search is not None:
+            value["anthropic_allow_web_search"] = self.anthropic_allow_web_search
         if self.github_repo_guard is not None:
             value["github_repo_guard"] = self.github_repo_guard
         return value
@@ -97,6 +102,25 @@ class ManagedIntegration:
 
     def to_json(self) -> dict[str, Any]:
         return {"enabled": self.enabled}
+
+
+@dataclass(frozen=True)
+class ClaudeIntegration:
+    """When enabled, Claude Code reaches Anthropic under the pinned account.
+    ``web_search`` opts into Anthropic's server-side web search, which runs on
+    Anthropic infrastructure past the proxy; it is off by default. When off,
+    the proxy denies the web_search tool declaration on api.anthropic.com.
+    Server-side web fetch, code execution, and remote MCP servers are always
+    denied regardless of this toggle."""
+
+    enabled: bool
+    web_search: bool = False
+
+    def to_json(self) -> dict[str, Any]:
+        value: dict[str, Any] = {"enabled": self.enabled}
+        if self.web_search:
+            value["web_search"] = True
+        return value
 
 
 @dataclass(frozen=True)
@@ -133,7 +157,7 @@ class GitHubIntegration:
 @dataclass(frozen=True)
 class ManagedNetworkIntegrations:
     openai: ManagedIntegration = field(default_factory=lambda: ManagedIntegration(False))
-    claude: ManagedIntegration = field(default_factory=lambda: ManagedIntegration(False))
+    claude: ClaudeIntegration = field(default_factory=lambda: ClaudeIntegration(False))
     github: GitHubIntegration = field(default_factory=lambda: GitHubIntegration(False))
     python_packages: ManagedIntegration = field(default_factory=lambda: ManagedIntegration(False))
     npm_packages: ManagedIntegration = field(default_factory=lambda: ManagedIntegration(False))
@@ -370,7 +394,7 @@ def parse_managed_network_integrations(raw: dict[str, Any]) -> ManagedNetworkInt
     _reject_extra(raw, {"openai", "claude", "github", "python_packages", "npm_packages"}, "managed_network_integrations")
     return ManagedNetworkIntegrations(
         openai=parse_simple_managed_integration(_object(raw, "openai", required=False), "managed_network_integrations.openai"),
-        claude=parse_simple_managed_integration(_object(raw, "claude", required=False), "managed_network_integrations.claude"),
+        claude=parse_claude_integration(_object(raw, "claude", required=False)),
         github=parse_github_integration(_object(raw, "github", required=False)),
         python_packages=parse_simple_managed_integration(
             _object(raw, "python_packages", required=False),
@@ -391,6 +415,22 @@ def parse_simple_managed_integration(raw: dict[str, Any], context: str) -> Manag
     if not isinstance(enabled, bool):
         raise ConfigError(f"{context}.enabled must be true or false")
     return ManagedIntegration(enabled)
+
+
+def parse_claude_integration(raw: dict[str, Any]) -> ClaudeIntegration:
+    if not raw:
+        return ClaudeIntegration(False)
+    context = "managed_network_integrations.claude"
+    _reject_extra(raw, {"enabled", "web_search"}, context)
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError(f"{context}.enabled must be true or false")
+    web_search = raw.get("web_search", False)
+    if not isinstance(web_search, bool):
+        raise ConfigError(f"{context}.web_search must be true or false")
+    if not enabled and web_search:
+        raise ConfigError(f"{context}.web_search requires enabled to be true")
+    return ClaudeIntegration(enabled=enabled, web_search=web_search)
 
 
 def parse_github_integration(raw: dict[str, Any]) -> GitHubIntegration:
@@ -455,7 +495,7 @@ def expand_network_controls(controls: NetworkControls) -> dict[str, Any]:
     if integrations.openai.enabled:
         generated.update(_provider_rules_json(OPENAI_PROVIDER_RULES))
     if integrations.claude.enabled:
-        generated.update(_provider_rules_json(CLAUDE_PROVIDER_RULES))
+        generated.update(_claude_provider_rules_json(integrations.claude))
     if integrations.github.enabled:
         generated.update(_github_provider_rules_json(integrations.github))
     if integrations.python_packages.enabled:
@@ -522,9 +562,26 @@ def _provider_rules_json(rules: dict[str, dict[str, Any]]) -> dict[str, dict[str
             openai_external_url_request_guard=rule.get("openai_external_url_request_guard"),
             openai_account_guard=rule.get("openai_account_guard"),
             anthropic_account_guard=rule.get("anthropic_account_guard"),
+            anthropic_external_url_request_guard=rule.get("anthropic_external_url_request_guard"),
+            anthropic_allow_web_search=rule.get("anthropic_allow_web_search"),
         ).to_json()
         for domain, rule in rules.items()
     }
+
+
+def _claude_provider_rules_json(integration: ClaudeIntegration) -> dict[str, dict[str, Any]]:
+    rules = _provider_rules_json(CLAUDE_PROVIDER_RULES)
+    rules["api.anthropic.com"] = DomainRule(
+        allow_http_methods=("GET", "POST"),
+        path_guards=(),
+        anthropic_account_guard=True,
+        # The body guard is always on (it denies server web fetch, code
+        # execution, and remote MCP); web search is allowed only when the
+        # operator opted in.
+        anthropic_external_url_request_guard=True,
+        anthropic_allow_web_search=True if integration.web_search else None,
+    ).to_json()
+    return rules
 
 
 def _github_provider_rules_json(integration: GitHubIntegration) -> dict[str, dict[str, Any]]:

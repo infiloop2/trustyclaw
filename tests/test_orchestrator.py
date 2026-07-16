@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 import tempfile
 import threading
 import unittest
@@ -8,7 +9,7 @@ from unittest.mock import patch
 
 import pg_harness
 
-from host.runtime import orchestrator
+from host.runtime import orchestrator, state
 from host.runtime.network_policy import anthropic_request_denied
 from host.runtime.state import save_network_policy as save_policy
 from host.runtime.state import (
@@ -30,9 +31,10 @@ class FakeServer:
 
     instances: list["FakeServer"] = []
 
-    def __init__(self, command: object = None) -> None:
+    def __init__(self, command: object = None, thread_id: str | None = None) -> None:
         self.started = 0
         self.closed = False
+        self.thread_id = thread_id
         FakeServer.instances.append(self)
 
     def start(self, init_timeout: float = 60.0) -> None:
@@ -183,11 +185,10 @@ class OrchestratorTests(unittest.TestCase):
         account = read_openai_account()
         self.assertEqual(account["codex_usage"]["last_checked_at"], "2026-06-29T23:10:00Z")
 
-    def test_refresh_without_fresh_usage_keeps_stored_usage_snapshot(self) -> None:
+    def test_refresh_without_fresh_usage_clears_stored_usage_snapshot(self) -> None:
         # The setUp default probe returns {} (an unparseable /usage response).
-        # The refresh rewrites the account row, so without the carry-over the
-        # previously fetched snapshot would vanish and the admin UI would
-        # blank known limits until a later probe succeeds.
+        # Absence stays structural: old percentages must not look current when
+        # the provider did not return any usage windows.
         stored_usage = {
             "current_session_used_percent": 14,
             "weekly_used_percent": 31,
@@ -201,7 +202,7 @@ class OrchestratorTests(unittest.TestCase):
         ):
             self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "active")
 
-        self.assertEqual(read_claude_account()["claude_usage"], stored_usage)
+        self.assertNotIn("claude_usage", read_claude_account())
 
     def test_delivered_steers_are_consumed_from_state(self) -> None:
         # steers() hands the worker only the undelivered queue, and each
@@ -390,6 +391,56 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(len(FakeServer.instances), 2)
         self.assertTrue(FakeServer.instances[1].closed)
         self.assertEqual(self.task_status("task_2"), "completed")
+
+    def test_app_task_server_receives_its_scoped_thread_and_instructions(self) -> None:
+        # App ownership is encoded directly in the host thread passed to the
+        # runtime scope; no per-turn attribution state is registered.
+        from test_agent_app_api import write_app_package
+
+        apps_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(apps_dir.cleanup)
+        write_app_package(Path(apps_dir.name), "workbench", host_slot=91, agent_api=True)
+        app_root = patch.object(orchestrator.app_platform, "APP_ROOT", Path(apps_dir.name))
+        app_root.start()
+        self.addCleanup(app_root.stop)
+
+        def observing_run_turn(server, input_message, codex_thread_id, model, effort, steers, on_message, steer_delivered):
+            return "codex-1", "done"
+
+        self.seed_tasks(make_task(1, "workbench__ws-1"))
+        with patch.object(orchestrator.codex_app_server, "run_turn", observing_run_turn):
+            orchestrator.run_next_task()
+        self.assertEqual(FakeServer.instances[-1].thread_id, "workbench__ws-1")
+        self.assertEqual(FakeServer.instances[-1].app_instructions, "Instructions for workbench.")
+
+        def failing_run_turn(server, input_message, codex_thread_id, model, effort, steers, on_message, steer_delivered):
+            raise RuntimeError("turn exploded")
+
+        self.seed_tasks(make_task(1, "workbench__ws-1", status="completed"), make_task(2, "workbench__ws-1"))
+        with patch.object(orchestrator.codex_app_server, "run_turn", failing_run_turn):
+            orchestrator.run_next_task()
+        self.assertEqual(self.task_status("task_2"), "failed")
+
+    def test_non_app_thread_is_still_passed_to_its_runtime_scope(self) -> None:
+        def observing_run_turn(server, input_message, codex_thread_id, model, effort, steers, on_message, steer_delivered):
+            return "codex-1", "done"
+
+        self.seed_tasks(make_task(1, "chat"))
+        with patch.object(orchestrator.codex_app_server, "run_turn", observing_run_turn):
+            orchestrator.run_next_task()
+        self.assertEqual(FakeServer.instances[-1].thread_id, "chat")
+        self.assertIsNone(FakeServer.instances[-1].app_instructions)
+
+    def test_app_instructions_apply_without_an_agent_api(self) -> None:
+        def observing_run_turn(server, input_message, codex_thread_id, model, effort, steers, on_message, steer_delivered):
+            return "codex-1", "done"
+
+        self.seed_tasks(make_task(1, "agent_chat__chat"))
+        with patch.object(orchestrator.codex_app_server, "run_turn", observing_run_turn):
+            orchestrator.run_next_task()
+
+        self.assertEqual(FakeServer.instances[-1].thread_id, "agent_chat__chat")
+        self.assertIn("You are working in Agent Chat", FakeServer.instances[-1].app_instructions)
 
     def test_completed_task_records_the_codex_thread_mapping_and_resumes_it(self) -> None:
         self.seed_tasks(make_task(1, "chat"))
@@ -786,6 +837,41 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(usage["weekly_used_percent"], 31)
         self.assertIn("last_checked_at", usage)
 
+    def test_claude_rotated_token_replaces_old_usage_after_pin_publish(self) -> None:
+        save_attested_claude_account(
+            "acct-real",
+            access_token_sha256="a" * 64,
+            claude_usage={"current_session_used_percent": 91, "last_checked_at": "old"},
+        )
+        with (
+            patch.object(
+                orchestrator.claude_code,
+                "account_status",
+                return_value=("active", None, {"access_token_sha256": "b" * 64}),
+            ),
+            patch.object(
+                orchestrator.claude_code,
+                "read_attested_identity",
+                return_value={"access_token_sha256": "b" * 64, "account_uuid": "acct-real"},
+            ),
+            patch.object(
+                orchestrator.claude_code,
+                "read_claude_usage",
+                return_value={"current_session_used_percent": 12},
+            ) as usage_probe,
+            patch.object(orchestrator, "utc_now", return_value="2026-07-16T14:00:00Z"),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "active")
+
+        usage_probe.assert_called_once_with()
+        self.assertEqual(
+            read_claude_account()["claude_usage"],
+            {
+                "current_session_used_percent": 12,
+                "last_checked_at": "2026-07-16T14:00:00Z",
+            },
+        )
+
     def test_claude_first_capture_requires_completed_token_hash(self) -> None:
         state = load_state()
         state["agent_runtime_statuses"]["claude_code"]["status"] = "awaiting_login"
@@ -952,6 +1038,19 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(orchestrator.refresh_runtime_status("codex"), "active")
 
         self.assertEqual(read_proxy_openai_account_id(), "acct-local")
+
+    def test_explicit_codex_refresh_forces_provider_probe(self) -> None:
+        with patch.object(
+            orchestrator.codex_app_server,
+            "account_status",
+            return_value=("awaiting_login", None, None),
+        ) as account_status:
+            self.assertEqual(
+                orchestrator.refresh_runtime_status("codex", force_provider_probe=True),
+                "awaiting_login",
+            )
+
+        account_status.assert_called_once_with(force_provider_probe=True)
 
     def test_codex_legacy_openai_row_is_not_operator_approved(self) -> None:
         save_openai_account({"account_id": "acct-legacy"})
@@ -1682,11 +1781,13 @@ class ClaudeLiveStatusTests(unittest.TestCase):
 
     def test_active_probe_verdict_is_reused_within_the_retry_window(self) -> None:
         account = {"access_token_sha256": "old"}
-        usage = {"current_session_used_percent": 14}
+        fetched_usage = {"current_session_used_percent": 14}
+        usage = {**fetched_usage, "last_checked_at": "2026-07-16T14:00:00Z"}
         with (
             patch.object(orchestrator, "read_claude_account", return_value=self.stored_account("old")),
-            patch.object(orchestrator.claude_code, "read_claude_usage", return_value=dict(usage)) as probe,
+            patch.object(orchestrator.claude_code, "read_claude_usage", return_value=dict(fetched_usage)) as probe,
             patch.object(orchestrator.claude_code, "read_claude_account", return_value=dict(account)),
+            patch.object(orchestrator, "utc_now", return_value="2026-07-16T14:00:00Z"),
         ):
             expected = ("active", None, {"access_token_sha256": "old", "claude_usage": usage})
             self.assertEqual(orchestrator._live_claude_status(account), expected)
@@ -1695,6 +1796,32 @@ class ClaudeLiveStatusTests(unittest.TestCase):
             assert orchestrator._CLAUDE_LIVE_PROBE is not None
             orchestrator._CLAUDE_LIVE_PROBE["at"] -= orchestrator.CLAUDE_LIVE_PROBE_RETRY_SECONDS + 1
             self.assertEqual(orchestrator._live_claude_status(account), expected)
+        self.assertEqual(probe.call_count, 2)
+
+    def test_forced_active_probe_bypasses_the_retry_window(self) -> None:
+        account = {"access_token_sha256": "old"}
+        with (
+            patch.object(orchestrator, "read_claude_account", return_value=self.stored_account("old")),
+            patch.object(
+                orchestrator.claude_code,
+                "read_claude_usage",
+                side_effect=[
+                    {"current_session_used_percent": 14},
+                    {"current_session_used_percent": 27},
+                ],
+            ) as probe,
+            patch.object(orchestrator.claude_code, "read_claude_account", return_value=dict(account)),
+            patch.object(orchestrator, "utc_now", return_value="2026-07-16T14:00:00Z"),
+        ):
+            first = orchestrator._live_claude_status(account)
+            cached = orchestrator._live_claude_status(account)
+            forced = orchestrator._live_claude_status(account, force_probe=True)
+
+        self.assertEqual(first, cached)
+        assert first[2] is not None
+        assert forced[2] is not None
+        self.assertEqual(first[2]["claude_usage"]["current_session_used_percent"], 14)
+        self.assertEqual(forced[2]["claude_usage"]["current_session_used_percent"], 27)
         self.assertEqual(probe.call_count, 2)
 
     def test_error_verdict_is_reused_within_the_retry_window(self) -> None:

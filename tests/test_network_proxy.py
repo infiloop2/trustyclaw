@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import pg_harness
 
+from host.runtime import network_policy
 from host.runtime.network_policy import load_policy
 from host.runtime.state import save_network_policy as save_policy
 from host.runtime.state import save_proxy_claude_account, save_proxy_openai_account_id
@@ -664,6 +665,55 @@ class WebSocketGuardTests(unittest.TestCase):
             )
         self.assertIn("remote MCP tools are disabled", denied.exception.reason)
 
+    def test_indexed_web_search_message_is_denied(self) -> None:
+        # external_web_access is false, but indexed_web_access authorizes the
+        # upstream to fetch server-approved external URLs, so it must be denied.
+        with self.assertRaises(network_proxy.WebSocketDenied) as denied:
+            self.guard().feed(
+                masked_frame(
+                    b'{"tools":[{"type":"web_search","external_web_access":false,'
+                    b'"indexed_web_access":true}]}'
+                )
+            )
+        self.assertIn("indexed web search is disabled", denied.exception.reason)
+
+    def test_bare_web_and_browse_tools_are_denied(self) -> None:
+        for body in (
+            b'{"tools":[{"type":"web"}]}',
+            b'{"tools":[{"type":"web_fetch","url":"https://evil.example"}]}',
+            b'{"tools":[{"type":"browser"}]}',
+            b'{"tools":[{"type":"computer_use"}]}',
+            b'{"tools":[{"type":"code_interpreter"}]}',
+        ):
+            with self.assertRaises(network_proxy.WebSocketDenied):
+                self.guard().feed(masked_frame(body))
+
+    def test_renamed_web_tool_carrying_access_flag_is_denied(self) -> None:
+        # A tool under an unknown type that still carries a *_web_access flag
+        # must fail closed rather than be forwarded.
+        with self.assertRaises(network_proxy.WebSocketDenied):
+            self.guard().feed(
+                masked_frame(b'{"tools":[{"type":"surf","external_web_access":true}]}')
+            )
+
+    def test_cached_web_search_with_explicit_indexed_false_is_forwarded(self) -> None:
+        body = (
+            b'{"tools":[{"type":"web_search","external_web_access":false,'
+            b'"indexed_web_access":false}]}'
+        )
+        frame = masked_frame(body)
+        self.assertEqual(self.guard().feed(frame), frame)
+
+    def test_non_web_hosted_tools_are_forwarded(self) -> None:
+        # image_generation and local_shell reach no external URL with request
+        # data; they must not be swept up by the web-tool guard.
+        for body in (
+            b'{"tools":[{"type":"image_generation"}]}',
+            b'{"tools":[{"type":"local_shell"}]}',
+        ):
+            frame = masked_frame(body)
+            self.assertEqual(self.guard().feed(frame), frame)
+
     def test_fragmented_message_is_reassembled_before_the_check(self) -> None:
         guard = self.guard()
         held = guard.feed(masked_frame(LIVE_SEARCH[:10], opcode=0x1, fin=False))
@@ -729,6 +779,126 @@ class WebSocketGuardTests(unittest.TestCase):
         self.assertEqual(upstream.recv(1024), b"\x00not a websocket frame at all")
         client.close()
         thread.join(timeout=5)
+
+
+class ExternalUrlRequestGuardTests(unittest.TestCase):
+    """Direct coverage of the structural guard, including the standalone Codex
+    search endpoints whose external_web_access/indexed_web_access live under
+    ``settings`` rather than a tool object."""
+
+    JSON = [("content-type", "application/json")]
+
+    def deny(self, payload: dict, path: str | None = None) -> str | None:
+        return network_policy._external_url_request_denial(self.JSON, json.dumps(payload).encode(), path)
+
+    def test_standalone_search_cached_is_allowed(self) -> None:
+        for path in ("/backend-api/codex/alpha/search", "/v1/alpha/search"):
+            self.assertIsNone(self.deny({"settings": {"external_web_access": False}}, path))
+
+    def test_standalone_search_live_is_denied(self) -> None:
+        reason = self.deny({"settings": {"external_web_access": True}}, "/v1/alpha/search")
+        self.assertIn("live web search is disabled", reason or "")
+
+    def test_standalone_search_indexed_is_denied(self) -> None:
+        reason = self.deny(
+            {"settings": {"external_web_access": False, "indexed_web_access": True}},
+            "/backend-api/codex/alpha/search",
+        )
+        self.assertIn("indexed web search is disabled", reason or "")
+
+    def test_standalone_search_missing_settings_is_denied(self) -> None:
+        self.assertIsNotNone(self.deny({}, "/v1/alpha/search"))
+
+    def test_indexed_flag_on_tool_is_denied(self) -> None:
+        reason = self.deny(
+            {"tools": [{"type": "web_search", "external_web_access": False, "indexed_web_access": True}]}
+        )
+        self.assertIn("indexed web search is disabled", reason or "")
+
+    def test_unknown_web_tool_fails_closed(self) -> None:
+        for tool_type in ("web", "web_fetch", "browser", "computer_use", "computer_use_preview", "code_interpreter"):
+            reason = self.deny({"tools": [{"type": tool_type}]})
+            self.assertIsNotNone(reason, f"{tool_type} should be denied")
+
+    def test_cached_web_search_still_allowed(self) -> None:
+        self.assertIsNone(self.deny({"tools": [{"type": "web_search", "external_web_access": False}]}))
+
+    def test_function_tool_still_allowed(self) -> None:
+        self.assertIsNone(self.deny({"tools": [{"type": "function", "name": "exec"}]}))
+
+    def test_non_web_tool_with_false_web_access_flag_is_allowed(self) -> None:
+        # A false/default *_web_access flag grants no access; a safe tool that
+        # carries one must not be swept into the guard and denied for its type.
+        self.assertIsNone(self.deny({"tools": [{"type": "function", "external_web_access": False}]}))
+        self.assertIsNone(self.deny({"tools": [{"type": "custom", "indexed_web_access": False}]}))
+
+    def test_non_web_tool_with_truthy_web_access_flag_is_denied(self) -> None:
+        # But a truthy flag under a non-web type is a renamed web tool: deny.
+        self.assertIsNotNone(self.deny({"tools": [{"type": "surf", "external_web_access": True}]}))
+        self.assertIsNotNone(self.deny({"tools": [{"type": "surf", "indexed_web_access": True}]}))
+
+
+class AnthropicServerToolGuardTests(unittest.TestCase):
+    """The api.anthropic.com body guard denies Anthropic server-side tools that
+    run off-box (web search/fetch, code execution, remote MCP). Client-executed
+    built-ins and user-defined tools pass. Only fires when the domain rule sets
+    ``anthropic_external_url_request_guard``."""
+
+    JSON = [("content-type", "application/json")]
+
+    def deny(self, payload: dict, guard: bool = True, allow_web_search: bool = False) -> str | None:
+        rule: dict = {"allow_http_methods": ["POST"]}
+        if guard:
+            rule["anthropic_external_url_request_guard"] = True
+        if allow_web_search:
+            rule["anthropic_allow_web_search"] = True
+        policy = {"allowed_network_access": {"api.anthropic.com": rule}}
+        return network_policy.anthropic_request_denied(
+            policy, "POST", "api.anthropic.com", "/v1/messages", self.JSON, json.dumps(payload).encode()
+        )
+
+    def test_server_side_web_tools_are_denied(self) -> None:
+        for tool_type in ("web_search_20250305", "web_search_20260209", "web_fetch_20250910", "code_execution_20260120"):
+            self.assertIsNotNone(self.deny({"tools": [{"type": tool_type}]}), f"{tool_type} should be denied")
+
+    def test_web_search_allowed_when_operator_enabled(self) -> None:
+        # With the toggle on, web search passes...
+        self.assertIsNone(self.deny({"tools": [{"type": "web_search_20250305"}]}, allow_web_search=True))
+        self.assertIsNone(self.deny({"tools": [{"type": "web_search_20260209"}]}, allow_web_search=True))
+        # ...but the other off-box server tools stay denied regardless.
+        self.assertIsNotNone(self.deny({"tools": [{"type": "web_fetch_20250910"}]}, allow_web_search=True))
+        self.assertIsNotNone(self.deny({"tools": [{"type": "code_execution_20260120"}]}, allow_web_search=True))
+        self.assertIsNotNone(self.deny({"mcp_servers": [{"type": "url", "name": "x", "url": "https://x/mcp"}]}, allow_web_search=True))
+
+    def test_remote_mcp_servers_are_denied(self) -> None:
+        self.assertIsNotNone(self.deny({"mcp_servers": [{"type": "url", "name": "x", "url": "https://x/mcp"}]}))
+
+    def test_client_side_and_user_tools_are_allowed(self) -> None:
+        self.assertIsNone(self.deny({"tools": [{"type": "bash_20250124", "name": "bash"}]}))
+        self.assertIsNone(self.deny({"tools": [{"type": "text_editor_20250728"}, {"type": "memory_20250818"}]}))
+        self.assertIsNone(self.deny({"tools": [{"name": "do_thing", "input_schema": {"type": "object"}}]}))
+        self.assertIsNone(self.deny({"model": "x", "messages": [{"role": "user", "content": "hi"}]}))
+
+    def test_empty_mcp_servers_is_allowed(self) -> None:
+        self.assertIsNone(self.deny({"mcp_servers": []}))
+
+    def test_guard_only_fires_when_flagged(self) -> None:
+        self.assertIsNone(self.deny({"tools": [{"type": "web_search_20250305"}]}, guard=False))
+
+    def test_undecodable_body_fails_closed(self) -> None:
+        policy = {"allowed_network_access": {"api.anthropic.com": {"allow_http_methods": ["POST"], "anthropic_external_url_request_guard": True}}}
+        headers = [("content-type", "application/json"), ("content-encoding", "br")]
+        reason = network_policy.anthropic_request_denied(policy, "POST", "api.anthropic.com", "/v1/messages", headers, b"\x00\x01\x02")
+        self.assertIsNotNone(reason)
+
+    def test_non_json_body_is_not_inspected(self) -> None:
+        policy = {"allowed_network_access": {"api.anthropic.com": {"allow_http_methods": ["POST"], "anthropic_external_url_request_guard": True}}}
+        self.assertIsNone(
+            network_policy.anthropic_request_denied(
+                policy, "POST", "api.anthropic.com", "/v1/messages",
+                [("content-type", "text/plain")], b"plain text mentioning web_search",
+            )
+        )
 
 
 if __name__ == "__main__":

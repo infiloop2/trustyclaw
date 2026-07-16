@@ -180,7 +180,16 @@
 
       <div id="panel-network" class="tab-panel" hidden>
         <div id="preset-info-popover" class="info-popover" role="dialog" hidden></div>
-        <div id="managed-integrations"></div>
+        <section class="network-group" aria-labelledby="ai-inference-heading">
+          <h2 id="ai-inference-heading" class="network-group-heading">AI Inference</h2>
+          <div id="ai-inference-integrations" class="integration-list"></div>
+        </section>
+        <section class="network-group" aria-labelledby="tools-heading">
+          <h2 id="tools-heading" class="network-group-heading">Tools</h2>
+          <!-- Managed tool integrations and bundled tools share this list and
+               are sorted together by their visible names. -->
+          <div id="tools" class="integration-list"></div>
+          <div id="tools-empty" class="empty-state" hidden>No bundled tools in this build.</div>
         <!-- Rendered in the GitHub integration dropdown above:
              renderManagedIntegrations() moves this node under that card and
              shows it only while GitHub is enabled (a disabled integration
@@ -238,10 +247,9 @@
             </div>
           </div>
         </div>
-        <!-- Bundled tools render below as integration rows like the managed
-             integrations above: collapsed by default, with connection, config,
-             and approvals inside each row's dropdown (tools.js). -->
-        <div id="tools"></div>
+        </section>
+        <section class="network-group network-group-manual" aria-labelledby="manual-heading">
+          <h2 id="manual-heading" class="network-group-heading">Manual</h2>
         <section class="integration-row custom-domain-card">
           <div class="integration-summary">
             <button id="custom-domain-toggle" class="ghost sm icon-button integration-chevron" data-action="toggle-custom-domain-access" aria-label="Toggle custom domain access details" aria-expanded="false">
@@ -250,7 +258,13 @@
             <div class="integration-title">
               <div class="preset-with-info">
                 <h2>Custom Domain Access</h2>
-                <button class="info-button" data-action="toggle-integration-info" data-info="custom_domain" aria-label="Custom Domain Access overview and protections" aria-haspopup="dialog" aria-expanded="false">i</button>
+                <button class="info-button" data-action="toggle-integration-info" data-info="custom_domain" aria-label="Custom Domain Access overview and protections" aria-haspopup="dialog" aria-expanded="false">
+                  <svg class="integration-info-icon" viewBox="0 0 20 20" aria-hidden="true">
+                    <circle cx="10" cy="10" r="7.25" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                    <circle cx="10" cy="6.55" r="1" fill="currentColor"/>
+                    <path d="M10 9.35v4.1" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round"/>
+                  </svg>
+                </button>
               </div>
               <div class="integration-subtitle">Creates an explicit network rule for a domain that is not covered by a managed integration or bundled tool.</div>
             </div>
@@ -278,6 +292,7 @@
               </div>
             </div>
           </div>
+        </section>
         </section>
       </div>
 

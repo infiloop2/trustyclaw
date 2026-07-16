@@ -8,8 +8,16 @@ import unittest
 from unittest.mock import patch
 
 from host.config import parse_input_config
-from tests.smoke.smoke_aws import AwsSmoke
-from tests.stage.stage_aws import StageAwsSmoke, _github_app_config_from_env, _required_env_path
+from host.runtime.tools_host import BUNDLED_TOOLS, validate_against_schema
+from tests.smoke.smoke_aws import SMOKE_TOOL_CALLS, AwsSmoke
+from tests.stage.stage_aws import (
+    STAGE_SUITES,
+    TOOL_SUITES,
+    StageAwsSmoke,
+    _github_app_config_from_env,
+    _required_env_path,
+    suite_tools,
+)
 
 
 class AwsSmokeTeardownTests(unittest.TestCase):
@@ -215,10 +223,121 @@ class StageAwsSmokeTests(unittest.TestCase):
         self.assertEqual(StageAwsSmoke.suite_runtimes("codex"), ("codex",))
         self.assertEqual(StageAwsSmoke.suite_runtimes("claude"), ("claude_code",))
         self.assertEqual(StageAwsSmoke.suite_runtimes("github"), ())
-        self.assertEqual(StageAwsSmoke.suite_runtimes("brave"), ())
+        self.assertEqual(StageAwsSmoke.suite_runtimes("brave_search"), ())
         self.assertEqual(StageAwsSmoke.suite_runtimes("gmail"), ())
-        self.assertEqual(StageAwsSmoke.suite_runtimes("gcal"), ())
+        self.assertEqual(StageAwsSmoke.suite_runtimes("google_calendar"), ())
         self.assertEqual(StageAwsSmoke.suite_runtimes("all"), ("codex", "claude_code"))
+        self.assertTrue(set(TOOL_SUITES).issubset(STAGE_SUITES))
+        self.assertEqual(suite_tools("all"), TOOL_SUITES)
+        self.assertEqual(suite_tools("linkedin"), ("linkedin",))
+        self.assertEqual(suite_tools("github"), ())
+
+    def test_stage_autoconfiguration_never_touches_oauth_tools(self) -> None:
+        smoke = object.__new__(StageAwsSmoke)
+        configured: set[tuple[str, str]] = set()
+        calls: list[tuple[str, str, dict | None]] = []
+
+        def fake_api(method: str, path: str, body: dict | None = None) -> dict:
+            calls.append((method, path, body))
+            if method == "PUT" and body is not None:
+                configured.add((path.split("/")[3], body["key"]))
+                return {}
+            if method == "GET" and path == "/v1/tools":
+                return {
+                    "tools": [
+                        {
+                            "tool_id": tool_id,
+                            "config": [
+                                {"key": requirement.key, "set": (tool_id, requirement.key) in configured}
+                                for requirement in BUNDLED_TOOLS[tool_id].manifest.config
+                            ],
+                        }
+                        for tool_id in ("brave_search", "gmail")
+                    ]
+                }
+            if method == "POST":
+                return {}
+            raise AssertionError((method, path, body))
+
+        smoke._api = fake_api  # type: ignore[method-assign]
+        environment = {
+            "TRUSTYCLAW_STAGE_BRAVE_SEARCH_API_KEY": "brave-key",
+            "TRUSTYCLAW_STAGE_GOOGLE_OAUTH_CLIENT_ID": "must-not-be-read",
+            "TRUSTYCLAW_STAGE_GOOGLE_OAUTH_CLIENT_SECRET": "must-not-be-read",
+        }
+        with patch.dict("os.environ", environment, clear=False):
+            smoke.autoconfigure_tools(("brave_search", "gmail"))
+
+        self.assertIn(
+            ("PUT", "/v1/tools/brave_search/config", {"key": "BRAVE_SEARCH_API_KEY", "value": "brave-key"}),
+            calls,
+        )
+        self.assertIn(("POST", "/v1/tools/brave_search/enable", {}), calls)
+        self.assertFalse(any("/gmail/" in path for _, path, _ in calls))
+
+    def test_stage_oauth_preflight_points_only_to_persistent_host_setup(self) -> None:
+        smoke = object.__new__(StageAwsSmoke)
+        smoke._api = lambda *_args, **_kwargs: {  # type: ignore[method-assign]
+            "tools": [
+                {
+                    "tool_id": "gmail",
+                    "enabled": False,
+                    "config": [
+                        {"key": "GOOGLE_OAUTH_CLIENT_ID", "set": False},
+                        {"key": "GOOGLE_OAUTH_CLIENT_SECRET", "set": False},
+                    ],
+                    "connection_status": {"connected": False},
+                }
+            ]
+        }
+        failures = smoke._tool_credential_failures("gmail")
+        self.assertEqual(len(failures), 1)
+        self.assertIn("stage admin UI", failures[0])
+        self.assertIn("connect its stage account once", failures[0])
+        self.assertIn("enable the tool", failures[0])
+        self.assertNotIn("TRUSTYCLAW_STAGE_GOOGLE", failures[0])
+
+    def test_fresh_smoke_has_valid_input_for_every_bundled_action(self) -> None:
+        covered = {
+            f"{tool_id}_{action_id}"
+            for tool_id, calls in SMOKE_TOOL_CALLS.items()
+            for action_id, _arguments in calls
+        }
+        covered.update(
+            {
+                "polymarket_get_market",
+                "polymarket_get_order_book",
+                "polymarket_price_history",
+            }
+        )
+        declared = {
+            f"{tool_id}_{action.id}"
+            for tool_id, tool in BUNDLED_TOOLS.items()
+            for action in tool.manifest.actions
+        }
+        self.assertEqual(covered, declared)
+        for tool_id, calls in SMOKE_TOOL_CALLS.items():
+            for action_id, arguments in calls:
+                spec = BUNDLED_TOOLS[tool_id].manifest.action(action_id)
+                self.assertIsNotNone(spec)
+                assert spec is not None
+                self.assertEqual(
+                    validate_against_schema(arguments, spec.input_schema),
+                    "",
+                    f"invalid smoke input for {tool_id}_{action_id}",
+                )
+        for action_id, arguments in (
+            ("get_market", {"market_id": "1"}),
+            ("get_order_book", {"token_id": "1"}),
+            ("price_history", {"token_id": "1", "interval": "1d"}),
+        ):
+            spec = BUNDLED_TOOLS["polymarket"].manifest.action(action_id)
+            assert spec is not None
+            self.assertEqual(
+                validate_against_schema(arguments, spec.input_schema),
+                "",
+                f"invalid smoke input for polymarket_{action_id}",
+            )
 
     def test_github_app_config_from_env_parses_or_requires_all(self) -> None:
         keys = (
@@ -285,9 +404,9 @@ class WorkflowSmokeTests(unittest.TestCase):
         self.assertNotIn(removed_action, stage_start)
         self.assertNotIn(removed_action, stage_stop)
 
-    def test_stage_workflow_exposes_suite_and_github_secrets(self) -> None:
+    def test_stage_workflow_exposes_only_enable_only_tool_secrets(self) -> None:
         stage = Path(".github/workflows/trustyclaw-stage.yml").read_text()
-        for option in ("all", "claude", "codex", "github"):
+        for option in ("all", *TOOL_SUITES, "claude", "codex", "github"):
             self.assertIn(f"- {option}", stage)
         self.assertIn("--suite", stage)
         for env_name in (
@@ -297,6 +416,14 @@ class WorkflowSmokeTests(unittest.TestCase):
             "STAGE_GITHUB_APP_PRIVATE_KEY",
         ):
             self.assertIn(env_name, stage)
+        for tool_id in TOOL_SUITES:
+            for requirement in BUNDLED_TOOLS[tool_id].manifest.config:
+                env_name = f"TRUSTYCLAW_STAGE_{requirement.key}"
+                mapping = f"{env_name}: ${{{{ secrets.{env_name} }}}}"
+                if BUNDLED_TOOLS[tool_id].manifest.connection == "oauth":
+                    self.assertNotIn(mapping, stage)
+                else:
+                    self.assertIn(mapping, stage)
 
     def test_fresh_smoke_workflow_uses_fresh_smoke_script(self) -> None:
         smoke = Path(".github/workflows/trustyclaw-smoke.yml").read_text()

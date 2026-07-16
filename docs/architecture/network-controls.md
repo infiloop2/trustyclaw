@@ -10,7 +10,10 @@ Defense in depth, fail closed at each layer:
    no egress at all), optional `cloudflared`, `systemd-resolved`, and
    `systemd-timesyncd`, with narrow
    loopback exceptions: the agent may reach only the proxy port, the admin API
-   may reach app backend ports, and app service users may answer established
+   and the agent-app service may reach app backend ports (the browser bridge
+   and the agent `app_api` proxy respectively — the agent-app service has no
+   other network reach; see [agent-app-api.md](apps/agent-app-api.md)), and app
+   service users may answer established
    admin-proxy connections. The agent has no direct network path at all.
    Non-root DNS is blocked even toward the local `systemd-resolved` stub (DNS
    lookups are an exfiltration channel); only `systemd-resolved`, the proxy,
@@ -44,21 +47,34 @@ The proxy enforces, per request:
 - `path_guards` regexes against path plus query.
 - OpenAI guards: `managed_network_integrations.openai` expands to the required OpenAI domains,
   denies requests that would make OpenAI reach an external URL with request
-  data (any web-search tool other than `web_search` with
-  `external_web_access: false`, Chat Completions search, standalone search
-  requests that do not opt into cached retrieval, and remote MCP tools) while
-  allowing cache-backed search, and requires
+  data (any web/browse tool other than `web_search` with
+  `external_web_access: false` and `indexed_web_access` false-or-absent —
+  including `indexed` mode, a bare `web`/`web_fetch`/`browser`/`computer_use`
+  tool, and any renamed tool carrying a truthy `*_web_access` flag — plus
+  Chat Completions search, standalone search requests that do not opt into
+  cached retrieval, and remote MCP tools) while allowing cache-backed search,
+  and requires
   data-plane traffic to match the account id inferred from Codex login status
   (failing closed while that id is unavailable). The agent's Codex runtime is
   also pinned to cached web search via a managed
-  `/etc/codex/requirements.toml`, which also disables Codex app/plugin
-  connector surfaces. The proxy remains a second enforcement layer.
+  `/etc/codex/requirements.toml` (`allowed_web_search_modes = ["cached"]`, which
+  excludes both `live` and `indexed`), which also disables Codex
+  app/plugin/browse feature surfaces (`apps`, `plugins`, `tool_search`,
+  `tool_suggest`, `computer_use`, `remote_plugin`, `plugin_sharing`) so the
+  agent does not attempt a tool the proxy would deny. The proxy remains the
+  ultimate enforcement layer.
 - Anthropic guards: `managed_network_integrations.claude` expands to the
   Claude Code OAuth path on `platform.claude.com` and the Anthropic API domain.
   The API domain fails closed until Claude Code OAuth has produced a locally
   readable account file; after that, API requests must carry the exact bearer
   token whose SHA-256 hash was inferred from the agent user's Claude credentials.
-  The proxy reads only that hash, never the bearer token itself.
+  The proxy reads only that hash, never the bearer token itself. The API domain
+  also applies a structural body guard that denies Anthropic server-side tools
+  which run off-box and reach external URLs with request data: `web_fetch`,
+  `code_execution`, and remote `mcp_servers` are always denied, and `web_search`
+  is denied unless the operator set `managed_network_integrations.claude.web_search`
+  (default off). Claude Code's client-side WebFetch and Bash egress stay gated by
+  the domain allow-list instead.
 - GitHub guards: `managed_network_integrations.github` expands to the GitHub
   domain set with an all-reads, scoped-writes guard. When enabled, every read
   is allowed (the agent may read any repository the injected token reaches);
@@ -137,8 +153,9 @@ reference for those fields.
 | `allow_http_methods` (generated) | every integration | Same mechanics as manual rules; the integration registry fixes the method list per generated domain (for example `POST` only on `api.openai.com`, `GET`/`HEAD` only on `raw.githubusercontent.com`). |
 | `path_guards` (generated) | `claude`, `python_packages`, `npm_packages` | Same regex mechanics as manual rules, with registry-fixed patterns (for example `^/v1/oauth(?:/.*)?$` on `platform.claude.com`, `^/packages(?:/.*)?$` on `files.pythonhosted.org`). Request paths are percent-decoded and dot-segment-normalized before matching so `..` segments cannot escape a guard. |
 | `openai_account_guard` | `openai` | Requires a `chatgpt-account-id` header on data-plane requests that is present and equal to the account id inferred from Codex login status (stored as the openai row in `proxy_provider_pins`). Missing id or missing header fails closed. |
-| `openai_external_url_request_guard` | `openai` | Denies requests that would make OpenAI reach an external URL with request data. Buffers and decodes the request body (gzip/deflate in-process, decoded output capped at 128 MiB; any other encoding is denied outright), then enforces the rule structurally on the parsed JSON: a web-search-family tool object must be exactly `web_search` with `external_web_access: false` (preview and dated variants always browse live and are denied), Chat Completions search (`web_search_options`, `*-search*` models) is denied outright, remote MCP tools (`type: mcp` by `server_url` or hosted `connector_id`, or a `server_url` key anywhere) are denied outright, and the Codex standalone search endpoints (`/backend-api/codex/alpha/search`, `/v1/alpha/search`) must set `settings.external_web_access: false` because the server default there is live. Prompt text mentioning a tool name carries no capability and never matches; JSON-looking bodies that fail to parse are denied. Also applied to each client-to-upstream WebSocket message on guarded domains. |
+| `openai_external_url_request_guard` | `openai` | Denies requests that would make OpenAI reach an external URL with request data. Buffers and decodes the request body (gzip/deflate in-process, decoded output capped at 128 MiB; any other encoding is denied outright), then enforces the rule structurally on the parsed JSON. The rule fails closed — only the cache-backed `web_search` shape is forwarded and every other collected web/browse tool is denied. A guarded tool object is collected when its `type` is `mcp`, starts with `web` (except the `web_search_call` history item), is a network-reaching hosted type (`browser`, `computer_use`, `computer_use_preview`, `code_interpreter`), or, so a renamed web tool is still caught, carries any truthy `*_web_access` flag. Of those, only a tool that is exactly `web_search` with `external_web_access: false` **and** `indexed_web_access` false-or-absent is allowed; `indexed` mode (server-approved external URL fetch), `web_search_preview`/dated variants, a bare `web`/`web_fetch`/`browser`/`computer_use`/`code_interpreter` tool, and any other truthy `*_web_access` flag are all denied. Chat Completions search (`web_search_options`, `*-search*` models) is denied outright, remote MCP tools (`type: mcp` by `server_url` or hosted `connector_id`, or a `server_url` key anywhere) are denied outright, and the Codex standalone search endpoints (`/backend-api/codex/alpha/search`, `/v1/alpha/search`) must set `settings.external_web_access: false` and must not set `settings.indexed_web_access: true` because the server default there is live. Prompt text mentioning a tool name carries no capability and never matches; JSON-looking bodies that fail to parse are denied. Also applied to each client-to-upstream WebSocket message on guarded domains. |
 | `anthropic_account_guard` | `claude` | Denies `api.anthropic.com` requests unless the presented bearer token's SHA-256 hash equals the hash stored in the claude `proxy_provider_pins` row after Claude OAuth. Allows the unauthenticated `GET /api/hello` readiness probe and a fixed set of bearer-authenticated pre-pin bootstrap `GET` paths. The proxy stores and compares only the hash. |
+| `anthropic_external_url_request_guard` | `claude` | Denies `api.anthropic.com` requests whose JSON body declares an Anthropic server-side tool that reaches an external URL or runs code off-box. Decodes the body (reusing the gzip/deflate-capped decoder), and if it parses as JSON, inspects the top-level `tools` array by `type` prefix: `web_fetch` and `code_execution` (and a non-empty top-level `mcp_servers` array) are always denied; `web_search` is denied unless the companion `anthropic_allow_web_search` flag is set (expanded from `managed_network_integrations.claude.web_search`, default off). Client-executed built-ins (`bash_*`, `text_editor_*`, `memory_*`) and user-defined tools (which carry a `name` but no `type`) do not match. A body that cannot be decoded or that is declared JSON but fails to parse is denied (fail-closed). |
 | `github_repo_guard` | `github` | Carries the normalized `write_repositories` list and `require_dot_github_approval` toggle. Applies the access decision tables — every read allowed on `github.com` web/smart-HTTP, `api.github.com` REST, and `codeload`/`raw`; writes gated to the write list, with repository administration denied outright, GraphQL denied outright, and REST content-write bypasses denied when `.github` approval is required. The signed-URL domains carry no guard: they expand to plain `GET`/`HEAD` rules (presigned S3 paths have no owner/repo; the signed URL is the access control). Runs after the generic domain/method/path checks, before upstream connection, with no DNS dependency. |
 
 ### Path canonicalization

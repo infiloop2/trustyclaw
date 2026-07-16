@@ -5,15 +5,14 @@ import hashlib
 import hmac
 import json
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 from collections.abc import Mapping
 from typing import cast
 
 from host.tools.json_types import JSONObject, JSONValue
 from host.tools.host_api import ConnectionAccount, HostAPI, StoredCredential
+from host.tools.shared.web import WebRequestError, json_request, request_bytes
 from host.tools.tool import (
     ConnectionStatus,
     OAuthCompleteConnectParams,
@@ -91,10 +90,15 @@ def normalize_email(value: str) -> str:
 
 def google_identity_from_userinfo(userinfo: Mapping[str, object]) -> JSONObject:
     sub = userinfo.get("sub")
-    if not isinstance(sub, str) or not sub:
+    if (
+        not isinstance(sub, str)
+        or not sub
+        or len(sub) > 200
+        or any(ord(character) < 32 or ord(character) == 127 for character in sub)
+    ):
         raise RuntimeError("Google did not return a stable account id.")
     email_value = userinfo.get("email")
-    if not isinstance(email_value, str) or not email_value.strip():
+    if not isinstance(email_value, str) or not email_value.strip() or len(email_value) > 500:
         raise RuntimeError("Google did not return an email address.")
     if userinfo.get("email_verified") is not True:
         raise RuntimeError("Google email address is not verified.")
@@ -203,24 +207,18 @@ def _post_google_oauth_form(
     invalid_response_message: str,
     invalid_grant_is_special: bool,
 ) -> dict[str, object]:
-    body = urllib.parse.urlencode(form).encode("utf-8")
-    request = urllib.request.Request(
-        GOOGLE_OAUTH_TOKEN_URL,
-        data=body,
-        headers={"content-type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            decoded = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        if invalid_grant_is_special and is_google_invalid_grant_payload(exc.read()):
+        decoded = json_request(
+            "POST",
+            GOOGLE_OAUTH_TOKEN_URL,
+            form=form,
+            failure_message=failure_message,
+            invalid_response_message=invalid_response_message,
+        )
+    except WebRequestError as exc:
+        if invalid_grant_is_special and is_google_invalid_grant_payload(exc.body):
             raise GoogleOAuthInvalidGrantError("Google OAuth refresh token is invalid.") from exc
         raise RuntimeError(failure_message) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(failure_message) from exc
-    if not isinstance(decoded, dict):
-        raise RuntimeError(invalid_response_message)
     return cast(dict[str, object], decoded)
 
 
@@ -274,43 +272,38 @@ def get_google_userinfo(
     failure_message: str,
     invalid_response_message: str,
 ) -> dict[str, object]:
-    request = urllib.request.Request(
-        GOOGLE_USERINFO_URL,
-        headers={"authorization": f"Bearer {access_token}"},
-        method="GET",
-    )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            decoded = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        if exc.code == 401:
+        decoded = json_request(
+            "GET",
+            GOOGLE_USERINFO_URL,
+            headers={"authorization": f"Bearer {access_token}"},
+            failure_message=failure_message,
+            invalid_response_message=invalid_response_message,
+        )
+    except WebRequestError as exc:
+        if exc.status == 401:
             # Same treatment as google_json_request: a rejected cached token
             # must surface the reconnect flow, and refresh_identity runs
             # before every write proposal and approved execution.
             raise IntegrationReconnectRequired(GOOGLE_UNAUTHORIZED_RECONNECT_MESSAGE) from exc
         raise RuntimeError(failure_message) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(failure_message) from exc
-    if not isinstance(decoded, dict):
-        raise RuntimeError(invalid_response_message)
     return cast(dict[str, object], decoded)
 
 
 def revoke_google_token(token: str) -> JSONObject:
     body = urllib.parse.urlencode({"token": token}).encode("utf-8")
-    request = urllib.request.Request(
-        GOOGLE_OAUTH_REVOKE_URL,
-        data=body,
-        headers={"content-type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(request, timeout=30):
-            pass
-    except urllib.error.HTTPError as exc:
-        return {"success": False, "failure_type": "http", "status": exc.code}
-    except urllib.error.URLError as exc:
-        return {"success": False, "failure_type": "network", "error_type": type(exc).__name__}
+        request_bytes(
+            "POST",
+            GOOGLE_OAUTH_REVOKE_URL,
+            headers={"content-type": "application/x-www-form-urlencoded"},
+            data=body,
+            failure_message="Google token revocation failed.",
+        )
+    except WebRequestError as exc:
+        if exc.status:
+            return {"success": False, "failure_type": "http", "status": exc.status}
+        return {"success": False, "failure_type": "network", "error_type": "WebRequestError"}
     return {"success": True}
 
 
@@ -541,29 +534,19 @@ def google_json_request(
     failure_message: str,
     invalid_response_message: str,
 ) -> JSONObject:
-    data = json.dumps(body, separators=(",", ":")).encode("utf-8") if body is not None else None
-    request = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "authorization": f"Bearer {access_token}",
-            **({"content-type": "application/json"} if body is not None else {}),
-        },
-        method=method,
-    )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            raw_body = response.read().decode("utf-8")
-            decoded = json.loads(raw_body) if raw_body.strip() else {}
-    except urllib.error.HTTPError as exc:
-        if exc.code == 401:
+        return json_request(
+            method,
+            url,
+            headers={"authorization": f"Bearer {access_token}"},
+            body=body,
+            failure_message=failure_message,
+            invalid_response_message=invalid_response_message,
+        )
+    except WebRequestError as exc:
+        if exc.status == 401:
             # A still-cached token Google no longer accepts (for example the
             # operator revoked the app) is a connection problem, not a
             # generic API failure: surface the reconnect-required flow.
             raise IntegrationReconnectRequired(GOOGLE_UNAUTHORIZED_RECONNECT_MESSAGE) from exc
         raise RuntimeError(failure_message) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(failure_message) from exc
-    if not isinstance(decoded, dict):
-        raise RuntimeError(invalid_response_message)
-    return cast(JSONObject, decoded)

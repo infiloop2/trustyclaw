@@ -5,7 +5,7 @@
 export const MANAGED_INTEGRATIONS = {
   openai: {
     label: "OpenAI",
-    summary: "Connects Codex to your OpenAI subscription through OAuth for agentic tasks and cached web search.",
+    summary: "Connect your OpenAI subscription and let your agent use Codex for tasks and cached web search.",
     protections: [
       "The linked OpenAI account is pinned. Authenticated traffic for another account is denied until you explicitly disconnect and log in again.",
       "Live browsing and remote tool servers are blocked. Codex can use only OpenAI's cached web search.",
@@ -36,7 +36,7 @@ export const MANAGED_INTEGRATIONS = {
           description: "This guide assumes a personal ChatGPT/Codex OAuth subscription. One account setting, Improve the model for everyone, controls training use.",
           points: [
             { label: "Before connecting", text: "Turn off Improve the model for everyone in ChatGPT Settings > Data Controls. While it is on, OpenAI may use new conversations and Codex content to improve its models; once off, OpenAI says new conversations are not used for model training. The setting changes training use, not retention." },
-            { label: "Regardless", text: "Limited reviewers may access content for abuse or security investigations, support, or legal matters." },
+            { label: "Either way", text: "Limited reviewers may access content for abuse or security investigations, support, or legal matters." },
           ],
           links: [
             { url: "https://help.openai.com/en/articles/7730893-chatgpt-data-usage-for-model-training", label: "OpenAI Data Controls instructions" },
@@ -46,7 +46,7 @@ export const MANAGED_INTEGRATIONS = {
         },
         {
           title: "How long OpenAI retains it",
-          description: "Codex chats remain saved until you delete them.",
+          description: "Codex chats and their content remain saved until you delete them.",
           points: [
             { label: "After deletion", text: "OpenAI schedules permanent deletion within 30 days unless data was de-identified, disassociated from your account, or must be kept for security or legal reasons." },
           ],
@@ -58,12 +58,9 @@ export const MANAGED_INTEGRATIONS = {
     },
     capabilities: [
       { name: "Codex model access", description: "Runs Codex tasks through the models and usage limits available to the linked OpenAI subscription." },
-      { name: "Cached web search", description: "Lets Codex search OpenAI's existing index or cache. OpenAI is not allowed to fetch arbitrary external URLs for the request." },
+      { name: "Cached web search", description: "Lets Codex search OpenAI's existing index or cache. TrustyClaw denies request forms that would let OpenAI fetch live external pages for the request." },
     ],
     controls: [
-      "Disable closes the OpenAI network path and deactivates the Codex runtime.",
-      "Disconnect is an operator action that clears the trusted account anchor and local OpenAI authentication before a different account can be linked.",
-      "Cached search must set external_web_access: false. Preview search, search-model, and remote MCP request forms are denied.",
       "The proxy fails closed when the account pin or request body cannot be checked.",
     ],
     networkScope: [
@@ -74,10 +71,10 @@ export const MANAGED_INTEGRATIONS = {
   },
   claude: {
     label: "Claude",
-    summary: "Connects Claude Code to your Anthropic subscription through OAuth for agentic tasks and web search.",
+    summary: "Connect your Anthropic subscription and let your agent use Claude Code for tasks. Web search is optional and off by default.",
     protections: [
       "The linked Anthropic account and OAuth token are pinned. Credentials for another account are denied until you explicitly disconnect and log in again.",
-      "Claude Code uses Anthropic's server-side web search and web fetch. This host connects only to Anthropic, but Anthropic can use search partners and retrieve source pages outside TrustyClaw's network boundary.",
+      "Web search is off by default. When you enable it, the query and surrounding context reach Anthropic's server-side search, which may use search partners and retrieve source pages outside TrustyClaw's boundary. Server-side web fetch, code execution, and remote tool servers stay blocked at the proxy regardless; the agent's own web fetch runs on this host and can reach only TrustyClaw's allowed domains.",
     ],
     setupSteps: [
       { title: "Enable Claude", description: "In Internet Access and Tools, choose Enable on the Claude row, then expand it." },
@@ -95,7 +92,7 @@ export const MANAGED_INTEGRATIONS = {
           title: "Where it can go",
           points: [
             { label: "Anthropic", text: "Everything the agent sends goes to Anthropic's services under the linked account, with service providers used to operate Claude." },
-            { label: "Search partners", text: "Web search may pass the query to Anthropic's search partners and retrieve source pages, outside TrustyClaw's network boundary." },
+            { label: "Search partners (only if web search is enabled)", text: "With web search enabled, the query may go to Anthropic's search partners and Anthropic may retrieve source pages, outside TrustyClaw's network boundary. Anthropic does not name which third-party search providers it uses. With web search off (the default), nothing leaves for search." },
           ],
           links: [],
         },
@@ -115,7 +112,7 @@ export const MANAGED_INTEGRATIONS = {
           title: "How long Anthropic retains it",
           description: "Personal conversations remain until you delete them; Anthropic says deletion removes them from history immediately and from backend storage within 30 days.",
           points: [
-            { label: "Fable 5", text: "Anthropic designates its most capable models, including Fable 5, as Covered Models with an extra safety measure: prompts and outputs are kept for 30 days on every plan, even with model improvement off. After 30 days they are deleted automatically unless a safety investigation or legal obligation requires longer." },
+            { label: "Covered Models", text: "Anthropic designates its most capable models, including Fable 5, as Covered Models with an extra safety measure: prompts and outputs are kept for 30 days on every plan, even with model improvement off. After 30 days they are deleted automatically unless a safety investigation or legal obligation requires longer." },
             { label: "Safety flags", text: "Anthropic may retain flagged inputs and outputs for up to 2 years and trust-and-safety classification scores for up to 7 years." },
             { label: "Feedback and de-identified data", text: "Feedback may be kept for 5 years; anonymized or de-identified data may be kept longer." },
           ],
@@ -129,28 +126,26 @@ export const MANAGED_INTEGRATIONS = {
     capabilities: [
       { name: "Claude Code model access", description: "Runs Claude Code tasks through the models and usage limits available to the linked Anthropic subscription." },
       {
-        name: "Web search",
-        description: "Runs server-side search with citations. Anthropic may use search partners and retrieve pages. Its commercial documentation does not name the text-search provider; a separate Claude for Government connector uses Brave, while image search uses Bing.",
+        name: "Web search (optional, off by default)",
+        description: "Off unless you enable it for the Claude integration. When on, Anthropic runs the search server-side: the query and surrounding context leave to Anthropic and its search partners — Anthropic does not name which third-party search providers it uses.",
         linkUrl: "https://support.claude.com/en/articles/10684626-enable-and-use-web-search",
         linkLabel: "Anthropic web search documentation",
       },
     ],
     controls: [
-      "Disable closes the Anthropic network path and deactivates the Claude Code runtime.",
-      "Disconnect clears the trusted account anchor and local Claude authentication before a different account can be linked.",
       "A token rotation is re-attested to Anthropic and must still match the operator-approved account.",
     ],
     networkScope: [
-      ["api.anthropic.com", "GET and POST; pinned-account and OAuth-token guards"],
+      ["api.anthropic.com", "GET and POST; pinned-account, OAuth-token, and server-side web-tool guards"],
       ["platform.claude.com", "GET and POST only for the Claude OAuth endpoints"],
     ],
   },
   github: {
     label: "GitHub",
-    summary: "Gives the agent GitHub read access and repository-scoped write access for the exact repositories you choose.",
+    summary: "Connect GitHub and let your agent read repositories and write only to the repositories you choose.",
     protections: [
-      "Reads can reach any public repository and private repositories visible to the credential; writes work only for repositories configured.",
-      "Repository administration, GraphQL, Git LFS uploads, and other escaping write paths stay denied.",
+      "Reads can reach any public repository and private repositories visible to the credential; writes work only for the repositories you configure.",
+      "Repository administration, GraphQL, Git LFS uploads, and other write paths that could reach beyond the configured repositories stay denied.",
       "Keep approval for `.github` pushes enabled. Workflow changes can make GitHub Actions run arbitrary code with network access and repository credentials.",
     ],
     setupSteps: [
@@ -175,7 +170,7 @@ export const MANAGED_INTEGRATIONS = {
         {
           title: "Where it can go",
           points: [
-            { label: "Write repositories", text: "Apart from the two cases below, data can go only to the repositories on your write list; in a private repository it is visible only to that repository's collaborators." },
+            { label: "Write repositories", text: "Apart from public repositories and GitHub Actions (below), data can go only to the repositories on your write list; in a private repository it is visible only to that repository's collaborators." },
             { label: "Public repositories", text: "Everything pushed to a public write repository is exposed to the entire internet." },
             { label: "GitHub Actions", text: "A push changing a .github path can start workflow runs, which execute code with network access and can send repository data anywhere. TrustyClaw holds .github pushes for your approval by default." },
           ],
@@ -199,8 +194,6 @@ export const MANAGED_INTEGRATIONS = {
       ],
     },
     controls: [
-      "One row per write repository provides its audit status and immediate Remove control.",
-      "Mutating REST paths that administer settings, access grants, hooks, keys, protections, security toggles, workflows, transfers, or automation signals are denied even on a write repository.",
       "Disabling GitHub clears the write-repository list; the independently stored credential can remain staged or be cleared separately.",
     ],
     networkScope: [
@@ -216,7 +209,7 @@ export const MANAGED_INTEGRATIONS = {
   },
   python_packages: {
     label: "Python packages",
-    summary: "Lets the agent discover and install public Python packages from PyPI.",
+    summary: "Lets your agent discover and install public Python packages from PyPI.",
     protections: [
       "Access is read-only and limited to the public PyPI index, package metadata, and distribution download paths.",
       "Package publishing and arbitrary requests to PyPI or the download host remain denied.",
@@ -262,21 +255,20 @@ export const MANAGED_INTEGRATIONS = {
         },
       ],
     },
-    controls: ["Disable removes both PyPI hosts from the agent's active network policy immediately."],
     networkScope: [
       ["pypi.org", "GET and HEAD only under /simple and /pypi/<package>/json"],
       ["files.pythonhosted.org", "GET and HEAD only under /packages"],
     ],
   },
   npm_packages: {
-    label: "npm packages",
-    summary: "Lets the agent discover and install public JavaScript packages and Node.js distributions.",
+    label: "NPM Packages",
+    summary: "Lets your agent discover and install public JavaScript packages and download Node.js releases.",
     protections: [
       "Registry and Node.js distribution access is read-only; npm publishing and arbitrary Node.js website paths remain denied.",
       "Only public registry data and release files are available through this integration.",
     ],
     setupSteps: [
-      { title: "Enable npm packages", description: "Choose Enable in Internet Access and Tools. npm and compatible clients can then resolve and download public packages and Node.js distributions." },
+      { title: "Enable NPM Packages", description: "Choose Enable in Internet Access and Tools. npm and compatible clients can then resolve and download public packages and Node.js distributions." },
     ],
     capabilities: [
       { name: "npm registry reads", description: "Reads public package metadata and tarballs through registry.npmjs.org." },
@@ -301,7 +293,7 @@ export const MANAGED_INTEGRATIONS = {
         },
         {
           title: "What npm and OpenJS can do with it",
-          description: "npm uses registry request logs to operate and secure the registry, with no per-user download detail published. OpenJS processes nodejs.org download request metadata the same way under its website Privacy Policy.",
+          description: "npm uses registry request logs to operate and secure the registry. OpenJS processes nodejs.org download request metadata the same way under its website Privacy Policy.",
           links: [
             { label: "npm Privacy Policy", url: "https://docs.npmjs.com/policies/privacy/" },
             { label: "OpenJS Foundation Privacy Policy", url: "https://openjsf.org/privacy" },
@@ -317,7 +309,6 @@ export const MANAGED_INTEGRATIONS = {
         },
       ],
     },
-    controls: ["Disable removes the registry and Node.js distribution hosts from the agent's active network policy immediately."],
     networkScope: [
       ["registry.npmjs.org", "GET and HEAD only"],
       ["nodejs.org", "GET and HEAD only under /dist"],
@@ -350,7 +341,7 @@ export const CUSTOM_DOMAIN_GUIDE = {
       },
       {
         title: "Where it can go",
-        description: "Directly to the configured domain. TrustyClaw adds no provider contract or field redaction, so any onward sharing is controlled entirely by that service's own terms.",
+        description: "Directly to the configured domain, and from there wherever that service's own terms allow. TrustyClaw applies no redaction and holds no contract limiting onward sharing.",
         links: [],
       },
       {
@@ -360,15 +351,13 @@ export const CUSTOM_DOMAIN_GUIDE = {
       },
       {
         title: "How long the third party retains it",
-        description: "TrustyClaw has no understanding of a custom domain's retention or deletion practices. Check that service's current policy before sending personal, confidential, regulated, or credential-bearing data.",
+        description: "TrustyClaw does not know the configured service's retention or deletion practices. Check that service's current policy before sending personal, confidential, regulated, or credential-bearing data.",
         links: [],
       },
     ],
   },
   controls: [
-    "One row per domain shows its active boundary and provides an immediate Remove action.",
     "Rules validate structurally and publish atomically; an invalid replacement leaves the active policy unchanged.",
-    "Use a bundled tool instead when credentials, structured actions, or operator approvals are needed.",
   ],
   networkScope: [],
 };

@@ -7,6 +7,13 @@ let selectedThreadRuntime = null;
 let selectedThreadModel = null;
 let selectedThreadEffort = null;
 let sessionOptions = {};
+// Render guards: the 5-second poll re-renders only when data actually
+// changed, so a steering draft or the reading scroll position survives
+// refreshes that bring nothing new.
+let renderedThreadsKey = null;
+let renderedHistoryKey = null;
+let renderedHistoryThread = null;
+let forceScrollBottom = false;
 
 const $ = id => document.getElementById(id);
 const runtimeLabel = runtime => runtime === "claude_code" ? "Claude Code" : runtime === "codex" ? "Codex" : runtime;
@@ -22,6 +29,18 @@ const formatDateTime = value => {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value || "");
   return date.toLocaleString(undefined, { year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" });
+};
+const relativeTime = value => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value || "");
+  const minutes = Math.round((Date.now() - date.getTime()) / 60000);
+  if (minutes < 1) return "now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 };
 
 window.addEventListener("message", event => {
@@ -78,29 +97,41 @@ async function refresh() {
 }
 
 function renderThreads() {
+  const key = JSON.stringify([selectedThreadId, threads]);
+  if (key === renderedThreadsKey) return;
+  renderedThreadsKey = key;
   if (!threads.length) {
-    $("threads").innerHTML = `<div class="empty-state">No threads yet. Start one on the right.</div>`;
+    $("threads").innerHTML = `<div class="sidebar-empty">No threads yet. Send a task below to start one.</div>`;
     return;
   }
-  $("threads").innerHTML = threads.map(thread => `
+  $("threads").innerHTML = threads.map(thread => {
+    const active = (thread.active_tasks || []).length > 0;
+    const count = `${thread.task_count} task${thread.task_count === 1 ? "" : "s"}`;
+    return `
     <button class="thread-item${thread.thread_id === selectedThreadId ? " selected" : ""}" data-thread-id="${esc(thread.thread_id)}" data-runtime="${esc(thread.agent_runtime)}" data-model="${esc(thread.model)}" data-effort="${esc(thread.effort)}">
-      <span class="thread-name">${esc(thread.thread_id)}</span>
-      <span class="thread-meta">${esc(runtimeLabel(thread.agent_runtime))} &middot; ${esc(thread.model)} &middot; ${esc(optionLabel(thread.effort))}</span>
-      <span class="thread-meta">${esc(thread.task_count)} task${thread.task_count === 1 ? "" : "s"}
-        ${(thread.active_tasks || []).map(task => badge(task.status)).join(" ")}</span>
-      <span class="thread-meta">${esc(formatDateTime(thread.last_used_at))}</span>
-    </button>`).join("");
+      <span class="thread-name"><span>${esc(thread.thread_id)}</span>${active ? `<span class="thread-dot running"></span>` : ""}</span>
+      <span class="thread-meta">${esc(runtimeLabel(thread.agent_runtime))} &middot; ${esc(thread.model)}</span>
+      <span class="thread-meta">${esc(count)} &middot; ${esc(relativeTime(thread.last_used_at))}</span>
+    </button>`;
+  }).join("");
 }
 
 function updateComposer() {
   const hasThread = selectedThreadId !== null;
-  $("thread-field").hidden = hasThread;
-  $("runtime-field").hidden = hasThread;
-  $("model-field").hidden = hasThread;
-  $("effort-field").hidden = hasThread;
-  document.querySelector(".composer").classList.toggle("new-thread", !hasThread);
-  $("composer-target").textContent = hasThread ? "New task" : "New thread";
-  $("new-task").placeholder = hasThread ? "Describe what the agent should do next" : "Describe the first task in this thread";
+  $("thread-title").textContent = hasThread ? selectedThreadId : "New thread";
+  const subtitle = hasThread
+    ? `${runtimeLabel(selectedThreadRuntime)} · ${selectedThreadModel} · ${optionLabel(selectedThreadEffort)}`
+    : "";
+  $("thread-subtitle").textContent = subtitle;
+  $("thread-subtitle").hidden = !subtitle;
+  $("archive-thread").hidden = !hasThread;
+  // Follow-up tasks reuse the thread's stored session configuration, so the
+  // pills only show while composing the first task of a new thread.
+  $("new-task-thread").hidden = hasThread;
+  $("new-task-runtime").hidden = hasThread;
+  $("new-task-model").hidden = hasThread;
+  $("new-task-effort").hidden = hasThread;
+  $("new-task").placeholder = hasThread ? "Describe what the agent should do next" : "Describe a task for the agent";
   if (hasThread) {
     $("new-task-thread").value = selectedThreadId;
     $("new-task-runtime").value = selectedThreadRuntime;
@@ -157,50 +188,60 @@ async function refreshSelectedThread() {
 }
 
 function renderThreadHistory() {
+  const key = JSON.stringify([selectedThreadId, tasks]);
+  if (key === renderedHistoryKey) return;
+  renderedHistoryKey = key;
+  const switched = renderedHistoryThread !== selectedThreadId;
+  renderedHistoryThread = selectedThreadId;
   if (!selectedThreadId) {
     $("thread-detail").innerHTML = `
-      <div class="thread-head">
-        <span class="thread-kicker">Thread</span>
-        <span class="thread-title">New thread</span>
+      <div class="chat-hero">
+        <h2>What should the agent work on?</h2>
+        <p>Each message starts a task in this thread; follow-ups reuse the same agent session. Pick a runtime and model below, then press Enter to send.</p>
       </div>`;
     return;
   }
+  const scroller = $("chat-scroll");
+  const nearBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 60;
+  // Keep an in-progress steering draft (and its focus) across the re-render.
+  const steerDrafts = new Map();
+  let focusedSteerTask = null;
+  document.querySelectorAll(".task-steer-input").forEach(input => {
+    if (input.value) steerDrafts.set(input.dataset.taskId, input.value);
+    if (input === document.activeElement) focusedSteerTask = input.dataset.taskId;
+  });
   const ordered = tasks.slice().sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
-  $("thread-detail").innerHTML = `
-    <div class="thread-head">
-      <span class="thread-kicker">Thread</span>
-      <span class="thread-title">${esc(selectedThreadId)}</span>
-      <span class="muted">${esc(runtimeLabel(selectedThreadRuntime))} &middot; ${esc(selectedThreadModel)} &middot; ${esc(optionLabel(selectedThreadEffort))}</span>
-      <span class="task-actions">
-        <button class="ghost sm" data-thread-action="archive">Archive</button>
-      </span>
-    </div>
-    ${ordered.length ? ordered.map(renderTaskCard).join("") : `<div class="empty-state thread-empty">No retained tasks for this thread yet.</div>`}`;
+  $("thread-detail").innerHTML = ordered.length
+    ? ordered.map(renderTurn).join("")
+    : `<div class="chat-hero"><p>No retained tasks for this thread yet.</p></div>`;
+  document.querySelectorAll(".task-steer-input").forEach(input => {
+    const draft = steerDrafts.get(input.dataset.taskId);
+    if (draft) input.value = draft;
+    if (input.dataset.taskId === focusedSteerTask) input.focus();
+  });
+  if (switched || nearBottom || forceScrollBottom) scroller.scrollTop = scroller.scrollHeight;
+  forceScrollBottom = false;
 }
 
-function renderTaskCard(task) {
-  const canRefresh = task.status === "running" || task.status === "queued";
+function renderTurn(task) {
   return `
-    <div class="task-card">
-      <div class="task-head">
-        <span class="mono muted">${esc(task.task_id)}</span>
-        ${badge(task.status)}
-        <span class="muted time">${esc(formatDateTime(task.created_at))}</span>
-        <span class="task-actions">
-          ${task.status === "running" ? `<button class="danger sm" data-task-action="kill" data-task-id="${esc(task.task_id)}">Kill</button>` : ""}
-          ${task.status === "queued" ? `<button class="ghost sm" data-task-action="cancel" data-task-id="${esc(task.task_id)}">Cancel</button>` : ""}
-          ${canRefresh ? `<button class="ghost sm" data-task-action="refresh" data-task-id="${esc(task.task_id)}">Refresh</button>` : ""}
-        </span>
+    <article class="turn">
+      <div class="turn-user"><div class="bubble"><pre>${esc(task.input_message)}</pre></div></div>
+      <div class="turn-meta">
+        ${task.status === "completed" ? "" : badge(task.status)}
+        <span class="mono">${esc(task.task_id)}</span>
+        <span title="${esc(formatDateTime(task.created_at))}">${esc(relativeTime(task.created_at))}</span>
+        ${task.status === "queued" ? `<button class="ghost sm" data-task-action="cancel" data-task-id="${esc(task.task_id)}">Cancel</button>` : ""}
+        ${task.status === "running" ? `<button class="danger ghost sm" data-task-action="kill" data-task-id="${esc(task.task_id)}">Stop</button>` : ""}
       </div>
-      <div class="msg user"><pre>${esc(task.input_message)}</pre></div>
+      ${task.output_message ? `<div class="turn-agent"><pre>${esc(task.output_message)}</pre></div>` : ""}
+      ${task.error_message ? `<div class="turn-error"><pre>${esc(task.error_message)}</pre></div>` : ""}
       ${task.status === "running" ? `
         <div class="task-steer">
-          <input class="task-steer-input" placeholder="Steer this task" aria-label="Steering message for ${esc(task.task_id)}">
-          <button class="sm" data-task-action="steer" data-task-id="${esc(task.task_id)}">Steer</button>
+          <input class="task-steer-input" data-task-id="${esc(task.task_id)}" placeholder="Steer this task" aria-label="Steering message for ${esc(task.task_id)}">
+          <button class="ghost sm" data-task-action="steer" data-task-id="${esc(task.task_id)}">Steer</button>
         </div>` : ""}
-      ${task.output_message ? `<div class="msg agent"><pre>${esc(task.output_message)}</pre></div>` : ""}
-      ${task.error_message ? `<div class="msg error"><pre>${esc(task.error_message)}</pre></div>` : ""}
-    </div>`;
+    </article>`;
 }
 
 async function createTask() {
@@ -209,15 +250,17 @@ async function createTask() {
   const runtime = $("new-task-runtime").value;
   const model = $("new-task-model").value;
   const effort = $("new-task-effort").value;
-  if (!message || !threadId || !model || !effort) return;
+  if (!message || !threadId || !model || !effort || $("create-task").disabled) return;
   const request = { input_message: message, thread_id: threadId };
   if (selectedThreadId === null) Object.assign(request, { agent_runtime: runtime, model, effort });
   const task = await api("POST", "/tasks", request);
   $("new-task").value = "";
+  autosizeComposer();
   selectedThreadId = threadId;
   selectedThreadRuntime = task.agent_runtime;
   selectedThreadModel = task.model;
   selectedThreadEffort = task.effort;
+  forceScrollBottom = true;
   updateComposer();
   await refresh();
 }
@@ -225,13 +268,11 @@ async function createTask() {
 async function taskAction(button) {
   const taskId = button.dataset.taskId;
   const action = button.dataset.taskAction;
-  if (action === "refresh") {
-    await refreshSelectedThread();
-  } else if (action === "cancel") {
+  if (action === "cancel") {
     await api("POST", `/tasks/${taskId}/cancel`);
     await refreshSelectedThread();
   } else if (action === "kill") {
-    if (!confirm("Kill running task " + taskId + "?")) return;
+    if (!confirm("Stop running task " + taskId + "?")) return;
     await api("POST", `/tasks/${taskId}/kill`);
     await refreshSelectedThread();
   } else if (action === "steer") {
@@ -246,6 +287,11 @@ async function taskAction(button) {
 async function archiveSelectedThread() {
   if (!selectedThreadId) return;
   await api("POST", `/threads/${encodeURIComponent(selectedThreadId)}/archive`);
+  startNewThread();
+  await refresh();
+}
+
+function startNewThread() {
   selectedThreadId = null;
   selectedThreadRuntime = null;
   selectedThreadModel = null;
@@ -253,47 +299,82 @@ async function archiveSelectedThread() {
   tasks = [];
   updateComposer();
   renderThreadHistory();
-  await refresh();
+  renderThreads();
+}
+
+// Must match the drawer breakpoint in agent_chat.css.
+const drawerMedia = window.matchMedia("(max-width: 720px)");
+
+function setSidebarOpen(open, restoreFocus = false) {
+  const mobile = drawerMedia.matches;
+  const isOpen = mobile && open;
+  const pane = document.querySelector(".thread-pane");
+  $("chat-app").classList.toggle("sidebar-open", isOpen);
+  // The closed drawer is only moved off-canvas by a transform, so drop it
+  // (and, while open, the pane behind it) from the tab order the same way
+  // the host mobile nav does.
+  pane.inert = mobile && !isOpen;
+  document.querySelector(".chat-main").inert = isOpen;
+  $("sidebar-backdrop").hidden = !isOpen;
+  $("sidebar-open").setAttribute("aria-expanded", String(isOpen));
+  if (isOpen) $("sidebar-close").focus();
+  else if (restoreFocus && mobile) $("sidebar-open").focus();
+}
+
+function autosizeComposer() {
+  const area = $("new-task");
+  area.style.height = "auto";
+  area.style.height = `${Math.min(area.scrollHeight, 200)}px`;
 }
 
 document.addEventListener("click", event => {
   const thread = event.target.closest && event.target.closest(".thread-item");
   if (thread) {
+    setSidebarOpen(false);
     showThread(thread.dataset.threadId, thread.dataset.runtime, thread.dataset.model, thread.dataset.effort).catch(error => setStatus(error.message));
-    return;
-  }
-  const threadButton = event.target.closest && event.target.closest("button[data-thread-action]");
-  if (threadButton && threadButton.dataset.threadAction === "archive") {
-    archiveSelectedThread().catch(error => setStatus(error.message));
     return;
   }
   const taskButton = event.target.closest && event.target.closest("button[data-task-action]");
   if (taskButton) taskAction(taskButton).catch(error => setStatus(error.message));
 });
 
+document.addEventListener("keydown", event => {
+  if (event.key !== "Enter" || event.shiftKey) return;
+  const steerInput = event.target.closest && event.target.closest(".task-steer-input");
+  if (!steerInput) return;
+  event.preventDefault();
+  const steerButton = steerInput.closest(".task-steer").querySelector("button[data-task-action=steer]");
+  taskAction(steerButton).catch(error => setStatus(error.message));
+});
+
 $("new-thread").addEventListener("click", () => {
-  selectedThreadId = null;
-  selectedThreadRuntime = null;
-  selectedThreadModel = null;
-  selectedThreadEffort = null;
-  tasks = [];
+  setSidebarOpen(false);
   $("new-task-thread").value = "main";
   $("new-task-runtime").value = "codex";
   setSessionOptions();
-  updateComposer();
-  renderThreadHistory();
-  renderThreads();
-  $("new-task-thread").focus();
+  startNewThread();
+  $("new-task").focus();
 });
+$("archive-thread").addEventListener("click", () => archiveSelectedThread().catch(error => setStatus(error.message)));
 $("create-task").addEventListener("click", () => createTask().catch(error => setStatus(error.message)));
 $("new-task-runtime").addEventListener("change", () => setSessionOptions());
 $("new-task-model").addEventListener("change", () => setSessionOptions($("new-task-model").value));
+$("new-task").addEventListener("input", autosizeComposer);
 $("new-task").addEventListener("keydown", event => {
-  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") createTask().catch(error => setStatus(error.message));
+  const sendKey = event.key === "Enter" && !event.isComposing && (!event.shiftKey || event.metaKey || event.ctrlKey);
+  if (!sendKey) return;
+  event.preventDefault();
+  createTask().catch(error => setStatus(error.message));
 });
+$("sidebar-open").addEventListener("click", () => setSidebarOpen(true));
+$("sidebar-close").addEventListener("click", () => setSidebarOpen(false, true));
+$("sidebar-backdrop").addEventListener("click", () => setSidebarOpen(false, true));
+drawerMedia.addEventListener("change", () => setSidebarOpen(false));
 
 setSessionOptions();
 updateComposer();
 renderThreadHistory();
+autosizeComposer();
+setSidebarOpen(false);
 refresh();
 setInterval(refresh, 5000);

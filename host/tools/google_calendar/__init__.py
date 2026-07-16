@@ -32,6 +32,7 @@ from host.tools.shared.google import GoogleCredentialStore, IntegrationReconnect
 CALENDAR_API_BASE_URL = "https://www.googleapis.com/calendar/v3"
 # Host approval summaries are capped at 500 UTF-8 bytes (tools_host SUMMARY_MAX_BYTES).
 CALENDAR_SUMMARY_MAX_BYTES = 500
+CALENDAR_READ_MAX_EVENTS = 10
 GOOGLE_OAUTH_SCOPES = (
     "openid",
     "email",
@@ -76,7 +77,7 @@ CALENDAR_OUTPUT_SCHEMA: JSONObject = {
 MANIFEST = ToolManifest(
     tool_id="google_calendar",
     display_name="Google Calendar",
-    description="Read Google Calendar. Creating, updating, or deleting events requires your approval.",
+    description="Connect your Google account and let your agent read your calendar and create, update, or delete events with your approval.",
     connection="oauth",
     data_summary=DataSummary(
         cards=(
@@ -84,14 +85,15 @@ MANIFEST = ToolManifest(
                 title="What leaves this host",
                 points=(
                     DataSummaryPoint(label="Reads", text="Read queries go to Google directly and carry only the requested time range."),
-                    DataSummaryPoint(label="Modifications", text="Go to Google only after your approval, and send exactly the event content you approved: title, description, location, and times."),
+                    DataSummaryPoint(label="Modifications", text="A change reaches Google only after your approval, and sends exactly the event content you approved: title, description, location, and times."),
                 ),
             ),
             DataSummaryCard(
                 title="Where it can go",
                 description=(
-                    "Everything goes to your own Google Calendar and stays in your account. Nothing in your calendar "
-                    "changes without your approval."
+                    "Everything goes to your own Google Calendar and stays in your account, and nothing in your calendar "
+                    "changes without your approval. One caution: if an approved change touches an event that already has "
+                    "guests, Google may notify those guests of the change."
                 ),
             ),
             DataSummaryCard(
@@ -117,10 +119,10 @@ MANIFEST = ToolManifest(
         ActionSpec(id="read_events",
             description="Read events in a time range.",
             data_policy=(
-                "Reads events from your primary calendar; only the timeMin/timeMax range and fixed listing options "
+                "Reads events from your primary calendar; only the requested time range and fixed listing options "
                 "go to Google. Runs directly with no approval."
             ),
-            input_schema=_schema({"start_time": {"type": "string"}, "end_time": {"type": "string"}}),
+            input_schema=_schema({"start_time": {"type": "string", "description": "Optional inclusive ISO 8601 window start; defaults to now."}, "end_time": {"type": "string", "description": "Optional exclusive ISO 8601 window end; defaults to seven days after now."}}),
             output_schema=CALENDAR_OUTPUT_SCHEMA,
         ),
         ActionSpec(id="event_change",
@@ -131,14 +133,14 @@ MANIFEST = ToolManifest(
             ),
             input_schema=_schema(
                 {
-                    "operation": {"type": "string", "enum": ["create", "update", "delete"]},
-                    "event_id": {"type": "string"},
-                    "summary": {"type": "string"},
-                    "description": {"type": "string"},
-                    "location": {"type": "string"},
-                    "start_time": {"type": "string"},
-                    "end_time": {"type": "string"},
-                    "time_zone": {"type": "string"},
+                    "operation": {"type": "string", "enum": ["create", "update", "delete"], "description": "Calendar change to queue for operator approval."},
+                    "event_id": {"type": "string", "description": "Existing event id from read_events; required for update/delete and forbidden for create."},
+                    "summary": {"type": "string", "description": "Event title; required for create and optional replacement value for update."},
+                    "description": {"type": "string", "description": "Event description; an empty string clears it during update."},
+                    "location": {"type": "string", "description": "Event location; an empty string clears it during update."},
+                    "start_time": {"type": "string", "description": "ISO 8601 event start; required for create."},
+                    "end_time": {"type": "string", "description": "ISO 8601 event end; required for create and after start_time."},
+                    "time_zone": {"type": "string", "description": "IANA time zone, allowed only with start_time or end_time."},
                 },
                 ["operation"],
             ),
@@ -262,7 +264,8 @@ def _calendar_events(access_token: str, tool_input: JSONObject) -> list[JSONObje
         invalid_response_message="Calendar API returned an invalid response.",
     )
     events: list[JSONObject] = []
-    for event in cast(list[Any], response.get("items", [])):
+    raw_items = response.get("items")
+    for event in (raw_items if isinstance(raw_items, list) else [])[:CALENDAR_READ_MAX_EVENTS]:
         if not isinstance(event, dict):
             continue
         event_object = cast(JSONObject, event)

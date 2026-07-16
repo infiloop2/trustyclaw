@@ -10,7 +10,7 @@
 // row is expanded and refresh on the poll while it stays open.
 
 import { api } from "./api.js";
-import { $, badge, esc, formatUnixTime, inlineCode, inlineMessage, notice, setHtml } from "./helpers.js";
+import { $, badge, esc, formatUnixTime, informationIcon, inlineCode, inlineMessage, notice, replaceIntegrationRows, setHtml } from "./helpers.js";
 import { closeIntegrationInfo, toggleInfoPopover } from "./network.js";
 
 let tools = [];
@@ -33,11 +33,14 @@ export async function refreshTools() {
 function renderTools() {
   // Re-rendering replaces the info buttons, so drop any open popover.
   closeIntegrationInfo();
+  $("tools-empty").hidden = tools.length > 0;
   if (!tools.length) {
-    setHtml($("tools"), `<div class="empty-state">No bundled tools in this build.</div>`);
+    replaceIntegrationRows($("tools"), "[data-tool-row]", "");
     return;
   }
-  setHtml($("tools"), tools.map(renderToolRow).join(""));
+  const sortedTools = [...tools]
+    .sort((left, right) => left.display_name.localeCompare(right.display_name, undefined, { sensitivity: "base" }));
+  replaceIntegrationRows($("tools"), "[data-tool-row]", sortedTools.map(renderToolRow).join(""));
   // Re-rendering the rows empties each expanded row's approvals table, so
   // repaint them from the cached approvals; the poll and actions refresh the
   // data.
@@ -63,7 +66,7 @@ function renderToolRow(tool) {
         <div class="integration-title">
           <div class="preset-with-info">
             <h2>${esc(tool.display_name)}</h2>
-            <button class="info-button" data-action="toggle-tool-info" data-tool="${esc(tool.tool_id)}" data-info="tool:${esc(tool.tool_id)}" aria-label="${esc(tool.display_name)} overview and protections" aria-haspopup="dialog" aria-expanded="false">i</button>
+            <button class="info-button" data-action="toggle-tool-info" data-tool="${esc(tool.tool_id)}" data-info="tool:${esc(tool.tool_id)}" aria-label="${esc(tool.display_name)} overview and protections" aria-haspopup="dialog" aria-expanded="false">${informationIcon()}</button>
           </div>
           <div class="integration-subtitle">${esc(tool.description)}</div>
         </div>

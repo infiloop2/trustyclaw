@@ -24,20 +24,38 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from host.constants import PROXY_PORT
+from host.runtime.tools_host import BUNDLED_TOOLS
 from tests.smoke.smoke_aws import SMOKE_RUNTIMES, AwsSmoke
 
 
 STAGE_AGENT_NAME = "trustyclaw-stage"
 
-# Selectable test suites. A provider suite runs that provider's checks plus the
-# shared preamble; "brave", "gmail", and "gcal" each run one bundled tool's live
-# check; "all" additionally runs the cross-runtime checks. A bundled-tool suite
-# you select explicitly fails its preflight when that tool's credential is not
-# configured on the stage host (like a provider suite requires that runtime
-# logged in); "all" instead self-skips whichever tools are unconfigured so it
-# stays useful mid-setup.
-STAGE_SUITES = ("all", "brave", "gmail", "gcal", "claude", "codex", "github")
+# Every bundled tool is an individually triggerable stage suite. A selected
+# tool fails preflight when its config/connection is missing; "all" requires
+# every tool so it is the comprehensive persistent-host check.
+TOOL_SUITES = tuple(sorted(BUNDLED_TOOLS))
+STAGE_SUITES = ("all", *TOOL_SUITES, "claude", "codex", "github")
 _RUNTIME_LABELS = {"codex": "Codex", "claude_code": "Claude Code"}
+
+STAGE_TOOL_CALLS: dict[str, tuple[str, dict]] = {
+    "brave_search": ("search_web", {"query": "TrustyClaw agent host"}),
+    "ibkr": ("get_positions", {}),
+    "instagram": ("get_profile", {}),
+    "instagram_discovery": ("get_trending_reels", {"limit": "1"}),
+    "linkedin": ("get_profile", {}),
+    "linkedin_discovery": ("search_posts", {"query": "TrustyClaw", "limit": "1"}),
+    "polymarket": ("list_markets", {"limit": "1"}),
+    # Use the connected user's OAuth token, not the separate app-only trends
+    # bearer, so this live probe proves the persisted connection itself works.
+    "twitter": ("search_tweets", {"query": "TrustyClaw", "max_results": "10"}),
+}
+
+
+def suite_tools(suite: str) -> tuple[str, ...]:
+    """Bundled tools required by one stage suite."""
+    if suite == "all":
+        return TOOL_SUITES
+    return (suite,) if suite in TOOL_SUITES else ()
 
 # Environment variables (fed from CI secrets) that supply a GitHub App
 # credential and sandbox write repo. When all are set the stage run installs
@@ -97,8 +115,8 @@ def main(argv: list[str] | None = None) -> int:
         default="all",
         help=(
             "Which test suite to run. 'claude', 'codex', or 'github' run that provider's "
-            "checks only (plus the shared preamble); 'brave', 'gmail', and 'gcal' each run "
-            "one bundled tool's live check; 'all' (default) also runs the cross-runtime "
+            "checks only (plus the shared preamble); each bundled tool id runs that tool's "
+            "live check; 'all' (default) also requires every tool and runs the cross-runtime "
             "checks. Every suite first verifies the operator configuration it needs is "
             "present, failing fast if not."
         ),
@@ -111,9 +129,7 @@ def main(argv: list[str] | None = None) -> int:
     run_codex = suite in ("codex", "all")
     run_claude = suite in ("claude", "all")
     run_github = suite in ("github", "all")
-    run_brave = suite in ("brave", "all")
-    run_gmail = suite in ("gmail", "all")
-    run_gcal = suite in ("gcal", "all")
+    selected_tools = suite_tools(suite)
     run_cross = suite == "all"
     try:
         stage.open_tunnel()
@@ -121,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
         # secrets when present, so the GitHub checks need no manual operator
         # setup. A no-op when the secrets are absent or GitHub is out of scope.
         stage.autoconfigure_github(suite)
+        stage.autoconfigure_tools(selected_tools)
         # Fail fast, before any long-running check, if the configuration this
         # suite depends on is still not present on the host.
         stage.verify_operator_configuration(suite)
@@ -131,8 +148,8 @@ def main(argv: list[str] | None = None) -> int:
         stage.check_agent_file_explorer()
         if run_cross:
             stage.check_both_runtimes_active()
-        if run_brave or run_gmail or run_gcal:
-            stage.check_tools_live(brave=run_brave, gmail=run_gmail, gcal=run_gcal)
+        if selected_tools:
+            stage.check_tools_live(selected_tools)
         if run_codex:
             stage.agent_runtime = "codex"
             stage.check_task()
@@ -306,7 +323,7 @@ class StageAwsSmoke(AwsSmoke):
             return ("codex",)
         if suite == "claude":
             return ("claude_code",)
-        if suite in ("github", "brave", "gmail", "gcal"):
+        if suite == "github" or suite in TOOL_SUITES:
             return ()
         return SMOKE_RUNTIMES
 
@@ -366,11 +383,8 @@ class StageAwsSmoke(AwsSmoke):
                 )
         if suite in ("github", "all"):
             failures.extend(self._github_config_failures())
-        # A bundled-tool suite you select explicitly must have its credential
-        # configured on the stage host, the same way a provider suite requires
-        # that runtime logged in; it fails here rather than silently skipping.
-        if suite in ("brave", "gmail", "gcal"):
-            failures.extend(self._tool_credential_failures(suite))
+        for tool_id in suite_tools(suite):
+            failures.extend(self._tool_credential_failures(tool_id))
         if failures:
             listing = "".join(f"\n  - {item}" for item in failures)
             raise AssertionError(
@@ -379,24 +393,38 @@ class StageAwsSmoke(AwsSmoke):
         self._ok(f"required operator configuration present for the {suite!r} suite")
 
     def _tool_credential_failures(self, suite: str) -> list[str]:
-        """Preflight credential check for a single bundled-tool suite. Returns a
-        remediation string when the tool's credential is not configured on the
-        stage host, or prints an [ok] line when it is. Read-only."""
-        if suite == "brave":
-            if os.environ.get("TRUSTYCLAW_STAGE_BRAVE_API_KEY", ""):
-                print("  [ok] Brave API key secret is set", flush=True)
-                return []
-            return ["Brave: set the TRUSTYCLAW_STAGE_BRAVE_API_KEY repository secret, then rerun"]
-        tool_id = "gmail" if suite == "gmail" else "google_calendar"
+        """Preflight one bundled tool after enable-only autoconfiguration.
+
+        OAuth tools are never configured or enabled from CI secrets. Their
+        complete ready state must already exist on the persistent stage host.
+        """
+        tool_id = suite
         tools = {entry["tool_id"]: entry for entry in self._api("GET", "/v1/tools")["tools"]}
         entry = tools.get(tool_id) or {}
-        if entry.get("enabled") and (entry.get("connection_status") or {}).get("connected"):
-            print(f"  [ok] {tool_id} is connected on the stage host", flush=True)
+        manifest = BUNDLED_TOOLS[tool_id].manifest
+        missing_config = [item["key"] for item in entry.get("config", []) if not item.get("set")]
+        connected = (entry.get("connection_status") or {}).get("connected") is True
+        if entry.get("enabled") and not missing_config and (
+            manifest.connection != "oauth" or connected
+        ):
+            state = "connected" if manifest.connection == "oauth" else "configured"
+            print(f"  [ok] {tool_id} is enabled and {state}", flush=True)
             return []
-        return [
-            f"{tool_id}: connect the stage Google account in the admin UI Tools tab, then rerun "
-            "(one-time stage-host configuration)"
-        ]
+        problems: list[str] = []
+        if missing_config:
+            if manifest.connection == "oauth":
+                problems.append(
+                    "set its OAuth app configuration once in the stage admin UI "
+                    f"(missing: {', '.join(missing_config)})"
+                )
+            else:
+                env_names = [f"TRUSTYCLAW_STAGE_{key}" for key in missing_config]
+                problems.append(f"set config via {', '.join(env_names)} or the admin UI")
+        if manifest.connection == "oauth" and not connected:
+            problems.append("connect its stage account once in the admin UI")
+        if not entry.get("enabled"):
+            problems.append("enable the tool")
+        return [f"{tool_id}: {'; '.join(problems)}"]
 
     def _github_config_failures(self) -> list[str]:
         """GitHub configuration checks for the preflight. Returns remediation
@@ -516,66 +544,45 @@ class StageAwsSmoke(AwsSmoke):
         except json.JSONDecodeError as exc:
             raise AssertionError(f"{name} returned non-JSON result text: {text!r}") from exc
 
-    def _autoconfigure_google_client(self) -> None:
-        """Set the shared Google OAuth client from stage secrets when present,
-        so the operator's one-time setup is reduced to the Connect step (the
-        OAuth sign-in still cannot be automated). A no-op without the secrets."""
-        client_id = os.environ.get("TRUSTYCLAW_STAGE_GOOGLE_OAUTH_CLIENT_ID", "")
-        client_secret = os.environ.get("TRUSTYCLAW_STAGE_GOOGLE_OAUTH_CLIENT_SECRET", "")
-        if bool(client_id) != bool(client_secret):
-            raise AssertionError(
-                "set both TRUSTYCLAW_STAGE_GOOGLE_OAUTH_CLIENT_ID and "
-                "TRUSTYCLAW_STAGE_GOOGLE_OAUTH_CLIENT_SECRET, or neither"
-            )
-        if not (client_id and client_secret):
-            return
-        # Config is scoped per tool, so set the shared Google client under each
-        # Google tool that will use it.
-        for tool_id in ("gmail", "google_calendar"):
-            self._api("PUT", f"/v1/tools/{tool_id}/config", {"key": "GOOGLE_OAUTH_CLIENT_ID", "value": client_id})
-            self._api("PUT", f"/v1/tools/{tool_id}/config", {"key": "GOOGLE_OAUTH_CLIENT_SECRET", "value": client_secret})
-            try:
-                self._api("POST", f"/v1/tools/{tool_id}/enable", {})
-            except Exception:
-                # Already enabled, or awaiting connect; enablement is idempotent.
-                pass
+    def autoconfigure_tools(self, tool_ids: tuple[str, ...]) -> None:
+        """Apply enable-only provider config from Actions secrets when present.
 
-    def check_tools_live(self, brave: bool = True, gmail: bool = True, gcal: bool = True) -> None:
-        """Bundled tools against real third-party services. The 'brave', 'gmail',
-        and 'gcal' suites each select one tool; 'all' runs every tool. Under a
-        dedicated tool suite the preflight has already required that tool's
-        credential (the Brave API key secret, or a connected Google account for
-        Gmail and Calendar), so it runs. Under 'all' a tool whose credential is
-        absent self-skips here, so stage stays useful mid-setup; there is no
-        separate per-tool opt-in switch."""
+        Every config key uses the uniform ``TRUSTYCLAW_STAGE_<KEY>`` secret
+        name. OAuth tools are deliberately untouched: stage verifies the
+        enabled, configured, connected state already stored on the persistent
+        host and fails with an operator-facing setup message when it is absent.
+        """
+        for tool_id in tool_ids:
+            manifest = BUNDLED_TOOLS[tool_id].manifest
+            if manifest.connection == "oauth":
+                continue
+            for requirement in manifest.config:
+                value = os.environ.get(f"TRUSTYCLAW_STAGE_{requirement.key}", "")
+                if value:
+                    self._api(
+                        "PUT",
+                        f"/v1/tools/{tool_id}/config",
+                        {"key": requirement.key, "value": value},
+                    )
+        listing = {
+            entry["tool_id"]: entry for entry in self._api("GET", "/v1/tools")["tools"]
+        }
+        for tool_id in tool_ids:
+            if BUNDLED_TOOLS[tool_id].manifest.connection == "oauth":
+                continue
+            entry = listing[tool_id]
+            if all(item.get("set") for item in entry.get("config", [])):
+                self._api("POST", f"/v1/tools/{tool_id}/enable", {})
+
+    def check_tools_live(self, tool_ids: tuple[str, ...]) -> None:
+        """Run each selected bundled tool independently against its provider."""
         self._step("bundled tools against live third-party APIs")
         # A per-run nonce keeps each run's draft/event title unique.
         unique_title = f"TrustyClaw stage check {os.urandom(4).hex()}"
         details: list[str] = []
+        selected = set(tool_ids)
 
-        if brave:
-            brave_key = os.environ.get("TRUSTYCLAW_STAGE_BRAVE_API_KEY", "")
-            if brave_key:
-                self._api("PUT", "/v1/tools/brave_search/config", {"key": "BRAVE_SEARCH_API_KEY", "value": brave_key})
-                self._api("POST", "/v1/tools/brave_search/enable", {})
-                search = self._shim_tool_result("brave_search_search_web", {"query": "TrustyClaw agent host"})
-                if not search.get("results"):
-                    raise AssertionError(f"live Brave search returned no results: {search}")
-                details.append(f"brave_search returned {len(search['results'])} results")
-            else:
-                print("  [skip] Brave: set the TRUSTYCLAW_STAGE_BRAVE_API_KEY secret to run the live search check", flush=True)
-
-        # Push the Google client config from stage secrets if present (a no-op
-        # otherwise), then run Gmail/Calendar only when the stage account is
-        # actually connected. Only fetch the listing when a Google tool is in scope.
-        tools: dict[str, dict] = {}
-        if gmail or gcal:
-            self._autoconfigure_google_client()
-            listing = self._api("GET", "/v1/tools")
-            tools = {entry["tool_id"]: entry for entry in listing["tools"]}
-
-        gmail_entry = tools.get("gmail") if gmail else None
-        if gmail_entry and gmail_entry["enabled"] and gmail_entry["connection_status"].get("connected"):
+        if "gmail" in selected:
             # Reads: search, labels, drafts.
             messages = self._shim_tool_result("gmail_search_messages", {"query": "in:anywhere"})
             labels = self._shim_tool_result("gmail_list_labels", {})
@@ -611,11 +618,7 @@ class StageAwsSmoke(AwsSmoke):
                 f"gmail search returned {len(messages.get('messages', []))} messages, "
                 f"{len(labels.get('labels', []))} labels, draft round trip created and deleted {draft_id}"
             )
-        elif gmail:
-            print("  [skip] Gmail: connect the stage Google account in the admin UI Tools tab to run this check", flush=True)
-
-        calendar = tools.get("google_calendar") if gcal else None
-        if calendar and calendar["enabled"] and calendar["connection_status"].get("connected"):
+        if "google_calendar" in selected:
             events = self._shim_tool_result("google_calendar_read_events", {})
             if events.get("status") != "success_executed":
                 raise AssertionError(f"calendar read failed: {events}")
@@ -651,8 +654,30 @@ class StageAwsSmoke(AwsSmoke):
             if cleanup_decision["approval"]["status"] != "executed":
                 raise AssertionError(f"approved calendar delete did not execute: {cleanup_decision}")
             details.append(f"calendar approval round trip created and deleted event {event_id}")
-        elif gcal:
-            print("  [skip] Calendar: connect the stage Google account in the admin UI Tools tab to run this check", flush=True)
+        for tool_id in sorted(selected - {"gmail", "google_calendar", "runway"}):
+            action_id, arguments = STAGE_TOOL_CALLS[tool_id]
+            result = self._shim_tool_result(f"{tool_id}_{action_id}", arguments)
+            if result.get("status") != "success_executed":
+                raise AssertionError(f"{tool_id} live check returned an invalid result: {result}")
+            details.append(f"{tool_id} {action_id} completed")
+
+        if "runway" in selected:
+            response = self._shim_call(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "runway_get_task",
+                        "arguments": {"task_id": "trustyclaw-stage-missing"},
+                    },
+                }
+            )
+            result = response.get("result") or {}
+            text = (result.get("content") or [{}])[0].get("text", "")
+            if not result.get("isError") or "not found" not in text.lower():
+                raise AssertionError(f"Runway authenticated task probe was unexpected: {response}")
+            details.append("runway authenticated missing-task probe completed")
 
         # Whenever any live tool ran, the dedicated tool audit log must have
         # recorded it (calls and approval decisions), and it must page.
@@ -665,7 +690,7 @@ class StageAwsSmoke(AwsSmoke):
                 raise AssertionError(f"tool events are not newest-first: {seqs}")
             details.append(f"tool audit log recorded {len(events)}+ events")
 
-        self._ok("; ".join(details) if details else "all live tool checks skipped (no stage tool credential present)")
+        self._ok("; ".join(details))
 
     @staticmethod
     def _created_id_from_message(result: object) -> str:

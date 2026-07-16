@@ -80,6 +80,7 @@ TOOL_APPROVALS_LIST_RE = re.compile(r"^/v1/tools/([a-z0-9_]+)/approvals$")
 TOOL_APPROVAL_RE = re.compile(r"^/v1/tools/([a-z0-9_]+)/approvals/([^/]+)/(approve|deny)$")
 TOOL_APPROVAL_GET_RE = re.compile(r"^/v1/tools/([a-z0-9_]+)/approvals/([^/]+)$")
 TOOL_CONFIG_RE = re.compile(r"^/v1/tools/([a-z0-9_]+)/config$")
+TOOL_EVENT_RE = re.compile(r"^/v1/tools/events/([1-9][0-9]*)$")
 MOCK_OAUTH_CODE = "mock-auth-code"
 RUNTIMES = ("codex", "claude_code")
 PROVIDER_BY_RUNTIME = {"codex": "openai", "claude_code": "claude"}
@@ -129,6 +130,7 @@ class MockState:
     claude_oauth: dict[str, str] = field(default_factory=dict)
     reboot_requested: bool = False
     upgrade_available: bool = True
+    usage_refreshes: int = 0
     github_pending_pushes: list[dict[str, Any]] = field(default_factory=list)
     tool_enabled: set[str] = field(default_factory=set)
     # Config is scoped per tool: tool_id -> set of configured keys.
@@ -196,7 +198,13 @@ class MockState:
         self.next_network_event_seq += 1
 
     def add_tool_event(
-        self, tool_id: str, action: str, outcome: str, detail: str = "", timestamp: str | None = None
+        self,
+        tool_id: str,
+        action: str,
+        outcome: str,
+        detail: str = "",
+        timestamp: str | None = None,
+        arguments: dict[str, Any] | None = None,
     ) -> None:
         self.tool_events.append({
             "seq": self.next_tool_event_seq,
@@ -205,6 +213,7 @@ class MockState:
             "action_id": action,
             "outcome": outcome,
             "detail": detail,
+            "arguments": arguments,
         })
         self.next_tool_event_seq += 1
 
@@ -452,13 +461,13 @@ def seed_state() -> None:
         },
     )
     # Tool audit log: a read, the executed approval, and a connect.
-    for tool_id, action, outcome, detail, minutes in [
-        ("google_calendar", "oauth_connect", "connected", "akshay@infiloop.io", 120),
-        ("gmail", "search_messages", "executed", "", 90),
-        ("google_calendar", "event_change", "executed", "approval_1", 60),
-        ("brave_search", "web_search", "failed", "Brave Search API rejected the configured API key.", 20),
+    for tool_id, action, outcome, detail, minutes, arguments in [
+        ("google_calendar", "oauth_connect", "connected", "akshay@infiloop.io", 120, None),
+        ("gmail", "search_messages", "executed", "", 90, {"query": "invoice from last week"}),
+        ("google_calendar", "event_change", "executed", "approval_1", 60, {"operation": "create", "title": "Team retro"}),
+        ("brave_search", "web_search", "failed", "Brave Search API rejected the configured API key.", 20, {"query": "quarterly market trends"}),
     ]:
-        STATE.add_tool_event(tool_id, action, outcome, detail, ago(minutes))
+        STATE.add_tool_event(tool_id, action, outcome, detail, ago(minutes), arguments)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -615,6 +624,17 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> dic
     if method == "GET" and path == "/v1/tools/events":
         before, limit = event_page_query(query, {"before", "limit"}, "tool event")
         return {"events": tool_events_before(before, limit)}
+    tool_event_match = TOOL_EVENT_RE.fullmatch(path)
+    if method == "GET" and tool_event_match:
+        if query:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "tool event detail does not accept query parameters")
+        seq = int(tool_event_match.group(1))
+        with STATE.lock:
+            event = next((dict(item) for item in STATE.tool_events if item["seq"] == seq), None)
+        if event is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, "tool event not found")
+        event["has_arguments"] = isinstance(event.get("arguments"), dict)
+        return {"event": event}
     if path == "/v1/network/policy":
         if method == "GET":
             return {"network_controls": STATE.policy}
@@ -702,6 +722,7 @@ def list_tools() -> dict[str, Any]:
                     for requirement in manifest.config
                 ],
                 "protections": list(manifest.protections),
+                "technical_details": list(manifest.technical_details),
                 "setup_steps": [
                     {
                         "title": step.title,
@@ -912,7 +933,7 @@ def agent_accounts() -> dict[str, Any]:
                             # a warning (amber) Fable weekly window, so all
                             # three ring thresholds appear side by side.
                             "claude_usage": {
-                                "current_session_used_percent": 97,
+                                "current_session_used_percent": 63 if STATE.usage_refreshes else 97,
                                 "current_session_resets_at": int(time.time()) + 90 * 60,
                                 "weekly_used_percent": 46,
                                 "weekly_resets_at": int(time.time()) + 5 * 24 * 60 * 60,
@@ -934,6 +955,8 @@ def refresh_agent_accounts(body: Any) -> dict[str, Any]:
     runtime = body.get("agent_runtime") if isinstance(body, dict) else None
     if runtime is not None and runtime not in RUNTIMES:
         raise ApiError(HTTPStatus.BAD_REQUEST, "agent_runtime must be codex or claude_code")
+    with STATE.lock:
+        STATE.usage_refreshes += 1
     return agent_accounts()
 
 
@@ -1212,7 +1235,11 @@ def tool_events_before(before: int | None, limit: int) -> list[dict[str, Any]]:
         events = list(reversed(STATE.tool_events))
         if before is not None:
             events = [event for event in events if event["seq"] < before]
-        return events[:limit]
+        return [
+            {key: value for key, value in event.items() if key != "arguments"}
+            | {"has_arguments": isinstance(event.get("arguments"), dict)}
+            for event in events[:limit]
+        ]
 
 
 def agent_processes() -> dict[str, Any]:

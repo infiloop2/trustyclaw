@@ -276,10 +276,15 @@ def _render_app_bootstrap(template: str) -> str:
             f"  runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.app_migrate record {app.id} \"$app_migration_version\"",
             f"done <<< \"${pending_var}\"",
         ])
+        # New connections to an app port are allowed from exactly two uids:
+        # the admin service (browser-bridge reverse proxy) and the agent-app
+        # service (agent app_api reverse proxy). Everything else — agent
+        # runtimes, other app users, ordinary local users — hits the drop.
         nftables_lines.extend([
             f"    oif lo ct state established,related meta skuid \"{app.linux_user}\" accept",
             f"    oif lo meta skuid \"{app.linux_user}\" drop",
             f"    oif lo tcp dport ${port} meta skuid \"trustyclaw-admin\" accept",
+            f"    oif lo tcp dport ${port} meta skuid \"trustyclaw-agent-app\" accept",
             f"    oif lo tcp dport ${port} drop",
         ])
         unit_blocks.append(

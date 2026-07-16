@@ -738,6 +738,10 @@ def network_policy_record() -> dict[str, Any] | None:
         settings_row = cur.fetchone()
         if settings_row and settings_row[0] and "github" in integrations:
             integrations["github"]["require_dot_github_approval"] = True
+        cur.execute("SELECT web_search FROM claude_settings")
+        claude_row = cur.fetchone()
+        if claude_row and claude_row[0] and "claude" in integrations:
+            integrations["claude"]["web_search"] = True
         allowed: dict[str, dict[str, Any]] = {}
         cur.execute("SELECT domain FROM allowed_domains ORDER BY domain")
         for (domain,) in cur.fetchall():
@@ -757,6 +761,20 @@ def network_policy_record() -> dict[str, Any] | None:
     }
 
 
+def read_claude_web_search() -> bool:
+    """Whether the operator enabled Anthropic server-side web search for Claude
+    Code. Read by the orchestrator to tell the root launcher whether to expose
+    the WebSearch tool; the proxy enforces the same toggle independently. Any
+    read failure returns False (fail closed — web search stays off)."""
+    try:
+        with db.transaction() as cur:
+            cur.execute("SELECT web_search FROM claude_settings")
+            row = cur.fetchone()
+            return bool(row and row[0])
+    except Exception:
+        return False
+
+
 def save_network_policy(controls: dict[str, Any], updated_at: str) -> None:
     """Replace the active policy in one transaction (admin service only; the
     proxy role can only read these tables). ``controls`` is the already
@@ -767,6 +785,7 @@ def save_network_policy(controls: dict[str, Any], updated_at: str) -> None:
         cur.execute("DELETE FROM allowed_domains")
         cur.execute("DELETE FROM github_repositories")
         cur.execute("DELETE FROM github_settings")
+        cur.execute("DELETE FROM claude_settings")
         cur.execute("DELETE FROM managed_integrations")
         cur.execute(
             "INSERT INTO network_policy (singleton, updated_at) VALUES (TRUE, %s)"
@@ -788,6 +807,9 @@ def save_network_policy(controls: dict[str, Any], updated_at: str) -> None:
                 cur.execute(
                     "INSERT INTO github_settings (singleton, require_dot_github_approval) VALUES (TRUE, TRUE)"
                 )
+        claude = integrations.get("claude")
+        if isinstance(claude, dict) and claude.get("web_search") is True:
+            cur.execute("INSERT INTO claude_settings (singleton, web_search) VALUES (TRUE, TRUE)")
         for domain, rule in (controls.get("allowed_network_access") or {}).items():
             cur.execute("INSERT INTO allowed_domains (domain) VALUES (%s)", (domain,))
             for position, method in enumerate(rule.get("allow_http_methods") or []):
@@ -1323,12 +1345,12 @@ def delete_tool_credential(tool_id: str) -> None:
 # The tool-side peer of the agent and network event logs: one row per tool
 # event, paged newest-first with the same before-cursor model.
 
-_TOOL_EVENT_FIELDS = "seq, created_at, tool_id, action_id, outcome, detail"
+_TOOL_EVENT_FIELDS = "seq, created_at, tool_id, action_id, outcome, detail, arguments"
 
 
-def _tool_event_dict(row: Any) -> dict[str, Any]:
-    seq, created_at, tool_id, action_id, outcome, detail = row
-    return {
+def _tool_event_dict(row: Any, *, include_arguments: bool = False) -> dict[str, Any]:
+    seq, created_at, tool_id, action_id, outcome, detail, arguments = row
+    event: dict[str, Any] = {
         "seq": int(seq),
         "timestamp": created_at,
         "event_id": f"tool_event_{seq}",
@@ -1336,18 +1358,28 @@ def _tool_event_dict(row: Any) -> dict[str, Any]:
         "action_id": action_id,
         "outcome": outcome,
         "detail": detail or "",
+        "has_arguments": isinstance(arguments, dict),
     }
+    if include_arguments:
+        event["arguments"] = arguments if isinstance(arguments, dict) else None
+    return event
 
 
-def record_tool_event(tool_id: str, action_id: str, outcome: str, detail: str = "") -> None:
+def record_tool_event(
+    tool_id: str,
+    action_id: str,
+    outcome: str,
+    detail: str = "",
+    arguments: dict[str, Any] | None = None,
+) -> None:
     """Append one tool audit event in its own transaction. seq is a serial:
     unique and increasing, with harmless gaps from aborted transactions.
     Prunes to MAX_EVENTS amortized, like the agent event log."""
     with mutation() as cur:
         cur.execute(
-            "INSERT INTO tool_events (created_at, tool_id, action_id, outcome, detail)"
-            " VALUES (%s, %s, %s, %s, %s) RETURNING seq",
-            (utc_now(), tool_id, action_id, outcome, detail),
+            "INSERT INTO tool_events (created_at, tool_id, action_id, outcome, detail, arguments)"
+            " VALUES (%s, %s, %s, %s, %s, %s) RETURNING seq",
+            (utc_now(), tool_id, action_id, outcome, detail, db.jsonb(arguments) if arguments is not None else None),
         )
         if int(cur.fetchone()[0]) % PRUNE_EVERY == 0:
             _prune_events(cur, "tool_events")
@@ -1357,6 +1389,14 @@ def page_tool_events_before(
     before: int | None, *, limit: int = EVENT_PAGE_LIMIT
 ) -> list[dict[str, Any]]:
     return _page_before("tool_events", _TOOL_EVENT_FIELDS, _tool_event_dict, before, limit)
+
+
+def tool_event(seq: int) -> dict[str, Any] | None:
+    """Load one audit event with its exact arguments for an operator expansion."""
+    with db.transaction() as cur:
+        cur.execute(f"SELECT {_TOOL_EVENT_FIELDS} FROM tool_events WHERE seq = %s", (seq,))
+        row = cur.fetchone()
+    return _tool_event_dict(row, include_arguments=True) if row is not None else None
 
 
 def _approval_id(number: int, check_token: str) -> str:

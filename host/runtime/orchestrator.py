@@ -61,6 +61,7 @@ from typing import Any
 
 from host.config import AGENT_RUNTIMES
 from host.runtime import (
+    app_platform,
     claude_code,
     codex_app_server,
     github_credential,
@@ -199,24 +200,29 @@ def agent_runtime_status() -> dict[str, Any]:
     return {"runtimes": runtimes}
 
 
-def refresh_runtime_status(runtime_type: str) -> str:
+def refresh_runtime_status(runtime_type: str, *, force_provider_probe: bool = False) -> str:
     """Re-derive the agent runtime status and cache it in memory. Runs the
     provider check outside the state transaction so a slow runtime process
     never blocks requests. Serialized per runtime by _REFRESH_LOCKS."""
     with _REFRESH_LOCKS[runtime_type]:
-        return _refresh_runtime_status_serialized(runtime_type)
+        return _refresh_runtime_status_serialized(
+            runtime_type, force_provider_probe=force_provider_probe
+        )
 
 
-def _refresh_runtime_status_serialized(runtime_type: str) -> str:
+def _refresh_runtime_status_serialized(runtime_type: str, *, force_provider_probe: bool = False) -> str:
     if not _runtime_network_enabled(runtime_type):
         return _mark_runtime_deactivated(runtime_type)
     provider = _provider_module(runtime_type)
     try:
-        status, error_message, account = provider.account_status()
+        if runtime_type == "codex" and force_provider_probe:
+            status, error_message, account = provider.account_status(force_provider_probe=True)
+        else:
+            status, error_message, account = provider.account_status()
     except Exception as exc:
         status, error_message, account = "error", f"unexpected error checking {runtime_type}: {exc!r}", None
     if runtime_type == "claude_code" and status == "active" and isinstance(account, dict):
-        status, error_message, account = _live_claude_status(account)
+        status, error_message, account = _live_claude_status(account, force_probe=force_provider_probe)
     # The status poll is the sole reader of the parked login server, so it has
     # now recorded any completed-login notification. Capture the first trusted
     # anchor here, in the same refresh, so this refresh's commit publishes the
@@ -261,20 +267,10 @@ def _refresh_runtime_status_serialized(runtime_type: str) -> str:
                     completed_login = state.oauth_login("codex", cur)
                     codex_login_to_close = _string_field(completed_login, "login_id") if completed_login else None
                 state.set_oauth_login(cur, _oauth_key(runtime_type), None)
-                usage_key = "claude_usage" if runtime_type == "claude_code" else "codex_usage"
-                if account_value is not None and usage_key not in account_value:
-                    # A refresh whose probe produced no usage keeps the stored
-                    # snapshot (with its original last_checked_at) instead of
-                    # rewriting the row without it and blanking known limits.
-                    stored = read_claude_account(cur) if runtime_type == "claude_code" else read_openai_account(cur)
-                    stored_usage = stored.get(usage_key)
-                    if isinstance(stored_usage, dict) and stored_usage:
-                        account_value[usage_key] = stored_usage
-                else:
-                    _stamp_usage_checked_at(account_value, usage_key, utc_now())
                 if runtime_type == "claude_code":
                     save_claude_account(account_value, cur)
                 else:
+                    _stamp_usage_checked_at(account_value, "codex_usage", utc_now())
                     save_openai_account(account_value, cur)
             _sync_runtime_proxy_pin_in(cur, runtime_type, account_value if status == "active" else None)
             if previous == "awaiting_login" and status == "active":
@@ -353,6 +349,8 @@ def _active_account_value(runtime_type: str, status: str, account: Any) -> dict[
 
 def _live_claude_status(
     account: dict[str, Any],
+    *,
+    force_probe: bool = False,
 ) -> tuple[str, str | None, dict[str, Any] | None]:
     """Validate a steady Claude credential through the CLI that owns refresh.
 
@@ -368,9 +366,10 @@ def _live_claude_status(
     Each probe's verdict is memoized per token hash (_CLAUDE_LIVE_PROBE), so
     the probe itself runs at most once per CLAUDE_LIVE_PROBE_RETRY_SECONDS:
     pre-task refreshes and the five-second non-active poll reuse the verdict
-    instead of generating provider traffic. An awaiting_login verdict never
-    expires; the token is rejected, and recovery is an operator login, which
-    mints a new token and therefore a new probe.
+    instead of generating provider traffic. An explicit operator refresh
+    bypasses the memo. An awaiting_login verdict never expires on automatic
+    checks; the token is rejected, and recovery is an operator login, account
+    reset, or an operator-forced recheck that succeeds.
     """
     global _CLAUDE_LIVE_PROBE
     token_hash = _string_field(account, "access_token_sha256")
@@ -382,7 +381,7 @@ def _live_claude_status(
     ):
         return "active", None, account
     memo = _CLAUDE_LIVE_PROBE
-    if memo is not None and memo["token_hash"] == token_hash:
+    if not force_probe and memo is not None and memo["token_hash"] == token_hash:
         if memo["status"] == "awaiting_login":
             return "awaiting_login", None, None
         if time.monotonic() - memo["at"] < CLAUDE_LIVE_PROBE_RETRY_SECONDS:
@@ -417,6 +416,7 @@ def _probe_claude_status(
         )
     refreshed = dict(account)
     refreshed.update(current)
+    usage = _checked_claude_usage(usage)
     current_hash = _string_field(refreshed, "access_token_sha256")
     if current_hash != token_hash:
         # The CLI rotated the token during the probe: no verdict is memoized
@@ -470,6 +470,7 @@ def _backfill_claude_usage(account: dict[str, Any] | None) -> None:
         usage = claude_code.read_claude_usage()
     except claude_code.ClaudeCodeError:
         return
+    usage = _checked_claude_usage(usage)
     _memo_claude_probe(token_hash, "active", None, usage)
     if not usage:
         return
@@ -478,8 +479,15 @@ def _backfill_claude_usage(account: dict[str, Any] | None) -> None:
         if _string_field(stored, "access_token_sha256") != token_hash:
             return  # the credential moved on; let its own refresh fetch usage
         stored["claude_usage"] = dict(usage)
-        _stamp_usage_checked_at(stored, "claude_usage", utc_now())
         save_claude_account(stored, cur)
+
+
+def _checked_claude_usage(usage: dict[str, Any]) -> dict[str, Any]:
+    if not usage:
+        return {}
+    checked = dict(usage)
+    checked["last_checked_at"] = utc_now()
+    return checked
 
 
 def _claude_attestation(account: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -966,7 +974,11 @@ def run_next_task() -> None:
         # unavailable to other claims until this entry exists; a kill arriving
         # before it finds no entry, and the post-start status re-check below
         # abandons the turn instead.
-        server = _new_agent_server(runtime_type)
+        server = _new_agent_server(runtime_type, thread_id)
+        # App instructions come from the host-validated manifest associated
+        # with this app-scoped thread, never from task request content. Runtime
+        # adapters deliver them at their developer/system instruction boundary.
+        server.app_instructions = _app_instructions(thread_id)
         with _LIVE_LOCK:
             _LIVE[_live_key(runtime_type, thread_id)] = _Turn(server, runtime_type, thread_id, task_id)
         server.start()
@@ -1149,10 +1161,29 @@ def _provider_module(runtime_type: str | None = None) -> Any:
     return claude_code if runtime_type == "claude_code" else codex_app_server
 
 
-def _new_agent_server(runtime_type: str) -> Any:
+def _app_for_thread(thread_id: str) -> tuple[app_platform.AppManifest, str] | None:
+    """Installed app and app-visible id for an app-scoped host thread."""
+    app_id, separator, visible_thread_id = thread_id.partition(app_platform.APP_SCOPED_ID_SEPARATOR)
+    if not separator or not app_id or not visible_thread_id:
+        return None
+    app = app_platform.app_by_id(app_id)
+    return (app, visible_thread_id) if app is not None else None
+
+
+def _app_instructions(thread_id: str) -> str | None:
+    app_thread = _app_for_thread(thread_id)
+    return app_thread[0].agent_instructions if app_thread is not None else None
+
+
+def _new_agent_server(runtime_type: str, thread_id: str) -> Any:
+    # Every task turn runs inside a scope named after its host thread. App
+    # threads carry the host-reserved `<app_id>__` prefix, so the agent-app
+    # service derives ownership directly from kernel-owned cgroup state.
+    # Turns on one thread are serialized, and --collect removes the scope
+    # before the same unit name can be used by its next turn.
     if runtime_type == "claude_code":
-        return claude_code.ClaudeCodeSession()
-    return codex_app_server.CodexAppServer()
+        return claude_code.ClaudeCodeSession(thread_id=thread_id)
+    return codex_app_server.CodexAppServer(thread_id=thread_id)
 
 
 def _live_key(runtime_type: str, thread_id: Any) -> str:

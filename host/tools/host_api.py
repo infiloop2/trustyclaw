@@ -19,9 +19,10 @@ rules of the boundary.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections.abc import Mapping
-from typing import Literal, Protocol, TypedDict
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
+from typing import BinaryIO, Literal, Protocol, TypedDict
 
 from host.tools.json_types import JSONObject
 
@@ -118,6 +119,33 @@ class Approvals(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class AssetMetadata:
+    """Non-secret metadata for one tools-owned staged asset."""
+
+    asset_id: str
+    filename: str
+    media_type: str
+    size_bytes: int
+    sha256: str
+    expires_at: int
+
+
+class Assets(Protocol):
+    """Tool-scoped access to bytes streamed into the tools service.
+
+    The caller supplies only an opaque asset id. The host owns storage and
+    returns an already-open binary stream, so tool packages never receive or
+    open an agent-controlled pathname.
+    """
+
+    def describe(self, asset_id: str) -> AssetMetadata: ...
+
+    def open(self, asset_id: str) -> AbstractContextManager[BinaryIO]: ...
+
+    def delete(self, asset_id: str) -> None: ...
+
+
 class HostAPI(Protocol):
     """The bundle handed to every tool call, scoped to one tool."""
 
@@ -129,3 +157,6 @@ class HostAPI(Protocol):
 
     @property
     def approvals(self) -> Approvals: ...
+
+    @property
+    def assets(self) -> Assets: ...

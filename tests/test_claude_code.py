@@ -6,11 +6,22 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from host.runtime import claude_code
 
 
 class ClaudeCodeTests(unittest.TestCase):
+    def test_thread_scope_is_separate_from_the_launcher_command(self) -> None:
+        # The web-search decision must remain the launcher's first argument, so
+        # app attribution stores its scope id separately from the command.
+        session = claude_code.ClaudeCodeSession(command=["/bin/echo"], thread_id="mission_pursuit__ws-3")
+        self.assertEqual(session._command, ["/bin/echo"])
+        self.assertEqual(session._thread_id, "mission_pursuit__ws-3")
+        self.assertEqual(claude_code.ClaudeCodeSession(command=["/bin/echo"])._command, ["/bin/echo"])
+        self.assertIsNone(claude_code._subprocess_cwd(claude_code.DEFAULT_COMMAND))
+        self.assertEqual(claude_code._subprocess_cwd(session._command), claude_code.AGENT_CWD)
+
     def test_read_claude_account_reads_helper_json(self) -> None:
         command = [
             sys.executable,
@@ -520,16 +531,17 @@ print(json.dumps({
             claude_code.DEFAULT_COMMAND = [sys.executable, "-u", "-c", script]
             claude_code.AGENT_CWD = "/definitely/not-readable-by-admin"
             server = claude_code.ClaudeCodeSession()
-            session_id, output = claude_code.run_turn(
-                server,
-                "initial",
-                None,
-                "opus",
-                "high",
-                lambda: [],
-                lambda _message: None,
-                lambda _message: None,
-            )
+            with patch("host.runtime.state.read_claude_web_search", return_value=False):
+                session_id, output = claude_code.run_turn(
+                    server,
+                    "initial",
+                    None,
+                    "opus",
+                    "high",
+                    lambda: [],
+                    lambda _message: None,
+                    lambda _message: None,
+                )
         finally:
             claude_code.DEFAULT_COMMAND = original_command
             claude_code.AGENT_CWD = original_cwd
@@ -554,17 +566,22 @@ print(json.dumps({
             with tempfile.TemporaryDirectory() as tmp:
                 claude_code.AGENT_CWD = tmp
                 argv_path = Path(tmp) / "argv.json"
-                server = claude_code.ClaudeCodeSession([sys.executable, "-u", "-c", script, str(argv_path)])
-                claude_code.run_turn(
-                    server,
-                    "initial",
-                    None,
-                    "fable",
-                    "ultracode",
-                    lambda: [],
-                    lambda _message: None,
-                    lambda _message: None,
+                server = claude_code.ClaudeCodeSession(
+                    [sys.executable, "-u", "-c", script, str(argv_path)],
+                    thread_id="mission_pursuit__ws-3",
                 )
+                server.app_instructions = "Use only the documented app routes."
+                with patch("host.runtime.state.read_claude_web_search", return_value=False):
+                    claude_code.run_turn(
+                        server,
+                        "initial",
+                        None,
+                        "fable",
+                        "ultracode",
+                        lambda: [],
+                        lambda _message: None,
+                        lambda _message: None,
+                    )
                 argv = json.loads(argv_path.read_text())
         finally:
             claude_code.AGENT_CWD = original_cwd
@@ -574,9 +591,56 @@ print(json.dumps({
         self.assertEqual(argv[argv.index("--model") + 1], "fable")
         self.assertEqual(argv[argv.index("--effort") + 1], "ultracode")
         self.assertIn("--strict-mcp-config", argv)
+        self.assertEqual(
+            argv[:3],
+            ["web-search=off", "--thread-scope", "mission_pursuit__ws-3"],
+        )
+        self.assertEqual(
+            argv[argv.index("--append-system-prompt") + 1],
+            "Use only the documented app routes.",
+        )
         self.assertNotIn("--dangerously-skip-permissions", argv)
         self.assertNotIn("--safe-mode", argv)
         self.assertNotIn("--permission-mode", argv)
+
+    def test_web_search_decision_is_passed_to_launcher(self) -> None:
+        # The orchestrator states the operator's decision to the launcher as the
+        # first argument (web-search=on/off); the launcher, not this side, builds
+        # the WebSearch deny. So run() must emit the token and must NOT build a
+        # --settings override itself.
+        script = r"""
+import json, pathlib, sys
+
+pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))
+json.loads(sys.stdin.readline())
+print(json.dumps({
+    "type": "result",
+    "subtype": "success",
+    "session_id": "argv-session",
+    "result": "OK",
+}), flush=True)
+"""
+        original_cwd = claude_code.AGENT_CWD
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                claude_code.AGENT_CWD = tmp
+                argv_path = Path(tmp) / "argv.json"
+                # The injected command stands in for run-claude-code and receives
+                # the decision exactly as the real launcher would.
+                command = [sys.executable, "-u", "-c", script, str(argv_path)]
+                for web_search, expected_token in ((False, "web-search=off"), (True, "web-search=on")):
+                    with patch("host.runtime.state.read_claude_web_search", return_value=web_search):
+                        claude_code.run_turn(
+                            claude_code.ClaudeCodeSession(command), "initial", None, "opus", "high",
+                            lambda: [], lambda _message: None, lambda _message: None,
+                        )
+                    argv = json.loads(argv_path.read_text())
+                    # The decision leads the Claude flags so the launcher can
+                    # consume it before forwarding the rest.
+                    self.assertEqual(argv[0], expected_token)
+                    self.assertNotIn("--settings", argv)
+        finally:
+            claude_code.AGENT_CWD = original_cwd
 
 
 class ToolsMcpConfigTests(unittest.TestCase):
@@ -623,6 +687,7 @@ print(json.dumps({
         self.assertIn("--strict-mcp-config", argv)
         self.assertIn("--mcp-config", argv)
         self.assertEqual(argv[argv.index("--mcp-config") + 1], claude_code.TOOLS_MCP_CONFIG)
+        self.assertNotIn("--append-system-prompt", argv)
         # Safe mode would drop every non-SDK MCP server (verified against the
         # pinned CLI), silently disabling the bundled tools.
         self.assertNotIn("--safe-mode", argv)

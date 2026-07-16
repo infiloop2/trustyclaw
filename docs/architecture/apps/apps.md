@@ -46,6 +46,10 @@ is the exact contract the app provides to the host.
 {
   "host_slot": 0,
   "title": "<App Title>",
+  "agent": {
+    "instructions": "agent.md",
+    "api": true
+  },
   "backend": {
     "entrypoint": "backend.py"
   },
@@ -87,6 +91,33 @@ database role.
 does not choose its final URL. The host mounts the UI under a host-derived path
 such as `/v1/apps/<app_id>/ui/`, and uses the app title as the admin tab
 label.
+
+Every manifest contains an `agent` object. `agent.instructions` names a UTF-8
+Markdown file inside the app package. The host rejects a package whose
+instructions are missing, empty, symlinked, non-UTF-8, NUL-containing, or over
+16 KiB, so there is no installed-app state without an agent contract.
+
+The host attaches these instructions through the provider's instruction
+channel; it never concatenates them into the human's current task message.
+Codex receives the current instructions as `developerInstructions` on both
+`thread/start` and every `thread/resume`, before the task's `turn/start` input.
+Claude runs one process per task, so the host passes the current instructions
+through `--append-system-prompt` on every new and resumed process. Both
+harnesses therefore refresh the contract for every task while preserving
+provider instruction precedence, without duplicating it as human conversation
+history or consuming the task-message budget.
+
+The host does not define or inject generic dynamic app state. Each app chooses
+what current context belongs in `input_message` and what the agent reads live
+through app routes.
+
+`agent.api` is an explicit boolean. When true, the app backend serves
+agent-callable routes under `/agent/`; calls from that app's threads through
+the stable `app_api` MCP tool are proxied to those routes by the dedicated
+agent-app service with kernel-verified thread attribution. Listing the tool
+grants no authority. An app without `agent.api` exposes no agent-facing
+surface, and its tasks receive 404 if they call the tool. See
+[Agent App API](agent-app-api.md).
 
 ## Host Integration
 
@@ -162,9 +193,11 @@ The host chooses the backend port and passes it through environment. App code is
 expected to bind the provided loopback address and port, but the host does not
 rely on app self-discipline for route security: the admin API proxies only to
 the host-derived app port, and nftables makes that assigned listener
-admin-proxy-only. New TCP connections to the assigned app port are accepted only
-from the `trustyclaw-admin` uid and are dropped for every other local uid before
-the broad loopback allow rule. If app code binds a different port, the host will
+proxy-only. New TCP connections to the assigned app port are accepted only
+from the `trustyclaw-admin` uid (the browser bridge) and the
+`trustyclaw-agent-app` uid (the agent app API proxy, for apps that opt into
+`agent.api`; see [Agent App API](agent-app-api.md)) and are dropped for every
+other local uid before the broad loopback allow rule. If app code binds a different port, the host will
 not route app UI traffic to it, it is not exposed through SSH forwarding,
 Cloudflare Access, or any non-loopback interface, and the app service uid still
 cannot initiate arbitrary loopback connections. Stronger kernel-level prevention
@@ -202,7 +235,9 @@ asset, with `data:` allowed for images and fonts. `connect-src` stays `none`, so
 browser network calls cannot bypass the parent bridge, and wildcard image/style
 sources are not allowed. The explicit app asset origin in CSP exists so the same
 policy works when a test or deployment serves the admin API on an ephemeral host
-or port; it is not permission to beacon to arbitrary origins.
+or port; it is not permission to beacon to arbitrary origins. The explicit
+`frame-src 'none'` directive prevents app UI from embedding nested frames; this
+is browser-enforced, not an app convention.
 
 ## Storage And Migrations
 
@@ -319,3 +354,10 @@ model; adding either would require a new host-owned authorization contract.
 
 The UI bridge continues to forward only requests to that app's backend proxy
 route. Direct host admin API calls remain outside the app UI surface.
+
+Agents working an app's tasks have one inbound path to the app: the `app_api`
+tool, proxied by the dedicated agent-app service to the app's `/agent/` route
+namespace with a host-attributed thread identity and host-enforced caps. The
+agent's host thread is read from kernel cgroup state; its reserved app prefix
+selects the installed app, so the agent can only reach the app that created
+the thread. See [Agent App API](agent-app-api.md).

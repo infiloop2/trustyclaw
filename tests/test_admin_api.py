@@ -95,7 +95,7 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertIn("renderDataSummary", guide)
         self.assertNotIn("renderDataFlows", guide)
         self.assertIn("What happens to your data", guide)
-        self.assertIn("Technical details", guide)
+        self.assertIn("Technical notes", guide)
         self.assertIn("renderGuide(selected)", guide)
         self.assertNotIn("guide.connection", guide)
         self.assertNotIn("guides.map(renderGuide)", guide)
@@ -372,7 +372,11 @@ class AdminUiStaticTests(unittest.TestCase):
 
         self.assertEqual(error.exception.status, HTTPStatus.BAD_REQUEST)
 
+        with self.assertRaises(admin_api.ApiError):
+            admin_api._validate_thread_id_not_reserved_by_app("future_app__chat", None)
         admin_api._validate_thread_id_not_reserved_by_app("agent_chat__chat", "agent_chat")
+        with self.assertRaises(admin_api.ApiError):
+            admin_api._validate_thread_id_not_reserved_by_app("agent_chat__", "agent_chat")
 
     def test_app_bridge_marker_cannot_leave_the_apps_own_api(self) -> None:
         # A bridge-tagged request is scoped server-side before any dispatch:
@@ -610,6 +614,52 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(host_task["task_id"], task["task_id"])
         self.assertEqual(host_task["thread_id"], "agent_chat__chat")
 
+    def test_app_backend_repeated_task_create_makes_another_task(self) -> None:
+        request = {
+            "input_message": "from app",
+            "thread_id": "repeated-create",
+            "agent_runtime": "codex",
+            "model": "gpt-5.6-terra",
+            "effort": "high",
+        }
+        first = self.app_backend_request("POST", "/v1/tasks", request)
+        repeated = self.app_backend_request("POST", "/v1/tasks", request)
+
+        self.assertNotEqual(repeated["task_id"], first["task_id"])
+        self.assertEqual(len(state.tasks_for_thread("agent_chat__repeated-create", 10)), 2)
+
+    def test_app_backend_repeated_steer_appends_again(self) -> None:
+        task = self.app_backend_request(
+            "POST",
+            "/v1/tasks",
+            {
+                "input_message": "from app",
+                "thread_id": "durable-steer",
+                "agent_runtime": "codex",
+                "model": "gpt-5.6-terra",
+                "effort": "high",
+            },
+        )
+        with state.mutation() as cur:
+            stored = state.get_task(task["task_id"], cur)
+            assert stored is not None
+            stored["status"] = "running"
+            state.save_task(cur, stored)
+
+        first = self.app_backend_request(
+            "POST",
+            f"/v1/tasks/{task['task_id']}/steer",
+            {"steer_message": "nudge"},
+        )
+        repeated = self.app_backend_request(
+            "POST",
+            f"/v1/tasks/{task['task_id']}/steer",
+            {"steer_message": "nudge"},
+        )
+
+        self.assertEqual(first, repeated)
+        self.assertEqual(state.task_steers(task["task_id"]), ["nudge", "nudge"])
+
     def test_app_backend_task_lookup_rejects_unscoped_task_ids(self) -> None:
         _, outside = self.request(
             "POST",
@@ -651,6 +701,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(response.headers["X-Frame-Options"], "SAMEORIGIN")
         csp = response.headers["Content-Security-Policy"]
         self.assertIn("frame-ancestors 'self'", csp)
+        self.assertIn("frame-src 'none'", csp)
         img_src = next((directive for directive in csp.split("; ") if directive.startswith("img-src ")), "")
         self.assertIn("'self'", img_src)
         self.assertIn("data:", img_src)
@@ -663,7 +714,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertNotIn("style-src *", csp)
 
         for asset_name, content_type, expected in (
-            ("agent_chat.css", "text/css", ".app-shell"),
+            ("agent_chat.css", "text/css", ".chat-app"),
             ("agent_chat.js", "application/javascript", "trustyclaw-app-api"),
         ):
             request = urllib.request.Request(f"{self.base_url}/v1/apps/agent_chat/ui/{asset_name}", method="GET")
@@ -1015,7 +1066,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 )
             self.assertEqual(error.exception.code, 400)
 
-    def test_task_follow_up_uses_only_the_stored_session_configuration(self) -> None:
+    def test_task_follow_up_accepts_omitted_or_matching_session_configuration(self) -> None:
         body = {
             "input_message": "first",
             "thread_id": "fixed-options",
@@ -1025,9 +1076,18 @@ class AdminApiIntegrationTests(unittest.TestCase):
         }
         self.request("POST", "/v1/tasks", body)
 
+        _, repeated = self.request(
+            "POST",
+            "/v1/tasks",
+            {**body, "input_message": "matching repeat"},
+        )
+        self.assertEqual(
+            (repeated["agent_runtime"], repeated["model"], repeated["effort"]),
+            (body["agent_runtime"], body["model"], body["effort"]),
+        )
+
         for index, fields in enumerate(
             (
-                {"model": "gpt-5.6-terra", "effort": "high"},
                 {"model": "gpt-5.6-sol", "effort": "high"},
                 {"model": "gpt-5.6-terra", "effort": "max"},
             )
@@ -1037,9 +1097,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
                     "POST",
                     "/v1/tasks",
                     {**body, "input_message": "conflict", **fields},
-                )
+            )
             self.assertEqual(error.exception.code, 400)
-            self.assertIn("must be omitted for an existing thread", error.exception.read().decode())
+            self.assertIn("must match the existing thread configuration", error.exception.read().decode())
 
         with self.assertRaises(urllib.error.HTTPError) as partial_error:
             self.request(
@@ -1053,7 +1113,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
             )
         self.assertEqual(partial_error.exception.code, 400)
         self.assertIn(
-            "must be omitted for an existing thread",
+            "must be provided together",
             partial_error.exception.read().decode(),
         )
 
@@ -1176,7 +1236,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual([task["task_id"] for task in body["tasks"]], ["task_1", "task_2"])
         self.assertEqual(body["tasks"][1]["output_message"], "done")
 
-    def test_create_task_rejects_configuration_for_existing_threads(self) -> None:
+    def test_create_task_rejects_conflicting_configuration_for_existing_threads(self) -> None:
         state = load_state()
         state["tasks"] = [
             {
@@ -1210,14 +1270,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 {"input_message": "bad", "thread_id": "used-by-session", "agent_runtime": "codex"},
             )
         self.assertEqual(session_error.exception.code, 400)
-
-        with self.assertRaises(urllib.error.HTTPError) as repeated_error:
-            self.request(
-                "POST",
-                "/v1/tasks",
-                {"input_message": "bad", "thread_id": "used-by-task", "agent_runtime": "codex"},
-            )
-        self.assertEqual(repeated_error.exception.code, 400)
 
         _, accepted = self.request(
             "POST",
@@ -1360,7 +1412,10 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertIn('button[data-action]', ui)
         self.assertNotIn("onclick=", ui)
         self.assertNotIn("oninput=", ui)
-        self.assertIn('id="managed-integrations"', html)
+        self.assertIn('id="ai-inference-integrations"', html)
+        self.assertIn('id="tools"', html)
+        self.assertLess(html.index('id="ai-inference-heading"'), html.index('id="tools-heading"'))
+        self.assertLess(html.index('id="tools-heading"'), html.index('id="manual-heading"'))
         self.assertIn('id="github-expansion"', html)
         self.assertIn('id="github-repos"', html)
         self.assertIn('id="domain-rules"', html)
@@ -1415,7 +1470,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertIn("Protections", ui)
         self.assertIn("View integration guide", ui)
         self.assertIn("Authenticated traffic for another account is denied", ui)
-        self.assertIn("writes work only for repositories configured", ui)
+        self.assertIn("writes work only for the repositories you configure", ui)
         self.assertNotIn("iconTile", ui)
         self.assertNotIn('class="icon-tile"', html)
         self.assertIn('data-provider-status="${esc(name)}"', ui)
@@ -1436,7 +1491,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertIn("auth.openai.com", ui)
         self.assertIn("GET and POST", ui)
         self.assertIn("api.anthropic.com", ui)
-        self.assertIn("pinned-account and OAuth-token guards", ui)
+        self.assertIn("pinned-account, OAuth-token, and server-side web-tool guards", ui)
         self.assertIn("api.github.com", ui)
         self.assertIn("GraphQL denied", ui)
         self.assertIn("LFS uploads denied", ui)
@@ -2671,14 +2726,20 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 {"agent_runtime": "claude_code"},
             )
 
-        refresh.assert_called_once_with("claude_code")
+        refresh.assert_called_once_with("claude_code", force_provider_probe=True)
         self.assertEqual([account["agent_runtime"] for account in body["accounts"]], ["codex", "claude_code"])
 
     def test_agent_runtime_refresh_endpoint_refreshes_all_runtimes_by_default(self) -> None:
         with patch("host.runtime.admin_api.orchestrator.refresh_runtime_status") as refresh:
             self.request("POST", "/v1/agent-runtime/refresh", {})
 
-        self.assertEqual([call.args[0] for call in refresh.call_args_list], ["codex", "claude_code"])
+        self.assertEqual(
+            [(call.args[0], call.kwargs) for call in refresh.call_args_list],
+            [
+                ("codex", {"force_provider_probe": True}),
+                ("claude_code", {"force_provider_probe": True}),
+            ],
+        )
 
     def test_agent_runtime_refresh_endpoint_rejects_unknown_runtime(self) -> None:
         with self.assertRaises(urllib.error.HTTPError) as error:
@@ -3427,9 +3488,22 @@ class ToolRoutesTests(unittest.TestCase):
 
         status, body = self.request("GET", "/v1/tools")
         self.assertEqual(status, 200)
-        self.assertEqual(
-            sorted(entry["tool_id"] for entry in body["tools"]),
-            ["brave_search", "gmail", "google_calendar"],
+        # New bundled packages should not need an edit here; released ids may
+        # not vanish. (test_tools_host uses the same issubset contract.)
+        self.assertTrue(
+            {
+                "brave_search",
+                "gmail",
+                "google_calendar",
+                "ibkr",
+                "instagram",
+                "instagram_discovery",
+                "linkedin",
+                "linkedin_discovery",
+                "polymarket",
+                "runway",
+                "twitter",
+            }.issubset({entry["tool_id"] for entry in body["tools"]})
         )
         gmail = self.tool_entry(body, "gmail")
         self.assertFalse(gmail["enabled"])
@@ -3445,6 +3519,7 @@ class ToolRoutesTests(unittest.TestCase):
         read = next(action for action in gmail["actions"] if action["id"] == "read_message")
         self.assertEqual(read["approval"], "direct")
         self.assertTrue(all(gmail["protections"]))
+        self.assertEqual(gmail["technical_details"], [])
         self.assertGreaterEqual(len(gmail["setup_steps"]), 5)
         self.assertIn("Google Cloud", gmail["setup_steps"][0]["description"])
         self.assertTrue(any(step["image_path"] for step in gmail["setup_steps"]))
@@ -3470,6 +3545,12 @@ class ToolRoutesTests(unittest.TestCase):
         self.assertFalse(config_keys["GOOGLE_OAUTH_CLIENT_ID"]["set"])
         # All config values are secrets; there is no per-key secret flag.
         self.assertNotIn("secret", config_keys["GOOGLE_OAUTH_CLIENT_ID"])
+
+        discovery = self.tool_entry(body, "instagram_discovery")
+        self.assertIn("at most 25 unique items", " ".join(discovery["protections"]))
+        self.assertIn("maps vendor responses to fixed fields", " ".join(discovery["technical_details"]))
+        for tool_id in ("ibkr", "instagram", "linkedin", "runway", "twitter"):
+            self.assertEqual(self.tool_entry(body, tool_id)["technical_details"], [])
 
     def test_config_and_enable_flow(self) -> None:
         # Config is scoped per tool: a key must be declared by that tool.
@@ -3516,6 +3597,18 @@ class ToolRoutesTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as error:
             self.request("POST", "/v1/tools/brave_search/oauth_connect/start", {"redirect_uri": "http://x/cb"})
         self.assertEqual(error.exception.code, 409)
+
+        # An enabled OAuth tool with no client config fails as an actionable
+        # operator input error; it is not a tools-service gateway failure.
+        self.request("POST", "/v1/tools/gmail/enable")
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request(
+                "POST",
+                "/v1/tools/gmail/oauth_connect/start",
+                {"redirect_uri": "http://localhost:7443/oauth/callback"},
+            )
+        self.assertEqual(error.exception.code, 400)
+        self.request("POST", "/v1/tools/gmail/disable")
 
         # OAuth tools require enablement before connecting.
         self.request("PUT", "/v1/tools/gmail/config", {"key": "GOOGLE_OAUTH_CLIENT_ID", "value": "client-1"})
@@ -3614,6 +3707,12 @@ class ToolRoutesTests(unittest.TestCase):
             self.assertEqual(seqs, sorted(seqs, reverse=True))
             self.assertEqual(body["events"][0]["tool_id"], "fake_notes")
             self.assertEqual(body["events"][0]["action_id"], "read_note")
+            self.assertTrue(body["events"][0]["has_arguments"])
+            self.assertNotIn("arguments", body["events"][0])
+
+            status, detail = self.request("GET", f"/v1/tools/events/{seqs[0]}")
+            self.assertEqual(status, 200)
+            self.assertEqual(detail["event"]["arguments"], {})
 
             status, older = self.request("GET", f"/v1/tools/events?before={seqs[-1]}")
             self.assertTrue(all(event["seq"] < seqs[-1] for event in older["events"]))
@@ -3623,6 +3722,8 @@ class ToolRoutesTests(unittest.TestCase):
             kinds = {(event["action_id"], event["outcome"], event["detail"]) for event in all_events}
             self.assertIn(("config", "set", "FAKE_NOTES_TOKEN"), kinds)
             self.assertIn(("enablement", "enabled", ""), kinds)
+            config_event = next(event for event in all_events if event["action_id"] == "config")
+            self.assertFalse(config_event["has_arguments"])
             self.request("POST", "/v1/tools/fake_notes/disable")
             after_disable = self.request("GET", "/v1/tools/events")[1]["events"]
             self.assertEqual(after_disable[0]["action_id"], "enablement")
@@ -3631,6 +3732,10 @@ class ToolRoutesTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as error:
                 self.request("GET", "/v1/tools/events?bogus=1")
             self.assertEqual(error.exception.code, 400)
+
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.request("GET", "/v1/tools/events/999999")
+            self.assertEqual(error.exception.code, 404)
 
     def test_oauth_callback_serves_the_ui_shell(self) -> None:
         request = urllib.request.Request(f"{self.base_url}/oauth/callback?code=x&state=y")

@@ -22,7 +22,7 @@ import { agentLog, netLog, toolLog, toggleNetDeniedFilter } from "./logs.js";
 import {
   addDomainRule, addGithubRepo, approveGithubPush, closeIntegrationInfo, deleteGithubCredential,
   loadPolicy, openProvider, recheckGithubAudit, rejectGithubPush, removeDomainRule,
-  removeGithubRepo, resetLinkedAccount, setGithubCredential, setGithubRequireApproval,
+  removeGithubRepo, resetLinkedAccount, setClaudeWebSearch, setGithubCredential, setGithubRequireApproval,
   setIntegrationEnabled, positionIntegrationInfo, refreshPendingGithubPushes, toggleGithubCredentialMode, toggleIntegrationExpansion,
   toggleCustomDomainAccess, toggleGithubRepoAudit, toggleIntegrationInfo,
 } from "./network.js";
@@ -31,7 +31,9 @@ import {
   refreshExpandedToolApprovals, refreshTools, saveToolConfig, setToolEnabled,
   toggleToolExpansion, toggleToolInfo,
 } from "./tools.js";
-import { openConnectionGuide, refreshConnectionGuide } from "./connection_guide.js";
+import {
+  copyCallbackUri, dismissCallbackCopyFeedback, openConnectionGuide, refreshConnectionGuide,
+} from "./connection_guide.js";
 
 let activeTab = "home";
 let installedApps = [];
@@ -84,6 +86,7 @@ function toggleMobileNav() {
 function showLogin() {
   setMobileNavOpen(false);
   document.body.classList.remove("connection-guide-open");
+  document.body.classList.remove("app-tab-open");
   $("login").hidden = false;
   $("app").hidden = true;
   $("logout-button").hidden = true;
@@ -97,8 +100,10 @@ function showTab(name) {
   const closeDrawer = mobileNavOpen;
   activeTab = name;
   const connectionGuideOpen = name === "connection-guide";
-  if (connectionGuideOpen) window.scrollTo(0, 0);
+  const appTabOpen = name.startsWith("app:");
+  if (connectionGuideOpen || appTabOpen) window.scrollTo(0, 0);
   document.body.classList.toggle("connection-guide-open", connectionGuideOpen);
+  document.body.classList.toggle("app-tab-open", appTabOpen);
   for (const tabName of staticTabs) {
     $(`tab-${tabName}`).classList.toggle("active-tab", tabName === name);
     $(`panel-${tabName}`).hidden = tabName !== name;
@@ -268,6 +273,7 @@ document.addEventListener("click", event => {
   const target = event.target;
   if (!(target instanceof Element)) return;
   if (!target.closest(".info-button, #preset-info-popover")) closeIntegrationInfo();
+  if (!target.closest(".guide-copy-button")) dismissCallbackCopyFeedback();
   const button = target.closest("button[data-action]");
   if (!button) return;
   const { action } = button.dataset;
@@ -305,6 +311,8 @@ document.addEventListener("click", event => {
     "remove-github-repo": () => removeGithubRepo(button.dataset.owner, button.dataset.repo),
     "enable-github-require-approval": () => setGithubRequireApproval(true),
     "disable-github-require-approval": () => setGithubRequireApproval(false),
+    "enable-claude-web-search": () => setClaudeWebSearch(true),
+    "disable-claude-web-search": () => setClaudeWebSearch(false),
     "add-domain-rule": () => addDomainRule(),
     "remove-domain-rule": () => removeDomainRule(button.dataset.domain),
     "set-github-credential": () => setGithubCredential(),
@@ -330,6 +338,7 @@ document.addEventListener("click", event => {
       showTab("connection-guide");
     },
     "jump-connection-guide": () => openConnectionGuide(button.dataset.guide),
+    "copy-callback-uri": () => copyCallbackUri(button),
   };
   const handler = actions[action];
   if (handler) handler();

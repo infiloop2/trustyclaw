@@ -10,12 +10,14 @@ the tool tables plus read access to the encryption key used for tool secrets.
 The admin service therefore holds no internet egress and executes no
 third-party tool action.
 
-It serves the agent-facing tools socket (``tools/list`` and ``tools/call`` for
-the MCP shim) and the operator delegation routes the admin service forwards for
+It serves the agent-facing tools socket (``tools/list``, ``tools/call``, and
+the shim's bounded raw-media streams) and the operator delegation routes the admin service forwards for
 the operations that need this service's egress (OAuth code exchange, token
 revoke) or run tool code over third-party data (approved-action execution). All
 tool credentials, config, approvals, and audit events live in the tool tables,
 reached with the scoped role over the same peer-authenticated Postgres socket.
+Staged media are ephemeral mode-0600 files in this service's private admin-volume
+directory, indexed only in memory and addressed by tool-scoped opaque ids.
 """
 
 from __future__ import annotations

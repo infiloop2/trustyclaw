@@ -138,6 +138,7 @@ GMAIL_DIRECT_ACTIONS = frozenset({"search_messages", "read_message", "read_threa
 
 BODY_BLOCK_SCHEMA: JSONObject = {
     "type": "array",
+    "description": "Ordered email body blocks: paragraphs contain text; line groups contain one or more lines.",
     "items": {
         "oneOf": [
             {
@@ -187,7 +188,7 @@ GMAIL_DRAFT_ACTION_POLICY = "Creates, updates, sends, or deletes one draft. Noth
 MANIFEST = ToolManifest(
     tool_id="gmail",
     display_name="Gmail",
-    description="Read and search Gmail. Sending mail and changing messages, labels, or drafts requires your approval.",
+    description="Connect your Google account and let your agent read and search email, and send messages or organize your mailbox with your approval.",
     connection="oauth",
     data_summary=DataSummary(
         cards=(
@@ -195,7 +196,7 @@ MANIFEST = ToolManifest(
                 title="What leaves this host",
                 points=(
                     DataSummaryPoint(label="Reads", text="Read queries and their parameters go to Google directly: the Gmail search query, time filters, and message, thread, draft, or label identifiers."),
-                    DataSummaryPoint(label="Modifications", text="Go to Google only after your approval, and send exactly what you approved: recipients, subject, and body for a send or draft, label and message changes otherwise."),
+                    DataSummaryPoint(label="Modifications", text="A change reaches Google only after your approval, and sends exactly what you approved: recipients, subject, and body for a send or draft, or the label and message changes otherwise."),
                 ),
             ),
             DataSummaryCard(
@@ -228,32 +229,32 @@ MANIFEST = ToolManifest(
         ActionSpec(id="search_messages",
             description="Search messages with a Gmail query string.",
             data_policy=GMAIL_SEARCH_POLICY,
-            input_schema=_schema({"query": {"type": "string"}, "start_time": {"type": "string"}, "end_time": {"type": "string"}}),
+            input_schema=_schema({"query": {"type": "string", "description": "Optional Gmail search syntax, e.g. from:alice@example.com is:unread."}, "start_time": {"type": "string", "description": "Optional inclusive lower bound as ISO 8601 or YYYY-MM-DD; naive values are UTC."}, "end_time": {"type": "string", "description": "Optional exclusive upper bound as ISO 8601 or YYYY-MM-DD; must be after start_time."}}),
             output_schema=GMAIL_OUTPUT_SCHEMA,
         ),
         ActionSpec(id="read_message",
             description="Read one message by id.",
             data_policy=GMAIL_READ_MESSAGE_POLICY,
-            input_schema=_schema({"message_id": {"type": "string"}}, ["message_id"]),
+            input_schema=_schema({"message_id": {"type": "string", "description": "Gmail message id returned by search_messages, read_thread, or list_drafts."}}, ["message_id"]),
             output_schema=GMAIL_OUTPUT_SCHEMA,
         ),
         ActionSpec(id="read_thread",
             description="Read a conversation thread by id.",
             data_policy=GMAIL_READ_THREAD_POLICY,
-            input_schema=_schema({"thread_id": {"type": "string"}}, ["thread_id"]),
+            input_schema=_schema({"thread_id": {"type": "string", "description": "Gmail thread id returned by message or search results."}}, ["thread_id"]),
             output_schema=GMAIL_OUTPUT_SCHEMA,
         ),
         ActionSpec(id="list_labels", description="List the account's labels.", data_policy=GMAIL_LIST_LABELS_POLICY, input_schema=_schema({}), output_schema=GMAIL_OUTPUT_SCHEMA),
         ActionSpec(id="list_drafts",
             description="List current drafts, each with its headers and body content.",
             data_policy=GMAIL_LIST_DRAFTS_POLICY,
-            input_schema=_schema({"query": {"type": "string"}, "page_token": {"type": "string"}, "include_spam_trash": {"type": "boolean"}}),
+            input_schema=_schema({"query": {"type": "string", "description": "Optional Gmail query used to filter drafts."}, "page_token": {"type": "string", "description": "Opaque nextPageToken from a prior list_drafts result."}, "include_spam_trash": {"type": "boolean", "description": "Include drafts associated with spam or trash (default false)."}}),
             output_schema=GMAIL_OUTPUT_SCHEMA,
         ),
         ActionSpec(id="send_email",
             description="Queue approval to send an email (to, subject, body blocks).",
             data_policy=GMAIL_SEND_POLICY,
-            input_schema=_schema({"to": {"type": "string"}, "subject": {"type": "string"}, "blocks": BODY_BLOCK_SCHEMA}, ["to", "subject", "blocks"]),
+            input_schema=_schema({"to": {"type": "string", "description": "Recipient address or comma-separated recipient addresses."}, "subject": {"type": "string", "description": "Email subject."}, "blocks": BODY_BLOCK_SCHEMA}, ["to", "subject", "blocks"]),
             output_schema=GMAIL_OUTPUT_SCHEMA,
             approval="operator",
         ),
@@ -262,9 +263,9 @@ MANIFEST = ToolManifest(
             data_policy=GMAIL_MESSAGE_ACTION_POLICY,
             input_schema=_schema(
                 {
-                    "action": {"type": "string", "enum": list(GMAIL_MESSAGE_ACTION_TYPES_BY_TOOL_ACTION)},
-                    "message_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": MAX_GMAIL_MESSAGE_ACTION_IDS},
-                    "label_ids": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_GMAIL_MESSAGE_ACTION_LABEL_IDS},
+                    "action": {"type": "string", "enum": list(GMAIL_MESSAGE_ACTION_TYPES_BY_TOOL_ACTION), "description": "One operation applied to every listed message."},
+                    "message_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": MAX_GMAIL_MESSAGE_ACTION_IDS, "description": "Gmail message ids, not thread ids."},
+                    "label_ids": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_GMAIL_MESSAGE_ACTION_LABEL_IDS, "description": "Required only for add_labels/remove_labels; obtain ids from list_labels."},
                 },
                 ["action", "message_ids"],
             ),
@@ -276,11 +277,11 @@ MANIFEST = ToolManifest(
             data_policy=GMAIL_LABEL_ACTION_POLICY,
             input_schema=_schema(
                 {
-                    "action": {"type": "string", "enum": ["create", "update", "delete"]},
-                    "label_id": {"type": "string"},
-                    "name": {"type": "string"},
-                    "background_color": {"type": "string", "enum": list(GMAIL_LABEL_BACKGROUND_COLORS)},
-                    "text_color": {"type": "string", "enum": list(GMAIL_LABEL_TEXT_COLORS)},
+                    "action": {"type": "string", "enum": ["create", "update", "delete"], "description": "Label operation to queue for approval."},
+                    "label_id": {"type": "string", "description": "Existing user-label id from list_labels; required for update/delete."},
+                    "name": {"type": "string", "description": "New label name for create, or replacement name for update."},
+                    "background_color": {"type": "string", "enum": list(GMAIL_LABEL_BACKGROUND_COLORS), "description": "Named background color; set together with text_color."},
+                    "text_color": {"type": "string", "enum": list(GMAIL_LABEL_TEXT_COLORS), "description": "Named text color; set together with background_color."},
                 },
                 ["action"],
             ),
@@ -292,10 +293,10 @@ MANIFEST = ToolManifest(
             data_policy=GMAIL_DRAFT_ACTION_POLICY,
             input_schema=_schema(
                 {
-                    "action": {"type": "string", "enum": ["create", "update", "send", "delete"]},
-                    "draft_id": {"type": "string"},
-                    "to": {"type": "string"},
-                    "subject": {"type": "string"},
+                    "action": {"type": "string", "enum": ["create", "update", "send", "delete"], "description": "Draft operation to queue for approval."},
+                    "draft_id": {"type": "string", "description": "Existing draft id from list_drafts; required for update/send/delete."},
+                    "to": {"type": "string", "description": "Recipient address or comma-separated addresses for create/update."},
+                    "subject": {"type": "string", "description": "Draft subject for create/update."},
                     "blocks": BODY_BLOCK_SCHEMA,
                 },
                 ["action"],
@@ -1130,14 +1131,22 @@ class GmailTool:
                 raise ToolInputValidationError("Gmail read thread requires thread_id.")
             response = execute_gmail_api_request(access_token, gmail_operation_request("users.threads.get", {"id": thread_id, "format": "metadata", "metadataHeaders": ["From", "To", "Cc", "Bcc", "Subject", "Date"]}))
             raw_messages = response.get("messages")
-            if isinstance(raw_messages, list):
-                response = {**response, "messages": cast(list[JSONValue], [gmail_message_index_entry(cast(JSONObject, message)) for message in raw_messages[:GMAIL_THREAD_MESSAGE_INDEX_MAX_RESULTS] if isinstance(message, dict)])}
-                if len(raw_messages) > GMAIL_THREAD_MESSAGE_INDEX_MAX_RESULTS:
-                    response["messageIndexTruncated"] = True
-                    response["messageIndexLimit"] = GMAIL_THREAD_MESSAGE_INDEX_MAX_RESULTS
-                    response["messageIndexOriginalCount"] = len(raw_messages)
-                    response["messageIndexOmittedCount"] = len(raw_messages) - GMAIL_THREAD_MESSAGE_INDEX_MAX_RESULTS
-            return {"status": "success_executed", "message": "Gmail thread message list loaded.", "thread": response}
+            messages = raw_messages if isinstance(raw_messages, list) else []
+            thread: JSONObject = {
+                "id": string_value(response, ("id",))[:500],
+                "historyId": string_value(response, ("historyId",))[:500],
+                "messages": cast(list[JSONValue], [
+                    gmail_message_index_entry(cast(JSONObject, message))
+                    for message in messages[:GMAIL_THREAD_MESSAGE_INDEX_MAX_RESULTS]
+                    if isinstance(message, dict)
+                ]),
+            }
+            if len(messages) > GMAIL_THREAD_MESSAGE_INDEX_MAX_RESULTS:
+                thread["messageIndexTruncated"] = True
+                thread["messageIndexLimit"] = GMAIL_THREAD_MESSAGE_INDEX_MAX_RESULTS
+                thread["messageIndexOriginalCount"] = len(messages)
+                thread["messageIndexOmittedCount"] = len(messages) - GMAIL_THREAD_MESSAGE_INDEX_MAX_RESULTS
+            return {"status": "success_executed", "message": "Gmail thread message list loaded.", "thread": thread}
         if action == "list_labels":
             response = execute_gmail_api_request(access_token, gmail_operation_request("users.labels.list", {}))
             return {"status": "success_executed", "message": "Gmail labels loaded.", "labels": gmail_label_list_summary(response)}
@@ -1145,9 +1154,18 @@ class GmailTool:
             parameters = _draft_list_parameters(tool_input)
             response = execute_gmail_api_request(access_token, gmail_operation_request("users.drafts.list", parameters))
             raw_drafts = response.get("drafts")
-            if isinstance(raw_drafts, list):
-                response = {**response, "drafts": cast(list[JSONValue], [gmail_draft_preview(access_token, string_value(cast(JSONObject, draft), ("id",))) for draft in raw_drafts if isinstance(draft, dict) and string_value(cast(JSONObject, draft), ("id",))])}
-            return {"status": "success_executed", "message": "Gmail drafts loaded.", "drafts": response}
+            drafts = raw_drafts if isinstance(raw_drafts, list) else []
+            normalized: JSONObject = {
+                "drafts": cast(list[JSONValue], [
+                    gmail_draft_preview(access_token, string_value(cast(JSONObject, draft), ("id",)))
+                    for draft in drafts[:DEFAULT_DRAFT_PAGE_LIMIT]
+                    if isinstance(draft, dict) and string_value(cast(JSONObject, draft), ("id",))
+                ])
+            }
+            next_page_token = response.get("nextPageToken")
+            if isinstance(next_page_token, str):
+                normalized["nextPageToken"] = next_page_token[:2_048]
+            return {"status": "success_executed", "message": "Gmail drafts loaded.", "drafts": normalized}
         raise ToolInputValidationError("Unsupported Gmail read action.")
 
     def _proposal(self, action: str, tool_input: JSONObject, api: HostAPI, access_token: str) -> tuple[JSONObject, str]:

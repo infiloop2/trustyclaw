@@ -457,6 +457,7 @@ class AppMigrationTests(unittest.TestCase):
                 ui_dir=Path(temp_dir),
                 port=7450,
                 allocation=app_platform.AppAllocation(uid=48000, gid=48000, port_offset=0),
+                agent_instructions="Test app instructions.",
             )
             with patch("host.runtime.app_platform.app_by_id", return_value=app):
                 with self.assertRaises(Exception):
