@@ -23,3 +23,20 @@ export async function api(method, path, body, extraHeaders) {
   if (!response.ok) throw new Error(data.error ? data.error.message : response.statusText);
   return data;
 }
+
+export async function apiBlob(path) {
+  const response = await fetch(path, {
+    method: "GET",
+    headers: { "Authorization": "Bearer " + getPassword() },
+  });
+  if (response.status === 401) { unauthorizedHandler(); throw new Error("unauthorized"); }
+  if (!response.ok) {
+    let message = response.statusText;
+    try {
+      const data = await response.json();
+      message = data.error ? data.error.message : message;
+    } catch (_) {}
+    throw new Error(message);
+  }
+  return response.blob();
+}

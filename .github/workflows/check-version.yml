@@ -64,14 +64,19 @@ jobs:
           set -euo pipefail
           # Applied migrations are immutable history: a migration file that
           # exists on the base branch must be byte-identical here, and never
-          # deleted — schema changes always ship as a new NNNN+1 file.
-          changed="$(git diff --name-only --diff-filter=MDR "${BASE_SHA}"...HEAD -- host/migrations/ || true)"
+          # deleted — schema changes always ship as a new NNNN+1 file. This
+          # covers the host migrations and every app's migrations.
+          # --no-renames: a replaced migration must report as D + A under its
+          # real paths; rename detection can pair the deletion with an added
+          # file in a different app and misattribute the violation.
+          paths=(host/migrations/ 'host/apps/*/migrations/*')
+          changed="$(git diff --name-only --no-renames --diff-filter=MD "${BASE_SHA}"...HEAD -- "${paths[@]}" || true)"
           if [ -n "${changed}" ]; then
             echo "migration files may only be added, never edited, renamed, or deleted:" >&2
             echo "${changed}" >&2
             exit 1
           fi
-          added="$(git diff --name-only --diff-filter=A "${BASE_SHA}"...HEAD -- host/migrations/ || true)"
+          added="$(git diff --name-only --no-renames --diff-filter=A "${BASE_SHA}"...HEAD -- "${paths[@]}" || true)"
           if [ -n "${added}" ]; then
             echo "new migration file(s):"
             echo "${added}"

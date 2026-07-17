@@ -16,8 +16,8 @@ The agent-facing HTTP surface is four routes:
   and ``check_tool_approval``. The MCP shim separately aggregates the network
   introspection and app services into the stable agent-facing tool list.
 - ``POST /call`` — ``{"name": ..., "input": {...}}`` executes one action and
-  returns the result shape from ``tools_host`` (``executed`` /
-  ``pending_approval`` / ``failed``).
+  returns either the JSON result shape from ``tools_host`` (``executed`` /
+  ``pending_approval`` / ``failed``) or one exclusive binary asset response.
 - ``POST /assets/video``: raw MP4/MOV bytes streamed by the MCP shim, with
   bounded metadata in headers; returns an opaque tool-scoped asset id.
 - ``POST /assets/image``: raw JPEG/PNG/WebP bytes streamed by the MCP shim,
@@ -43,9 +43,10 @@ import struct
 import threading
 import time
 from typing import Any, BinaryIO, cast
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from host.runtime import state, tool_assets, tools_host
+from host.tools import OpenedStreamingAsset, StreamingAssetError
 
 DEFAULT_SOCKET_PATH = "/run/trustyclaw-tools/tools.sock"
 SOCKET_PATH = os.environ.get("TRUSTYCLAW_TOOLS_SOCKET", DEFAULT_SOCKET_PATH)
@@ -76,6 +77,11 @@ _UPLOAD_SLOTS = threading.BoundedSemaphore(2)
 # defending against.
 REQUEST_READ_TIMEOUT_SECONDS = 30
 ASSET_CLEANUP_INTERVAL_SECONDS = 3600
+MAX_STREAMING_ASSET_BYTES = 200_000_000
+STREAMING_RESULT_HEADER = "streaming-asset"
+STREAMING_MEDIA_TYPE_RE = re.compile(
+    r"^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}$"
+)
 
 CHECK_APPROVAL_TOOL = {
     "name": "check_tool_approval",
@@ -147,7 +153,7 @@ def call_action(
     name: Any,
     tool_input: Any,
     asset_store: tool_assets.ToolAssetStore | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | tools_host.StreamingAction:
     if not isinstance(name, str):
         raise tools_host.ToolCallError("Tool name must be a string.")
     if name == "check_tool_approval":
@@ -381,8 +387,7 @@ class ToolsRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self) -> None:
-        # Peers are scoped strictly by path; every GET route belongs to the
-        # agent MCP surface, so only the agent peer reaches it.
+        # The sole GET route belongs to the agent MCP surface.
         if not self._peer_is_agent():
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "Peer not allowed."})
             return
@@ -390,6 +395,88 @@ class ToolsRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"tools": action_listing()})
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Unknown path."})
+
+    def do_DELETE(self) -> None:
+        if not self._peer_is_agent():
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "Peer not allowed."})
+            return
+        self._send_json(HTTPStatus.NOT_FOUND, {"error": "Unknown path."})
+
+    @staticmethod
+    def _validated_stream_metadata(opened: OpenedStreamingAsset) -> tuple[str, str, int]:
+        filename = opened.filename
+        if (
+            not isinstance(filename, str)
+            or not 1 <= len(filename.encode("utf-8")) <= 255
+            or filename in {".", ".."}
+            or "/" in filename
+            or "\\" in filename
+            or any(ord(character) < 32 or ord(character) == 127 for character in filename)
+        ):
+            raise ValueError("invalid filename")
+        media_type = opened.media_type
+        if not isinstance(media_type, str) or not STREAMING_MEDIA_TYPE_RE.fullmatch(media_type):
+            raise ValueError("invalid media type")
+        size_bytes = opened.size_bytes
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or not 1 <= size_bytes <= MAX_STREAMING_ASSET_BYTES
+        ):
+            raise ValueError("invalid size")
+        return filename, media_type, size_bytes
+
+    def _send_streaming_action(self, streaming: tools_host.StreamingAction) -> None:
+        """Relay one exclusive binary result without landing it on admin disk."""
+        headers_committed = False
+        error: str | None = None
+        try:
+            with streaming.asset.open_stream() as opened:
+                filename, media_type, size_bytes = self._validated_stream_metadata(opened)
+                self.send_response(HTTPStatus.OK.value)
+                self.send_header("Content-Type", media_type)
+                self.send_header("Content-Length", str(size_bytes))
+                self.send_header("X-TrustyClaw-Result", STREAMING_RESULT_HEADER)
+                self.send_header("X-TrustyClaw-Filename", quote(filename, safe=""))
+                self.send_header("Cache-Control", "private, no-store, max-age=0")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                headers_committed = True
+
+                # Keep the final chunk until one-byte lookahead proves the
+                # provider supplied exactly the declared length. An oversized
+                # stream therefore reaches the shim as a truncated response,
+                # never as an apparently complete file.
+                remaining = size_bytes
+                pending = b""
+                while remaining:
+                    requested = min(1024 * 1024, remaining)
+                    chunk = opened.source.read(requested)
+                    if not chunk:
+                        raise StreamingAssetError("Tool asset stream ended early.")
+                    if len(chunk) > requested:
+                        raise StreamingAssetError("Tool asset stream exceeded its declared size.")
+                    if pending:
+                        self.wfile.write(pending)
+                    pending = chunk
+                    remaining -= len(chunk)
+                if opened.source.read(1):
+                    raise StreamingAssetError("Tool asset stream exceeded its declared size.")
+                self.wfile.write(pending)
+                self.wfile.flush()
+        except StreamingAssetError as exc:
+            error = str(exc) or "Tool asset stream failed."
+        except ValueError:
+            error = "Tool returned invalid streaming asset metadata."
+        except Exception:
+            error = "Tool asset stream failed."
+
+        tools_host.finish_streaming_action(streaming, error)
+        if error is not None and not headers_committed:
+            self._send_json(
+                HTTPStatus.OK,
+                {"status": "failed", "error": error, "reconnect_required": False},
+            )
 
     def _read_json_object_body(self, length: int) -> dict[str, Any] | None:
         """Read and parse the request body as a JSON object, or send the error
@@ -448,33 +535,38 @@ class ToolsRequestHandler(BaseHTTPRequestHandler):
             if body is None:
                 return
             try:
-                result = handle_operator(self.path, body, self.server.asset_store)
+                operator_result = handle_operator(self.path, body, self.server.asset_store)
             except OperatorError as exc:
                 self._send_json(exc.status, {"error": exc.message})
                 return
-            self._send_json(HTTPStatus.OK, result)
+            self._send_json(HTTPStatus.OK, operator_result)
             return
         # Agent tool calls each block a handler thread on a third-party request, so
         # they are capacity-capped, checked before the agent-controlled body is read.
         if not _CALL_SLOTS.acquire(blocking=False):
             self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "Too many concurrent tool calls."})
             return
+        action_result: dict[str, Any] | tools_host.StreamingAction
         try:
-            body = self._read_json_object_body(length)
-            if body is None:
-                return
-            result = call_action(
-                body.get("name"), body.get("input"), self.server.asset_store
-            )
-        except tools_host.ToolCallError as exc:
-            result = {"status": "failed", "error": str(exc), "reconnect_required": False}
-        except Exception:
-            # Tool packages map their own errors; anything else must not leak
-            # internals to the agent.
-            result = {"status": "failed", "error": "Tool call failed.", "reconnect_required": False}
+            try:
+                body = self._read_json_object_body(length)
+                if body is None:
+                    return
+                action_result = call_action(
+                    body.get("name"), body.get("input"), self.server.asset_store
+                )
+            except tools_host.ToolCallError as exc:
+                action_result = {"status": "failed", "error": str(exc), "reconnect_required": False}
+            except Exception:
+                # Tool packages map their own errors; anything else must not leak
+                # internals to the agent.
+                action_result = {"status": "failed", "error": "Tool call failed.", "reconnect_required": False}
+            if isinstance(action_result, tools_host.StreamingAction):
+                self._send_streaming_action(action_result)
+            else:
+                self._send_json(HTTPStatus.OK, action_result)
         finally:
             _CALL_SLOTS.release()
-        self._send_json(HTTPStatus.OK, result)
 
     def _stage_asset(self, length: int, kind: tool_assets.AssetKind) -> None:
         """Receive raw media bytes from the agent-side shim into private,

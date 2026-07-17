@@ -1,0 +1,17 @@
+{
+  "host_slot": 5,
+  "title": "Software Builder",
+  "agent": {
+    "instructions": "agent.md",
+    "api": true
+  },
+  "backend": {
+    "entrypoint": "backend.py"
+  },
+  "database": {
+    "migrations": "migrations"
+  },
+  "ui": {
+    "path": "ui"
+  }
+}

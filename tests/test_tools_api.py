@@ -7,6 +7,9 @@ harnesses launch it.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import io
+import http.client
 import json
 import os
 from pathlib import Path
@@ -20,10 +23,73 @@ from unittest.mock import patch
 import pg_harness
 from test_tools_host import FakeTool
 
-from host.runtime import state, tools_api, tools_host
+from host.runtime import state, tools_api, tools_host, tools_mcp_shim
 from host.runtime.tools_mcp_shim import UnixHTTPConnection
+from host.tools import OpenedStreamingAsset, StreamingAsset
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+class _MemoryResponse:
+    def __init__(self, data: bytes, **headers: str) -> None:
+        self._source = io.BytesIO(data)
+        self._headers = headers
+
+    def getheader(self, name: str, default: str = "") -> str:
+        return self._headers.get(name, default)
+
+    def read(self, size: int = -1) -> bytes:
+        return self._source.read(size)
+
+
+class StreamMaterializationUnitTests(unittest.TestCase):
+    def test_materializes_exact_stream_with_private_modes(self) -> None:
+        payload = b"v" * 512
+        response = _MemoryResponse(
+            payload,
+            **{
+                "Content-Length": str(len(payload)),
+                "Content-Type": "video/mp4",
+                "X-TrustyClaw-Filename": "generated.mp4",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"HOME": directory}):
+            result = tools_mcp_shim._materialize_stream(response)  # type: ignore[arg-type]
+            local_path = Path(directory) / result["path"].lstrip("/")
+            self.assertEqual(local_path.read_bytes(), payload)
+            self.assertEqual(local_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(local_path.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_short_stream_leaves_no_partial_file(self) -> None:
+        response = _MemoryResponse(
+            b"short",
+            **{
+                "Content-Length": "512",
+                "Content-Type": "video/mp4",
+                "X-TrustyClaw-Filename": "generated.mp4",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"HOME": directory}):
+            with self.assertRaisesRegex(RuntimeError, "ended early"):
+                tools_mcp_shim._materialize_stream(response)  # type: ignore[arg-type]
+            self.assertEqual(list((Path(directory) / "tool_assets").iterdir()), [])
+
+    def test_rejects_symlinked_tool_assets_directory(self) -> None:
+        response = _MemoryResponse(
+            b"x",
+            **{
+                "Content-Length": "1",
+                "Content-Type": "application/octet-stream",
+                "X-TrustyClaw-Filename": "generated.bin",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as target:
+            (Path(directory) / "tool_assets").symlink_to(target)
+            with patch.dict(os.environ, {"HOME": directory}), self.assertRaisesRegex(
+                RuntimeError, "storage is unavailable"
+            ):
+                tools_mcp_shim._materialize_stream(response)  # type: ignore[arg-type]
+            self.assertEqual(list(Path(target).iterdir()), [])
 
 
 class ToolsApiTestCase(unittest.TestCase):
@@ -140,6 +206,7 @@ class ToolsSocketTests(ToolsApiTestCase):
             agent_uids if agent_uids is not None else frozenset({os.getuid()}),
             admin_uids,
         )
+        self.last_server = server
         import threading
 
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -331,6 +398,65 @@ class ToolsSocketTests(ToolsApiTestCase):
         # The operator route reached the handler (unknown tool -> 404), not the cap.
         self.assertEqual(op_status, 404)
 
+    def test_streaming_result_writes_host_named_agent_file_without_spool(self) -> None:
+        socket_path = self.start_server()
+        payload = b"v" * 512
+
+        @contextmanager
+        def open_stream():
+            yield OpenedStreamingAsset("runway-task.mp4", "video/mp4", len(payload), io.BytesIO(payload))
+
+        with state.mutation() as cur:
+            state.set_tool_enabled(cur, "runway", True)
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(
+                    tools_host.BUNDLED_TOOLS["runway"],
+                    "execute",
+                    return_value=StreamingAsset(open_stream),
+                ),
+                patch.dict(os.environ, {"HOME": directory}),
+            ):
+                response = tools_mcp_shim._tools_action_request(
+                    {"name": "runway_save_video", "input": {"task_id": "task-1"}},
+                    socket_path,
+                )
+            result = response["result"]
+            self.assertRegex(result["path"], r"^/tool_assets/asset-[0-9a-f]{32}\.mp4$")
+            self.assertEqual((Path(directory) / result["path"].lstrip("/")).read_bytes(), payload)
+            self.assertEqual(result, {
+                "path": result["path"],
+                "media_type": "video/mp4",
+                "size_bytes": len(payload),
+            })
+        spool = Path(socket_path).parent / "assets"
+        self.assertFalse(spool.exists() and any(spool.iterdir()))
+
+    def test_streaming_result_removes_partial_file_when_source_ends_early(self) -> None:
+        socket_path = self.start_server()
+
+        @contextmanager
+        def open_stream():
+            yield OpenedStreamingAsset("runway-task.mp4", "video/mp4", 512, io.BytesIO(b"short"))
+
+        with state.mutation() as cur:
+            state.set_tool_enabled(cur, "runway", True)
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(
+                    tools_host.BUNDLED_TOOLS["runway"],
+                    "execute",
+                    return_value=StreamingAsset(open_stream),
+                ),
+                patch.dict(os.environ, {"HOME": directory}),
+                self.assertRaises((RuntimeError, http.client.IncompleteRead)),
+            ):
+                tools_mcp_shim._tools_action_request(
+                    {"name": "runway_save_video", "input": {"task_id": "task-1"}},
+                    socket_path,
+                )
+            self.assertEqual(list((Path(directory) / "tool_assets").iterdir()), [])
+
     def test_stalled_request_is_closed_by_the_read_timeout(self) -> None:
         # A peer that connects and never finishes its request must not pin a
         # handler thread: the read timeout closes the connection instead.
@@ -363,6 +489,7 @@ class McpShimTests(ToolsApiTestCase):
         env = os.environ.copy()
         env["TRUSTYCLAW_TOOLS_SOCKET"] = socket_path
         env["PYTHONPATH"] = str(REPO_ROOT)
+        env["HOME"] = str(Path(socket_path).parent)
         shim = subprocess.Popen(
             [sys.executable, "-m", "host.runtime.tools_mcp_shim"],
             cwd=REPO_ROOT,
@@ -392,10 +519,11 @@ class McpShimTests(ToolsApiTestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-        # Enable runway so its actions list (which makes both media staging
-        # actions advertised) and staging into it passes the enablement gate.
+        # Enable Runway and Instagram so their actions and the matching public
+        # staging actions appear in the MCP surface.
         with state.mutation() as cur:
             state.set_tool_enabled(cur, "runway", True)
+            state.set_tool_enabled(cur, "instagram", True)
         shim = self.start_shim(socket_path)
 
         initialized = self.rpc(shim, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
@@ -413,6 +541,20 @@ class McpShimTests(ToolsApiTestCase):
         self.assertIn("stage_video", names)
         self.assertIn("app_api", names)
         self.assertTrue(all("inputSchema" in tool for tool in listed["result"]["tools"]))
+        by_name = {tool["name"]: tool for tool in listed["result"]["tools"]}
+        save_schema = by_name["runway_save_video"]["inputSchema"]
+        self.assertEqual(save_schema["required"], ["task_id"])
+        self.assertNotIn("path", save_schema["properties"])
+        edit_schema = by_name["runway_edit_video"]["inputSchema"]
+        self.assertIn("video_asset_id", edit_schema["properties"])
+        self.assertNotIn("video_path", edit_schema["properties"])
+        generate_schema = by_name["runway_generate_video"]["inputSchema"]
+        self.assertIn("image_asset_id", generate_schema["properties"])
+        self.assertNotIn("image_path", generate_schema["properties"])
+        publish_schema = by_name["instagram_post_reel"]["inputSchema"]
+        self.assertEqual(publish_schema["required"], ["video_asset_id"])
+        self.assertIn("video_asset_id", publish_schema["properties"])
+        self.assertNotIn("path", publish_schema["properties"])
 
         video = Path(socket_dir.name) / "clip.mp4"
         video.write_bytes(b"x" * 512)
@@ -424,7 +566,7 @@ class McpShimTests(ToolsApiTestCase):
                 "method": "tools/call",
                 "params": {
                     "name": "stage_video",
-                    "arguments": {"path": str(video), "for_tool": "runway"},
+                    "arguments": {"path": "/clip.mp4", "for_tool": "runway"},
                 },
             },
         )
@@ -445,7 +587,7 @@ class McpShimTests(ToolsApiTestCase):
                 "method": "tools/call",
                 "params": {
                     "name": "stage_image",
-                    "arguments": {"path": str(image), "for_tool": "runway"},
+                    "arguments": {"path": "/frame.png", "for_tool": "runway"},
                 },
             },
         )
@@ -465,7 +607,7 @@ class McpShimTests(ToolsApiTestCase):
                 "method": "tools/call",
                 "params": {
                     "name": "stage_video",
-                    "arguments": {"path": str(symlink), "for_tool": "runway"},
+                    "arguments": {"path": "/linked.mp4", "for_tool": "runway"},
                 },
             },
         )

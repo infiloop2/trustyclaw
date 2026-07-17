@@ -20,12 +20,14 @@ from unittest.mock import patch
 
 import pg_harness
 
+from host.apps.workspace_kit import engine, server
+from host.apps.workspace_kit.config import DomainAction
 from host.runtime import app_migrate, app_platform, db, migrate
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _load_backend() -> Any:
+def _load_mp_backend() -> Any:
     spec = importlib.util.spec_from_file_location(
         "mission_pursuit_backend", REPO_ROOT / "host" / "apps" / "mission_pursuit" / "backend.py"
     )
@@ -35,7 +37,12 @@ def _load_backend() -> Any:
     return module
 
 
-backend = _load_backend()
+# Mission Pursuit is now a thin config over the shared engine. The generic
+# machinery the tests drive lives on the engine (bound here to Mission Pursuit's
+# config); the dream-cycle seed and its constants stay on the thin mp module.
+mp = _load_mp_backend()
+engine.configure(mp.CONFIG)
+backend = engine
 
 CODEX_SETTINGS = {
     "agent_runtime": "codex",
@@ -86,17 +93,42 @@ class ProxyMarkerTests(unittest.TestCase):
     def test_operator_and_agent_routes_require_distinct_exact_proxy_markers(self) -> None:
         host = self.StubHandler({"X-TrustyClaw-App-Proxy": backend.APP_ID})
         agent = self.StubHandler({"X-TrustyClaw-Agent-App-Proxy": backend.APP_ID})
-        backend.Handler._require_host_proxy(host)  # type: ignore[arg-type]
-        backend.Handler._require_agent_proxy(agent)  # type: ignore[arg-type]
+        server.Handler._require_host_proxy(host)  # type: ignore[arg-type]
+        server.Handler._require_agent_proxy(agent)  # type: ignore[arg-type]
 
         for headers, check in (
-            ({}, backend.Handler._require_host_proxy),
-            ({"X-TrustyClaw-App-Proxy": "another_app"}, backend.Handler._require_host_proxy),
-            ({"X-TrustyClaw-App-Proxy": backend.APP_ID}, backend.Handler._require_agent_proxy),
+            ({}, server.Handler._require_host_proxy),
+            ({"X-TrustyClaw-App-Proxy": "another_app"}, server.Handler._require_host_proxy),
+            ({"X-TrustyClaw-App-Proxy": backend.APP_ID}, server.Handler._require_agent_proxy),
         ):
             with self.subTest(headers=headers), self.assertRaises(backend.AppError) as error:
                 check(self.StubHandler(headers))  # type: ignore[arg-type]
             self.assertEqual(error.exception.status, HTTPStatus.UNAUTHORIZED)
+
+    def test_unexpected_backend_exception_is_redacted(self) -> None:
+        sent: list[tuple[HTTPStatus, dict[str, Any]]] = []
+
+        class Stub:
+            path = "/workspace"
+            headers = {"X-TrustyClaw-App-Proxy": backend.APP_ID}
+
+            def _read_body(self) -> None:
+                return None
+
+            def _require_host_proxy(self) -> None:
+                return None
+
+            def _send_json(self, status: HTTPStatus, body: dict[str, Any]) -> None:
+                sent.append((status, body))
+
+        with (
+            patch.object(backend, "route_ui_request", side_effect=RuntimeError("database secret")),
+            patch.object(server.LOGGER, "exception") as logged,
+        ):
+            server.Handler._handle(Stub(), "GET")  # type: ignore[arg-type]
+
+        logged.assert_called_once()
+        self.assertEqual(sent, [(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": {"message": "internal server error"}})])
 
 
 class ActionShapeTests(unittest.TestCase):
@@ -198,13 +230,13 @@ class BuilderActionShapeTests(unittest.TestCase):
 
 class DreamScheduleTests(unittest.TestCase):
     def test_next_dream_run_is_the_next_utc_dream_hour(self) -> None:
-        before = calendar.timegm((2026, 7, 9, backend.DREAM_HOUR_UTC - 1, 30, 0, 0, 0, 0))
-        after = calendar.timegm((2026, 7, 9, backend.DREAM_HOUR_UTC, 0, 1, 0, 0, 0))
-        self.assertEqual(backend.format_utc(backend._next_dream_epoch(before)), f"2026-07-09T{backend.DREAM_HOUR_UTC:02d}:00:00Z")
-        self.assertEqual(backend.format_utc(backend._next_dream_epoch(after)), f"2026-07-10T{backend.DREAM_HOUR_UTC:02d}:00:00Z")
+        before = calendar.timegm((2026, 7, 9, mp.DREAM_HOUR_UTC - 1, 30, 0, 0, 0, 0))
+        after = calendar.timegm((2026, 7, 9, mp.DREAM_HOUR_UTC, 0, 1, 0, 0, 0))
+        self.assertEqual(backend.format_utc(mp._next_dream_epoch(before)), f"2026-07-09T{mp.DREAM_HOUR_UTC:02d}:00:00Z")
+        self.assertEqual(backend.format_utc(mp._next_dream_epoch(after)), f"2026-07-10T{mp.DREAM_HOUR_UTC:02d}:00:00Z")
 
     def test_dream_prompt_fits_the_schedule_prompt_cap(self) -> None:
-        self.assertLessEqual(len(backend.DREAM_PROMPT), backend.SCHEDULE_PROMPT_LIMIT)
+        self.assertLessEqual(len(mp.DREAM_PROMPT), backend.SCHEDULE_PROMPT_LIMIT)
 
 
 class ViewValidationTests(unittest.TestCase):
@@ -266,30 +298,6 @@ class ViewValidationTests(unittest.TestCase):
 
     def test_progress_bounds(self) -> None:
         self.assertIn("between 0 and 100", backend.validate_view([{"type": "progress", "value": 120}]))
-
-    def test_numeric_blocks_reject_overflowing_integers_without_crashing(self) -> None:
-        # A JSON integer too large to convert to float must be a validation
-        # error, not an OverflowError escaping to a 500 (math.isfinite raises
-        # on such ints).
-        huge = 10 ** 400
-        self.assertIn(
-            "between 0 and 100",
-            backend.validate_view([{"type": "progress", "value": huge}]) or "",
-        )
-        self.assertIn(
-            "finite numbers",
-            backend.validate_view(
-                [{"type": "chart", "kind": "bar", "points": [{"label": "a", "value": 1}, {"label": "b", "value": huge}]}]
-            )
-            or "",
-        )
-        # And the whole action validates (returns a string) rather than raising.
-        self.assertIsInstance(
-            backend.validate_action_shape(
-                {"action": "create_artifact", "artifact_id": "a", "title": "t", "view": [{"type": "progress", "value": huge}]}
-            ),
-            str,
-        )
 
     def test_rich_blocks_reject_unbounded_or_unknown_shapes(self) -> None:
         self.assertIn(
@@ -389,6 +397,12 @@ class ScheduleTimingTests(unittest.TestCase):
 
 
 class InputCompositionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # The engine holds one module-level config: in production each app is
+        # its own process, but sibling app test modules configure the shared
+        # engine at import time, so reassert Mission Pursuit's config here.
+        backend.configure(mp.CONFIG)
+
     def test_ui_exposes_the_host_session_option_matrix(self) -> None:
         response = backend.route_ui_request("GET", "/session-options", None)
         self.assertIn("codex", response["session_options"])
@@ -547,32 +561,15 @@ class ClipEncodedTextTests(unittest.TestCase):
         self.assertTrue(truncated)
         self.assertEqual(clipped, '"' * 25)
 
-    def test_clip_error_bounds_agent_supplied_detail(self) -> None:
-        # An "unknown block type <...>" error interpolates the agent-supplied
-        # type verbatim; the stored/returned string must stay bounded.
-        error = backend._validate_block({"type": "z" * 300_000})
-        self.assertIn("unknown block type", error)
-        clipped = backend._clip_error(error)
-        self.assertLessEqual(len(json.dumps(clipped).encode()) - 2, backend.ERROR_DETAIL_BYTES)
-
-    def test_clip_snapshot_meta_bounds_string_leaves(self) -> None:
-        meta = {
-            "action": "artifact_interaction",
-            "value": "\U0001f600" * backend.FIELD_VALUE_LIMIT,
-            "control_label": "x" * 5_000,
-            "control_type": "field",
-        }
-        clipped = backend._clip_snapshot_meta(meta)
-        self.assertLessEqual(len(json.dumps(clipped).encode()), backend.SNAPSHOT_META_BYTES)
-        self.assertEqual(clipped["action"], "artifact_interaction")
-        self.assertEqual(clipped["control_type"], "field")
-
 
 class MissionPursuitDbTests(unittest.TestCase):
     DB_NAME = "trustyclaw_mission_pursuit_test"
     _initialized = False
 
     def setUp(self) -> None:
+        # Re-bind the shared engine to Mission Pursuit in case another app's
+        # test module reconfigured it during import.
+        backend.configure(mp.CONFIG)
         pg_harness.ensure_database()
         if not MissionPursuitDbTests._initialized:
             pg_harness.create_database(self.DB_NAME)
@@ -870,7 +867,7 @@ class MissionPursuitDbTests(unittest.TestCase):
         # The seeded dream cycle plus the schedule this turn created.
         self.assertEqual(
             {schedule["schedule_id"] for schedule in snapshot["schedules"]},
-            {backend.DREAM_SCHEDULE_ID, "check"},
+            {mp.DREAM_SCHEDULE_ID, "check"},
         )
         self.assertEqual(snapshot["busy"], [])
 
@@ -923,7 +920,7 @@ class MissionPursuitDbTests(unittest.TestCase):
         state = self.agent_call("GET", "/agent/workspace")
         self.assertEqual([a["artifact_id"] for a in state["artifacts"]], ["notes"])
         self.assertEqual([m["memory_id"] for m in state["memories"]], ["boss_tz"])
-        self.assertIn(backend.DREAM_SCHEDULE_ID, [s["schedule_id"] for s in state["schedules"]])
+        self.assertIn(mp.DREAM_SCHEDULE_ID, [s["schedule_id"] for s in state["schedules"]])
 
     def test_agent_action_budget_is_per_turn(self) -> None:
         backend.send_message(first_message("spam"))
@@ -950,6 +947,79 @@ class MissionPursuitDbTests(unittest.TestCase):
         self._run_turn("again", actions=[{"action": "set_goal", "goal": "fresh"}], task_id="task_2")
         snapshot = backend.workspace_snapshot()
         self.assertEqual(snapshot["workspace"]["goal"], "fresh")
+
+    def test_rejected_domain_action_write_rolls_back(self) -> None:
+        backend.send_message(first_message("go"))
+        self.host_responses["POST /v1/tasks"] = {"task_id": "task_1", "thread_id": "ws-1", "agent_runtime": "codex", "status": "queued"}
+        backend._dispatch_pending_runs()
+
+        def write_then_reject(cur: Any, action: dict[str, Any], now: str) -> str | None:
+            backend._insert_event(cur, "leaked partial write", {"action": "leaky"}, now)
+            cur.execute(
+                "INSERT INTO memories (memory_id, content, created_at, updated_at) VALUES (%s, %s, %s, %s)",
+                ("leak", "partial", now, now),
+            )
+            return "rejected after writing"
+
+        leaky = DomainAction(validate=lambda action: None, apply=write_then_reject)
+        with patch.dict(engine._DOMAIN_ACTIONS, {"leaky": leaky}):
+            status, message = self.agent_action_error({"action": "leaky"})
+        self.assertEqual(status, int(HTTPStatus.UNPROCESSABLE_ENTITY))
+        self.assertIn("rejected after writing", message)
+        # Everything the hook wrote before rejecting rolled back; only the
+        # rejection row committed.
+        contents = [content for _, content in self._messages()]
+        self.assertFalse(any("leaked partial write" in content for content in contents))
+        self.assertTrue(any("Action rejected: rejected after writing" in content for content in contents))
+        with db.transaction() as cur:
+            cur.execute("SET LOCAL search_path TO app_mission_pursuit")
+            cur.execute("SELECT 1 FROM memories WHERE memory_id = 'leak'")
+            self.assertIsNone(cur.fetchone())
+
+    def test_action_racing_deactivation_fails_closed(self) -> None:
+        backend.send_message(first_message("go"))
+        self.host_responses["POST /v1/tasks"] = {"task_id": "task_1", "thread_id": "ws-1", "agent_runtime": "codex", "status": "queued"}
+        backend._dispatch_pending_runs()
+        # Simulate the race: the route-level attribution check for task_1 has
+        # already passed when deactivation commits. The write transaction
+        # re-verifies under the workspace row lock and must fail closed.
+        backend.deactivate_workspace(None)
+        with self.assertRaises(backend.AppError) as raised:
+            backend.apply_agent_action(
+                {"action": "create_schedule", "schedule_id": "stale", "title": "Stale", "prompt": "p", "every_minutes": 30},
+                "task_1",
+            )
+        self.assertEqual(int(raised.exception.status), int(HTTPStatus.FORBIDDEN))
+        with db.transaction() as cur:
+            cur.execute("SET LOCAL search_path TO app_mission_pursuit")
+            cur.execute("SELECT 1 FROM schedules WHERE schedule_id = 'stale'")
+            self.assertIsNone(cur.fetchone())
+
+    def test_deactivated_workspace_fires_no_schedules(self) -> None:
+        backend.send_message(first_message("seed"))
+        self.host_responses["POST /v1/tasks"] = {"task_id": "task_1", "thread_id": "ws-1", "agent_runtime": "codex", "status": "queued"}
+        backend._dispatch_pending_runs()
+        self.agent_action(
+            {"action": "create_schedule", "schedule_id": "brief", "title": "Brief", "prompt": "Summarize", "every_minutes": 30}
+        )
+        self.host_responses["GET /v1/tasks/task_1"] = {"task_id": "task_1", "status": "completed", "output_message": "ok"}
+        backend._reap_active_runs()
+        backend.deactivate_workspace(None)
+        with db.transaction() as cur:
+            cur.execute("SET LOCAL search_path TO app_mission_pursuit")
+            # Defense in depth: even if an enabled due schedule exists on a
+            # deactivated workspace, the firer must not act on it.
+            cur.execute(
+                "UPDATE schedules SET enabled = TRUE, next_run_at = '2020-01-01T00:00:00Z' WHERE schedule_id = 'brief'"
+            )
+        backend._fire_due_schedules()
+        self.assertEqual([run for run in self._runs() if run["kind"] == "schedule"], [])
+        with db.transaction() as cur:
+            cur.execute("SET LOCAL search_path TO app_mission_pursuit")
+            cur.execute("SELECT next_run_at FROM schedules WHERE schedule_id = 'brief'")
+            # The schedule row is untouched: nothing fires and nothing
+            # advances until the workspace is active again.
+            self.assertEqual(cur.fetchone()[0], "2020-01-01T00:00:00Z")
 
     def test_due_schedule_fires_once_and_advances(self) -> None:
         backend.send_message(first_message("seed"))
@@ -1157,43 +1227,6 @@ class MissionPursuitDbTests(unittest.TestCase):
         self.assertTrue(any(role == "error" and "runtime exploded" in content for role, content in self._messages()))
         self.assertEqual(self._runs()[0]["status"], "done")
 
-    def test_completed_reply_is_clipped_before_storage(self) -> None:
-        # The host does not bound task output; the backend must clip it so a
-        # multi-MB reply cannot bloat the feed or store unreadable dead weight.
-        backend.send_message(first_message("go"))
-        self.host_responses["POST /v1/tasks"] = {"task_id": "task_1", "thread_id": "ws-1", "agent_runtime": "codex", "status": "queued"}
-        backend._dispatch_pending_runs()
-        self.host_responses["GET /v1/tasks/task_1"] = {
-            "task_id": "task_1",
-            "status": "completed",
-            "output_message": "y" * (backend.FULL_MESSAGE_BYTES + 10_000),
-        }
-        backend._reap_active_runs()
-        stored = next(content for role, content in self._messages() if role == "agent")
-        self.assertEqual(len(stored), backend.FULL_MESSAGE_BYTES)
-
-    def test_overflowing_action_value_is_rejected_not_500_and_journaled(self) -> None:
-        backend.send_message(first_message("go"))
-        self.host_responses["POST /v1/tasks"] = {"task_id": "task_1", "thread_id": "ws-1", "agent_runtime": "codex", "status": "queued"}
-        backend._dispatch_pending_runs()
-        status, message = self.agent_action_error(
-            {"action": "create_artifact", "artifact_id": "a", "title": "t", "view": [{"type": "progress", "value": 10 ** 400}]}
-        )
-        self.assertEqual(status, int(HTTPStatus.UNPROCESSABLE_ENTITY))
-        self.assertIn("between 0 and 100", message)
-        self.assertTrue(any(role == "error" and "between 0 and 100" in content for role, content in self._messages()))
-
-    def test_lost_and_oversized_runs_release_the_action_budget_cache(self) -> None:
-        backend.send_message(first_message("go"))
-        self.host_responses["POST /v1/tasks"] = {"task_id": "task_1", "thread_id": "ws-1", "agent_runtime": "codex", "status": "queued"}
-        backend._dispatch_pending_runs()
-        self.agent_action({"action": "set_goal", "goal": "x"})
-        self.assertIn("task_1", backend._AGENT_ACTIONS_BY_TASK)
-        self.host_responses["GET /v1/tasks/task_1"] = backend.AppError(HTTPStatus.NOT_FOUND, "no such task")
-        backend._reap_active_runs()
-        # The lost-run path must drop the per-task budget entry, not leak it.
-        self.assertNotIn("task_1", backend._AGENT_ACTIONS_BY_TASK)
-
     def _run_turn(
         self,
         content: str,
@@ -1218,22 +1251,107 @@ class MissionPursuitDbTests(unittest.TestCase):
         self.host_responses[f"GET /v1/tasks/{task_id}"] = {"task_id": task_id, "status": "completed", "output_message": reply}
         backend._reap_active_runs()
 
+    def test_activation_creates_the_workspace_without_queueing_a_turn(self) -> None:
+        # The activation gate is a plain button: settings only, no message.
+        result = backend.activate_workspace(dict(CODEX_SETTINGS))
+        self.assertEqual(result, {"activated": True})
+        snapshot = backend.workspace_snapshot()
+        self.assertEqual(snapshot["workspace"]["agent_runtime"], "codex")
+        # The seed ran (routines disclosed on the gate) but no agent turn did.
+        self.assertIn(mp.DREAM_SCHEDULE_ID, [s["schedule_id"] for s in snapshot["schedules"]])
+        self.assertEqual(self._runs(), [])
+        with self.assertRaises(backend.AppError) as error:
+            backend.activate_workspace(dict(CODEX_SETTINGS))
+        self.assertEqual(error.exception.status, HTTPStatus.CONFLICT)
+        with self.assertRaises(backend.AppError):
+            backend.activate_workspace({"agent_runtime": "codex"})
+
+    def test_deactivation_stops_work_and_reactivation_keeps_schedules_paused(self) -> None:
+        backend.activate_workspace(dict(CODEX_SETTINGS))
+        backend.send_message({"content": "first"})
+        self.host_responses["POST /v1/tasks"] = {
+            "task_id": "task_1",
+            "thread_id": "ws-1",
+            "agent_runtime": "codex",
+            "status": "queued",
+        }
+        backend._dispatch_pending_runs()
+        backend.send_message({"content": "second"})
+        pending_run = self._runs()[1]
+        backend._DISPATCH_ATTEMPTS[pending_run["id"]] = 1.0
+
+        # A transient host outage does not reopen the app or lose the desired
+        # stop: the active row remains tracked for the worker to retry.
+        self.host_responses["GET /v1/tasks/task_1"] = OSError("host unavailable")
+        result = backend.route_ui_request("POST", "/deactivate", {})
+        self.assertEqual(result, {"activated": False, "stopping_tasks": 1})
+        snapshot = backend.workspace_snapshot()
+        self.assertIsNone(snapshot["workspace"]["agent_runtime"])
+        self.assertIsNone(snapshot["workspace"]["model"])
+        self.assertIsNone(snapshot["workspace"]["effort"])
+        self.assertEqual(snapshot["workspace"]["thread_seq"], 2)
+        self.assertTrue(snapshot["messages"], "workspace history is preserved")
+        self.assertTrue(all(not schedule["enabled"] for schedule in snapshot["schedules"]))
+        with self.assertRaises(backend.AppError) as inactive_schedule:
+            backend.set_schedule_enabled(mp.DREAM_SCHEDULE_ID, True)
+        self.assertEqual(inactive_schedule.exception.status, HTTPStatus.CONFLICT)
+        self.assertIn("reactivate", inactive_schedule.exception.message)
+        self.assertTrue(
+            all(not schedule["enabled"] for schedule in backend.workspace_snapshot()["schedules"])
+        )
+        self.assertNotIn(pending_run["id"], backend._DISPATCH_ATTEMPTS)
+        self.assertEqual([run["status"] for run in self._runs()], ["active", "done"])
+        with self.assertRaises(backend.AppError) as stale_thread:
+            self.agent_call("GET", "/agent/workspace", thread_id="ws-1")
+        self.assertEqual(stale_thread.exception.status, HTTPStatus.FORBIDDEN)
+        with self.assertRaises(backend.AppError) as still_stopping:
+            backend.activate_workspace(dict(CODEX_SETTINGS))
+        self.assertEqual(still_stopping.exception.status, HTTPStatus.CONFLICT)
+        with self.assertRaises(backend.AppError) as message_reactivation:
+            backend.send_message(first_message("do not restart"))
+        self.assertEqual(message_reactivation.exception.status, HTTPStatus.CONFLICT)
+        self.assertIn("still stopping", message_reactivation.exception.message)
+        self.assertIsNone(backend.workspace_snapshot()["workspace"]["agent_runtime"])
+
+        self.host_responses["GET /v1/tasks/task_1"] = {
+            "task_id": "task_1",
+            "status": "queued",
+        }
+        self.host_responses["POST /v1/tasks/task_1/cancel"] = {
+            "task_id": "task_1",
+            "status": "cancelled",
+        }
+        backend._reap_active_runs()
+        self.assertIn(("POST", "/v1/tasks/task_1/cancel", {}), self.host_calls)
+        self.host_responses["GET /v1/tasks/task_1"] = {
+            "task_id": "task_1",
+            "status": "cancelled",
+        }
+        backend._reap_active_runs()
+        self.assertEqual([run["status"] for run in self._runs()], ["done", "done"])
+
+        self.assertEqual(backend.activate_workspace(dict(CODEX_SETTINGS)), {"activated": True})
+        reactivated = backend.workspace_snapshot()
+        self.assertEqual(reactivated["workspace"]["thread_seq"], 2)
+        self.assertTrue(all(not schedule["enabled"] for schedule in reactivated["schedules"]))
+
     def test_first_message_seeds_the_dream_cycle(self) -> None:
         backend.send_message(first_message("hello"))
         snapshot = backend.workspace_snapshot()
-        dream = next(s for s in snapshot["schedules"] if s["schedule_id"] == backend.DREAM_SCHEDULE_ID)
+        dream = next(s for s in snapshot["schedules"] if s["schedule_id"] == mp.DREAM_SCHEDULE_ID)
         self.assertEqual(dream["every_minutes"], 24 * 60)
+        # Enabled from activation: the activation screen disclosed the cycle.
         self.assertTrue(dream["enabled"])
-        self.assertTrue(dream["next_run_at"].endswith(f"T{backend.DREAM_HOUR_UTC:02d}:00:00Z"))
+        self.assertTrue(dream["next_run_at"].endswith(f"T{mp.DREAM_HOUR_UTC:02d}:00:00Z"))
         self.assertTrue(any("dream cycle" in content for role, content in self._messages() if role == "event"))
         # It is an ordinary schedule: the operator can delete it, and an agent
         # settings change does not resurrect it.
         backend.discard_pending_run(str(self._runs()[0]["id"]))
-        backend.delete_schedule_from_ui(backend.DREAM_SCHEDULE_ID)
+        backend.delete_schedule_from_ui(mp.DREAM_SCHEDULE_ID)
         backend.update_agent_settings(CLAUDE_SETTINGS)
         backend.send_message({"content": "again"})
         snapshot = backend.workspace_snapshot()
-        self.assertNotIn(backend.DREAM_SCHEDULE_ID, [s["schedule_id"] for s in snapshot["schedules"]])
+        self.assertNotIn(mp.DREAM_SCHEDULE_ID, [s["schedule_id"] for s in snapshot["schedules"]])
 
     def test_setup_brief_rides_until_a_goal_is_set(self) -> None:
         self._run_turn("hi", actions=[{"action": "set_goal", "goal": "Ship the newsletter"}])

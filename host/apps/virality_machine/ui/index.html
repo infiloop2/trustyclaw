@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Virality Machine</title>
+<link rel="stylesheet" href="/admin_ui.css">
+<link rel="stylesheet" href="/workspace-kit/view_blocks.css">
+<link rel="stylesheet" href="virality_machine.css">
+</head>
+<body>
+<main class="app-shell">
+  <header class="app-frame-head">
+    <div class="app-title-group">
+      <div class="app-mark" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 20 20"><rect x="3" y="4.5" width="14" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8.5 8.2v3.6l3-1.8z" fill="currentColor"/></svg>
+      </div>
+      <div>
+        <h1 class="app-frame-title">Virality Machine</h1>
+      </div>
+    </div>
+    <div class="app-frame-actions">
+      <span id="connections-pill" class="connections-pill" role="status" hidden></span>
+      <button class="header-action danger" id="deactivate-app" hidden>Deactivate</button>
+      <button class="header-action" id="agent-settings-toggle" aria-expanded="false" aria-controls="agent-settings-popover" disabled>Agent settings</button>
+      <button class="header-action" id="info-toggle" aria-expanded="false" aria-controls="info-popover">How it works</button>
+      <div id="agent-settings-popover" class="anchored-popover settings-popover" role="dialog" aria-labelledby="agent-settings-title" hidden>
+        <div class="settings-head">
+          <div>
+            <span class="popover-eyebrow">Agent</span>
+            <h3 id="agent-settings-title">Choose how your agent works</h3>
+            <p>These settings apply to chat and scheduled work.</p>
+          </div>
+          <button class="icon-button" id="agent-settings-cancel" aria-label="Close agent settings">&times;</button>
+        </div>
+        <div class="settings-fields">
+          <label class="field">
+            <span class="field-label">Runtime</span>
+            <select id="agent-runtime"></select>
+          </label>
+          <label class="field">
+            <span class="field-label">Model</span>
+            <select id="agent-model"></select>
+          </label>
+          <label class="field">
+            <span class="field-label">Effort</span>
+            <select id="agent-effort"></select>
+          </label>
+        </div>
+        <div id="agent-settings-warning" class="settings-warning" hidden>
+          Changing the agent restarts its short-term memory. Your goal, artifacts,
+          schedules, memories, render queue, and activity stay here.
+        </div>
+        <div class="settings-actions">
+          <span id="agent-settings-note" class="muted"></span>
+          <button class="settings-apply sm" id="agent-settings-apply" disabled>Apply changes</button>
+        </div>
+      </div>
+      <div id="info-popover" class="anchored-popover info-popover" role="dialog" aria-labelledby="info-title" hidden>
+        <div class="popover-head">
+          <div>
+            <span class="popover-eyebrow">Your workspace</span>
+            <h3 id="info-title">How Virality Machine works</h3>
+          </div>
+        </div>
+        <div class="info-steps">
+          <div class="info-step">
+            <span class="info-step-number">1</span>
+            <div><strong>Set the channel and cadence</strong><p>Tell the agent your niche, style, and how many Reels you want, and agree on how progress is measured.</p></div>
+          </div>
+          <div class="info-step">
+            <span class="info-step-number">2</span>
+            <div><strong>Ideate and storyboard</strong><p>The agent researches trends, drafts concepts, and lays out shots. Generated clips render asynchronously in the render queue.</p></div>
+          </div>
+          <div class="info-step">
+            <span class="info-step-number">3</span>
+            <div><strong>Review and publish</strong><p>Finished Reels land in the publish queue. Publishing to Instagram always waits for your approval.</p></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+  <div id="status" class="app-status" hidden></div>
+
+  <div id="hero" class="hero" hidden>
+    <div class="hero-inner">
+      <div class="hero-mark" aria-hidden="true">
+        <svg width="34" height="34" viewBox="0 0 20 20"><rect x="3" y="4.5" width="14" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8.5 8.2v3.6l3-1.8z" fill="currentColor"/></svg>
+      </div>
+      <h2 class="hero-title">Virality Machine</h2>
+      <p class="hero-sub">Turn trends into publish-ready short-form video, with your agent.</p>
+      <div class="hero-about">
+        <div class="hero-about-block">
+          <span class="hero-about-label">What it does</span>
+          <p>Plans short-form reels, drives Runway renders through a queue, and publishes to Instagram only after your explicit approval.</p>
+        </div>
+        <div class="hero-about-block">
+          <span class="hero-about-label">Tools it uses</span>
+          <p>Runway, Instagram (approval-gated publishing), Instagram Discovery, X, and Brave Search. Each stays off until you enable it on the host's Tools page.</p>
+        </div>
+        <div class="hero-about-block">
+          <span class="hero-about-label">Background routines</span>
+          <p>Starts on activation: a daily Instagram trend scan. Pause, edit, or delete it anytime under Schedules.</p>
+        </div>
+      </div>
+      <div class="hero-actions">
+        <button class="send-button with-label" id="hero-send" aria-label="Activate" title="Activate this workspace">
+            <span>Activate</span>
+            <svg width="18" height="18" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11M11 6l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        <span class="hero-hint" id="hero-hint">Starts the app and the routines above. The conversation begins whenever you send the first message.</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="workspace" class="workspace" hidden>
+    <section class="conversation" aria-label="Conversation">
+      <div class="conversation-head">
+        <div><span class="panel-eyebrow">Collaborate</span><h2>Conversation</h2></div>
+        <span class="conversation-note">Direct the work. The panels hold the reel.</span>
+      </div>
+      <div id="goal-banner" class="goal-banner" hidden></div>
+      <div id="feed" class="feed"></div>
+      <div id="busy-bar" class="busy-bar" hidden>
+        <span class="busy-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span id="busy-text">Working</span>
+        <button class="ghost sm" id="stop-task" hidden>Stop</button>
+      </div>
+      <div class="composer composer-surface">
+        <textarea id="chat-input" rows="2" placeholder="Message your agent"></textarea>
+        <div class="composer-footer">
+          <span><kbd>&#8984;</kbd><kbd>Enter</kbd> to send</span>
+          <button class="send-button" id="chat-send" aria-label="Send" title="Send message">
+            <svg width="18" height="18" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11M11 6l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+      </div>
+    </section>
+    <aside class="rail" aria-label="Workspace panels">
+      <section class="rail-card storyboard-card">
+        <div class="rail-head">
+          <div><span class="panel-eyebrow">Compose</span><h2>Storyboard</h2></div>
+          <span class="panel-hint">Ordered shots</span>
+        </div>
+        <div id="storyboard" class="rail-list"></div>
+      </section>
+      <section class="rail-card render-card">
+        <div class="rail-head">
+          <div><span class="panel-eyebrow">Runway</span><h2>Render queue</h2></div>
+          <span class="panel-hint" id="render-count"></span>
+        </div>
+        <div id="render-queue" class="rail-list"></div>
+      </section>
+      <section class="rail-card publish-card">
+        <div class="rail-head">
+          <div><span class="panel-eyebrow">Approve</span><h2>Publish queue</h2></div>
+          <span class="panel-hint">Approval-gated</span>
+        </div>
+        <div id="publish-queue" class="rail-list"></div>
+      </section>
+      <section class="rail-card artifacts-card">
+        <div class="rail-head">
+          <div><span class="panel-eyebrow">Operate</span><h2>Artifacts</h2></div>
+          <span class="panel-hint">Ideas and more</span>
+        </div>
+        <div id="artifacts" class="rail-list artifact-grid"></div>
+      </section>
+      <section class="rail-card schedules-card">
+        <div class="rail-head">
+          <div><span class="panel-eyebrow">Automatic</span><h2>Schedules</h2></div>
+        </div>
+        <div id="schedules" class="rail-list"></div>
+      </section>
+      <section class="rail-card memories-card">
+        <div class="rail-head">
+          <div><span class="panel-eyebrow">Remembered</span><h2>Memories</h2></div>
+        </div>
+        <div id="memories" class="rail-list"></div>
+      </section>
+      <section class="rail-card tools-card">
+        <div class="rail-head">
+          <div><span class="panel-eyebrow">Available</span><h2>Tools</h2></div>
+        </div>
+        <div id="tools" class="rail-list"></div>
+      </section>
+    </aside>
+  </div>
+
+  <div id="artifact-overlay" class="artifact-overlay" hidden>
+    <div class="artifact-panel" role="dialog" aria-modal="true" aria-labelledby="artifact-title">
+      <div class="artifact-head">
+        <div class="artifact-head-main">
+          <span class="panel-eyebrow">Artifact</span>
+          <h2 id="artifact-title"></h2>
+          <span id="artifact-updated" class="muted"></span>
+        </div>
+        <button class="artifact-delete-subtle" id="artifact-delete">Delete</button>
+      </div>
+      <div id="artifact-body" class="artifact-body"></div>
+      <div class="artifact-actions">
+        <button class="primary sm" id="artifact-close">Close</button>
+      </div>
+    </div>
+  </div>
+</main>
+<script src="/workspace-kit/view_blocks.js"></script>
+<script src="virality_machine.js"></script>
+</body>
+</html>

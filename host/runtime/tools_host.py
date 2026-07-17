@@ -32,6 +32,7 @@ from host.tools import (
     ApprovalStatus,
     JSONObject,
     StoredCredential,
+    StreamingAsset,
     Tool,
     ToolManifest,
 )
@@ -228,7 +229,6 @@ class HostAssets:
     def delete(self, asset_id: str) -> None:
         self._store.delete(self._tool_id, asset_id)
 
-
 def _approval_record(record: dict[str, Any]) -> ApprovalRecord:
     status: ApprovalStatus = record["status"]
     return ApprovalRecord(
@@ -299,15 +299,25 @@ def enabled_tool(tool_id: str) -> Tool:
 # -- action execution ----------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class StreamingAction:
+    """One exclusive binary action result plus its eventual audit context."""
+
+    asset: StreamingAsset
+    tool_id: str
+    action: str
+    arguments: JSONObject
+
+
 def execute_action(
     tool_id: str,
     action: str,
     tool_input: Any,
     asset_store: tool_assets.ToolAssetStore | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | StreamingAction:
     """Run one agent-initiated action call end to end: resolve the enabled
     tool, schema-validate the input, invoke the package, audit, and return
-    the JSON shape of the result."""
+    either its JSON result shape or an exclusive streaming result."""
     tool = enabled_tool(tool_id)
     spec = tool.manifest.action(action) if isinstance(action, str) else None
     if spec is None:
@@ -333,10 +343,31 @@ def execute_action(
         result = ActionFailed(str(exc))
     except Exception:
         result = ActionFailed("Tool call failed.")
+    if isinstance(result, StreamingAsset):
+        return StreamingAction(result, tool_id, action, audit_arguments)
     result_json = _result_json(result)
     result_json = _validate_output(tool_id, action, spec, result_json)
     _audit(tool_id, action, result_json, arguments=audit_arguments)
     return result_json
+
+
+def finish_streaming_action(streaming: StreamingAction, error: str | None = None) -> None:
+    """Audit a stream only after the transport has completed or failed."""
+    result_json: dict[str, Any]
+    if error is None:
+        result_json = {"status": "executed"}
+    else:
+        result_json = {
+            "status": "failed",
+            "error": error,
+            "reconnect_required": False,
+        }
+    _audit(
+        streaming.tool_id,
+        streaming.action,
+        result_json,
+        arguments=streaming.arguments,
+    )
 
 
 def _execute_approved(

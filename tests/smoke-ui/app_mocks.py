@@ -28,7 +28,7 @@ _SMOKE_MODULES: dict[str, ModuleType | None] = {}
 def route_app_api(
     method: str,
     path: str,
-    _query: dict[str, list[str]],
+    query: dict[str, list[str]],
     body: Any,
     api_error: ApiErrorFactory,
     host_api: HostApi,
@@ -42,7 +42,7 @@ def route_app_api(
     handler = None if module is None else getattr(module, "route_app_api", None)
     if handler is None:
         raise api_error(HTTPStatus.NOT_FOUND, f"mock app service not found: {app_id}")
-    return handler(method, relative, body, api_error, host_api)
+    return handler(method, relative, query, body, api_error, host_api)
 
 
 def _load_app_smoke(app_id: str) -> ModuleType | None:

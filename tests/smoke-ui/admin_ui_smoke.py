@@ -219,6 +219,42 @@ def desktop_smoke(page, url: str) -> None:
     expect(page.locator("#health")).to_contain_text("Admin volume")
     expect(page.locator("#health")).to_contain_text("Agent volume")
     expect(page.locator("#panel-home").get_by_role("button", name="Reboot host")).to_be_visible()
+    # Agent Chat is hardwired as the hero app: home opens with its
+    # "Begin chat" navigator, and its nav entry sits directly below Home,
+    # outside the Apps section.
+    expect(page.locator("#home-hero .home-hero-card")).to_be_visible()
+    expect(page.locator("#home-hero")).to_contain_text("Agent Chat")
+    hero_tab = page.locator("#hero-app-tab").get_by_role("button", name="Agent Chat", exact=True)
+    expect(hero_tab).to_be_visible()
+    hero_box = hero_tab.bounding_box()
+    home_tab_box = page.locator("#tab-home").bounding_box()
+    network_tab_box = page.locator("#tab-network").bounding_box()
+    if (
+        not hero_box
+        or not home_tab_box
+        or not network_tab_box
+        or not home_tab_box["y"] < hero_box["y"] < network_tab_box["y"]
+    ):
+        raise AssertionError("the hero app entry must sit between Home and the other nav tabs")
+    expect(page.locator("#app-tabs").get_by_role("button", name="Agent Chat", exact=True)).to_have_count(0)
+    expect(page.locator("#app-tabs").get_by_role("button", name="Mission Pursuit", exact=True)).to_be_visible()
+    # Below the hero, the host tabs are grouped: Configuration, then Audit,
+    # then Apps (Beta). The beta explanation is nested in the last heading.
+    headings = page.locator("#sidebar .sidebar-section-title:visible")
+    expect(headings).to_have_count(3)
+    expect(headings.nth(0)).to_have_text("Configuration")
+    expect(headings.nth(1)).to_have_text("Audit")
+    expect(headings.nth(2).locator(":scope > span").first).to_have_text("Apps (Beta)")
+    expect(page.locator("#sidebar-configuration .tab-button")).to_have_count(2)
+    expect(page.locator("#sidebar-configuration #tab-network")).to_be_visible()
+    expect(page.locator("#sidebar-audit .tab-button")).to_have_count(6)
+    expect(page.locator("#sidebar-audit #tab-processes")).to_be_visible()
+    expect(page.locator("#sidebar-audit #tab-tool-log")).to_be_visible()
+    page.locator("#home-hero").get_by_role("button", name="Begin chat", exact=True).click()
+    expect(page.locator("#panel-app-agent_chat")).to_be_visible()
+    expect(page.locator("#panel-home")).to_be_hidden()
+    page.get_by_role("button", name="Home", exact=True).click()
+    expect(page.locator("#panel-home")).to_be_visible()
     expect(page.locator("#runtime-overview")).to_contain_text("Codex")
     expect(page.locator("#runtime-overview")).to_contain_text("Claude Code")
     expect(page.locator("#runtime-overview")).to_contain_text("deactivated")
@@ -780,14 +816,15 @@ def desktop_smoke(page, url: str) -> None:
     expect(claude_row.get_by_role("button", name="Start Claude Code login")).to_be_visible()
     page.get_by_role("button", name="Start Codex login").click()
     expect(openai_row.locator(".provider-oauth")).to_contain_text("MOCK-CODEX")
-    # The dashboard refreshes on its own 5-second poll; wait for the next one
-    # rather than reaching into module internals (there is no test-only hook).
+    # The mock completes the device login out of band a couple of seconds
+    # after it starts, like the real flow; the dashboard notices on its own
+    # 5-second poll, so allow two poll rounds for the flip to render.
     with page.expect_response(
         lambda response: "/v1/agent-runtime/account" in response.url and response.request.method == "GET",
         timeout=8000,
     ):
         pass
-    expect(openai_row.get_by_role("button", name="Start Codex login")).to_have_count(0)
+    expect(openai_row.get_by_role("button", name="Start Codex login")).to_have_count(0, timeout=12000)
     expect(openai_row).to_contain_text("connected: akshay@infiloop.io")
     expect(openai_row).to_contain_text("Connected account")
     expect(openai_row.locator(".connection-summary")).to_be_visible()
@@ -985,7 +1022,7 @@ def tools_smoke(page) -> None:
         "TrustyClaw does not publish the media"
     )
     expect(page.locator("#preset-info-popover")).to_contain_text(
-        "temporary URLs that typically expire within 24 to 48 hours"
+        "saved from Runway's authoritative temporary URL into the agent workspace"
     )
     expect(page.locator("#preset-info-popover")).not_to_contain_text(
         "save anything"
@@ -1307,10 +1344,19 @@ def mobile_smoke(page, url: str) -> None:
         expect(summary.locator(".usage-ring")).to_have_count(rings)
         for index in range(rings):
             expect(summary.locator(".usage-ring").nth(index)).to_be_visible()
+    # The hero navigator is the phone's entry into chat: visible on home
+    # without opening the drawer, with a thumb-sized CTA.
+    expect(page.locator("#home-hero")).to_contain_text("Agent Chat")
+    hero_cta = page.locator("#home-hero").get_by_role("button", name="Begin chat", exact=True)
+    expect(hero_cta).to_be_visible()
+    hero_cta_box = hero_cta.bounding_box()
+    if not hero_cta_box or hero_cta_box["height"] < 40:
+        raise AssertionError(f"the Begin chat CTA is below thumb size on a phone: {hero_cta_box}")
     assert_no_horizontal_overflow(page, "home")
 
     # The drawer closes on backdrop click, Escape, and destination selection.
     open_mobile_navigation(page)
+    expect(page.locator("#hero-app-tab").get_by_role("button", name="Agent Chat", exact=True)).to_be_visible()
     page.locator("#nav-backdrop").click(position={"x": 380, "y": 400})
     expect(page.locator("#nav-backdrop")).to_be_hidden()
     open_mobile_navigation(page)

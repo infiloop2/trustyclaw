@@ -12,10 +12,11 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import re
 import socket
 import time
 from typing import Any
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from host.constants import LOOPBACK, MAX_REQUEST_BODY_BYTES as ADMIN_MAX_REQUEST_BODY_BYTES
 from host.runtime import db
@@ -71,6 +72,13 @@ class Handler(BaseHTTPRequestHandler):
                 if len(parts) != 3:
                     raise AppError(HTTPStatus.NOT_FOUND, "route not found")
                 response = list_app_thread_tasks(_path_segment(parts[1]))
+            elif method == "GET" and path.startswith("/threads/") and path.endswith("/events"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 3:
+                    raise AppError(HTTPStatus.NOT_FOUND, "route not found")
+                response = list_app_thread_events(
+                    _path_segment(parts[1]), parse_qs(urlparse(self.path).query)
+                )
             elif method == "POST" and path.startswith("/threads/") and path.endswith("/archive"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 3:
@@ -131,49 +139,72 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def list_app_threads() -> dict[str, Any]:
+    """The thread index: one bulk host call joined against the app's own
+    thread bookkeeping. The host's app-scoped `GET /v1/threads` returns
+    session config and live status for exactly this app's threads, so the
+    index costs one socket round trip regardless of thread count.
+
+    A thread is shown only when it is unarchived and has at least one recorded
+    task: the host stays the source of truth for runtime/model/effort and
+    active status, but task_count and active ids are taken from the app's own
+    `thread_tasks`, so an orphaned host task (created then cancelled when
+    `_record_app_task` failed) never inflates a count or resurrects a thread
+    the app never finished recording. A reservation that never got a task has
+    no `thread_tasks` rows and stays invisible."""
+    recorded = _recorded_task_ids_by_thread()
+    response = call_admin_api("GET", "/v1/threads")
+    summaries = response.get("threads")
+    if not isinstance(summaries, list):
+        raise AppError(HTTPStatus.BAD_GATEWAY, "host admin returned invalid thread list")
+    app_threads = [
+        _app_thread_summary(summary, recorded[summary["thread_id"]])
+        for summary in summaries
+        if isinstance(summary, dict) and summary.get("thread_id") in recorded
+    ]
+    app_threads.sort(key=lambda item: str(item.get("last_used_at") or ""), reverse=True)
+    return {"threads": app_threads}
+
+
+def _recorded_task_ids_by_thread() -> dict[str, set[str]]:
+    """This app's unarchived threads mapped to their recorded task ids. Only
+    threads with at least one recorded task appear, matching the index rule."""
     with db.transaction() as cur:
         _set_search_path(cur)
         cur.execute(
-            """
-            SELECT thread_id
-            FROM threads
-            WHERE archived = FALSE
-            ORDER BY thread_id ASC
-            """
+            "SELECT thread_tasks.thread_id, thread_tasks.task_id"
+            " FROM thread_tasks JOIN threads ON threads.thread_id = thread_tasks.thread_id"
+            " WHERE threads.archived = FALSE"
         )
         rows = cur.fetchall()
-    app_threads: list[dict[str, Any]] = []
-    for (thread_id,) in rows:
-        task_response = list_app_thread_tasks(thread_id)
-        tasks = task_response["tasks"]
-        if not tasks:
-            continue
-        configs = {_host_task_session_config(task) for task in tasks}
-        if len(configs) != 1:
-            raise AppError(HTTPStatus.BAD_GATEWAY, "host admin returned inconsistent thread configuration")
-        runtime, model, effort = configs.pop()
-        timestamps = [
-            str(task.get("updated_at") or task.get("created_at"))
-            for task in tasks
-            if isinstance(task.get("updated_at") or task.get("created_at"), str)
-        ]
-        app_threads.append(
-            {
-                "thread_id": thread_id,
-                "agent_runtime": runtime,
-                "model": model,
-                "effort": effort,
-                "last_used_at": max(timestamps, default=""),
-                "task_count": len(tasks),
-                "active_tasks": [
-                    {"task_id": task["task_id"], "status": task["status"]}
-                    for task in tasks
-                    if task.get("status") in {"queued", "running"} and isinstance(task.get("task_id"), str)
-                ],
-            }
-        )
-    app_threads.sort(key=lambda item: str(item.get("last_used_at") or ""), reverse=True)
-    return {"threads": app_threads}
+    recorded: dict[str, set[str]] = {}
+    for thread_id, task_id in rows:
+        recorded.setdefault(thread_id, set()).add(task_id)
+    return recorded
+
+
+def _app_thread_summary(summary: dict[str, Any], recorded_task_ids: set[str]) -> dict[str, Any]:
+    runtime, model, effort = _host_task_session_config(summary)
+    active_tasks = summary.get("active_tasks")
+    if not isinstance(active_tasks, list):
+        raise AppError(HTTPStatus.BAD_GATEWAY, "host admin returned invalid thread summary")
+    return {
+        "thread_id": _required_response_text(summary.get("thread_id"), "thread_id"),
+        "agent_runtime": runtime,
+        "model": model,
+        "effort": effort,
+        "last_used_at": str(summary.get("last_used_at") or ""),
+        # Count and active ids come from the app's recorded tasks, never the
+        # host's raw totals, so an orphaned host task cannot inflate them.
+        "task_count": len(recorded_task_ids),
+        "active_tasks": [
+            {"task_id": task["task_id"], "status": task["status"]}
+            for task in active_tasks
+            if isinstance(task, dict)
+            and isinstance(task.get("task_id"), str)
+            and isinstance(task.get("status"), str)
+            and task["task_id"] in recorded_task_ids
+        ],
+    }
 
 
 def list_app_thread_tasks(thread_id: str) -> dict[str, Any]:
@@ -186,10 +217,38 @@ def list_app_thread_tasks(thread_id: str) -> dict[str, Any]:
     return {"tasks": [task for task in host_tasks if isinstance(task, dict) and task.get("task_id") in known_task_ids]}
 
 
+def list_app_thread_events(thread_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
+    """The thread's full event stream, oldest first, forward-paged by ``since``.
+
+    Every event under the app-scoped thread comes from a task this app
+    created, so the stream passes through unfiltered; the UI groups events by
+    task and ignores ids it does not know.
+    """
+    _require_app_thread(thread_id)
+    since_values = query.get("since") or []
+    path = f"/v1/threads/{quote(thread_id, safe='')}/events"
+    if since_values:
+        since = since_values[0]
+        if not since.isdigit():
+            raise AppError(HTTPStatus.BAD_REQUEST, "since must be a non-negative integer")
+        path += f"?since={since}"
+    response = call_admin_api("GET", path)
+    events = response.get("events")
+    if not isinstance(events, list):
+        raise AppError(HTTPStatus.BAD_GATEWAY, "host admin returned invalid event list")
+    return {"events": events}
+
+
 def create_app_task(body: Any) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise AppError(HTTPStatus.BAD_REQUEST, "task request must be an object")
-    thread_id = _required_text(body.get("thread_id"), "thread_id")
+    if "thread_id" in body:
+        thread_id = _required_text(body.get("thread_id"), "thread_id")
+    else:
+        # A request without thread_id starts a new thread: the app owns thread
+        # naming, so the operator never types an id.
+        thread_id = _reserve_generated_thread_id()
+        body = {**body, "thread_id": thread_id}
     requested_config = _requested_session_config(body)
     response = call_admin_api("POST", "/v1/tasks", body)
     task_id = _required_response_text(response.get("task_id"), "task_id")
@@ -235,6 +294,41 @@ def archive_app_thread(thread_id: str) -> dict[str, Any]:
         "thread_id": row[0],
         "archived": row[1],
     }
+
+
+THREAD_NAME_RE = re.compile(r"thread-([1-9][0-9]*)")
+
+
+def _reserve_generated_thread_id() -> str:
+    """Allocate the next successive thread name (thread-1, thread-2, ...).
+
+    The name is reserved by inserting its thread row before the host call:
+    the primary key makes concurrent generators take distinct names instead
+    of merging two new chats into one thread (the host accepts a matching
+    session configuration on an existing thread). Names count over every
+    recorded thread, archived included, so a generated id never revives an
+    archived thread. A reservation whose host call later fails stays as an
+    empty thread: the index hides threads without tasks and the generator
+    counts it, so its number is skipped rather than reused.
+    """
+    while True:
+        with db.transaction() as cur:
+            _set_search_path(cur)
+            cur.execute("SELECT thread_id FROM threads")
+            rows = cur.fetchall()
+            numbers = [
+                int(match.group(1))
+                for (thread_id,) in rows
+                if (match := THREAD_NAME_RE.fullmatch(thread_id)) is not None
+            ]
+            candidate = f"thread-{max(numbers, default=0) + 1}"
+            cur.execute(
+                "INSERT INTO threads (thread_id, archived) VALUES (%s, FALSE)"
+                " ON CONFLICT (thread_id) DO NOTHING RETURNING thread_id",
+                (candidate,),
+            )
+            if cur.fetchone() is not None:
+                return candidate
 
 
 def _record_app_task(thread_id: str, task_id: str) -> None:

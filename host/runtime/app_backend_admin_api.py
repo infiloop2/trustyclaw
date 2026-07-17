@@ -32,12 +32,16 @@ APP_BACKEND_ADMIN_SOCKET = Path(
 )
 APP_BACKEND_AUTH_HEADER = "X-TrustyClaw-App-Backend"
 APP_BACKEND_ALLOWED_ADMIN_ROUTES = (
+    ("GET", "/v1/tools"),
+    ("GET", "/v1/network/policy"),
     ("POST", "/v1/tasks"),
     ("GET", "/v1/tasks/:task_id"),
     ("POST", "/v1/tasks/:task_id/cancel"),
     ("POST", "/v1/tasks/:task_id/kill"),
     ("POST", "/v1/tasks/:task_id/steer"),
+    ("GET", "/v1/threads"),
     ("GET", "/v1/threads/:thread_id/tasks"),
+    ("GET", "/v1/threads/:thread_id/events"),
 )
 
 
@@ -165,6 +169,22 @@ def route_app_backend_request(
         internal_body,
         app_backend_id=app_id,
     )
+    if method == "GET" and path == "/v1/threads" and isinstance(response, dict):
+        # The bulk thread list is host-global; an app backend sees only the
+        # summaries under its own prefix. Filtering happens here, before the
+        # generic response mapper, which treats any unprefixed thread_id as a
+        # scoping bug.
+        prefix = _thread_prefix(app_id)
+        threads = response.get("threads")
+        if isinstance(threads, list):
+            response = {
+                **response,
+                "threads": [
+                    thread
+                    for thread in threads
+                    if isinstance(thread, dict) and str(thread.get("thread_id", "")).startswith(prefix)
+                ],
+            }
     return _visible_response(app_id, response)
 
 
@@ -199,8 +219,8 @@ def _route_pattern_matches(path: str, pattern: str) -> bool:
 
 def _internal_path(app_id: str, method: str, path: str) -> str:
     parts = path.strip("/").split("/")
-    if len(parts) == 4 and parts[:2] == ["v1", "threads"] and parts[3] == "tasks" and method == "GET":
-        return f"/v1/threads/{_internal_thread_id(app_id, parts[2])}/tasks"
+    if len(parts) == 4 and parts[:2] == ["v1", "threads"] and parts[3] in {"tasks", "events"} and method == "GET":
+        return f"/v1/threads/{_internal_thread_id(app_id, parts[2])}/{parts[3]}"
     return path
 
 

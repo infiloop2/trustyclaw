@@ -96,6 +96,14 @@ UI_ASSETS = {
     "/admin_ui.css": (RUNTIME_DIR / "admin_ui.css", "text/css; charset=utf-8"),
     "/favicon.ico": (RUNTIME_DIR / "admin_favicon.svg", "image/svg+xml"),
     "/favicon.svg": (RUNTIME_DIR / "admin_favicon.svg", "image/svg+xml"),
+    "/workspace-kit/view_blocks.css": (
+        app_platform.APP_ROOT / "workspace_kit" / "ui" / "view_blocks.css",
+        "text/css; charset=utf-8",
+    ),
+    "/workspace-kit/view_blocks.js": (
+        app_platform.APP_ROOT / "workspace_kit" / "ui" / "view_blocks.js",
+        "application/javascript; charset=utf-8",
+    ),
 }
 # The admin UI ships as native ES modules in host/runtime/admin_ui/. The
 # served set is fixed at startup from the files present, so any other
@@ -117,10 +125,18 @@ SECURITY_HEADERS = {
         "form-action 'self'; "
         "frame-ancestors 'none'; "
         "img-src 'self' data:; "
+        "media-src blob:; "
         "object-src 'none'; "
         "script-src 'self'; "
         "style-src 'self'"
     ),
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
+UNTRUSTED_FILE_SECURITY_HEADERS = {
+    "Content-Security-Policy": "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; sandbox",
+    "Content-Disposition": "inline",
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
@@ -144,6 +160,8 @@ OAUTH_LOGIN_STATUSES = ("awaiting_login", "error")
 REBOOT_HELPER_TIMEOUT_SECONDS = 10
 AGENT_FILE_HELPER_TIMEOUT_SECONDS = 10
 AGENT_FILE_HELPER_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/read-agent-file"]
+AGENT_FILE_STREAM_MAX_BYTES = 200_000_000
+AGENT_FILE_STREAM_MEDIA_TYPES = {".mp4": "video/mp4", ".mov": "video/quicktime"}
 AGENT_AUTH_CLEAR_HELPER_TIMEOUT_SECONDS = 10
 AGENT_AUTH_CLEAR_HELPER_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/clear-agent-auth"]
 AGENT_CGROUP_ROOT = Path("/sys/fs/cgroup/trustyclaw_agent.slice")
@@ -200,6 +218,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_app_ui_asset(*app_asset)
                     return
             self._authenticate()
+            if method == "GET" and path.path == "/v1/agent-files/content":
+                self._send_agent_file(_agent_file_path(parse_qs(path.query)))
+                return
             bridge_app_id = self.headers.get("X-TrustyClaw-App-Bridge", "") or None
             response = route(
                 method, path.path, parse_qs(path.query), self._read_body(), bridge_app_id=bridge_app_id
@@ -257,7 +278,7 @@ class Handler(BaseHTTPRequestHandler):
             "navigate-to 'self'; "
             "object-src 'none'; "
             "sandbox allow-scripts allow-forms allow-modals; "
-            f"script-src 'self' 'unsafe-inline' {asset_origin}; "
+            f"script-src 'self' {asset_origin}; "
             f"style-src 'self' 'unsafe-inline' {asset_origin}",
         )
         self.send_header("Referrer-Policy", "no-referrer")
@@ -306,6 +327,72 @@ class Handler(BaseHTTPRequestHandler):
         self._send_security_headers()
         self.end_headers()
         self.wfile.write(data)
+
+    def _send_agent_file(self, path: str) -> None:
+        expected_media_type = AGENT_FILE_STREAM_MEDIA_TYPES.get(Path(path).suffix.lower())
+        if expected_media_type is None:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "agent file streaming supports only MP4 or MOV video files")
+        process = subprocess.Popen(
+            [*AGENT_FILE_HELPER_COMMAND, "stream", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert process.stdout is not None
+        try:
+            raw_header = process.stdout.readline(4097)
+            if len(raw_header) > 4096 or not raw_header.endswith(b"\n"):
+                process.kill()
+                raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "agent file helper returned an invalid stream header")
+            try:
+                header = json.loads(raw_header)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                process.wait(timeout=AGENT_FILE_HELPER_TIMEOUT_SECONDS)
+                raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "agent file helper returned invalid JSON") from exc
+            if not isinstance(header, dict) or "size_bytes" not in header:
+                process.wait(timeout=AGENT_FILE_HELPER_TIMEOUT_SECONDS)
+                status = {
+                    2: HTTPStatus.NOT_FOUND,
+                    3: HTTPStatus.BAD_REQUEST,
+                    4: HTTPStatus.BAD_REQUEST,
+                }.get(process.returncode, HTTPStatus.INTERNAL_SERVER_ERROR)
+                message = header.get("error", {}).get("message") if isinstance(header, dict) else None
+                raise ApiError(status, str(message or "agent file helper failed"))
+            size_bytes = header.get("size_bytes")
+            media_type = header.get("media_type")
+            if (
+                not isinstance(size_bytes, int)
+                or not 0 <= size_bytes <= AGENT_FILE_STREAM_MAX_BYTES
+                or media_type != expected_media_type
+            ):
+                process.kill()
+                raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "agent file helper returned invalid metadata")
+            self.send_response(HTTPStatus.OK.value)
+            self.send_header("Content-Type", expected_media_type)
+            self.send_header("Content-Length", str(size_bytes))
+            self._send_ui_cache_headers()
+            for name, value in UNTRUSTED_FILE_SECURITY_HEADERS.items():
+                self.send_header(name, value)
+            self.end_headers()
+            remaining = size_bytes
+            try:
+                while remaining:
+                    chunk = process.stdout.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+            if remaining:
+                process.kill()
+                self.close_connection = True
+        finally:
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=AGENT_FILE_HELPER_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
 
 
 def route(
@@ -743,6 +830,18 @@ def thread_route(method: str, path: str, query: dict[str, list[str]]) -> Any:
         if not THREAD_ID_RE.fullmatch(thread_id):
             raise ApiError(HTTPStatus.NOT_FOUND, "thread route not found")
         return list_thread_tasks(thread_id)
+    if len(parts) == 4 and parts[3] == "events" and method == "GET":
+        thread_id = parts[2]
+        if not THREAD_ID_RE.fullmatch(thread_id):
+            raise ApiError(HTTPStatus.NOT_FOUND, "thread route not found")
+        _reject_query_keys(query, {"since", "limit"}, "thread event")
+        return {
+            "events": state.page_thread_events(
+                thread_id,
+                _optional_non_negative_int(query, "since"),
+                _event_page_limit(query),
+            )
+        }
     raise ApiError(HTTPStatus.NOT_FOUND, "thread route not found")
 
 

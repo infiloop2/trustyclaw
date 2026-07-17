@@ -125,6 +125,7 @@ def installed_apps(root: Path | None = None) -> list[AppManifest]:
                 raise AppError(f"duplicate generated app {kind}: {value}")
             seen_generated.add(key)
         apps.append(app)
+    apps.sort(key=lambda app: (app.allocation.port_offset, app.id))
     return apps
 
 
@@ -171,6 +172,12 @@ def _app_package_dirs(root: Path) -> list[Path]:
         if not APP_ID_RE.fullmatch(child.name):
             raise AppError(f"{child}: app package directory must match {APP_ID_RE.pattern}")
         manifest_path = child / "manifest.json"
+        if not manifest_path.exists() and (child / "__init__.py").is_file():
+            # An importable Python library colocated under host/apps for
+            # locality (for example workspace_kit, the shared workspace engine):
+            # it has an __init__.py and no manifest, so it is not an installed
+            # app and is skipped. A directory with neither is still a mistake.
+            continue
         if not manifest_path.is_file() or manifest_path.is_symlink():
             raise AppError(f"{child}: app package must contain a regular manifest.json file")
         packages.append(child)

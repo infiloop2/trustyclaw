@@ -34,7 +34,7 @@
 | `tools MCP shim` | `trustyclaw-agent` | Codex / Claude Code | Aggregates the tools, network-introspection, and app sockets into one MCP server; one per agent session that uses host tools. |
 | `read-codex-account-id` / `read-claude-account` | starts as root, then `trustyclaw-agent` | admin API via sudo | Reads provider auth files narrowly and prints only account guard metadata. |
 | `clear-agent-auth` | starts as root, then `trustyclaw-agent` | admin API via sudo | Removes local Codex/Claude auth files during linked-account reset. |
-| `read-agent-file` helper | starts as root, then `trustyclaw-agent` | admin API via sudo | Lists agent-home directories or returns a bounded text preview without giving admin general agent-home access. |
+| `read-agent-file` helper | starts as root, then `trustyclaw-agent` | admin API via sudo | Lists agent-home directories, returns a bounded text preview, or streams one bounded regular file to the authenticated Files viewer without giving admin general agent-home access. |
 | `mint-github-app-token` helper | root | admin API via sudo | Mints installation-wide GitHub App tokens through root egress because the admin service has none; the proxy repo guard is the per-repository boundary. |
 | `audit-github-repo` helper | root | admin API via sudo | Reads GitHub repository/security facts with the working token and returns facts without storing secrets. |
 | `approve-github-push` helper | root | admin API via sudo | Replays or cleans up a push held by the `.github` approval gate using the proxy-state quarantine mirror and a working GitHub token piped on stdin. |

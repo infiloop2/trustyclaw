@@ -145,7 +145,6 @@ class Assets(Protocol):
 
     def delete(self, asset_id: str) -> None: ...
 
-
 class HostAPI(Protocol):
     """The bundle handed to every tool call, scoped to one tool."""
 

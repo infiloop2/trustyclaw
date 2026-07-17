@@ -117,10 +117,12 @@ The listed actions are the enabled tools' manifest actions, named
   the terminal execution result — so another agent process cannot enumerate old
   approvals by guessing sequential ids. Direct-action results are returned inline
   on the call.
-- **`stage_video` and `stage_image`** live in the MCP shim because that process
+- **`stage_video` and `stage_image`** are public MCP actions because that process
   has the agent's filesystem access. They open a regular, non-symlink MP4/MOV
   or JPEG/PNG/WebP as the agent, bound it to 512 bytes–200 MB, and stream raw
-  bytes to the matching `POST /assets/video` or `POST /assets/image` route.
+  bytes through `POST /assets/video` or `POST /assets/image`. The tools service
+  returns a random, tool-scoped asset id. The agent passes that id directly to
+  the consuming Runway or Instagram action and does not persist it as app state.
   The shim stores no copy. It streams the opened descriptor over
   `/run/trustyclaw-tools/tools.sock`; the socket's kernel peer credentials
   authenticate the `trustyclaw-agent` UID, then the separate
@@ -141,9 +143,10 @@ The listed actions are the enabled tools' manifest actions, named
   The tools service accepts only the authenticated agent peer, receives
   filename/type/length but no pathname, and stores a mode-0600 private copy in
   its mode-0700 asset directory. The returned random id is scoped to either
-  Runway or Instagram. Instagram deletes its copy after the approved publishing
-  attempt; Runway deletes its copy after Runway accepts the generation or editing task.
-  Otherwise the id expires after about 26 hours. The next staging/access check
+  Runway or Instagram. Runway deletes its input copy after Runway accepts the
+  generation or editing task. Instagram deletes its copy after publishing.
+  Every remaining id expires after about
+  26 hours. The next staging/access check
   removes it immediately after expiry, and an hourly service sweep removes it
   even when no later call touches the store. A tools-service restart deletes
   every remaining file and forgets every id. No asset metadata enters
@@ -153,6 +156,29 @@ The listed actions are the enabled tools' manifest actions, named
   1 GB total are staged across both media types. This private spool preserves
   the Instagram approval boundary: Meta receives no video bytes until approval.
 
+  Binary action output uses a generic exclusive result. A package returns either
+  `ActionExecuted` JSON or one `StreamingAsset`, never both. The tools service
+  enters the stream, validates its basename-only filename, media type, and exact
+  length up to 200 MB, and relays it directly over the existing agent Unix-socket
+  response. Provider output does not land in the private staged-input spool.
+
+  The MCP shim recognizes the binary response and always converts it into one
+  mode-0600 agent file under `/tool_assets`. It validates the same bounded
+  metadata, streams into an exclusive temporary file, verifies the declared
+  length, fsyncs it, and atomically exposes a random host-generated filename.
+  Failure removes the partial file. The final MCP result is JSON containing only
+  `path`, `media_type`, and `size_bytes`; the agent never chooses a destination
+  path or sees a transport id.
+
+  Runway is the first producer. `runway_save_video {task_id}` re-reads the task
+  from Runway, accepts only its authoritative successful HTTPS output, and
+  returns that response as a `StreamingAsset`. The egress-capable tools process
+  cannot write agent files, while the filesystem-capable shim has no Runway
+  credential or external network access. To publish the returned workspace file
+  later, the agent explicitly stages it for Instagram and passes the resulting
+  `video_asset_id` into `instagram_post_reel`; the Instagram package and shim
+  interface stay unchanged.
+
   One process lock owns every index and quota transition. An upload reserves
   its declared count and bytes under that lock, then streams outside it so a
   slow agent cannot block reads or cleanup; the reservation is not readable
@@ -161,15 +187,14 @@ The listed actions are the enabled tools' manifest actions, named
   using that Unix file descriptor after an unlink, or loses the race and fails
   closed before sending bytes to a provider.
 
-  Staging is a separate built-in action because bundled tool packages execute
-  as `trustyclaw-tools`, without access to the agent filesystem. Giving package
+  Staging is a separate public action because bundled tool packages execute as
+  `trustyclaw-tools`, without access to the agent filesystem. Giving package
   code a local path would either be unusable or give internet-facing tool code
   read access to agent files. It would also force large media through JSON tool
-  arguments and the audit log. The built-in action streams bytes once and gives
-  package code only an opaque, tool-scoped id. That same stable private copy can
-  survive an Instagram approval wait, while one shared host implementation
-  enforces size, count, lifetime, destination, and cleanup limits for every
-  media-consuming package.
+  arguments and the audit log. The explicit two-call flow keeps package schemas
+  unchanged: stage the file, then pass the short-lived id to the media action.
+  One shared host implementation enforces size, count, lifetime, destination,
+  and cleanup limits.
 
 **Concurrency cap.** Each agent tool call blocks one handler thread on a
 third-party request, so the agent's in-flight tool calls are capped at

@@ -1,0 +1,17 @@
+{
+  "host_slot": 4,
+  "title": "Virality Machine",
+  "agent": {
+    "instructions": "agent.md",
+    "api": true
+  },
+  "backend": {
+    "entrypoint": "backend.py"
+  },
+  "database": {
+    "migrations": "migrations"
+  },
+  "ui": {
+    "path": "ui"
+  }
+}

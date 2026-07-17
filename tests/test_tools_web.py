@@ -13,6 +13,7 @@ from host.tools.shared.web import (
     MAX_RESPONSE_BYTES,
     RESPONSE_TOO_LARGE_MESSAGE,
     WebRequestError,
+    open_response_stream,
     request_bytes,
     stream_request_bytes,
 )
@@ -115,6 +116,14 @@ class WebResponseCapTests(unittest.TestCase):
 
     def test_default_cap_is_eight_mib(self) -> None:
         self.assertEqual(MAX_RESPONSE_BYTES, 8 * 1024 * 1024)
+
+    def test_stream_does_not_remap_caller_value_error(self) -> None:
+        with _serving(b"video"):
+            with self.assertRaisesRegex(ValueError, "local destination failed"):
+                with open_response_stream(
+                    "GET", "https://cdn.example/video", failure_message="download failed"
+                ):
+                    raise ValueError("local destination failed")
 
     def test_stream_request_sets_known_length_without_buffering_body(self) -> None:
         class Response:

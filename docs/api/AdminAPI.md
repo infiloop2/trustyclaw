@@ -387,6 +387,7 @@ POST /v1/tasks/{task_id}/cancel
 POST /v1/tasks/{task_id}/kill
 GET  /v1/threads
 GET  /v1/threads/{thread_id}/tasks
+GET  /v1/threads/{thread_id}/events
 ```
 
 Every task belongs to a client-chosen thread (`thread_id`). Tasks on the same
@@ -417,6 +418,7 @@ Task endpoints:
 | `POST` | `/v1/tasks/{task_id}/kill` | none | Task kill response | Kills one running task: its runtime process is terminated and the task becomes `cancelled`. Only tasks with status `running` can be killed; returns `409` otherwise. The thread itself survives — a later task on the same `thread_id` resumes the conversation. |
 | `GET` | `/v1/threads` | none | Thread list response | Lists recent runtime threads, including active queued/running work and retained runtime session mappings. |
 | `GET` | `/v1/threads/{thread_id}/tasks` | none | Task list response | Lists retained tasks for one thread, newest first by `updated_at` with task id as a tiebreaker. |
+| `GET` | `/v1/threads/{thread_id}/events?since=<seq>&limit=<n>` | `since` and `limit` query parameters are optional | Event list response | Streams one thread's task events across all of its tasks, oldest first, with `seq > since`. `limit` defaults to 100 and is capped there. |
 
 Create task request:
 
@@ -1129,13 +1131,7 @@ host-derived resources assigned to each one:
       "id": "agent_chat",
       "title": "Agent Chat",
       "backend": {
-        "api_route": "/v1/apps/agent_chat/api/",
-        "localhost_base_url": "http://127.0.0.1:7450",
-        "service": "trustyclaw-app-agent_chat.service"
-      },
-      "database": {
-        "schema": "app_agent_chat",
-        "role": "trustyclaw-app-agent_chat"
+        "api_route": "/v1/apps/agent_chat/api/"
       },
       "ui": {
         "iframe_src": "/v1/apps/agent_chat/ui/index.html",
@@ -1150,9 +1146,6 @@ host-derived resources assigned to each one:
 | --- | --- |
 | `apps[].id`, `title` | Stable manifest id and operator-facing title. |
 | `apps[].backend.api_route` | Authenticated admin API prefix that reverse-proxies to this app backend. |
-| `apps[].backend.localhost_base_url` | Host-assigned loopback listener. nftables permits new connections only from `trustyclaw-admin`; it is metadata, not an operator access URL. |
-| `apps[].backend.service` | Host-derived systemd service name. |
-| `apps[].database.schema`, `role` | Host-derived Postgres namespace and matching peer-authenticated app role. |
 | `apps[].ui.iframe_src` | Static entry point mounted by the admin API. |
 | `apps[].ui.sandbox` | iframe permissions the admin shell applies. `allow-same-origin` is deliberately absent, so the app frame has an opaque origin. |
 

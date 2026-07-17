@@ -44,6 +44,14 @@ UI_ASSETS = {
     "/admin_ui.css": (RUNTIME_DIR / "admin_ui.css", "text/css; charset=utf-8"),
     "/favicon.ico": (RUNTIME_DIR / "admin_favicon.svg", "image/svg+xml"),
     "/favicon.svg": (RUNTIME_DIR / "admin_favicon.svg", "image/svg+xml"),
+    "/workspace-kit/view_blocks.css": (
+        app_platform.APP_ROOT / "workspace_kit" / "ui" / "view_blocks.css",
+        "text/css; charset=utf-8",
+    ),
+    "/workspace-kit/view_blocks.js": (
+        app_platform.APP_ROOT / "workspace_kit" / "ui" / "view_blocks.js",
+        "application/javascript; charset=utf-8",
+    ),
 }
 UI_ASSETS.update({
     f"/admin_ui/{module.name}": (module, "application/javascript; charset=utf-8")
@@ -63,6 +71,7 @@ SECURITY_HEADERS = {
         "form-action 'self'; "
         "frame-ancestors 'none'; "
         "img-src 'self' data:; "
+        "media-src blob:; "
         "object-src 'none'; "
         "script-src 'self'; "
         "style-src 'self'"
@@ -74,6 +83,7 @@ SECURITY_HEADERS = {
 PASSWORD = "dev"
 TASK_RE = re.compile(r"^/v1/tasks/([^/]+)(?:/(steer|cancel|kill|events))?$")
 THREAD_TASKS_RE = re.compile(r"^/v1/threads/([^/]+)/tasks$")
+THREAD_EVENTS_RE = re.compile(r"^/v1/threads/([^/]+)/events$")
 TOOL_ACTION_RE = re.compile(r"^/v1/tools/([a-z0-9_]+)/(enable|disable|oauth_connect/start|oauth_connect/complete|oauth_connect/disconnect)$")
 GITHUB_PENDING_PUSH_RE = re.compile(r"^/v1/network-tools/github-pending-pushes/([a-z0-9]+)/(approve|reject)$")
 TOOL_APPROVALS_LIST_RE = re.compile(r"^/v1/tools/([a-z0-9_]+)/approvals$")
@@ -333,6 +343,179 @@ def seed_state() -> None:
             "started_min": None,
             "completed_min": 9,
         },
+        # Agent Chat threads (generated successive names): a long finished
+        # conversation, a live one with a steerable running task, and one that
+        # ended in a policy denial with a queued retry. Together they give the
+        # chat UI several screens of history on a phone.
+        {
+            "task_id": "task_8",
+            "thread_id": "thread-1",
+            "agent_runtime": "codex",
+            "status": "completed",
+            "input_message": "Clone acme-web into the workspace and give me a tour of the codebase.",
+            "output_message": (
+                "Cloned acme-web into workspace/acme-web. The tour:\n\n"
+                "- src/index.ts wires the nav toggle and boots the page; no framework, plain Vite + TypeScript.\n"
+                "- src/app.css holds all styling. One brand token (--brand) and a 768px nav breakpoint.\n"
+                "- package.json has three scripts: dev (vite), build (vite build), lint (eslint src).\n"
+                "- There is no test runner configured yet; lint is the only automated check.\n"
+                "- Deploys go to staging from main; there is no preview environment.\n\n"
+                "Weak spots worth knowing: the nav collapse is CSS-only and loses state on resize, images ship "
+                "unsized (layout shift on slow connections), and the pricing table relies on a fixed min-width. "
+                "Happy to take any of these as follow-ups."
+            ),
+            "created_min": 2905,
+            "started_min": 2904,
+            "completed_min": 2896,
+        },
+        {
+            "task_id": "task_9",
+            "thread_id": "thread-1",
+            "agent_runtime": "codex",
+            "status": "completed",
+            "input_message": "Add a dark mode toggle to the settings page and respect the system preference by default.",
+            "output_message": (
+                "Done. Implementation notes:\n\n"
+                "1. Added a theme store in src/theme.ts: reads prefers-color-scheme, persists an explicit "
+                "operator choice to localStorage under acme-theme, and exposes subscribe/set.\n"
+                "2. The settings page renders a three-state control: System, Light, Dark. System is the default "
+                "and clears the stored override.\n"
+                "3. Colors moved to custom properties on :root with a [data-theme=dark] override block; "
+                "components reference tokens only, so future palette work is one file.\n"
+                "4. The toggle applies before first paint via a small inline script in index.html that sets "
+                "data-theme from storage synchronously.\n\n"
+                "npm run lint passes. Manual check: toggling System while the OS is in dark mode keeps the page "
+                "dark; an explicit Light choice survives a reload."
+            ),
+            "created_min": 2890,
+            "started_min": 2889,
+            "completed_min": 2878,
+        },
+        {
+            "task_id": "task_10",
+            "thread_id": "thread-1",
+            "agent_runtime": "codex",
+            "status": "completed",
+            "input_message": "Write unit tests for the theme store and run whatever suite exists.",
+            "output_message": (
+                "Added vitest (devDependency) plus a test script and six tests in src/theme.test.ts:\n\n"
+                "- defaults to system when storage is empty\n"
+                "- explicit choice persists and wins over the media query\n"
+                "- clearing back to system removes the storage key\n"
+                "- subscribers fire on set and on media-query flips\n"
+                "- corrupt storage values fall back to system\n"
+                "- set is idempotent (no duplicate notifications)\n\n"
+                "Result: 6 passed in 0.41s. Lint stays clean. The suite runs in CI via npm test with no browser "
+                "dependency (matchMedia is stubbed)."
+            ),
+            "created_min": 2874,
+            "started_min": 2873,
+            "completed_min": 2866,
+        },
+        {
+            "task_id": "task_11",
+            "thread_id": "thread-1",
+            "agent_runtime": "codex",
+            "status": "completed",
+            "input_message": "The toggle still flashes light theme for a frame on a cold load. Fix the flash.",
+            "stream": [
+                ("agent", "Reproduced the flash with CPU throttling on: first paint uses the light tokens before the boot script runs."),
+                ("agent", "The inline script is placed after the stylesheet link, so the stylesheet paints first. Moving it up."),
+                ("user", "Also make sure the scrollbar matches, it flashes white too."),
+                ("agent", "Good catch. Added color-scheme to :root so the scrollbar and native controls follow the theme from the first frame."),
+            ],
+            "output_message": (
+                "Root cause: the inline script ran after the stylesheet link, so first paint could happen with "
+                "the default light tokens. Moved the script above the stylesheet in <head> and made it set "
+                "data-theme on <html> rather than <body> (body does not exist yet at that point). Also added "
+                "color-scheme to :root so the scrollbar and form controls match from the first frame.\n\n"
+                "Verified with CPU and network throttling in a private window: no flash in 20 cold loads."
+            ),
+            "created_min": 2860,
+            "started_min": 2859,
+            "completed_min": 2853,
+        },
+        {
+            "task_id": "task_12",
+            "thread_id": "thread-1",
+            "agent_runtime": "codex",
+            "status": "completed",
+            "input_message": "Nice. Document the theming setup in the README and open a PR with all of it.",
+            "output_message": (
+                "README gains a Theming section: the token file, the data-theme contract, how System/Light/Dark "
+                "resolve, and the no-flash boot script with a warning not to move it below the stylesheet.\n\n"
+                "Opened acme/acme-web#214 with the store, settings control, tests, boot script, and docs. CI is "
+                "green (lint + 6 tests). Requested review from @frontend."
+            ),
+            "created_min": 2848,
+            "started_min": 2847,
+            "completed_min": 2839,
+        },
+        {
+            "task_id": "task_13",
+            "thread_id": "thread-2",
+            "agent_runtime": "claude_code",
+            "status": "completed",
+            "input_message": "Draft a launch blog post for the acme mobile app. Friendly but concrete; around 600 words.",
+            "output_message": (
+                "Draft is in workspace/acme-web/notes/launch-post.md. Structure and the argument it makes:\n\n"
+                "Opening: the phone is where acme actually gets used; the desktop site was designed first and it "
+                "showed. The post owns that directly instead of pretending the app was always the plan.\n\n"
+                "Section 1, Built for one hand: navigation moved to the bottom bar, every primary action within "
+                "thumb reach, and the checkout flow cut from five screens to two. Numbers included: median "
+                "checkout time dropped from 74s to 31s in beta.\n\n"
+                "Section 2, Fast on bad networks: the app renders from a local cache first and reconciles in the "
+                "background, so a subway ride does not mean a blank screen. Product list loads in under 400ms "
+                "on a throttled 3G profile.\n\n"
+                "Section 3, What is next: offline order drafts and price alerts, both shipping this quarter, "
+                "with a one-line invitation to the beta channel.\n\n"
+                "Close: download links and a thank-you to the 900 beta testers by count, not by name.\n\n"
+                "It reads at about 640 words. Want me to tighten it to 600, or is the overage fine?"
+            ),
+            "created_min": 55,
+            "started_min": 54,
+            "completed_min": 41,
+        },
+        {
+            "task_id": "task_14",
+            "thread_id": "thread-2",
+            "agent_runtime": "claude_code",
+            "status": "running",
+            "input_message": "Tighten the intro, add a short section on offline mode, and get it to exactly 600 words.",
+            "stream": [
+                ("agent", "Cut the intro from four sentences to two and led with the one-hand stat; it reads harder now."),
+                ("agent", "Drafting the offline section: local cache first, background reconcile, order drafts that survive a dead zone."),
+            ],
+            "created_min": 14,
+            "started_min": 13,
+            "completed_min": 12,
+        },
+        {
+            "task_id": "task_15",
+            "thread_id": "thread-3",
+            "agent_runtime": "codex",
+            "status": "failed",
+            "input_message": "Push the release build to TestFlight so the beta group gets tonight's fixes.",
+            "error_message": (
+                "network access to appstoreconnect.apple.com denied by policy (no custom domain rule).\n"
+                "The build and signing steps completed locally; only the upload was blocked. Add a domain rule "
+                "for appstoreconnect.apple.com (POST) under Internet Access and Tools > Manual, or run the "
+                "upload from a machine with App Store Connect access."
+            ),
+            "created_min": 150,
+            "started_min": 149,
+            "completed_min": 141,
+        },
+        {
+            "task_id": "task_16",
+            "thread_id": "thread-3",
+            "agent_runtime": "codex",
+            "status": "queued",
+            "input_message": "Access is being sorted out. Queue the upload again and verify the build number this time.",
+            "created_min": 8,
+            "started_min": None,
+            "completed_min": 8,
+        },
     ]
     for spec in seed_tasks:
         task = {
@@ -368,6 +551,15 @@ def seed_state() -> None:
                 {"message": "Reading the workspace and planning the change.", "source": "agent"},
                 ago(spec["started_min"] - 1),
             )
+            # Optional mid-task conversation: interim agent progress and any
+            # operator steering, so a finished thread shows the full stream,
+            # not just prompt and answer. Timestamps fall between start and
+            # finish so ordering by seq matches the wall clock.
+            stream = spec.get("stream") or []
+            span = max(spec["started_min"] - spec["completed_min"], 1)
+            for index, (source, message) in enumerate(stream, start=1):
+                moment = spec["started_min"] - span * index / (len(stream) + 1)
+                STATE.add_agent_event("task.message", task_id, {"message": message, "source": source}, ago(moment))
         if spec["status"] == "completed":
             STATE.add_agent_event(
                 "task.message", task_id, {"message": spec["output_message"], "source": "agent"}, ago(spec["completed_min"])
@@ -512,6 +704,9 @@ mockUpgradeNotice.addEventListener("click", async () => {
                     self._send_app_asset(HTTPStatus.OK, asset.read_bytes(), content_type)
                     return
             self._authenticate()
+            if method == "GET" and parsed.path == "/v1/agent-files/content":
+                self._send(HTTPStatus.OK, b"\x00\x00\x00\x18ftypmp42mock-video", "video/mp4")
+                return
             response = route(method, parsed.path, parse_qs(parsed.query), self._read_body())
             self._send_json(HTTPStatus.OK, response)
         except ApiError as exc:
@@ -558,7 +753,7 @@ mockUpgradeNotice.addEventListener("click", async () => {
             "default-src 'none'; base-uri 'none'; connect-src 'none'; "
             f"font-src 'self' {asset_origin} data:; form-action 'none'; frame-ancestors 'self'; "
             f"img-src 'self' {asset_origin} data:; navigate-to 'self'; object-src 'none'; "
-            f"sandbox allow-scripts allow-forms allow-modals; script-src 'self' 'unsafe-inline' {asset_origin}; "
+            f"sandbox allow-scripts allow-forms allow-modals; script-src 'self' {asset_origin}; "
             f"style-src 'self' 'unsafe-inline' {asset_origin}",
         )
         self.send_header("Referrer-Policy", "no-referrer")
@@ -615,6 +810,9 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> dic
     thread_match = THREAD_TASKS_RE.fullmatch(path)
     if method == "GET" and thread_match:
         return list_thread_tasks(unquote(thread_match.group(1)))
+    thread_events_match = THREAD_EVENTS_RE.fullmatch(path)
+    if method == "GET" and thread_events_match:
+        return list_thread_events(unquote(thread_events_match.group(1)), query)
     if method == "GET" and path == "/v1/events":
         before, limit = event_page_query(query, {"before", "limit"}, "event")
         return {"events": agent_events_before(before, limit)}
@@ -822,6 +1020,7 @@ def decide_tool_approval(approval_id: str, decision: str) -> dict[str, Any]:
 
 def health() -> dict[str, Any]:
     with STATE.lock:
+        complete_due_codex_login_locked()
         progress_running_tasks_locked()
         start_queued_tasks_locked()
         runtime = agent_runtime_status_locked()
@@ -859,6 +1058,7 @@ def health() -> dict[str, Any]:
 
 def agent_runtime_status() -> dict[str, Any]:
     with STATE.lock:
+        complete_due_codex_login_locked()
         progress_running_tasks_locked()
         start_queued_tasks_locked()
         return agent_runtime_status_locked()
@@ -879,6 +1079,7 @@ def agent_runtime_status_locked() -> dict[str, Any]:
 
 def agent_accounts() -> dict[str, Any]:
     with STATE.lock:
+        complete_due_codex_login_locked()
         checked_at = STATE.now()
         accounts: list[dict[str, Any]] = []
         for runtime in RUNTIMES:
@@ -974,22 +1175,19 @@ def oauth(runtime: str, method: str) -> dict[str, str]:
             if method == "GET" and not STATE.codex_oauth:
                 raise ApiError(HTTPStatus.NOT_FOUND, "Codex OAuth login has not been started")
             if not STATE.codex_oauth:
+                # The real Codex device flow completes out of band after the
+                # operator enters the code in their browser. The mock stays
+                # awaiting_login for a couple of seconds and then completes on
+                # the next status read, so the device-code card is a stable
+                # surface (not a transient the UI poll can wipe mid-assertion).
                 STATE.codex_oauth = {
                     "status": "awaiting_login",
                     "device_code": "MOCK-CODEX",
                     "login_url": "https://auth.openai.com/activate",
                     "expires_at": expires,
+                    "_completes_at": time.time() + 2,
                 }
-            if method == "POST":
-                # The real Codex device flow completes out of band after the
-                # operator enters the code. The mock flips active here so local
-                # UI smoke can inspect the active account surface. A background
-                # GET may already have created the pending device-code record.
-                STATE.logged_in["codex"] = True
-                STATE.add_agent_event("agent_runtime.login_completed", None, {"agent_runtime": "codex"})
-                STATE.add_agent_event("agent_runtime.active", None, {"agent_runtime": "codex"})
-                start_queued_tasks_locked()
-            return dict(STATE.codex_oauth)
+            return {key: value for key, value in STATE.codex_oauth.items() if not key.startswith("_")}
     if method not in {"GET", "POST"}:
         raise ApiError(HTTPStatus.NOT_FOUND, "route not found")
     with STATE.lock:
@@ -1185,6 +1383,26 @@ def list_thread_tasks(thread_id: str) -> dict[str, Any]:
         progress_running_tasks_locked()
         tasks = [STATE.public_task(task) for task in STATE.tasks if task["thread_id"] == thread_id]
         return {"tasks": list(reversed(tasks))}
+
+
+def list_thread_events(thread_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
+    """The thread's task events, oldest first, forward-paged by ``since`` —
+    the seq-ordered stream the chat UI accumulates into per-task messages."""
+    unsupported = sorted(set(query) - {"since", "limit"})
+    if unsupported:
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"unsupported thread event query parameter: {unsupported[0]}")
+    since = int((query.get("since") or ["0"])[0])
+    limit = int((query.get("limit") or ["100"])[0])
+    with STATE.lock:
+        progress_running_tasks_locked()
+        start_queued_tasks_locked()
+        task_ids = {task["task_id"] for task in STATE.tasks if task["thread_id"] == thread_id}
+        events = [
+            event
+            for event in STATE.agent_events
+            if event["task_id"] in task_ids and event["seq"] > since
+        ]
+        return {"events": events[:limit]}
 
 
 def event_page_query(
@@ -1666,6 +1884,19 @@ def decide_github_pending_push(push_id: str, decision: str) -> dict[str, Any]:
         else:
             push["status"] = "rejected"
         return {"pending_push": dict(push)}
+
+
+def complete_due_codex_login_locked() -> None:
+    """Complete a pending Codex device login once its out-of-band approval
+    window has passed; runs on every status read, like the real poller."""
+    record = STATE.codex_oauth
+    if not record or STATE.logged_in.get("codex") or record.get("_completes_at", 0) > time.time():
+        return
+    STATE.logged_in["codex"] = True
+    STATE.codex_oauth = {}
+    STATE.add_agent_event("agent_runtime.login_completed", None, {"agent_runtime": "codex"})
+    STATE.add_agent_event("agent_runtime.active", None, {"agent_runtime": "codex"})
+    start_queued_tasks_locked()
 
 
 def fail_running_tasks_locked(runtime: str, error_message: str) -> None:

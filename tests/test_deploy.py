@@ -1216,6 +1216,21 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("TRUSTYCLAW_APP_AGENT_CHAT_GID=48000", bootstrap)
         self.assertIn("App ports are generated from the same package-local host_slot values", bootstrap)
         self.assertIn("APP_AGENT_CHAT_PORT=7450", bootstrap)
+        # The four ecosystem apps take stable host slots 2-5, so their UIDs and
+        # ports follow the same 48000+slot / 7450+slot derivation.
+        for app_id, slot in (
+            ("ALPHA_SEEKER", 2),
+            ("SOCIAL_MARKETER", 3),
+            ("VIRALITY_MACHINE", 4),
+            ("SOFTWARE_BUILDER", 5),
+        ):
+            self.assertIn(f"TRUSTYCLAW_APP_{app_id}_UID={48000 + slot}", bootstrap)
+            self.assertIn(f"TRUSTYCLAW_APP_{app_id}_GID={48000 + slot}", bootstrap)
+            self.assertIn(f"APP_{app_id}_PORT={7450 + slot}", bootstrap)
+        for app_id in ("alpha_seeker", "social_marketer", "virality_machine", "software_builder"):
+            self.assertIn(f"User=trustyclaw-app-{app_id}", bootstrap)
+            self.assertIn(f"trustyclaw-app-{app_id}.service", bootstrap)
+            self.assertIn(f"python3 -m host.runtime.app_migrate pending {app_id}", bootstrap)
         self.assertIn("ensure_user postgres \"$POSTGRES_UID\" postgres /var/lib/postgresql", bootstrap)
         self.assertLess(
             bootstrap.index('ensure_user postgres "$POSTGRES_UID"'),
@@ -1729,9 +1744,13 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("listen_addresses = ''", bootstrap)
         # The four core DB clients plus every bundled app fit below the server
         # cap with explicit room for operator, superuser, and deploy sessions.
-        self.assertIn("max_connections = 100", bootstrap)
+        self.assertIn("max_connections = 300", bootstrap)
         self.assertEqual(db.MAX_ACTIVE_CONNECTIONS, 14)
-        self.assertEqual((4 + len(app_platform.installed_apps())) * db.MAX_ACTIVE_CONNECTIONS, 84)
+        # Provisioned once: installing another app must not retune Postgres.
+        # 34 slots stay reserved for operator psql, the superuser reserve, and
+        # deploy work; when this trips, raise max_connections deliberately.
+        active_session_budget = (4 + len(app_platform.installed_apps())) * db.MAX_ACTIVE_CONNECTIONS
+        self.assertLessEqual(active_session_budget, 300 - 34)
         self.assertIn("local  trustyclaw_admin  trustyclaw-admin  peer", bootstrap)
         self.assertIn("local  trustyclaw_admin  trustyclaw-agent-network  peer", bootstrap)
         self.assertNotIn("local  trustyclaw_admin  trustyclaw-agent-app  peer", bootstrap)
@@ -2037,6 +2056,19 @@ class DeployUnitTests(unittest.TestCase):
 
             self.assertEqual(exc.exception.code, 3)
             self.assertIn("symlinks are not supported", output.getvalue())
+
+    def test_agent_file_helper_stream_rejects_non_video_content(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            home_path = Path(home)
+            (home_path / "payload.html").write_text("<script>bad()</script>")
+            namespace = self._agent_file_helper_namespace(home_path)
+
+            output = io.StringIO()
+            with patch("sys.stdout", output), self.assertRaises(SystemExit) as exc:
+                namespace["stream_path"]("/payload.html")  # type: ignore[index, operator]
+
+            self.assertEqual(exc.exception.code, 3)
+            self.assertIn("only MP4 or MOV", output.getvalue())
 
     def _agent_file_helper_namespace(self, home_path: Path) -> dict[str, object]:
         helper = Path("host/bootstrap/helpers/read-agent-file.sh").read_text()

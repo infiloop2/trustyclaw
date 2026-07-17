@@ -2,19 +2,23 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import importlib.util
+import re
 import tempfile
 import unittest
 
-from host.runtime import app_platform
+from host.runtime import app_platform, migrate
 from host.constants import APP_PORT_BASE
 
 
 RELEASED_APP_SLOTS = {
     "agent_chat": 0,
     "mission_pursuit": 1,
+    "alpha_seeker": 2,
+    "social_marketer": 3,
+    "virality_machine": 4,
+    "software_builder": 5,
 }
-
-
 class AppPlatformTests(unittest.TestCase):
     def test_installed_agent_chat_manifest_derives_host_owned_names(self) -> None:
         apps = app_platform.installed_apps()
@@ -49,6 +53,38 @@ class AppPlatformTests(unittest.TestCase):
         self.assertIn('"type":"artifact_interaction"', mission.agent_instructions)
         self.assertIn('"type": "button"', mission.agent_instructions)
 
+    def test_installed_app_migrations_are_well_formed(self) -> None:
+        for app in app_platform.installed_apps():
+            with self.subTest(app_id=app.id):
+                self.assertTrue(migrate.load_migrations(app.migrations_dir))
+
+    def test_workspace_kit_ui_has_no_agent_controlled_browser_capability_sink(self) -> None:
+        forbidden = (
+            "window.open", "location.href", "location.assign", "location.replace",
+            "document.location", "document.write", "eval(", "new Function",
+            "fetch(", "XMLHttpRequest", "WebSocket", "EventSource",
+            'createElement("script")', 'createElement("iframe")',
+        )
+        canonical_renderer = app_platform.APP_ROOT / "workspace_kit" / "ui" / "view_blocks.js"
+        canonical_source = canonical_renderer.read_text()
+        self.assertIn("div.textContent", canonical_source)
+        for sink in forbidden:
+            self.assertNotIn(sink, canonical_source, f"shared renderer exposes browser sink {sink}")
+        checked = 0
+        for app in app_platform.installed_apps():
+            ui = app.ui_dir
+            index = (ui / "index.html").read_text()
+            if "/workspace-kit/view_blocks.js" not in index:
+                continue
+            with self.subTest(app_id=app.id):
+                source = "\n".join(path.read_text() for path in sorted(ui.glob("*.js")))
+                for sink in forbidden:
+                    self.assertNotIn(sink, source, f"{app.id} exposes browser sink {sink}")
+                self.assertIsNone(re.search(r"<a(?:\s|>)", index, re.I))
+                self.assertIn("/workspace-kit/view_blocks.css", index)
+                checked += 1
+        self.assertEqual(checked, len(RELEASED_APP_SLOTS) - 1)
+
     def test_installed_apps_have_unique_host_owned_names(self) -> None:
         apps = app_platform.installed_apps()
 
@@ -81,6 +117,20 @@ class AppPlatformTests(unittest.TestCase):
                 self.assertEqual(app.allocation.uid, app_platform.APP_UID_BASE + host_slot)
                 self.assertEqual(app.allocation.gid, app_platform.APP_UID_BASE + host_slot)
                 self.assertEqual(app.port, APP_PORT_BASE + host_slot)
+
+    def test_every_installed_app_has_dynamic_smoke_coverage(self) -> None:
+        smoke_root = Path(__file__).parent / "apps"
+        for app in app_platform.installed_apps():
+            with self.subTest(app_id=app.id):
+                smoke = smoke_root / app.id / "smoke.py"
+                self.assertTrue(smoke.is_file(), f"missing smoke module for {app.id}")
+                spec = importlib.util.spec_from_file_location(f"smoke_{app.id}", smoke)
+                self.assertIsNotNone(spec)
+                assert spec is not None and spec.loader is not None
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                self.assertTrue(callable(getattr(module, "desktop_smoke", None)))
+                self.assertTrue(callable(getattr(module, "mobile_smoke", None)))
 
     def test_agent_chat_port_does_not_depend_on_manifest_scan_order(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -172,6 +222,13 @@ class AppPlatformTests(unittest.TestCase):
             root = Path(temp)
             self._write_minimal_app(root, "legacy", extra={"agent_api": True})
             with self.assertRaisesRegex(app_platform.AppError, "unsupported agent_api"):
+                app_platform.installed_apps(root)
+
+    def test_manifest_rejects_release_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_minimal_app(root, "bad_app", extra={"release_stage": "beta"})
+            with self.assertRaisesRegex(app_platform.AppError, "unsupported release_stage"):
                 app_platform.installed_apps(root)
 
     def test_ui_asset_resolves_only_inside_app_ui_directory(self) -> None:

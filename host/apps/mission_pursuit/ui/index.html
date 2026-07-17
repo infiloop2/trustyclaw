@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Mission Pursuit</title>
 <link rel="stylesheet" href="/admin_ui.css">
+<link rel="stylesheet" href="/workspace-kit/view_blocks.css">
 <link rel="stylesheet" href="mission_pursuit.css">
 </head>
 <body>
@@ -19,6 +20,7 @@
       </div>
     </div>
     <div class="app-frame-actions">
+      <button class="header-action danger" id="deactivate-app" hidden>Deactivate</button>
       <button class="header-action" id="agent-settings-toggle" aria-expanded="false" aria-controls="agent-settings-popover" disabled>Agent settings</button>
       <button class="header-action" id="info-toggle" aria-expanded="false" aria-controls="info-popover">How it works</button>
       <div id="agent-settings-popover" class="anchored-popover settings-popover" role="dialog" aria-labelledby="agent-settings-title" hidden>
@@ -86,14 +88,26 @@
       </div>
       <h2 class="hero-title">Mission Pursuit</h2>
       <p class="hero-sub">A workspace your agent furnishes as you work together.</p>
-      <div class="hero-composer composer-surface">
-        <textarea id="hero-input" rows="3" placeholder="What do you want to achieve?"></textarea>
-        <div class="hero-controls">
-          <span>Start with the outcome you want</span>
-          <button class="send-button" id="hero-send" aria-label="Start" title="Start mission">
+      <div class="hero-about">
+        <div class="hero-about-block">
+          <span class="hero-about-label">What it does</span>
+          <p>A persistent workspace the agent furnishes around your goal: artifacts, memory, a tools inventory, and schedules it proposes as it works.</p>
+        </div>
+        <div class="hero-about-block">
+          <span class="hero-about-label">Tools it uses</span>
+          <p>None preset — the agent records what your mission needs, and you enable each tool on the host's Internet Access and Tools page.</p>
+        </div>
+        <div class="hero-about-block">
+          <span class="hero-about-label">Background routines</span>
+          <p>Starts on activation: a nightly memory dream cycle. Pause, edit, or delete it anytime under Schedules.</p>
+        </div>
+      </div>
+      <div class="hero-actions">
+        <button class="send-button with-label" id="hero-send" aria-label="Activate" title="Activate this workspace">
+            <span>Activate</span>
             <svg width="18" height="18" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11M11 6l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
-        </div>
+        <span class="hero-hint" id="hero-hint">Starts the app and the routines above. The conversation begins whenever you send the first message.</span>
       </div>
     </div>
   </div>
@@ -167,6 +181,7 @@
     </div>
   </div>
 </main>
+<script src="/workspace-kit/view_blocks.js"></script>
 <script src="mission_pursuit.js"></script>
 </body>
 </html>
