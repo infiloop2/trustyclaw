@@ -25,6 +25,9 @@ from host.tools.results import (
     ActionResult,
     ApprovalExecuted,
     ApprovalResult,
+    OpenedStreamingAsset,
+    StreamingAsset,
+    StreamingAssetError,
 )
 from host.tools.tool import (
     ConnectionStatus,
@@ -74,8 +77,11 @@ __all__ = [
     "OAuthCompleteConnectResult",
     "OAuthStartConnectParams",
     "OAuthStartConnectResult",
+    "OpenedStreamingAsset",
     "SetupStep",
     "StoredCredential",
+    "StreamingAsset",
+    "StreamingAssetError",
     "Tool",
     "ToolManifest",
 ]

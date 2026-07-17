@@ -276,11 +276,15 @@ function usageRing(label, window) {
 
 async function showOauth(start, runtime) {
   const provider = runtime === "claude_code" ? "claude" : "openai";
-  const target = document.querySelector(`[data-provider-oauth="${provider}"]`);
-  if (!target) return;
+  // The card target is re-queried after each await: the 5-second poll can
+  // re-render the provider card while the request is in flight, and writing
+  // into the detached old node would silently drop the login card.
+  if (!document.querySelector(`[data-provider-oauth="${provider}"]`)) return;
   try {
     if (runtime === "claude_code") {
       const login = await api(start ? "POST" : "GET", "/v1/agent-runtime/claude-oauth-login");
+      const target = document.querySelector(`[data-provider-oauth="${provider}"]`);
+      if (!target) return;
       setHtml(target, `<div class="oauth-card">
         <span>Claude Code login: open
         <a href="${esc(login.login_url)}" target="_blank">${esc(login.login_url)}</a>
@@ -289,6 +293,8 @@ async function showOauth(start, runtime) {
       return;
     }
     const login = await api(start ? "POST" : "GET", "/v1/agent-runtime/codex-oauth-login");
+    const target = document.querySelector(`[data-provider-oauth="${provider}"]`);
+    if (!target) return;
     setHtml(target, `<div class="oauth-card">
       <span>Codex login: enter code <b>${esc(login.device_code)}</b> at
       <a href="${esc(login.login_url)}" target="_blank">${esc(login.login_url)}</a>

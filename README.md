@@ -285,9 +285,17 @@ Continue to [step 5](#5-deploy).
   ([tools architecture](docs/architecture/tools/README.md)).
 - **Installed apps:** purpose-built product surfaces with richer UX than a
   terminal chat loop, running behind the same host boundaries. These are
-  **Agent Chat** (threaded conversations over host tasks) and **Mission
+  **Agent Chat** (threaded conversations over host tasks), **Mission
   Pursuit** (a persistent workspace one agent furnishes with a goal, artifacts,
-  memory, and scheduled runs).
+  memory, and scheduled runs), and four domain workspaces built on the same
+  engine: **Alpha Seeker** (financial research over read-only IBKR and Polymarket),
+  **Social Marketer** (campaign planning and approval-gated publishing to X and
+  LinkedIn), **Virality Machine** (Runway video generation and approval-gated
+  Instagram publishing), and **Software Builder** (creating, reviewing, and
+  merging pull requests on your connected repo). The platform contract for adding more apps is in
+  [docs/architecture/apps/apps.md](./docs/architecture/apps/apps.md); each app has its
+  own doc under
+  [docs/architecture/apps/](./docs/architecture/apps/).
 
 These choices follow from a broader set of beliefs about running AI agents.
 See [PHILOSOPHY.md](./PHILOSOPHY.md).

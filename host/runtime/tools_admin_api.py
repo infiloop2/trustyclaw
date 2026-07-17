@@ -84,8 +84,6 @@ TOOL_APPROVALS_LIST_RE = re.compile(r"^/v1/tools/([a-z0-9_]{1,64})/approvals$")
 TOOL_APPROVAL_GET_RE = re.compile(r"^/v1/tools/([a-z0-9_]{1,64})/approvals/([A-Za-z0-9._:-]{1,128})$")
 TOOL_APPROVAL_DECIDE_RE = re.compile(r"^/v1/tools/([a-z0-9_]{1,64})/approvals/([A-Za-z0-9._:-]{1,128})/(approve|deny)$")
 TOOL_CONFIG_PATH_RE = re.compile(r"^/v1/tools/([a-z0-9_]{1,64})/config$")
-
-
 def tools_route(method: str, path: str, body: Any) -> Any:
     if path == "/v1/tools" and method == "GET":
         return list_tools()

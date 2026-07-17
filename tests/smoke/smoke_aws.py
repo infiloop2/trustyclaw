@@ -206,6 +206,7 @@ SMOKE_TOOL_CALLS: dict[str, tuple[tuple[str, dict], ...]] = {
         ("generate_image", {"prompt": "TrustyClaw smoke"}),
         ("generate_speech", {"text": "TrustyClaw smoke"}),
         ("get_task", {"task_id": "trustyclaw-smoke-missing"}),
+        ("save_video", {"task_id": "trustyclaw-smoke-missing"}),
     ),
     "twitter": (
         ("search_tweets", {"query": "TrustyClaw", "max_results": "10"}),
@@ -1129,12 +1130,20 @@ class AwsSmoke:
                 description="Claude Code draft settings to apply",
             )
 
-            app.evaluate(
-                f"document.getElementById('hero-input').value={json.dumps(message)};"
-                "document.getElementById('hero-send').click(); true"
-            )
+            # Activation is a single button: it creates the workspace with the
+            # drafted settings and queues no agent turn. The first message is
+            # sent afterward from the composer.
+            app.evaluate("document.getElementById('hero-send').click(); true")
             app.wait_for(
                 "!document.getElementById('workspace').hidden && "
+                "document.getElementById('hero').hidden",
+                description="the workspace to activate",
+            )
+            app.evaluate(
+                f"document.getElementById('chat-input').value={json.dumps(message)};"
+                "document.getElementById('chat-send').click(); true"
+            )
+            app.wait_for(
                 f"document.getElementById('feed').innerText.includes({json.dumps(message)})",
                 description="the first mission message to appear",
             )
@@ -2372,12 +2381,14 @@ class AwsSmoke:
         # live in the agent workspace, are opened by the agent-side shim, and
         # are removed immediately after the private tool-scoped copies exist.
         media_root = "/mnt/trustyclaw-agent/agent-home"
-        image_path = f"{media_root}/trustyclaw-smoke.png"
-        video_path = f"{media_root}/trustyclaw-smoke.mp4"
+        image_path = "/trustyclaw-smoke.png"
+        video_path = "/trustyclaw-smoke.mp4"
+        image_local = f"{media_root}{image_path}"
+        video_local = f"{media_root}{video_path}"
         create_media = (
             "umask 077; "
-            f"dd if=/dev/zero of={shlex.quote(image_path)} bs=512 count=1 status=none; "
-            f"dd if=/dev/zero of={shlex.quote(video_path)} bs=512 count=1 status=none"
+            f"dd if=/dev/zero of={shlex.quote(image_local)} bs=512 count=1 status=none; "
+            f"dd if=/dev/zero of={shlex.quote(video_local)} bs=512 count=1 status=none"
         )
         self._ssh_code(f"sudo -u trustyclaw-agent sh -c {shlex.quote(create_media)}")
         try:
@@ -2393,7 +2404,7 @@ class AwsSmoke:
         finally:
             self._ssh_code(
                 "sudo -u trustyclaw-agent rm -f "
-                f"{shlex.quote(image_path)} {shlex.quote(video_path)}"
+                f"{shlex.quote(image_local)} {shlex.quote(video_local)}"
             )
         if (
             not isinstance(image_stage, dict)
@@ -2413,6 +2424,7 @@ class AwsSmoke:
         spool_mode = self._ssh_code(f"sudo stat -c '%U:%G:%a' {spool}")
         if spool_mode.strip() != "trustyclaw-tools:trustyclaw-tools:700":
             raise AssertionError(f"tool asset spool has unsafe ownership or mode: {spool_mode!r}")
+
         for label, asset_id in asset_ids.items():
             if not isinstance(asset_id, str):
                 raise AssertionError(f"local media staging returned invalid {label}: {asset_id!r}")

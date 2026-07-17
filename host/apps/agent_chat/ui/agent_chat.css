@@ -248,6 +248,14 @@ button.icon-button.quiet svg { height: 18px; width: 18px; }
   padding: 0.55rem 0.85rem;
 }
 
+/* A steering message sent mid-task: same side as the prompt, but a quiet
+   accent outline marks it as a follow-up nudge rather than the turn's
+   opening request. */
+.turn-user .bubble.steer-bubble {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+}
+
 .turn-meta {
   align-items: center;
   color: var(--text-dim);
@@ -367,11 +375,6 @@ button.icon-button.quiet svg { height: 18px; width: 18px; }
 .composer-pill:focus {
   border-color: var(--border-strong);
   color: var(--text);
-}
-
-input.thread-input {
-  font-family: var(--font-mono);
-  width: 9.5rem;
 }
 
 .send-button {

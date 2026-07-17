@@ -77,6 +77,12 @@ adding its directory; there is no root registry or bootstrap list to update.
 
 `title` is the human-readable name shown in app listings and diagnostics.
 
+The admin shell hardwires Agent Chat as the host's main interface: the home
+tab opens with a "Begin chat" navigator and Agent Chat's navigation entry
+sits directly below Home, above the grouped host sections and the Apps
+section that lists every other installed app. This is shell presentation
+only; the manifest contract and `/v1/apps` carry no hero field.
+
 `backend.entrypoint` is the app backend server code, relative to the app
 package. The app provides code only; the host chooses the port, local bind
 address, environment, service unit name, working directory, and run user. Port
@@ -153,14 +159,45 @@ than a hard quota: app backends can use idle cores, but under CPU contention
 the admin API, proxy, Postgres, SSH, and other host services in `system.slice`
 keep priority over app backend CPU loops.
 
-App UI does not call host admin APIs directly and never receives the operator's
-admin credential. The isolated frame posts app-backend requests to the parent
-admin shell. The parent adds the operator's existing admin auth only for that
-app's reverse-proxy route, `/v1/apps/<app_id>/api/...`. The admin API verifies
-the normal admin auth, verifies the route is an installed app backend route, then
-proxies to the app service over host loopback with a host proxy marker. The
-operator's raw admin credential is stripped before the request reaches the app
+### App UI Parent Bridge
+
+An app UI runs in an isolated iframe without the operator's admin credential.
+It communicates with the parent admin shell through a small, typed
+`postMessage` bridge. The parent accepts messages only from the exact
+`contentWindow` of an installed app iframe. All other message types and sources
+are ignored.
+
+The complete iframe-to-parent request allowlist is:
+
+| Message type | Fields | Parent behavior |
+| --- | --- | --- |
+| `trustyclaw-app-api` | `request_id`, `method`, `path`, optional `body` | Makes one authenticated request only to that same app's `/v1/apps/<app_id>/api/...` route, then returns `trustyclaw-app-api-result` to the iframe. |
+| `trustyclaw-app-open-file` | absolute agent-workspace `path` | Switches the parent operator UI to Agent workspace / Files and opens the path there. It returns no file bytes to the iframe. |
+
+The API message is the app UI's only backend-request mechanism. The parent adds
+the operator's existing admin auth only for the sending app's reverse-proxy
+route. The admin API verifies the normal admin auth and installed-app route,
+then proxies to the app service over host loopback with a host proxy marker.
+The operator's raw credential is stripped before the request reaches the app
 backend.
+
+The open-file message is a fixed parent-shell UI action, not an API proxy or a
+browser redirect. An app cannot use it to open a URL, render a file inside its
+iframe, read file bytes, or choose another parent-shell action. The parent
+accepts an absolute path without `..`; the operator-authenticated agent-file
+route then resolves it beneath agent home and rejects traversal and symlinks.
+Non-video content is replacement-decoded text inserted with `textContent`. The
+binary route accepts only regular MP4 or MOV files up to 200 MB, assigns a fixed
+video media type, sends `nosniff` plus a `default-src 'none'; sandbox` response
+policy, and is fetched by the parent into a blob URL used only as the Files
+tab's `<video>` source. Agent bytes never become markup, script, or a navigation
+URL. This keeps file review as one host concept instead of giving apps a second
+staged-asset playback protocol.
+
+There are no parent bridge messages for arbitrary admin APIs, external URLs,
+network requests, credentials, parent DOM access, or arbitrary tab control.
+Adding another parent capability expands the app UI trust boundary and requires
+an explicit message type with host-side validation.
 
 When an app backend needs host resources such as tasks or threads, it calls the
 host admin API server-to-server over a local Unix-domain socket. The admin API
@@ -170,10 +207,15 @@ uid-derived app id. This avoids storing a second app secret while keeping the
 browser-facing TCP admin API protected by the operator password, and prevents
 one app service user from impersonating another app over the shared socket.
 Server-to-server calls are then checked against an app-backend route allowlist.
-The allowlist is intentionally narrow: it includes only task creation and
-task/thread lookup or control route shapes needed by app workflows. It does not
-allow broad host routes such as network policy, files, process inventory,
-runtime auth, app registry, or generic task/thread listing.
+The allowlist is intentionally narrow: it includes only task creation, task and
+thread lookup, thread and per-thread event listing, and task control route
+shapes needed by app workflows. The thread list (`GET /v1/threads`) and thread
+event stream are app-scoped at the socket boundary, not generic: the host
+filters each response to threads under the caller's own `<app_id>__` prefix
+and strips the prefix, so an app sees exactly its own threads and never another
+app's or the operator's. The allowlist does not allow broad host routes such as
+network policy, files, process inventory, runtime auth, app registry, or the
+host-wide agent event log.
 
 Task and thread names sent by an app backend are app-scoped at the socket
 boundary. The app sends and receives its normal `thread_id` values, but the host
@@ -225,8 +267,9 @@ host renders app UI in a sandboxed iframe without `allow-same-origin`, and app
 UI asset responses carry a CSP `sandbox` directive so direct/top-level app UI
 loads also receive an opaque origin. A third-party or compromised app that
 shared the admin browser principal could read JS-accessible admin credentials
-and call host routes as the operator, so the only browser bridge exposed to app
-UI is a reverse-proxy helper for that app's backend route. The bridge is not a
+and call host routes as the operator, so the browser bridge exposes only a
+reverse-proxy helper for that app's backend route and a command that opens an
+absolute agent-workspace path in the host Files viewer. The bridge is not a
 generic host admin API bridge.
 
 App UI asset CSP is intentionally narrow. App frames may load scripts, styles,
@@ -237,7 +280,17 @@ sources are not allowed. The explicit app asset origin in CSP exists so the same
 policy works when a test or deployment serves the admin API on an ephemeral host
 or port; it is not permission to beacon to arbitrary origins. The explicit
 `frame-src 'none'` directive prevents app UI from embedding nested frames; this
-is browser-enforced, not an app convention.
+is browser-enforced, not an app convention. App scripts are external audited
+assets; inline scripts and event handlers are denied. Inline styles remain
+allowed for bounded renderer-owned layout values such as progress widths and
+chart tooltip positions.
+
+App UIs should render agent-authored values as escaped text. They should not
+turn agent-authored strings into runtime anchors or pass them to `window.open`
+or location assignment, because that would turn untrusted data into a
+navigation target. An app that needs a parent-shell action should use a typed,
+host-validated bridge message instead of interpreting an agent-authored value
+as a URL.
 
 ## Storage And Migrations
 

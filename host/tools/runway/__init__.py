@@ -6,13 +6,22 @@ import ipaddress
 import re
 import secrets
 import urllib.parse
+from contextlib import contextmanager
 from typing import BinaryIO, Iterator, cast
 
 from host.tools.json_types import JSONObject
 from host.tools.manifest import ActionSpec, ConfigRequirement, DataSummary, DataSummaryCard, DataSummaryLink, DataSummaryPoint, SetupStep, ToolManifest
-from host.tools.results import ActionExecuted, ActionFailed, ActionResult, ApprovalResult
+from host.tools.results import (
+    ActionExecuted,
+    ActionFailed,
+    ActionResult,
+    ApprovalResult,
+    OpenedStreamingAsset,
+    StreamingAsset,
+    StreamingAssetError,
+)
 from host.tools.host_api import ApprovalRecord, HostAPI
-from host.tools.shared.web import WebRequestError, json_request, stream_request_bytes
+from host.tools.shared.web import WebRequestError, json_request, open_response_stream, stream_request_bytes
 
 # Runway's Developer API is a single Bearer-authenticated JSON surface. Every
 # generation is an async task: POST a generation endpoint to get a task id, then
@@ -116,6 +125,11 @@ RUNWAY_POLL_POLICY = (
     "Read-only poll. Sends only the task id to Runway's Developer API and "
     "returns the task status and, once finished, a temporary download URL for "
     "the generated video, image, or audio into active model context. Runs directly with no approval."
+)
+RUNWAY_SAVE_VIDEO_POLICY = (
+    "Read-only handoff. Sends the task id to Runway, downloads the completed video from "
+    "Runway's authoritative temporary output URL, and streams it through the agent-side "
+    "bridge into a host-generated path under /tool_assets in the agent workspace."
 )
 
 
@@ -246,11 +260,28 @@ MANIFEST = ToolManifest(
             },
             output_schema=RUNWAY_OUTPUT_SCHEMA,
         ),
+        ActionSpec(
+            id="save_video",
+            description=(
+                "Save a completed Runway video under /tool_assets in the agent workspace. "
+                "The agent-side bridge creates the filename and returns the durable path."
+            ),
+            data_policy=RUNWAY_SAVE_VIDEO_POLICY,
+            input_schema={
+                "type": "object",
+                "required": ["task_id"],
+                "properties": {
+                    "task_id": {"type": "string", "description": "Completed Runway video task id."},
+                },
+                "additionalProperties": False,
+            },
+            output_schema=RUNWAY_OUTPUT_SCHEMA,
+        ),
     ),
     config=(ConfigRequirement(key="RUNWAY_API_SECRET", description="Runway Developer API key (org-scoped) from the dev.runwayml.com dashboard."),),
     protections=(
         "Your Runway key stays in write-only tool config. Inputs are bounded, and local images and videos are uploaded to Runway only when used as inputs.",
-        "Generation is billed to your Runway organization. TrustyClaw does not publish the media. Outputs are returned through temporary URLs that typically expire within 24 to 48 hours.",
+        "Generation is billed to your Runway organization. TrustyClaw does not publish the media. A completed video can be saved from Runway's authoritative temporary URL into the agent workspace for durable operator review and later approval-gated publishing.",
     ),
     setup_steps=(
         SetupStep(
@@ -686,6 +717,66 @@ def _failure_from_status(exc: WebRequestError) -> str:
     return "Runway API request failed."
 
 
+def _save_video(task_id: str, headers: dict[str, str]) -> ActionResult:
+    if not TASK_ID_RE.fullmatch(task_id):
+        raise ToolInputValidationError("Runway tool_input.task_id is invalid.")
+    response = json_request(
+        "GET",
+        f"{TASKS_ENDPOINT}/{urllib.parse.quote(task_id, safe='')}",
+        headers=headers,
+        failure_message="Runway task lookup failed.",
+        invalid_response_message="Runway returned an invalid task response.",
+    )
+    if response.get("status") != "SUCCEEDED":
+        return ActionFailed("Runway video is not complete. Poll get_task and try again after it succeeds.")
+    output = response.get("output")
+    output_url = output[0] if isinstance(output, list) and output and isinstance(output[0], str) else ""
+    if not output_url or not _is_https_output_url(output_url):
+        return ActionFailed("Runway reported success but returned no valid video URL.")
+    @contextmanager
+    def open_video() -> Iterator[OpenedStreamingAsset]:
+        try:
+            with open_response_stream(
+                "GET", output_url, failure_message="Runway video download failed.", timeout=120
+            ) as (source, response_headers):
+                raw_length = response_headers.get("content-length", "")
+                if not raw_length.isascii() or not raw_length.isdecimal():
+                    raise StreamingAssetError(
+                        "Runway video download did not include a valid size."
+                    )
+                size_bytes = int(raw_length)
+                if not 512 <= size_bytes <= 200_000_000:
+                    raise StreamingAssetError(
+                        "Runway video download size is outside the supported range."
+                    )
+                media_type = (
+                    response_headers.get("content-type", "")
+                    .split(";", 1)[0]
+                    .strip()
+                    .lower()
+                )
+                suffixes = {"video/mp4": ".mp4", "video/quicktime": ".mov"}
+                suffix = suffixes.get(media_type)
+                if suffix is None:
+                    raise StreamingAssetError(
+                        "Runway video download returned an unsupported media type."
+                    )
+                yield OpenedStreamingAsset(
+                    filename=f"runway-{task_id}{suffix}",
+                    media_type=media_type,
+                    size_bytes=size_bytes,
+                    source=source,
+                )
+        except StreamingAssetError:
+            raise
+        except WebRequestError as exc:
+            raise StreamingAssetError(_failure_from_status(exc)) from exc
+        except ValueError as exc:
+            raise StreamingAssetError(str(exc) or "Runway video download failed.") from exc
+
+    return StreamingAsset(open_video)
+
+
 class RunwayTool:
     @property
     def manifest(self) -> ToolManifest:
@@ -762,6 +853,12 @@ class RunwayTool:
                 if isinstance(result, ActionExecuted):
                     api.assets.delete(asset_id)
                 return result
+            if action == "save_video":
+                if set(tool_input) != {"task_id"} or not isinstance(tool_input.get("task_id"), str):
+                    raise ToolInputValidationError(
+                        "Runway save_video requires exactly one string task_id."
+                    )
+                return _save_video(cast(str, tool_input["task_id"]), headers)
             if action == "generate_image":
                 body = _image_request(tool_input)
                 return self._create_task(TEXT_TO_IMAGE_ENDPOINT, body, headers, IMAGE_MODEL, "image")

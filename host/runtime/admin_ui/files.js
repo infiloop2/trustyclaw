@@ -1,12 +1,13 @@
 // Agent workspace tab: read-only file explorer over the agent home.
 
-import { api } from "./api.js";
+import { api, apiBlob } from "./api.js";
 import { $ } from "./helpers.js";
 
 const FILE_LIST_ENTRY_LIMIT = 1000;
 
 let currentFilePath = "/";
 let fileEntries = [];
+let activeFileUrl = null;
 
 function fileMessage(message, isError) {
   const node = $("file-message");
@@ -49,6 +50,12 @@ export function loadParentDirectory() {
 async function readAgentFile(path) {
   try {
     fileMessage("");
+    if (/\.(mp4|mov)$/i.test(path)) {
+      const blob = await apiBlob(`/v1/agent-files/content?path=${encodeURIComponent(path)}`);
+      if (!blob.type.startsWith("video/")) throw new Error("file is not a supported video");
+      renderFileVideo(path, blob);
+      return;
+    }
     const response = await api("GET", `/v1/agent-files/read?path=${encodeURIComponent(path)}`);
     renderFileContent(response);
   } catch (error) {
@@ -119,9 +126,24 @@ function fileRow(name, path, type, sizeBytes) {
 }
 
 function renderFileContent(file) {
+  if (activeFileUrl) URL.revokeObjectURL(activeFileUrl);
+  activeFileUrl = null;
+  $("file-video").hidden = true;
+  $("file-video").removeAttribute("src");
+  $("file-content").hidden = false;
   const truncated = file.truncated ? " (truncated)" : "";
   $("file-viewer-title").textContent = `${file.path || ""}${truncated}`;
   $("file-content").textContent = file.content || "";
+}
+
+function renderFileVideo(path, blob) {
+  if (activeFileUrl) URL.revokeObjectURL(activeFileUrl);
+  activeFileUrl = URL.createObjectURL(blob);
+  $("file-viewer-title").textContent = path;
+  $("file-content").hidden = true;
+  const video = $("file-video");
+  video.src = activeFileUrl;
+  video.hidden = false;
 }
 
 export function goToFilePath() {

@@ -421,11 +421,14 @@ cat > "$PGDATA_DIR/postgresql.conf" <<PGCONF
 listen_addresses = ''
 unix_socket_directories = '/var/run/postgresql'
 # Each service process bounds its own active sessions client-side
-# (db.MAX_ACTIVE_CONNECTIONS = 14). The four core database clients plus two
-# bundled apps use at most 6 x 14 = 84 sessions, leaving 16 slots for operator
-# psql, the superuser reserve, and deployment work. Bursts beyond a process's cap
+# (db.MAX_ACTIVE_CONNECTIONS = 14). Provisioned once for growth rather than
+# retuned per app: up to fifteen bundled apps plus the four core database
+# clients use at most 19 x 14 = 266 sessions, leaving 34 slots for operator
+# psql, the superuser reserve, and deployment work (test_deploy asserts the
+# installed budget stays under this provision). Idle Postgres backends cost a
+# few MB each, so the larger ceiling is cheap; bursts beyond a process's cap
 # queue client-side instead of immediately failing at the server.
-max_connections = 100
+max_connections = 300
 log_destination = 'stderr'
 PGCONF
 cat > "$PGDATA_DIR/pg_hba.conf" <<'PGHBA'

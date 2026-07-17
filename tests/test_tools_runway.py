@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import unittest
+from contextlib import contextmanager
+import io
 from typing import Any
 from unittest.mock import patch
 
 from host.tools.json_types import JSONObject
-from host.tools.results import ActionExecuted, ActionFailed
+from host.tools.results import ActionExecuted, ActionFailed, StreamingAsset
 from host.tools import runway
 from host.tools.runway import RunwayTool
 from host.tools.shared.web import WebRequestError
@@ -22,13 +24,16 @@ def api_with_key() -> FakeHostAPI:
 
 
 class RunwayToolTests(unittest.TestCase):
-    def test_manifest_is_enable_only_with_five_actions(self) -> None:
+    def test_manifest_is_enable_only_with_six_actions(self) -> None:
         tool = RunwayTool()
         self.assertEqual(tool.manifest.connection, "enable_only")
         self.assertIsNone(tool.credentials)
         self.assertEqual(
             [spec.id for spec in tool.manifest.actions],
-            ["generate_video", "edit_video", "generate_image", "generate_speech", "get_task"],
+            [
+                "generate_video", "edit_video", "generate_image", "generate_speech",
+                "get_task", "save_video",
+            ],
         )
         cards = tool.manifest.data_summary.cards
         self.assertEqual(len(cards), 4)
@@ -47,7 +52,8 @@ class RunwayToolTests(unittest.TestCase):
         self.assertIn("to OpenAI's GPT Image 2", destination_text)
         self.assertIn("to ElevenLabs Multilingual v2", destination_text)
         retention = next(card for card in cards if card.title == "How long Runway retains it")
-        self.assertNotIn("local copy", retention.description)
+        protections = " ".join(tool.manifest.protections)
+        self.assertIn("agent workspace", protections)
 
     def test_generate_video_text_to_video_defaults_to_gen45(self) -> None:
         seen: dict[str, Any] = {}
@@ -357,6 +363,43 @@ class RunwayToolTests(unittest.TestCase):
         ):
             with self.subTest(value=value[:100]):
                 self.assertFalse(runway._is_https_runway_url(value))
+
+    def test_save_video_uses_authoritative_task_output_and_returns_stream(self) -> None:
+        api = api_with_key()
+
+        def fake_json_request(method: str, url: str, **kwargs: Any) -> JSONObject:
+            self.assertEqual(method, "GET")
+            self.assertEqual(url, f"{runway.TASKS_ENDPOINT}/task-1")
+            return {"id": "task-1", "status": "SUCCEEDED", "output": ["https://cdn.example/reel.mp4"]}
+
+        @contextmanager
+        def fake_stream(method: str, url: str, **kwargs: Any):
+            self.assertEqual((method, url), ("GET", "https://cdn.example/reel.mp4"))
+            yield io.BytesIO(b"x" * 600), {"content-length": "600", "content-type": "video/mp4"}
+
+        with (
+            patch.object(runway, "json_request", fake_json_request),
+            patch.object(runway, "open_response_stream", fake_stream),
+        ):
+            result = RunwayTool().execute(
+                "save_video", {"task_id": "task-1"}, api
+            )
+            assert isinstance(result, StreamingAsset)
+            with result.open_stream() as opened:
+                self.assertEqual(opened.filename, "runway-task-1.mp4")
+                self.assertEqual(opened.media_type, "video/mp4")
+                self.assertEqual(opened.size_bytes, 600)
+                self.assertEqual(opened.source.read(), b"x" * 600)
+
+        self.assertEqual(api.assets.records, {})
+
+    def test_save_video_rejects_nonterminal_task(self) -> None:
+        with patch.object(runway, "json_request", return_value={"id": "task-1", "status": "RUNNING"}):
+            result = RunwayTool().execute(
+                "save_video", {"task_id": "task-1"}, api_with_key()
+            )
+        assert isinstance(result, ActionFailed)
+        self.assertIn("not complete", result.error)
 
     def test_edit_video_validates_input(self) -> None:
         tool = RunwayTool()

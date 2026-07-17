@@ -19,8 +19,13 @@ so operators and contributors can jump to the trust boundary they need.
 | [Runtime harness dependencies](harness-dependencies.md) | Codex and Claude Code interfaces, auth files, request shapes, and upgrade review points. |
 | [Admin API architecture](admin-api.md) | Local API security, task orchestration, and maintenance. |
 | [Apps](apps/apps.md) | App services, storage and migrations, embedded admin UI surfaces, and app security boundaries. |
+| [Workspace Kit](apps/workspace-kit.md) | Shared resident-workspace state, actions, run lifecycle, bounds, authentication, and verification. |
 | [App: Agent Chat](apps/agent-chat.md) | The threaded chat app: thread index, task references, and its display-only agent surface. |
 | [App: Mission Pursuit](apps/mission-pursuit.md) | The agent-furnished workspace app: action protocol, scheduling, artifacts, memory, and its structured agent boundary. |
+| [App: Alpha Seeker](apps/alpha-seeker.md) | The financial-research workspace: read-only IBKR and Polymarket monitoring, watchlists, and a scheduled market brief. |
+| [App: Social Marketer](apps/social-marketer.md) | The marketing workspace: campaign planning, a drafts table, and approval-gated publishing to X and LinkedIn. |
+| [App: Virality Machine](apps/virality-machine.md) | The short-form-video workspace: Runway generation, a render-job queue, storyboards, and approval-gated Instagram publishing. |
+| [App: Software Builder](apps/software-builder.md) | The GitHub workspace: creates, reviews, and advances pull requests in connected repositories. |
 | [Agent App API](apps/agent-app-api.md) | The `app_api` tool: kernel-attributed agent → app backend calls through the dedicated agent-app service. |
 | [Network controls](network-controls.md) | nftables, typed integration guards (AI providers, GitHub, packages, custom domains), agent introspection, and fail-closed behavior. |
 | [GitHub write-path controls](github-write-path-controls.md) | The implemented `.github` push-inspection, quarantine, approval, replay, and failure model. |

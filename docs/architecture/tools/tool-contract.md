@@ -185,7 +185,8 @@ exact subset the host enforces.
 ```
 host resolves the enabled, configured tool
   └─ tool.execute(action, tool_input, api)
-       ├─ direct action        → call third-party APIs → ActionExecuted(result)
+       ├─ direct JSON action   → call third-party APIs → ActionExecuted(result)
+       ├─ direct file action   → open provider bytes   → StreamingAsset(open_stream)
        ├─ approval-gated action → validate, build the exact execution payload +
        │                          a redacted summary → api.approvals.request(...)
        │                        → ActionPendingApproval(approval_id, summary)
@@ -207,18 +208,29 @@ stored payload exactly as proposed, and returns `ApprovalExecuted` or
 @dataclass(frozen=True)
 class ActionExecuted:      result: JSONObject      # direct action, validated vs output_schema
 @dataclass(frozen=True)
+class OpenedStreamingAsset: filename: str; media_type: str; size_bytes: int; source: BinaryIO
+@dataclass(frozen=True)
+class StreamingAsset:      open_stream: Callable[[], AbstractContextManager[OpenedStreamingAsset]]
+@dataclass(frozen=True)
 class ActionPendingApproval: approval_id: str; summary: str = ""
 @dataclass(frozen=True)
 class ApprovalExecuted:    message: str            # approved action outcome, user-visible
 @dataclass(frozen=True)
 class ActionFailed:        error: str; reconnect_required: bool = False
 
-ActionResult   = ActionExecuted | ActionPendingApproval | ActionFailed   # execute(...)
+ActionResult   = ActionExecuted | StreamingAsset | ActionPendingApproval | ActionFailed
 ApprovalResult = ApprovalExecuted | ActionFailed                          # execute_approved(...)
 ```
 
 - `ActionExecuted.result` is a JSON object validated against `output_schema`,
   shown to the agent. It must not include tokens, secrets, or raw provider bodies.
+- `StreamingAsset` is the entire direct-action result, never a field inside an
+  `ActionExecuted` JSON object. Entering `open_stream` yields one opened source
+  plus its filename, media type, and exact encoded byte length. The host relays
+  the bytes over its agent transport, and the agent-side adapter converts every
+  stream into a durable workspace path. The two result variants make mixed
+  JSON-and-binary responses unrepresentable. Expected open or transfer failures
+  raise `StreamingAssetError` with a redacted agent-visible message.
 - The outcome of an **approved** action is a single user-visible
   `ApprovalExecuted.message` string, not a JSON result validated against an
   `output_schema`. The host stores it as the approval's terminal `result` text
@@ -251,10 +263,10 @@ size-limit violations raise `ValueError`; a missing config key raises `KeyError`
 
 ### Staged assets
 
-`Assets` is the narrow binary-data exception to the JSON action contract. A
-host-specific ingress streams bytes into host-owned storage and returns an
-opaque id; no caller pathname enters the tool process. The host scopes that id
-to one tool and exposes metadata plus an already-open binary stream:
+`Assets` is the narrow ingress exception to the action result contract. A
+host-specific ingress can stream agent file bytes into host-owned storage and
+return an opaque id; no caller pathname enters the tool process. The host scopes
+every id to one tool and exposes metadata plus an already-open binary stream:
 
 ```python
 @dataclass(frozen=True)
@@ -272,10 +284,12 @@ class Assets(Protocol):
     def delete(self, asset_id: str) -> None: ...
 ```
 
-Tool packages receive neither a storage path nor cross-tool lookup. An
-approval payload that references an asset binds its filename, encoded byte
-size, and SHA-256; execution verifies those values before data-out. Assets are
-ephemeral inputs, not durable tool state.
+Tool packages receive neither a storage path nor cross-tool lookup.
+
+An approval payload that references an input asset binds its filename, encoded
+byte size, and SHA-256; execution verifies those values before data-out. Assets
+are ephemeral input transport, not durable tool state. Provider output uses the
+generic `StreamingAsset` result instead and never enters this staged-asset store.
 
 ### Credentials
 

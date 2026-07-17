@@ -44,8 +44,10 @@ class ActionSpec:
     it next to the action before enabling the tool.
 
     ``output_schema`` describes the JSON ``ActionExecuted.result`` of a direct
-    action and may be empty (``{}``) for approval-gated actions, which return a
-    user-visible ``ApprovalExecuted`` message rather than a JSON result.
+    action. It does not apply when that action returns an exclusive
+    ``StreamingAsset``. It may be empty (``{}``) for approval-gated actions,
+    which return a user-visible ``ApprovalExecuted`` message rather than a JSON
+    result.
     """
 
     id: str

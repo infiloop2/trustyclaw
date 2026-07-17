@@ -39,6 +39,8 @@ let activeTab = "home";
 let installedApps = [];
 const appFrames = new Map();
 const staticTabs = ["home", "agent", "processes", "agent-log", "files", "network", "connection-guide", "net-log", "tool-log"];
+const HERO_APP_ID = "agent_chat";
+const HERO_CTA = "Begin chat";
 const MOBILE_NAV_QUERY = "(max-width: 860px)";
 let mobileNavOpen = false;
 
@@ -194,22 +196,36 @@ async function loadApps() {
 function renderAppTabs() {
   const container = $("app-tabs");
   container.innerHTML = "";
+  $("hero-app-tab").innerHTML = "";
   document.querySelectorAll(".app-tab-panel").forEach(panel => panel.remove());
   appFrames.clear();
-  if (!installedApps.length) {
+  // Agent Chat is hardwired as the host's main interface: the home hero
+  // navigator carries its CTA, and its nav entry sits directly below Home
+  // instead of inside Apps (Beta). Every other installed app belongs to that
+  // beta section. Shell presentation only: app manifests and /v1/apps carry
+  // neither hero nor maturity fields.
+  const heroApp = installedApps.find(app => app.id === HERO_APP_ID) || null;
+  renderHomeHero(heroApp);
+  const listedApps = installedApps.filter(app => app !== heroApp);
+  if (!listedApps.length) {
     container.innerHTML = `<div class="sidebar-empty">No apps installed</div>`;
-    return;
   }
   const main = document.querySelector("main");
   for (const app of installedApps) {
     const button = document.createElement("button");
     button.id = `tab-app-${app.id}`;
-    button.className = "tab-button app-tab-button";
+    button.className = app === heroApp ? "tab-button hero-app-tab" : "tab-button";
     button.dataset.action = "show-tab";
     button.dataset.tab = `app:${app.id}`;
-    button.innerHTML = `${appIconSvg()}<span></span>`;
-    button.querySelector("span").textContent = app.title || app.id;
-    container.appendChild(button);
+    if (app === heroApp) {
+      button.innerHTML = `${chatIconSvg()}<span></span>`;
+      button.querySelector("span").textContent = app.title || app.id;
+      $("hero-app-tab").appendChild(button);
+    } else {
+      button.innerHTML = `${appIconSvg()}<span></span>`;
+      button.querySelector("span").textContent = app.title || app.id;
+      container.appendChild(button);
+    }
 
     const panel = document.createElement("div");
     panel.id = `panel-app-${app.id}`;
@@ -229,15 +245,46 @@ function renderAppTabs() {
   }
 }
 
+function renderHomeHero(heroApp) {
+  const hero = $("home-hero");
+  hero.hidden = !heroApp;
+  hero.innerHTML = "";
+  if (!heroApp) return;
+  const card = document.createElement("section");
+  card.className = "home-hero-card";
+  card.innerHTML = `
+    <div class="home-hero-copy">
+      <span class="home-hero-icon">${chatIconSvg()}</span>
+      <h1></h1>
+    </div>
+    <button class="home-hero-cta" data-action="show-tab"></button>`;
+  card.querySelector("h1").textContent = heroApp.title || heroApp.id;
+  const cta = card.querySelector(".home-hero-cta");
+  cta.dataset.tab = `app:${heroApp.id}`;
+  cta.textContent = HERO_CTA;
+  hero.appendChild(card);
+}
+
 function appIconSvg() {
   return `<svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h9A1.5 1.5 0 0 1 16 5.5v9a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 4 14.5v-9Z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 8h6M7 11h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`;
 }
 
+function chatIconSvg() {
+  return `<svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4.5h12A1.5 1.5 0 0 1 17.5 6v6a1.5 1.5 0 0 1-1.5 1.5H9.4L6 16.5v-3H4A1.5 1.5 0 0 1 2.5 12V6A1.5 1.5 0 0 1 4 4.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M6.5 8h7M6.5 10.6h4.6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`;
+}
+
 window.addEventListener("message", event => {
   const message = event.data;
-  if (!message || message.type !== "trustyclaw-app-api") return;
+  if (!message || !["trustyclaw-app-api", "trustyclaw-app-open-file"].includes(message.type)) return;
   const app = installedApps.find(candidate => appFrames.get(candidate.id)?.contentWindow === event.source);
   if (!app) return;
+  if (message.type === "trustyclaw-app-open-file") {
+    const path = typeof message.path === "string" ? message.path : "";
+    if (!path.startsWith("/") || path.split("/").includes("..")) return;
+    showTab("files");
+    openAgentPath(path, "file").catch(error => notice(error.message, true));
+    return;
+  }
   handleAppApiMessage(app, event.source, message).catch(error => {
     event.source.postMessage({
       type: "trustyclaw-app-api-result",

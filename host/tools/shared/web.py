@@ -8,6 +8,7 @@ visible, so callers keep them free of secrets and raw provider bodies.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import http.client
 import json
 import math
@@ -15,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
-from typing import BinaryIO, Iterable, cast
+from typing import BinaryIO, Iterable, Iterator, cast
 
 from host.tools.json_types import JSONObject, JSONValue
 
@@ -71,6 +72,46 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 # One shared opener with redirects disabled and no proxy handler. Built once so
 # every request_bytes call gets the same hardened behavior.
 _OPENER = urllib.request.build_opener(_NoRedirectHandler, urllib.request.ProxyHandler({}))
+
+
+@contextmanager
+def open_response_stream(
+    method: str,
+    url: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    failure_message: str,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+) -> Iterator[tuple[BinaryIO, dict[str, str]]]:
+    """Open a redirect-free HTTPS response for bounded streaming by a caller.
+
+    The caller validates Content-Length and media type before consuming bytes.
+    Raw provider errors and signed URLs never escape this helper.
+    """
+    if not url.startswith("https://"):
+        raise WebRequestError(failure_message)
+    request = urllib.request.Request(url, headers=dict(headers or {}), method=method)
+    try:
+        response = _OPENER.open(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        body = b""
+        try:
+            body = exc.read(4096)
+        except Exception:
+            pass
+        raise WebRequestError(failure_message, status=exc.code, body=body) from exc
+    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as exc:
+        raise WebRequestError(failure_message) from exc
+    try:
+        with response:
+            response_headers = {name.lower(): value for name, value in response.headers.items()}
+            yield cast(BinaryIO, response), response_headers
+    except WebRequestError:
+        raise
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        # Network failures while the caller reads remain provider failures.
+        # Caller exceptions such as ValueError pass through unchanged.
+        raise WebRequestError(failure_message) from exc
 
 
 def encode_query(params: Mapping[str, str]) -> str:

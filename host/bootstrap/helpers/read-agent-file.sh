@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import errno
 import json
 import os
+import shutil
 import stat
 import sys
 from pathlib import Path, PurePosixPath
@@ -15,6 +16,7 @@ from pathlib import Path, PurePosixPath
 AGENT_HOME = Path("/mnt/trustyclaw-agent/agent-home").resolve(strict=True)
 MAX_LIST_ENTRIES = 1000
 MAX_READ_BYTES = 1024 * 1024
+MAX_STREAM_BYTES = 200_000_000
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 NONBLOCK = getattr(os, "O_NONBLOCK", 0)
@@ -171,9 +173,50 @@ def read_path(raw_path: str) -> None:
     }, sort_keys=True))
 
 
+def stream_path(raw_path: str) -> None:
+    parts = parse_path(raw_path)
+    if not parts:
+        fail(3, "path is not a regular file")
+    media_types = {".mp4": "video/mp4", ".mov": "video/quicktime"}
+    media_type = media_types.get(Path(parts[-1]).suffix.lower())
+    if media_type is None:
+        fail(3, "stream supports only MP4 or MOV video files")
+    parent_fd = open_agent_dir(parts[:-1])
+    try:
+        try:
+            file_fd = os.open(parts[-1], os.O_RDONLY | NOFOLLOW | NONBLOCK, dir_fd=parent_fd)
+        except FileNotFoundError:
+            fail(2, "path not found")
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                fail(3, "symlinks are not supported")
+            raise
+    finally:
+        os.close(parent_fd)
+    try:
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode):
+            fail(3, "path is not a regular file")
+        if not 0 <= info.st_size <= MAX_STREAM_BYTES:
+            fail(3, f"file is larger than {MAX_STREAM_BYTES} bytes")
+        header = {
+            "path": public_path_for(parts),
+            "size_bytes": info.st_size,
+            "media_type": media_type,
+        }
+        sys.stdout.buffer.write(json.dumps(header, sort_keys=True).encode() + b"\n")
+        sys.stdout.buffer.flush()
+        with os.fdopen(file_fd, "rb") as source:
+            file_fd = -1
+            shutil.copyfileobj(source, sys.stdout.buffer, length=1024 * 1024)
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 3:
-        fail(3, "usage: read-agent-file <list|read> <path>")
+        fail(3, "usage: read-agent-file <list|read|stream> <path>")
     action, raw_path = argv[1], argv[2]
     if action == "list":
         list_path(raw_path)
@@ -181,7 +224,10 @@ def main(argv: list[str]) -> int:
     if action == "read":
         read_path(raw_path)
         return 0
-    fail(3, "operation must be list or read")
+    if action == "stream":
+        stream_path(raw_path)
+        return 0
+    fail(3, "operation must be list, read, or stream")
     return 1
 
 

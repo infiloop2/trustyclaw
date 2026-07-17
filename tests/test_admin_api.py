@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import hashlib
+import io
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 import json
@@ -12,7 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import subprocess
 from typing import Any
 import urllib.error
@@ -214,8 +215,11 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertIn('id="processes"', html)
         self.assertIn('id="sidebar-apps"', html)
         self.assertIn('id="app-tabs"', html)
+        self.assertIn('id="app-tabs"', html)
+        self.assertIn("under development and may not function properly", html)
         app_js = (runtime / "admin_ui" / "app.js").read_text()
         self.assertIn("trustyclaw-app-api", app_js)
+        self.assertIn("trustyclaw-app-open-file", app_js)
         self.assertIn('"X-TrustyClaw-App-Bridge": app.id', app_js)
         # The bridge scope is enforced server-side (route() 403s any
         # bridge-tagged request outside the app's own API); the shell keeps
@@ -226,6 +230,12 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertNotIn("host-runtime", bridge_code)
         self.assertNotIn("network/policy", bridge_code)
         self.assertNotIn("agent-files", bridge_code)
+        files_js = (runtime / "admin_ui" / "files.js").read_text()
+        self.assertNotIn(".innerHTML", files_js)
+        self.assertIn("button.textContent", files_js)
+        self.assertIn("video.src = activeFileUrl", files_js)
+        self.assertNotIn("window.open", files_js)
+        self.assertNotIn("location.", files_js)
 
     def test_app_backend_auth_maps_peer_uid_to_installed_app(self) -> None:
         class User:
@@ -255,11 +265,15 @@ class AdminUiStaticTests(unittest.TestCase):
     def test_app_backend_route_allowlist_starts_with_task_routes(self) -> None:
         allowed = [
             ("POST", "/v1/tasks"),
+            ("GET", "/v1/tools"),
+            ("GET", "/v1/network/policy"),
             ("GET", "/v1/tasks/task_1"),
             ("POST", "/v1/tasks/task_1/cancel"),
             ("POST", "/v1/tasks/task_1/kill"),
             ("POST", "/v1/tasks/task_1/steer"),
+            ("GET", "/v1/threads"),
             ("GET", "/v1/threads/thread_1/tasks"),
+            ("GET", "/v1/threads/thread_1/events"),
         ]
 
         for method, path in allowed:
@@ -270,10 +284,14 @@ class AdminUiStaticTests(unittest.TestCase):
         denied = [
             ("GET", "/v1/tasks"),
             ("PUT", "/v1/tasks/task_1"),
-            ("GET", "/v1/threads"),
             ("GET", "/v1/health"),
             ("PUT", "/v1/network/policy"),
             ("GET", "/v1/agent-files"),
+            ("POST", "/v1/tools/brave_search/enable"),
+            ("GET", "/v1/tools/brave_search/approvals"),
+            ("GET", "/v1/network-tools/github-credential"),
+            ("GET", "/v1/agent-runtime/account"),
+            ("GET", "/v1/events"),
         ]
 
         for method, path in denied:
@@ -313,6 +331,42 @@ class AdminUiStaticTests(unittest.TestCase):
 
         route.assert_called_once_with("GET", "/v1/threads/agent_chat__chat/tasks", {}, None, app_backend_id="agent_chat")
         self.assertEqual(response["tasks"], [{"task_id": "task_1", "thread_id": "chat"}])
+
+    def test_app_backend_thread_events_use_app_prefixed_thread_path(self) -> None:
+        with patch(
+            "host.runtime.app_backend_admin_api.admin_api.route",
+            return_value={"events": [{"seq": 4, "task_id": "task_1", "event_type": "task.message"}]},
+        ) as route:
+            response = app_backend_admin_api.route_app_backend_request(
+                "agent_chat", "GET", "/v1/threads/chat/events", {"since": ["2"]}, None
+            )
+
+        route.assert_called_once_with(
+            "GET", "/v1/threads/agent_chat__chat/events", {"since": ["2"]}, None, app_backend_id="agent_chat"
+        )
+        self.assertEqual(response["events"][0]["seq"], 4)
+
+    def test_app_backend_bulk_thread_list_is_filtered_to_the_calling_app(self) -> None:
+        with patch(
+            "host.runtime.app_backend_admin_api.admin_api.route",
+            return_value={
+                "threads": [
+                    {"thread_id": "agent_chat__chat", "task_count": 2},
+                    {"thread_id": "other_app__notes", "task_count": 1},
+                    {"thread_id": "agent_chat__docs", "task_count": 5},
+                ]
+            },
+        ) as route:
+            response = app_backend_admin_api.route_app_backend_request(
+                "agent_chat", "GET", "/v1/threads", {}, None
+            )
+
+        route.assert_called_once_with("GET", "/v1/threads", {}, None, app_backend_id="agent_chat")
+        # Only this app's threads survive, and the prefix is stripped from each.
+        self.assertEqual(
+            response["threads"],
+            [{"thread_id": "chat", "task_count": 2}, {"thread_id": "docs", "task_count": 5}],
+        )
 
     def test_app_backend_visible_response_rejects_unscoped_thread_ids(self) -> None:
         with self.assertRaises(admin_api.ApiError) as error:
@@ -558,6 +612,11 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(app["ui"]["iframe_src"], "/v1/apps/agent_chat/ui/index.html")
         self.assertEqual(app["backend"]["api_route"], "/v1/apps/agent_chat/api/")
 
+    def test_agent_file_content_route_requires_operator_auth(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request("GET", "/v1/agent-files/content?path=%2Fworkspace%2Freel.mp4", auth=False)
+        self.assertEqual(error.exception.code, 401)
+
     def test_app_backend_header_does_not_authenticate_tcp_admin_api(self) -> None:
         request = urllib.request.Request(f"{self.base_url}/v1/threads", method="GET")
         request.add_header("X-TrustyClaw-App-Backend", "agent_chat")
@@ -706,9 +765,12 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertIn("'self'", img_src)
         self.assertIn("data:", img_src)
         self.assertIn("navigate-to 'self'", csp)
+        self.assertNotIn("media-src", csp)
         self.assertIn("sandbox allow-scripts allow-forms allow-modals", csp)
         self.assertNotIn("allow-same-origin", csp)
-        self.assertIn("script-src 'self' 'unsafe-inline'", csp)
+        script_src = next((directive for directive in csp.split("; ") if directive.startswith("script-src ")), "")
+        self.assertIn("'self'", script_src)
+        self.assertNotIn("'unsafe-inline'", script_src)
         self.assertIn("style-src 'self' 'unsafe-inline'", csp)
         self.assertNotIn("img-src *", csp)
         self.assertNotIn("style-src *", csp)
@@ -897,6 +959,8 @@ class AdminApiIntegrationTests(unittest.TestCase):
             ("/admin_ui.css", "text/css", ".shell"),
             ("/admin_ui/app.js", "application/javascript", "setInterval(tick, 5000)"),
             ("/admin_ui/health.js", "application/javascript", "/v1/health"),
+            ("/workspace-kit/view_blocks.css", "text/css", ".b-text"),
+            ("/workspace-kit/view_blocks.js", "application/javascript", "function renderBlock"),
             ("/favicon.ico", "image/svg+xml", "<svg"),
             ("/favicon.svg", "image/svg+xml", "<svg"),
         ):
@@ -968,6 +1032,68 @@ class AdminApiIntegrationTests(unittest.TestCase):
             "/",
         ])
         self.assertEqual(calls[1][-2:], ["read", "/README.md"])
+
+    def test_agent_file_content_streams_authenticated_video(self) -> None:
+        payload = b"mock-video-bytes"
+        process = MagicMock()
+        process.stdout = io.BytesIO(
+            json.dumps({
+                "path": "/workspace/reel.mp4",
+                "size_bytes": len(payload),
+                "media_type": "video/mp4",
+            }).encode() + b"\n" + payload
+        )
+        process.stderr = io.BytesIO()
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+
+        request = urllib.request.Request(
+            f"{self.base_url}/v1/agent-files/content?path=%2Fworkspace%2Freel.mp4"
+        )
+        request.add_header("Authorization", "Bearer admin-secret")
+        with (
+            patch("host.runtime.admin_api.subprocess.Popen", return_value=process) as popen,
+            urllib.request.urlopen(request, timeout=5) as response,
+        ):
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers["Content-Type"], "video/mp4")
+            self.assertEqual(response.read(), payload)
+            for name, value in admin_api.UNTRUSTED_FILE_SECURITY_HEADERS.items():
+                self.assertEqual(response.headers[name], value)
+
+        self.assertEqual(
+            popen.call_args.args[0][-2:],
+            ["stream", "/workspace/reel.mp4"],
+        )
+
+    def test_agent_file_content_rejects_non_video_helper_output(self) -> None:
+        process = MagicMock()
+        process.stdout = io.BytesIO(
+            json.dumps({
+                "path": "/workspace/payload.mp4",
+                "size_bytes": 20,
+                "media_type": "text/html",
+            }).encode() + b"\n<script>bad()</script>"
+        )
+        process.stderr = io.BytesIO()
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+
+        with patch("host.runtime.admin_api.subprocess.Popen", return_value=process):
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.request("GET", "/v1/agent-files/content?path=%2Fworkspace%2Fpayload.mp4")
+
+        self.assertEqual(error.exception.code, 500)
+        self.assertIn("invalid metadata", error.exception.read().decode())
+
+    def test_agent_file_content_rejects_non_video_path_before_helper(self) -> None:
+        with patch("host.runtime.admin_api.subprocess.Popen") as popen:
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.request("GET", "/v1/agent-files/content?path=%2Fworkspace%2Fpayload.html")
+
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn("only MP4 or MOV", error.exception.read().decode())
+        popen.assert_not_called()
 
     def test_agent_file_helper_errors_map_to_http_status(self) -> None:
         def missing(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:

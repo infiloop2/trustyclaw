@@ -2,6 +2,11 @@ const pending = new Map();
 let nextRequestId = 1;
 let threads = [];
 let tasks = [];
+// The selected thread's accumulated task events (its full message stream),
+// fetched forward-paged by seq; EVENTS_PAGE mirrors the host page size.
+let threadEvents = [];
+let threadEventsSeq = 0;
+const EVENTS_PAGE = 100;
 let selectedThreadId = null;
 let selectedThreadRuntime = null;
 let selectedThreadModel = null;
@@ -13,6 +18,8 @@ let sessionOptions = {};
 let renderedThreadsKey = null;
 let renderedHistoryKey = null;
 let renderedHistoryThread = null;
+// Per-task rendered HTML, so a poll only patches turns that actually changed.
+const renderedTurnHtml = new Map();
 let forceScrollBottom = false;
 
 const $ = id => document.getElementById(id);
@@ -126,14 +133,13 @@ function updateComposer() {
   $("thread-subtitle").hidden = !subtitle;
   $("archive-thread").hidden = !hasThread;
   // Follow-up tasks reuse the thread's stored session configuration, so the
-  // pills only show while composing the first task of a new thread.
-  $("new-task-thread").hidden = hasThread;
+  // pills only show while composing the first task of a new thread. The
+  // thread id itself is backend-generated, never typed.
   $("new-task-runtime").hidden = hasThread;
   $("new-task-model").hidden = hasThread;
   $("new-task-effort").hidden = hasThread;
   $("new-task").placeholder = hasThread ? "Describe what the agent should do next" : "Describe a task for the agent";
   if (hasThread) {
-    $("new-task-thread").value = selectedThreadId;
     $("new-task-runtime").value = selectedThreadRuntime;
     setSessionOptions(selectedThreadModel, selectedThreadEffort);
   }
@@ -172,6 +178,8 @@ async function showThread(threadId, runtime, model, effort) {
   selectedThreadRuntime = runtime;
   selectedThreadModel = model;
   selectedThreadEffort = effort;
+  threadEvents = [];
+  threadEventsSeq = 0;
   updateComposer();
   renderThreads();
   await refreshSelectedThread();
@@ -182,19 +190,51 @@ async function refreshSelectedThread() {
     renderThreadHistory();
     return;
   }
-  const response = await api("GET", `/threads/${encodeURIComponent(selectedThreadId)}/tasks`);
+  // Capture the id: a thread switch mid-flight must not let a stale response
+  // land in the newly selected thread's state.
+  const threadId = selectedThreadId;
+  const response = await api("GET", `/threads/${encodeURIComponent(threadId)}/tasks`);
+  if (threadId !== selectedThreadId) return;
   tasks = response.tasks || [];
+  await drainThreadEvents(threadId);
+  if (threadId !== selectedThreadId) return;
   renderThreadHistory();
 }
 
+async function drainThreadEvents(threadId) {
+  // Forward-paged accumulation: each page picks up after the last seen seq,
+  // so the first open drains the backlog and later polls fetch only news.
+  for (;;) {
+    const response = await api(
+      "GET",
+      `/threads/${encodeURIComponent(threadId)}/events?since=${threadEventsSeq}`,
+    );
+    if (threadId !== selectedThreadId) return;
+    const events = response.events || [];
+    // Only accept events past the cursor, so a server that re-sends an
+    // overlapping page can never double-append into the stream.
+    const fresh = events.filter(event => event.seq > threadEventsSeq);
+    if (fresh.length) {
+      threadEvents.push(...fresh);
+      threadEventsSeq = fresh[fresh.length - 1].seq;
+    }
+    // Keep paging only while the cursor advanced by a full page; a short or
+    // no-progress page means the backlog is drained (and prevents a loop if a
+    // server ignores `since` and keeps returning the same rows).
+    if (fresh.length < EVENTS_PAGE) return;
+  }
+}
+
 function renderThreadHistory() {
-  const key = JSON.stringify([selectedThreadId, tasks]);
+  const key = JSON.stringify([selectedThreadId, tasks, threadEventsSeq]);
   if (key === renderedHistoryKey) return;
   renderedHistoryKey = key;
   const switched = renderedHistoryThread !== selectedThreadId;
   renderedHistoryThread = selectedThreadId;
+  const detail = $("thread-detail");
   if (!selectedThreadId) {
-    $("thread-detail").innerHTML = `
+    renderedTurnHtml.clear();
+    detail.innerHTML = `
       <div class="chat-hero">
         <h2>What should the agent work on?</h2>
         <p>Each message starts a task in this thread; follow-ups reuse the same agent session. Pick a runtime and model below, then press Enter to send.</p>
@@ -211,21 +251,84 @@ function renderThreadHistory() {
     if (input === document.activeElement) focusedSteerTask = input.dataset.taskId;
   });
   const ordered = tasks.slice().sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
-  $("thread-detail").innerHTML = ordered.length
-    ? ordered.map(renderTurn).join("")
-    : `<div class="chat-hero"><p>No retained tasks for this thread yet.</p></div>`;
+  if (switched || !ordered.length) {
+    renderedTurnHtml.clear();
+    detail.innerHTML = ordered.length
+      ? ""
+      : `<div class="chat-hero"><p>No retained tasks for this thread yet.</p></div>`;
+  }
+  // Patch turns in place instead of rebuilding the whole history: a poll that
+  // brings a task-field change only touches that task's article, so an
+  // in-flight touch scroll (and its momentum) survives the refresh.
+  const messagesByTask = new Map();
+  for (const event of threadEvents) {
+    if (event.event_type !== "task.message") continue;
+    if (!messagesByTask.has(event.task_id)) messagesByTask.set(event.task_id, []);
+    messagesByTask.get(event.task_id).push(event);
+  }
+  if (ordered.length) {
+    ordered.forEach((task, index) => {
+      const html = renderTurn(task, messagesByTask.get(task.task_id) || []);
+      const current = detail.children[index];
+      if (current && current.dataset.taskId === task.task_id) {
+        if (renderedTurnHtml.get(task.task_id) !== html) detail.replaceChild(turnElement(html), current);
+      } else {
+        detail.insertBefore(turnElement(html), current || null);
+      }
+      renderedTurnHtml.set(task.task_id, html);
+    });
+    while (detail.children.length > ordered.length) {
+      renderedTurnHtml.delete(detail.lastElementChild.dataset.taskId);
+      detail.lastElementChild.remove();
+    }
+  }
   document.querySelectorAll(".task-steer-input").forEach(input => {
     const draft = steerDrafts.get(input.dataset.taskId);
     if (draft) input.value = draft;
     if (input.dataset.taskId === focusedSteerTask) input.focus();
   });
-  if (switched || nearBottom || forceScrollBottom) scroller.scrollTop = scroller.scrollHeight;
+  // Instant jump when landing in a thread; smooth glide when the operator
+  // just sent a message; stick to the bottom while reading there.
+  if (switched) scroller.scrollTop = scroller.scrollHeight;
+  else if (forceScrollBottom) scroller.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
+  else if (nearBottom) scroller.scrollTop = scroller.scrollHeight;
   forceScrollBottom = false;
 }
 
-function renderTurn(task) {
+function turnElement(html) {
+  const template = document.createElement("template");
+  template.innerHTML = html.trim();
+  return template.content.firstElementChild;
+}
+
+function renderTurn(task, messages) {
+  // The full message stream renders inline: the runtime echoes the input as
+  // the task's first user message, so that one is skipped (the bubble above
+  // already shows it); later user messages are steering; agent messages are
+  // interim progress. The stored output renders only when the stream's last
+  // agent message is not already the same text.
+  const stream = [];
+  let inputEchoSkipped = false;
+  let lastAgentText = null;
+  for (const event of messages) {
+    const text = event.payload && event.payload.message;
+    if (typeof text !== "string" || !text) continue;
+    if (event.payload.source === "user") {
+      if (!inputEchoSkipped && text === task.input_message) {
+        inputEchoSkipped = true;
+        continue;
+      }
+      stream.push(`<div class="turn-user"><div class="bubble steer-bubble"><pre>${esc(text)}</pre></div></div>`);
+    } else {
+      stream.push(`<div class="turn-agent"><pre>${esc(text)}</pre></div>`);
+      lastAgentText = text;
+    }
+  }
+  const output = task.output_message && task.output_message !== lastAgentText
+    ? `<div class="turn-agent"><pre>${esc(task.output_message)}</pre></div>`
+    : "";
   return `
-    <article class="turn">
+    <article class="turn" data-task-id="${esc(task.task_id)}">
       <div class="turn-user"><div class="bubble"><pre>${esc(task.input_message)}</pre></div></div>
       <div class="turn-meta">
         ${task.status === "completed" ? "" : badge(task.status)}
@@ -234,7 +337,8 @@ function renderTurn(task) {
         ${task.status === "queued" ? `<button class="ghost sm" data-task-action="cancel" data-task-id="${esc(task.task_id)}">Cancel</button>` : ""}
         ${task.status === "running" ? `<button class="danger ghost sm" data-task-action="kill" data-task-id="${esc(task.task_id)}">Stop</button>` : ""}
       </div>
-      ${task.output_message ? `<div class="turn-agent"><pre>${esc(task.output_message)}</pre></div>` : ""}
+      ${stream.join("")}
+      ${output}
       ${task.error_message ? `<div class="turn-error"><pre>${esc(task.error_message)}</pre></div>` : ""}
       ${task.status === "running" ? `
         <div class="task-steer">
@@ -246,17 +350,26 @@ function renderTurn(task) {
 
 async function createTask() {
   const message = $("new-task").value.trim();
-  const threadId = $("new-task-thread").value.trim();
   const runtime = $("new-task-runtime").value;
   const model = $("new-task-model").value;
   const effort = $("new-task-effort").value;
-  if (!message || !threadId || !model || !effort || $("create-task").disabled) return;
-  const request = { input_message: message, thread_id: threadId };
-  if (selectedThreadId === null) Object.assign(request, { agent_runtime: runtime, model, effort });
+  if (!message || !model || !effort || $("create-task").disabled) return;
+  // A request without thread_id asks the backend to open a new thread with a
+  // generated successive name (thread-1, thread-2, ...).
+  const startingNewThread = selectedThreadId === null;
+  const request = { input_message: message };
+  if (startingNewThread) Object.assign(request, { agent_runtime: runtime, model, effort });
+  else request.thread_id = selectedThreadId;
   const task = await api("POST", "/tasks", request);
   $("new-task").value = "";
   autosizeComposer();
-  selectedThreadId = threadId;
+  if (startingNewThread) {
+    // A brand-new thread has no prior event stream to keep; start its
+    // accumulator clean so the first poll drains only this task's events.
+    threadEvents = [];
+    threadEventsSeq = 0;
+  }
+  selectedThreadId = task.thread_id;
   selectedThreadRuntime = task.agent_runtime;
   selectedThreadModel = task.model;
   selectedThreadEffort = task.effort;
@@ -297,6 +410,8 @@ function startNewThread() {
   selectedThreadModel = null;
   selectedThreadEffort = null;
   tasks = [];
+  threadEvents = [];
+  threadEventsSeq = 0;
   updateComposer();
   renderThreadHistory();
   renderThreads();
@@ -349,7 +464,6 @@ document.addEventListener("keydown", event => {
 
 $("new-thread").addEventListener("click", () => {
   setSidebarOpen(false);
-  $("new-task-thread").value = "main";
   $("new-task-runtime").value = "codex";
   setSessionOptions();
   startNewThread();

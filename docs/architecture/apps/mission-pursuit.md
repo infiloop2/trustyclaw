@@ -18,7 +18,8 @@ durable state of its own making:
   enabled, or not implemented yet,
 - **schedules**: future runs the agent plans for itself, fired by the app
   backend as normal host tasks and reported with per-run status — including
-  a seeded nightly **dream cycle** that tidies memory.
+  a seeded nightly **dream cycle** that tidies memory (started at activation,
+  which disclosed it; pause it in Schedules).
 
 The product idea is that the agent stops being a chat transcript and becomes a
 resident machine: it runs full time, does planned work while the operator is

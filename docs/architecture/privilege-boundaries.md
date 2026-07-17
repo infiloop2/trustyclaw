@@ -63,7 +63,8 @@ the root volume as root-owned code.
   `trustyclaw-agent` during linked-account reset.
 - `read-agent-file` — demotes to `trustyclaw-agent`, confines paths to
   `agent-home`, rejects symlinks, bounds directory scan work, and lists
-  directories or returns bounded text previews.
+  directories, returns bounded text previews, or streams one bounded regular
+  file to the authenticated Files viewer.
 - `check-for-upgrade` — fetches only the public
   `infiloop2/trustyclaw` main-branch `VERSION` file over HTTPS, with strict
   connection, transfer-time, and response-size limits. It accepts no input.

@@ -1,8 +1,10 @@
 """Action results: how a tool action call resolves.
 
 ``Tool.execute`` returns an ``ActionResult``: the action either ran directly
-(``ActionExecuted`` with a JSON result), was queued for a user decision
-(``ActionPendingApproval``), or failed (``ActionFailed``).
+(``ActionExecuted`` with a JSON result or ``StreamingAsset`` with one binary
+file), was queued for a user decision (``ActionPendingApproval``), or failed
+(``ActionFailed``). JSON and streamed bytes are mutually exclusive result
+kinds.
 
 ``Tool.execute_approved`` returns an ``ApprovalResult``: a previously approved
 action either ran (``ApprovalExecuted`` with a user-visible message) or failed
@@ -14,7 +16,9 @@ must already be redacted (no tokens, no secrets, no raw third-party error bodies
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from typing import BinaryIO, Callable
 
 from host.tools.json_types import JSONObject
 
@@ -28,6 +32,32 @@ class ActionExecuted:
     """
 
     result: JSONObject
+
+
+@dataclass(frozen=True)
+class OpenedStreamingAsset:
+    """One opened binary result and its bounded response metadata."""
+
+    filename: str
+    media_type: str
+    size_bytes: int
+    source: BinaryIO
+
+
+@dataclass(frozen=True)
+class StreamingAsset:
+    """A direct action whose entire result is one lazily opened binary file.
+
+    The host enters ``open_stream`` before committing response headers and
+    closes it after streaming. Packages must raise ``StreamingAssetError``
+    with a redacted, agent-safe message for expected open or transfer failures.
+    """
+
+    open_stream: Callable[[], AbstractContextManager[OpenedStreamingAsset]]
+
+
+class StreamingAssetError(RuntimeError):
+    """A redacted streaming failure safe to return to the agent."""
 
 
 @dataclass(frozen=True)
@@ -70,6 +100,6 @@ class ActionFailed:
 
 
 # Returned by Tool.execute.
-ActionResult = ActionExecuted | ActionPendingApproval | ActionFailed
+ActionResult = ActionExecuted | StreamingAsset | ActionPendingApproval | ActionFailed
 # Returned by Tool.execute_approved.
 ApprovalResult = ApprovalExecuted | ActionFailed

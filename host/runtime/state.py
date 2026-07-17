@@ -706,6 +706,20 @@ def page_task_events(task_id: str, since: int | None) -> list[dict[str, Any]]:
         return [_event_dict(row) for row in cur.fetchall()]
 
 
+def page_thread_events(thread_id: str, since: int | None, limit: int) -> list[dict[str, Any]]:
+    """One oldest-first page of a thread's task events: rows with
+    ``seq > since`` across every task in the thread, so a chat surface can
+    accumulate the full message stream incrementally."""
+    with db.transaction() as cur:
+        cur.execute(
+            f"SELECT {_EVENT_FIELDS} FROM agent_events"
+            " WHERE task_id IN (SELECT 'task_' || number FROM tasks WHERE thread_id = %s)"
+            " AND seq > %s ORDER BY seq LIMIT %s",
+            (thread_id, since if since is not None else 0, limit),
+        )
+        return [_event_dict(row) for row in cur.fetchall()]
+
+
 # -- network policy and proxy account pins (admin writes, proxy reads) ---------------
 
 

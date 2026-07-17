@@ -265,7 +265,7 @@ class ToolAssetStoreTests(unittest.TestCase):
 
 
 class ShimVideoStageTests(unittest.TestCase):
-    def test_shim_opens_regular_file_and_sends_bytes_without_path(self) -> None:
+    def test_shim_maps_files_root_path_and_stages_regular_video(self) -> None:
         class Response:
             status = 200
 
@@ -291,14 +291,16 @@ class ShimVideoStageTests(unittest.TestCase):
                 pass
 
         with tempfile.TemporaryDirectory() as directory:
-            video = Path(directory) / "clip.mp4"
+            video = Path(directory) / "workspace" / "videos" / "clip.mp4"
+            video.parent.mkdir(parents=True)
             video.write_bytes(b"x" * 512)
             connection = Connection("unused")
-            with patch.object(
-                tools_mcp_shim, "UnixHTTPConnection", return_value=connection
+            with (
+                patch.dict("os.environ", {"HOME": directory}),
+                patch.object(tools_mcp_shim, "UnixHTTPConnection", return_value=connection),
             ):
                 result = tools_mcp_shim._stage_video(
-                    {"path": str(video), "for_tool": "runway"}
+                    {"path": "/workspace/videos/clip.mp4", "for_tool": "runway"}
                 )
         self.assertEqual(result, {"video_asset_id": "opaque-id"})
         self.assertEqual(connection.body, b"x" * 512)
@@ -313,11 +315,12 @@ class ShimVideoStageTests(unittest.TestCase):
             symlink = Path(directory) / "linked.mp4"
             symlink.symlink_to(video)
             with (
+                patch.dict("os.environ", {"HOME": directory}),
                 patch.object(tools_mcp_shim, "UnixHTTPConnection") as connection,
                 self.assertRaisesRegex(RuntimeError, "regular, non-symlink"),
             ):
                 tools_mcp_shim._stage_video(
-                    {"path": str(symlink), "for_tool": "runway"}
+                    {"path": "/linked.mp4", "for_tool": "runway"}
                 )
             connection.assert_not_called()
 
@@ -345,11 +348,12 @@ class ShimVideoStageTests(unittest.TestCase):
             image = Path(directory) / "frame.webp"
             image.write_bytes(b"x" * 512)
             connection = Connection()
-            with patch.object(
-                tools_mcp_shim, "UnixHTTPConnection", return_value=connection
+            with (
+                patch.dict("os.environ", {"HOME": directory}),
+                patch.object(tools_mcp_shim, "UnixHTTPConnection", return_value=connection),
             ):
                 result = tools_mcp_shim._stage_image(
-                    {"path": str(image), "for_tool": "runway"}
+                    {"path": "/frame.webp", "for_tool": "runway"}
                 )
         self.assertEqual(result, {"image_asset_id": "opaque-image-id"})
         self.assertEqual(connection.body, b"x" * 512)

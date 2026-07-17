@@ -149,7 +149,6 @@ class MemoryAssets:
     def delete(self, asset_id: str) -> None:
         self.records.pop(asset_id, None)
 
-
 @dataclass(frozen=True)
 class FakeHostAPI:
     credentials: MemoryCredentials = field(default_factory=MemoryCredentials)

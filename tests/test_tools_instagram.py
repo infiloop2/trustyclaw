@@ -216,6 +216,8 @@ class InstagramReelTests(unittest.TestCase):
         self.assertEqual(streamed["url"], "https://rupload.facebook.com/ig-api-upload/x")
         self.assertEqual(streamed["headers"]["Authorization"], "OAuth ig-access")
         self.assertEqual(streamed["headers"]["offset"], "0")
+        # The agent-facing workspace file remains; this internal approval spool
+        # copy is consumed after Meta accepts it.
         self.assertNotIn(asset_id, api.assets.records)
 
     def test_post_reel_validates_input(self) -> None:
