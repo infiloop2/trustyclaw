@@ -208,7 +208,7 @@ class StageAwsSmoke(AwsSmoke):
 
     def enforcement_policy(self) -> dict:
         policy = super().enforcement_policy()
-        github = policy["managed_network_integrations"]["github"]
+        github = policy["network_integrations"]["github"]
         base_repos = [repo for repo in github["write_repositories"] if isinstance(repo, dict)]
         # Stage repositories (the CI-secret sandbox repo, or the operator's) go
         # first, ahead of the hardcoded public read repo, so
@@ -278,7 +278,7 @@ class StageAwsSmoke(AwsSmoke):
             ]
         else:
             stored = self._api("GET", "/v1/network/policy").get("network_controls") or {}
-            integrations = stored.get("managed_network_integrations") or {}
+            integrations = stored.get("network_integrations") or {}
             github = integrations.get("github") or {}
             self.stage_github_repositories = [
                 repo for repo in (github.get("write_repositories") or []) if isinstance(repo, dict)
@@ -356,9 +356,9 @@ class StageAwsSmoke(AwsSmoke):
         # response wraps the controls; the PUT takes them directly. Other
         # integrations and domain rules are preserved.
         controls = self._api("GET", "/v1/network/policy").get("network_controls") or {}
-        integrations = dict(controls.get("managed_network_integrations") or {})
+        integrations = dict(controls.get("network_integrations") or {})
         integrations["github"] = {"enabled": True, "write_repositories": [repo]}
-        controls["managed_network_integrations"] = integrations
+        controls["network_integrations"] = integrations
         self._api("PUT", "/v1/network/policy", controls)
         self._ok(f"GitHub App credential stored and {config['owner']}/{config['repo']} set as the sole write repo")
 
@@ -435,7 +435,7 @@ class StageAwsSmoke(AwsSmoke):
         one sandbox write repository."""
         failures: list[str] = []
         stored = self._api("GET", "/v1/network/policy").get("network_controls") or {}
-        github = ((stored.get("managed_network_integrations") or {}).get("github")) or {}
+        github = ((stored.get("network_integrations") or {}).get("github")) or {}
         write_repos = [repo for repo in (github.get("write_repositories") or []) if isinstance(repo, dict)]
         metadata = self._api("GET", "/v1/network-tools/github-credential")
         if metadata.get("configured") is True:
@@ -483,7 +483,7 @@ class StageAwsSmoke(AwsSmoke):
         try:
             policy = self._api("GET", "/v1/network/policy")
             controls = policy.get("network_controls") or {}
-            integrations = controls.get("managed_network_integrations") or {}
+            integrations = controls.get("network_integrations") or {}
             enabled = {
                 name: (value.get("enabled") if isinstance(value, dict) else None)
                 for name, value in integrations.items()
@@ -815,13 +815,13 @@ class StageAwsSmoke(AwsSmoke):
         wrong_account_response = post_openai(cached, account_header=f"{account_id}-wrong")
         live_response = post_openai(live)
         cached_response = post_openai(cached)
-        if "OpenAI account id header is required" not in missing_account_response:
+        if "openai_account_header_required" not in missing_account_response:
             raise AssertionError(f"missing account header was not blocked; proxy returned {missing_account_response!r}")
-        if "not the configured account" not in wrong_account_response:
+        if "openai_account_mismatch" not in wrong_account_response:
             raise AssertionError(f"wrong account header was not blocked; proxy returned {wrong_account_response!r}")
-        if "live web search is disabled" not in live_response:
+        if "openai_web_tool_denied" not in live_response:
             raise AssertionError(f"live web search payload was not blocked; proxy returned {live_response!r}")
-        if "live web search is disabled" in cached_response:
+        if "openai_web_tool_denied" in cached_response:
             raise AssertionError("cached web search payload was incorrectly blocked")
 
         baseline_seq = max((event["seq"] for event in self._network_events()), default=0)
@@ -881,9 +881,9 @@ class StageAwsSmoke(AwsSmoke):
             f"-H 'Authorization: Bearer stage-wrong-token' "
             f"--data {shlex.quote(payload)} {shlex.quote(url)}"
         )
-        if "Claude bearer token is required" not in missing:
+        if "anthropic_token_required" not in missing:
             raise AssertionError(f"missing Claude bearer was not blocked; proxy returned {missing!r}")
-        if "Claude bearer token does not match" not in wrong:
+        if "anthropic_token_mismatch" not in wrong:
             raise AssertionError(f"wrong Claude bearer was not blocked; proxy returned {wrong!r}")
 
         task_baseline_seq = max((event["seq"] for event in self._network_events()), default=0)
@@ -1065,9 +1065,9 @@ git push -q origin HEAD:{shlex.quote(ref)} >/dev/null 2>&1 && echo SEED_PUSHED |
             branch_landed = True
 
             approval_policy = self.enforcement_policy()
-            github = dict(approval_policy["managed_network_integrations"]["github"])
+            github = dict(approval_policy["network_integrations"]["github"])
             github["require_dot_github_approval"] = True
-            approval_policy["managed_network_integrations"]["github"] = github
+            approval_policy["network_integrations"]["github"] = github
             self._api("PUT", "/v1/network/policy", approval_policy)
 
             rest_code = self._ssh_code(
@@ -1139,13 +1139,13 @@ echo PUSH_STATUS:$status
                 raise AssertionError(f"approved branch cleanup via git delete failed: {deleted!r}")
             branch_landed = False
             reasons = {
-                event.get("reason")
+                event.get("reason_code")
                 for event in self._network_events(since=baseline_seq)
                 if event.get("host") in {"github.com", "api.github.com"}
             }
             for reason in ("github_dot_github_rest_write_denied", "github_push_queued_for_approval"):
                 if reason not in reasons:
-                    raise AssertionError(f"missing network event reason {reason!r} after approval e2e: {sorted(reasons)}")
+                    raise AssertionError(f"missing network event reason code {reason!r} after approval e2e: {sorted(reasons)}")
         finally:
             if pending_id:
                 try:
@@ -1163,10 +1163,9 @@ echo PUSH_STATUS:$status
             self._ssh_code(f"sudo rm -rf {workdir} /tmp/trustyclaw-stage-dotgithub-push.out")
 
     def _print_denied_github_events(self, since: int) -> None:
-        """Dump denied GitHub network events since ``since`` with their reasons.
-        The reason string is what separates a policy that failed to load or
-        expand ('network policy unavailable: ...') from a host that simply is
-        not allowed ('host is not in the allowed network policy')."""
+        """Dump denied GitHub network events since ``since`` with their reason
+        codes: what separates an unloadable policy ('network_policy_unavailable')
+        from a host that simply is not allowed ('network_policy_denied')."""
         github_hosts = {
             "github.com", "api.github.com", "uploads.github.com",
             "codeload.github.com", "raw.githubusercontent.com",

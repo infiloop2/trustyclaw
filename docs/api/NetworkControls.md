@@ -23,13 +23,15 @@ agent, admin API, or proxy users; it does not expose an inbound EC2 port. The
 agent runs as a non-root user with no sudo, so it reaches root's broader path
 only if it first escalates to root.
 
-Policy has two parts: managed network integrations, where the operator states
-intent and the host expands exact rules and guards internally, and raw
-per-domain rules in `allowed_network_access` for uncommon websites.
+Policy is one object: `network_integrations`, keyed by integration id. The
+managed provider integrations own exact provider rules and guards; the
+`custom` integration holds operator-defined domains for destinations no
+provider integration owns. Every reachable host belongs to exactly one
+integration.
 
 ```json
 {
-  "managed_network_integrations": {
+  "network_integrations": {
     "openai": {"enabled": true},
     "claude": {"enabled": true},
     "github": {
@@ -40,54 +42,51 @@ per-domain rules in `allowed_network_access` for uncommon websites.
       ]
     },
     "python_packages": {"enabled": true},
-    "npm_packages": {"enabled": true}
-  },
-  "allowed_network_access": {}
+    "npm_packages": {"enabled": true},
+    "custom": {
+      "domains": {
+        "api.example.com": {"allow_http_methods": ["GET"], "path_guards": ["^/v1(?:/.*)?$"]}
+      }
+    }
+  }
 }
 ```
 
 | Field | Required | Type | Behavior |
 | --- | --- | --- | --- |
-| `managed_network_integrations` | No | object | Managed integration intent, keyed by integration id. Known ids are `openai`, `claude`, `github`, `python_packages`, and `npm_packages`. Missing keys or `enabled: false` disable that integration. |
-| `allowed_network_access` | Yes | object | Map of raw domain rules. Keys are exact domains or wildcard suffix domains. Wildcards must start with `*.`, such as `*.example.com`; `*` matches any non-empty hostname prefix ending at that dot. Embedded globs and regex keys are not supported. Domains owned by a managed integration are always rejected here. |
+| `network_integrations` | No | object | Integration configs keyed by integration id. Known ids are `openai`, `claude`, `github`, `python_packages`, `npm_packages`, and `custom`. The five provider integrations take an `enabled` boolean; `custom` has no `enabled` field and is enabled exactly while its `domains` map is non-empty (passing `enabled` to `custom` is rejected). A missing key or `enabled: false` disables a provider; a disabled integration carries no other state, and serialization omits it entirely. |
+| `network_integrations.custom.domains` | No | object | Map of operator-defined domain rules. Keys are exact domains or wildcard suffix domains. Wildcards must start with `*.`, such as `*.example.com`; `*` matches any non-empty hostname prefix ending at that dot. Embedded globs and regex keys are not supported. Domains owned by a provider integration are always rejected here. The custom integration is enabled exactly while this map is non-empty. |
 
-Managed integration entries are stored exactly as configured. The host expands
-them in memory into exact domain rules and guard flags before request
-enforcement; the generated rules never appear in the stored policy or in
-`allowed_network_access`. The internal guard fields on the generated rules and
-how each is implemented are documented in
-[../architecture/network-controls.md](../architecture/network-controls.md#internal-guard-fields).
+Integration entries are stored exactly as configured. The host parses each
+entry directly into that integration's typed config. The proxy selects one
+integration for a host and asks its guard to decide the request; it does not
+generate a parallel domain-rule or guard-field representation.
 
 ## Reserved Managed Domains
 
-Every domain owned by a managed integration is reserved: it is rejected in
-`allowed_network_access` whether or not the integration is enabled, so a manual
-rule can never be broader than the managed guard. The reserved suffixes are
+Every domain owned by a provider integration is reserved: it is rejected in
+`network_integrations.custom.domains` whether or not the integration is
+enabled, so a custom rule can never be broader than the integration's guard. The reserved suffixes are
 `openai.com`, `chatgpt.com`, `anthropic.com`, `claude.ai`, `claude.com`,
 `github.com`, `githubusercontent.com`, `pypi.org`, `pythonhosted.org`,
 `npmjs.org`, and `nodejs.org`, including all their subdomains. Manual rules
-also cannot set managed-only guard fields such as `openai_account_guard`,
-`anthropic_account_guard`, or `github_repo_guard`.
+also cannot set provider-specific guard configuration.
 
 ## OpenAI Integration
 
-When `managed_network_integrations.openai.enabled` is `true`, Codex tasks can
-run after Codex OAuth login. The host expands, in memory:
+When `network_integrations.openai.enabled` is `true`, Codex tasks can
+run after Codex OAuth login. The OpenAI integration directly enforces:
 
 ```json
 {
   "api.openai.com": {
-    "allow_http_methods": ["POST"],
-    "openai_account_guard": true,
-    "openai_external_url_request_guard": true
+    "allow_http_methods": ["POST"]
   },
   "auth.openai.com": {
     "allow_http_methods": ["GET", "POST"]
   },
   "chatgpt.com": {
-    "allow_http_methods": ["GET", "POST"],
-    "openai_account_guard": true,
-    "openai_external_url_request_guard": true
+    "allow_http_methods": ["GET", "POST"]
   }
 }
 ```
@@ -103,14 +102,13 @@ processes, and fails running Codex tasks.
 
 ## Claude Integration
 
-When `managed_network_integrations.claude.enabled` is `true`, Claude Code tasks
-can run after Claude OAuth login. The host expands, in memory:
+When `network_integrations.claude.enabled` is `true`, Claude Code tasks
+can run after Claude OAuth login. The Claude integration directly enforces:
 
 ```json
 {
   "api.anthropic.com": {
-    "allow_http_methods": ["GET", "POST"],
-    "anthropic_account_guard": true
+    "allow_http_methods": ["GET", "POST"]
   },
   "platform.claude.com": {
     "allow_http_methods": ["GET", "POST"],
@@ -159,22 +157,20 @@ and dispatching GitHub Actions workflows, which would execute agent-chosen
 payloads on GitHub's runners with the repository's secrets, beyond this host's
 network controls.
 
-When GitHub is enabled, the host expands, in memory (`github_repo_guard`
-carries the configured write-repository list into the proxy's GitHub guard):
+When GitHub is enabled, the GitHub integration directly enforces the following
+host and method boundary. Its typed config carries the write-repository list
+and `.github` approval toggle:
 
 ```json
 {
   "github.com": {
-    "allow_http_methods": ["GET", "HEAD", "POST"],
-    "github_repo_guard": {"write_repositories": [{"owner": "infiloop2", "repo": "trustyclaw"}]}
+    "allow_http_methods": ["GET", "HEAD", "POST"]
   },
   "api.github.com": {
-    "allow_http_methods": ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"],
-    "github_repo_guard": {"write_repositories": [{"owner": "infiloop2", "repo": "trustyclaw"}]}
+    "allow_http_methods": ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
   },
   "uploads.github.com": {
-    "allow_http_methods": ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"],
-    "github_repo_guard": {"write_repositories": [{"owner": "infiloop2", "repo": "trustyclaw"}]}
+    "allow_http_methods": ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
   },
   "codeload.github.com": {"allow_http_methods": ["GET", "HEAD"]},
   "raw.githubusercontent.com": {"allow_http_methods": ["GET", "HEAD"]},
@@ -250,16 +246,15 @@ Every GitHub write denial carries a specific reason in network events —
 `github_lfs_operation_unresolved` — so an operator can see exactly which rule
 fired and which repository would need to be added to `write_repositories`.
 One more reason exists as a fail-closed default: `github_repo_scope_required`
-fires if a `github_repo_guard` ever rides a domain the guard has no rules
-for. The generated rules attach the guard only to the three domains above,
-so it is unreachable today; it exists so a future wiring mistake denies
-instead of allowing.
+fires if the GitHub guard receives a host for which it has no access rules. It
+is unreachable with today's fixed dispatch table; it exists so a future wiring
+mistake denies instead of allowing.
 
 ### The `.github` approval gate
 
 When `require_dot_github_approval` is set, a `git push` to a write repository that
 passes the write guard is inspected before it is forwarded. The proxy hands the
-buffered `git-receive-pack` body to `github_push_gate`, which resolves the thin
+buffered `git-receive-pack` body to the push-gate engine (`host/network_integrations/github/push_gate/`), which resolves the thin
 pack against a per-repo quarantine mirror (a bare clone under the proxy's state
 directory, fetched with the working token) and uses real `git`
 (`index-pack` + `diff-tree`) to list the changed paths:
@@ -375,8 +370,8 @@ healthy published token.
 
 ## Python Packages Integration
 
-When `managed_network_integrations.python_packages.enabled` is `true`, the host
-expands, in memory:
+When `network_integrations.python_packages.enabled` is `true`, its
+integration directly enforces:
 
 ```json
 {
@@ -398,8 +393,8 @@ be a data-exfiltration sink for those URL paths.
 
 ## NPM Packages Integration
 
-When `managed_network_integrations.npm_packages.enabled` is `true`, the host
-expands, in memory:
+When `network_integrations.npm_packages.enabled` is `true`, its
+integration directly enforces:
 
 ```json
 {
@@ -419,7 +414,7 @@ not to leak data through requested URL paths.
 
 ## Domain Rule
 
-Each value in `allowed_network_access` is a domain rule.
+Each value in `network_integrations.custom.domains` is a domain rule.
 
 Domain keys must be exact DNS names such as `api.example.com` or wildcard DNS
 names such as `*.example.com`. A wildcard must be the first character and must

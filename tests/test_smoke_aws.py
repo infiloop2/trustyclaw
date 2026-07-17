@@ -374,7 +374,7 @@ class StageAwsSmokeTests(unittest.TestCase):
             ssh_key.write_text("private key")
             smoke = StageAwsSmoke(result_path, ssh_key)
         smoke.stage_github_repositories = [{"owner": "sandbox-owner", "repo": "sandbox"}]
-        repos = smoke.enforcement_policy()["managed_network_integrations"]["github"]["write_repositories"]
+        repos = smoke.enforcement_policy()["network_integrations"]["github"]["write_repositories"]
         self.assertEqual(repos[0], {"owner": "sandbox-owner", "repo": "sandbox"})
         self.assertIn({"owner": "infiloop2", "repo": "trustyclaw"}, repos)
 

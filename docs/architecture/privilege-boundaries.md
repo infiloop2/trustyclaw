@@ -5,6 +5,7 @@
 | `trustyclaw-operator` | Human SSH login. | Full passwordless sudo, and therefore intentionally equivalent to root once logged in. |
 | `trustyclaw-admin` | Runs the admin API; owns admin state (the `trustyclaw_admin` database role, full access). | sudo for exactly eleven root helpers (below). No internet egress at all. |
 | `trustyclaw-tools` | Runs the bundled tool packages in the dedicated tools service; owns the agent-facing tools socket. | No sudo. Postgres role scoped to the five tool tables plus read access to `secret_keys`. DNS and outbound HTTPS (443) for tool third-party APIs. |
+| `trustyclaw-agent-network` | Runs the network-introspection service and owns its agent-facing socket. | No sudo, secrets, or egress. Postgres role has SELECT-only access to network policy and decision-log tables. |
 | `trustyclaw-agent-app` | Runs the agent-app service; owns the agent-facing app API socket and proxies attributed `app_api` calls to app backends. | No sudo, database access, secrets, or egress. Its only network reach is opening loopback connections to installed app backend ports (the one uid besides `trustyclaw-admin` nftables allows there). |
 | `trustyclaw-proxy` | Runs the policy proxy; owns proxy TLS and Git quarantine files. | No sudo. A narrow Postgres role reads enforcement inputs and the working token/key, inserts network and pending-push records, and prunes network events. Only nftables-approved DNS and TCP 80/443 egress. |
 | `trustyclaw-agent` | Runs Codex and Claude Code runtime processes. | None. No sudo, no direct network, no database role. |
@@ -16,7 +17,8 @@ The service accounts use fixed numeric IDs: `trustyclaw-admin` is
 `47741`, `trustyclaw-proxy` is `47742`, `trustyclaw-agent` is `47743`,
 `cloudflared` is `47744`, `postgres` is `47745` (created by bootstrap
 before the PostgreSQL packages would assign a dynamic id),
-`trustyclaw-tools` is `47746`, and `trustyclaw-agent-app` is `47747`.
+`trustyclaw-tools` is `47746`, `trustyclaw-agent-app` is `47747`, and
+`trustyclaw-agent-network` is `47748`.
 Installed app service
 users use the reserved UID/GID range `48000-48099`, matching the 100-app
 cap. Each app package declares one stable `host_slot`; the host generates the
@@ -115,11 +117,19 @@ kernel state the agent cannot rewrite), and the app prefix selects the owning
 app's `/agent/` routes. The service holds no secrets and no egress; see
 [`agent-app-api.md`](apps/agent-app-api.md).
 
+The network-introspection socket
+(`/run/trustyclaw-agent-network/agent-network.sock`) is a separate read-only
+crossing from the agent to `trustyclaw-agent-network`. Peer credentials admit
+only the agent uid. The service has no egress and can SELECT only policy and
+network-event tables, so the egress-capable tools service receives no network
+policy database access.
+
 Admin state adds one more boundary with the same shape: the database accepts
 Unix-socket connections only, authenticated by OS identity (`peer`), with a role
 for `trustyclaw-admin` (full admin state), narrowly scoped roles for
 `trustyclaw-proxy` (enforcement inputs, working events/pushes, and its token),
 `trustyclaw-tools` (the five tool tables plus the shared encryption key),
+`trustyclaw-agent-network` (SELECT-only policy and network-event state),
 per-app roles confined to their schemas, `postgres` for operators, and an
 explicit reject for everyone else, so
 the agent user cannot read or write admin state, and a compromised tools, proxy,

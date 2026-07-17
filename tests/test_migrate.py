@@ -186,10 +186,10 @@ class RepoMigrationDataTests(unittest.TestCase):
         from host.runtime.network_policy import load_policy
 
         parsed = parse_network_controls(load_policy())
-        self.assertTrue(parsed.managed_network_integrations.openai.enabled)
-        self.assertFalse(parsed.managed_network_integrations.python_packages.enabled)
-        self.assertFalse(parsed.managed_network_integrations.npm_packages.enabled)
-        self.assertFalse(parsed.managed_network_integrations.github.enabled)
+        self.assertTrue(parsed.integrations["openai"].enabled)
+        self.assertFalse(parsed.integrations["python_packages"].enabled)
+        self.assertFalse(parsed.integrations["npm_packages"].enabled)
+        self.assertFalse(parsed.integrations["github"].enabled)
 
     def test_0008_migrates_existing_tasks_and_provider_sessions(self) -> None:
         migrate.up(target=7, directory=self.repo_migrations, quiet=True)

@@ -37,6 +37,7 @@ from urllib.parse import parse_qs, urlparse
 
 from host.config import AGENT_RUNTIMES, ConfigError, parse_network_controls
 from host.constants import ADMIN_API_PORT, LOOPBACK, MAX_REQUEST_BODY_BYTES, PROXY_PORT
+from host.network_integrations.github.push_gate import pending as github_pending_push
 from host.session_options import session_config_error
 # app_backend_admin_api imports this module back to dispatch through route().
 # The cycle is safe with plain module imports: each side binds the module
@@ -48,7 +49,6 @@ from host.runtime import (
     claude_code,
     codex_app_server,
     github_credential,
-    github_pending_push,
     github_repo_audit,
     network_policy,
     orchestrator,

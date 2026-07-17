@@ -30,6 +30,7 @@ flowchart LR
             admin["trustyclaw-admin<br/>Admin API/UI + orchestrator<br/>127.0.0.1:7443<br/>no internet egress"]
             proxy["trustyclaw-proxy<br/>Network proxy<br/>127.0.0.1:7445<br/>DNS + TCP 80/443 only"]
             tools["trustyclaw-tools<br/>Tool packages + tools.sock<br/>DNS + TCP 443 only"]
+            agentnetwork["trustyclaw-agent-network<br/>Network introspection socket<br/>no egress"]
             agentapp["trustyclaw-agent-app<br/>app_api proxy + agent-app.sock<br/>loopback to app ports only"]
             apps["trustyclaw-app-*<br/>App backends<br/>host-slot uid, port, schema<br/>no egress"]
             agent["trustyclaw-agent<br/>Codex + Claude Code<br/>no sudo, DB role, or direct egress"]
@@ -63,6 +64,7 @@ flowchart LR
     proxy -->|"guarded agent egress + GitHub token injection"| outside_services
 
     agent -->|"MCP list/call, peer uid route"| tools
+    agent -->|"network status + denials, peer uid"| agentnetwork
     admin -->|"operator tool routes, peer uid route"| tools
     tools -->|"third-party tool APIs"| outside_services
 
@@ -77,6 +79,7 @@ flowchart LR
     proxy -->|"enforcement reads, event/push writes, working token"| db
     proxy -->|"CA keypair, leaf certs, Git quarantine"| adminvol
     tools -->|"tool tables + secret key only"| db
+    agentnetwork -->|"SELECT-only policy + events"| db
     tools -->|"bounded temporary media"| adminvol
     apps -->|"own app schema only"| db
     db -->|"PGDATA"| adminvol

@@ -141,9 +141,9 @@ def ensure_database() -> None:
     os.environ["TRUSTYCLAW_DB_NAME"] = "trustyclaw_test"
     os.environ["TRUSTYCLAW_DB_USER"] = "postgres"
 
-    # The proxy and tools roles must exist before migrations run (the schema
+    # The scoped service roles must exist before migrations run (the schema
     # GRANTs them their tables). Tests connect as postgres either way.
-    for role in ("trustyclaw-proxy", "trustyclaw-tools"):
+    for role in ("trustyclaw-proxy", "trustyclaw-tools", "trustyclaw-agent-network"):
         subprocess.run(
             [str(pg_bin / "createuser"), "-h", str(socket_dir), "-U", "postgres", role],
             stdout=subprocess.DEVNULL,

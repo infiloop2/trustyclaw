@@ -6,6 +6,7 @@
 | `trustyclaw-postgres.service` | `postgres` | Admin-state PostgreSQL, Unix socket only (no TCP listener). |
 | `trustyclaw-admin-api.service` | `trustyclaw-admin` | Admin API on `127.0.0.1:7443`. Owns admin state; holds no internet egress. |
 | `trustyclaw-tools.service` | `trustyclaw-tools` | Runs the bundled tool packages and owns the agent-facing tools socket `/run/trustyclaw-tools/tools.sock` (peer-credential authenticated). The only TrustyClaw application service besides the proxy with DNS+HTTPS egress; its Postgres role is scoped to the five tool tables plus read access to the encryption key needed for tool secrets. |
+| `trustyclaw-agent-network.service` | `trustyclaw-agent-network` | Serves read-only network integration and denial introspection on `/run/trustyclaw-agent-network/agent-network.sock`. No egress; its Postgres role has SELECT-only policy and network-event grants. |
 | `trustyclaw-agent-app.service` | `trustyclaw-agent-app` | Serves the agent-facing app API socket `/run/trustyclaw-agent-app/agent-app.sock` (peer-credential authenticated, agent uid only) and proxies thread-scope-attributed `app_api` calls to app backend ports. No database access or egress. See [agent-app-api.md](apps/agent-app-api.md). |
 | `trustyclaw-app-<app_id>.service` | `trustyclaw-app-<app_id>` | Installed app backend on its host-assigned loopback app port, reachable only from the admin API and agent-app service uids. |
 | `trustyclaw-cloudflared.service` | `cloudflared` | Optional Cloudflare Tunnel connector for Cloudflare Access operator endpoints. Installed only when `operator_connections` contains `cloudflare_access`. |
@@ -22,6 +23,7 @@
 | `trustyclaw-postgres.service` | `postgres` | systemd | Stores admin state; local Unix-socket connections only. |
 | `trustyclaw-admin-api.service` | `trustyclaw-admin` | systemd | Serves localhost API/UI, owns task state, and supervises runtime work. |
 | `trustyclaw-tools.service` | `trustyclaw-tools` | systemd | Executes bundled tool calls and operator-delegated OAuth/approval work; owns the peer-authenticated tools socket. |
+| `trustyclaw-agent-network.service` | `trustyclaw-agent-network` | systemd | Serves the peer-authenticated network-introspection socket from SELECT-only policy and event state, without egress. |
 | `trustyclaw-agent-app.service` | `trustyclaw-agent-app` | systemd | Attributes agent `app_api` calls to their app-prefixed thread by cgroup and proxies them to the owning app backend; owns the peer-authenticated agent-app socket. |
 | `trustyclaw-app-<app_id>.service` | `trustyclaw-app-<app_id>` | systemd | Serves an installed app API on a loopback app port selected by the host. The admin API and agent-app service are the only uids allowed to open new TCP connections to that listener. |
 | `trustyclaw-cloudflared.service` | `cloudflared` | systemd | Optional Cloudflare Tunnel connector. Reads `/etc/trustyclaw/cloudflared.token` and exposes the admin API through the configured Cloudflare Access hostname. |
@@ -29,7 +31,7 @@
 | `codex app-server` | `trustyclaw-agent` | launch helper | Executes one Codex turn, resuming its provider thread by id, then exits. |
 | `run-claude-code` helper | starts as root, then `trustyclaw-agent` | admin API via sudo | Starts one Claude Code CLI process. |
 | `claude` | `trustyclaw-agent` | launch helper | Executes one Claude Code turn, then exits. |
-| `tools MCP shim` | `trustyclaw-agent` | Codex / Claude Code | Bridges the harness's MCP client to the tools service's socket; one per agent session that uses tools. |
+| `tools MCP shim` | `trustyclaw-agent` | Codex / Claude Code | Aggregates the tools, network-introspection, and app sockets into one MCP server; one per agent session that uses host tools. |
 | `read-codex-account-id` / `read-claude-account` | starts as root, then `trustyclaw-agent` | admin API via sudo | Reads provider auth files narrowly and prints only account guard metadata. |
 | `clear-agent-auth` | starts as root, then `trustyclaw-agent` | admin API via sudo | Removes local Codex/Claude auth files during linked-account reset. |
 | `read-agent-file` helper | starts as root, then `trustyclaw-agent` | admin API via sudo | Lists agent-home directories or returns a bounded text preview without giving admin general agent-home access. |
@@ -44,6 +46,7 @@
 | --- | --- | --- |
 | HTTP handler threads | admin API | One per concurrent API request. Mutations use state transactions and run slow helper calls outside the state lock. |
 | Tools socket handler threads | tools service | One per agent tool call (and per delegated operator operation), bounded by a concurrency cap; tool packages run their third-party requests on these threads. |
+| Network-introspection socket handler threads | agent-network service | One per local request, bounded by a concurrency cap; calls perform read-only policy or denial queries. |
 | Maintenance thread | admin API | Periodically prunes bounded state and event history. |
 | Runtime status poller | admin API/orchestrator | Rechecks provider login state and updates each runtime status. |
 | Task worker threads | admin API/orchestrator | Six total workers claim queued tasks; at most three tasks run per runtime. Each turn spawns and closes its own runtime process. |
@@ -82,11 +85,12 @@ re-derive active status from the agent user's home directory.
 
 ## Reboot and restart
 
-The admin API, proxy, tools, Postgres, app backends, nftables, and optional
-Cloudflare Tunnel service are `systemctl enable`d, so they resume on every
-boot. Postgres starts before the proxy and tools services; the proxy, tools,
-and Postgres start before the admin API; app backends and `cloudflared` start
-after the admin API when installed. nftables reloads `/etc/nftables.conf`.
+The admin API, proxy, tools, network-introspection, Postgres, app backends,
+nftables, and optional Cloudflare Tunnel service are `systemctl enable`d, so
+they resume on every boot. Postgres starts before the proxy, tools, and
+network-introspection services; those services start before the admin API; app
+backends and `cloudflared` start after the admin API when installed. nftables
+reloads `/etc/nftables.conf`.
 Because admin state and agent home data live on the two data EBS volumes, a
 reboot, including via `POST /v1/host-runtime/reboot`, preserves them: the proxy comes
 back immediately enforcing the last active policy (no fail-open window),

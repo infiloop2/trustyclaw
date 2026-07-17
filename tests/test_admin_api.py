@@ -21,12 +21,12 @@ import urllib.request
 import pg_harness
 
 from host.config import parse_network_controls
+from host.network_integrations.github.push_gate import pending as github_pending_push
 from host.runtime import (
     app_api_proxy,
     app_backend_admin_api,
     admin_api,
     github_credential,
-    github_pending_push,
     orchestrator,
     tools_admin_api,
     tools_api,
@@ -452,7 +452,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
             }
         )
         save_policy(
-            {"managed_network_integrations": {"openai": {"enabled": True}}, "allowed_network_access": {}},
+            {"network_integrations": {"openai": {"enabled": True}}},
             "2026-06-08T00:00:00Z",
         )
         state = load_state()
@@ -1558,26 +1558,27 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
     def test_network_policy_replace_and_events(self) -> None:
         body = {
-            "managed_network_integrations": {"openai": {"enabled": True}},
-            "allowed_network_access": {
-                "api.example.com": {"allow_http_methods": ["GET"], "path_guards": ["^/v1$"]}
+            "network_integrations": {
+                "openai": {"enabled": True},
+                "custom": {"domains": {"api.example.com": {"allow_http_methods": ["GET"], "path_guards": ["^/v1$"]}}},
             },
         }
         _, response = self.request("PUT", "/v1/network/policy", body)
 
-        self.assertEqual(response["network_controls"]["allowed_network_access"]["api.example.com"]["allow_http_methods"], ["GET"])
-        # The stored policy keeps the operator-facing shape: managed provider
-        # domains are expanded only inside the proxy process.
-        self.assertNotIn("api.openai.com", response["network_controls"]["allowed_network_access"])
+        custom = response["network_controls"]["network_integrations"]["custom"]["domains"]
+        self.assertEqual(custom["api.example.com"]["allow_http_methods"], ["GET"])
+        # The stored policy keeps the operator-facing shape. Provider hosts are
+        # owned by their integration, never listed as custom domains.
+        self.assertNotIn("api.openai.com", custom)
         stored = load_policy()
         self.assertEqual(stored, response["network_controls"])
-        self.assertNotIn("api.openai.com", stored["allowed_network_access"])
+        self.assertNotIn("openai", stored["network_integrations"]["custom"]["domains"])
         self.mock_reconcile.assert_called_once()
         _, current = self.request("GET", "/v1/network/policy")
         self.assertEqual(current["network_controls"], response["network_controls"])
 
     def test_network_policy_rejects_ssh_port_field(self) -> None:
-        body = {"ssh_port_opened": False, "managed_network_integrations": {"openai": {"enabled": True}}, "allowed_network_access": {}}
+        body = {"ssh_port_opened": False, "network_integrations": {"openai": {"enabled": True}}}
         with patch("host.runtime.admin_api.subprocess.run") as run:
             with self.assertRaises(urllib.error.HTTPError) as error:
                 self.request("PUT", "/v1/network/policy", body)
@@ -1586,18 +1587,17 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
     def test_network_policy_replace_succeeds_when_existing_policy_is_error(self) -> None:
         save_policy({"bogus": True}, "2026-06-08T00:00:01Z")
-        body = {"managed_network_integrations": {"openai": {"enabled": True}}, "allowed_network_access": {}}
+        body = {"network_integrations": {"openai": {"enabled": True}}}
         status, _ = self.request("PUT", "/v1/network/policy", body)
         self.assertEqual(status, 200)
-        self.assertEqual(load_policy()["managed_network_integrations"], {"openai": {"enabled": True}})
+        self.assertEqual(load_policy()["network_integrations"], {"openai": {"enabled": True}})
 
     def _enable_github_policy(self) -> None:
         save_policy(
             {
-                "managed_network_integrations": {
+                "network_integrations": {
                     "github": {"enabled": True, "write_repositories": [{"owner": "infiloop2", "repo": "trustyclaw"}]}
                 },
-                "allowed_network_access": {},
             },
             "2026-06-08T00:00:01Z",
         )
@@ -1626,7 +1626,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
             timeouts.append(timeout)
             return {"ok": True}
 
-        with patch("host.runtime.github_pending_push._run_helper_json", side_effect=fake_helper):
+        with patch("host.network_integrations.github.push_gate.pending._run_helper_json", side_effect=fake_helper):
             status, approved = self.request(
                 "POST", "/v1/network-tools/github-pending-pushes/aa11bb22/approve", {}
             )
@@ -1638,7 +1638,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(timeouts[0], github_pending_push.APPROVE_HELPER_TIMEOUT_SECONDS)
 
         # Reject invokes the helper in cleanup mode, then marks the row.
-        with patch("host.runtime.github_pending_push._run_helper_json", side_effect=fake_helper):
+        with patch("host.network_integrations.github.push_gate.pending._run_helper_json", side_effect=fake_helper):
             _, rejected = self.request(
                 "POST", "/v1/network-tools/github-pending-pushes/cc33dd44/reject", {}
             )
@@ -1661,7 +1661,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 raise github_credential.HelperError("lease rejected")
             return {"ok": True}
 
-        with patch("host.runtime.github_pending_push._run_helper_json", side_effect=fail_approve_then_cleanup):
+        with patch("host.network_integrations.github.push_gate.pending._run_helper_json", side_effect=fail_approve_then_cleanup):
             with self.assertRaises(urllib.error.HTTPError) as failed:
                 self.request("POST", "/v1/network-tools/github-pending-pushes/dd55ee66/approve", {})
         self.assertEqual(failed.exception.code, 409)
@@ -1682,7 +1682,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         # replay never runs (no token to push with), so the push fails
         # terminally and only the quarantine refs are torn down. Recovery is a
         # fresh push once the credential is fixed.
-        with patch("host.runtime.github_pending_push._run_helper_json") as no_token_run:
+        with patch("host.network_integrations.github.push_gate.pending._run_helper_json") as no_token_run:
             with self.assertRaises(urllib.error.HTTPError) as no_token:
                 self.request("POST", "/v1/network-tools/github-pending-pushes/0badcafe/approve", {})
         self.assertEqual(no_token.exception.code, 409)
@@ -1705,7 +1705,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
             cleanup_calls.append(payload)
             raise github_credential.HelperError("stale lock")
 
-        with patch("host.runtime.github_pending_push._run_helper_json", side_effect=fail_cleanup):
+        with patch("host.network_integrations.github.push_gate.pending._run_helper_json", side_effect=fail_cleanup):
             # Rejecting means the push never leaves the box: a failed ref
             # cleanup (best-effort housekeeping) does not change the outcome.
             status, rejected_with_bad_cleanup = self.request(
@@ -1732,7 +1732,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertTrue(github_pending_push.RESOLVE_LOCK.acquire(timeout=1))
         self.addCleanup(github_pending_push.RESOLVE_LOCK.release)
         with patch.object(github_pending_push, "RESOLVE_LOCK_TIMEOUT_SECONDS", 0.05):
-            with patch("host.runtime.github_pending_push._run_helper_json") as run:
+            with patch("host.network_integrations.github.push_gate.pending._run_helper_json") as run:
                 with self.assertRaises(urllib.error.HTTPError) as racing:
                     self.request("POST", "/v1/network-tools/github-pending-pushes/ee77ff88/reject", {})
         self.assertEqual(racing.exception.code, 409)
@@ -1771,10 +1771,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
             "PUT",
             "/v1/network/policy",
             {
-                "managed_network_integrations": {
+                "network_integrations": {
                     "github": {"enabled": True, "write_repositories": [{"owner": "infiloop2", "repo": "trustyclaw"}]}
                 },
-                "allowed_network_access": {},
             },
         )
         self.assertEqual(status, 200)
@@ -1823,7 +1822,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 "PUT",
                 "/v1/network/policy",
                 {
-                    "managed_network_integrations": {
+                    "network_integrations": {
                         "github": {
                             "enabled": True,
                             "write_repositories": [
@@ -1832,7 +1831,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                             ],
                         }
                     },
-                    "allowed_network_access": {},
                 },
             )
         self.assertEqual(len(mints), 2)
@@ -1967,10 +1965,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 "PUT",
                 "/v1/network/policy",
                 {
-                    "managed_network_integrations": {
+                    "network_integrations": {
                         "github": {"enabled": True, "write_repositories": [{"owner": "infiloop2", "repo": "just-granted"}]}
                     },
-                    "allowed_network_access": {},
                 },
             )
         self.assertEqual(status, 200)
@@ -1987,7 +1984,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 "PUT",
                 "/v1/network/policy",
                 {
-                    "managed_network_integrations": {
+                    "network_integrations": {
                         "openai": {"enabled": True},
                         "github": {
                             "enabled": True,
@@ -1997,7 +1994,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
                             ],
                         },
                     },
-                    "allowed_network_access": {},
                 },
             )
         self.assertEqual(state.read_proxy_github_token(), "ghs_widened")
@@ -2011,10 +2007,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 "PUT",
                 "/v1/network/policy",
                 {
-                    "managed_network_integrations": {
+                    "network_integrations": {
                         "github": {"enabled": True, "write_repositories": [{"owner": "infiloop2", "repo": "just-granted"}]}
                     },
-                    "allowed_network_access": {},
                 },
             )
         self.assertEqual(status, 200)
@@ -2031,11 +2026,10 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 "PUT",
                 "/v1/network/policy",
                 {
-                    "managed_network_integrations": {
+                    "network_integrations": {
                         "openai": {"enabled": True},
                         "github": {"enabled": True, "write_repositories": [{"owner": "infiloop2", "repo": "just-granted"}]},
                     },
-                    "allowed_network_access": {},
                 },
             )
         self.assertEqual(status, 200)
@@ -2059,10 +2053,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
         )
         state.save_proxy_github_token("ghs_pre_grant", "2999-01-01T00:00:00Z")
         enabling_policy = {
-            "managed_network_integrations": {
+            "network_integrations": {
                 "github": {"enabled": True, "write_repositories": [{"owner": "infiloop2", "repo": "just-granted"}]}
             },
-            "allowed_network_access": {},
         }
         mint_up = {"up": False}
 
@@ -2079,7 +2072,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
             # Enabled, but failed closed: the previously published token is
             # withdrawn (it may not cover the published list), and the mint
             # error is visible in the validation status.
-            self.assertTrue(load_policy()["managed_network_integrations"]["github"]["enabled"])
+            self.assertTrue(load_policy()["network_integrations"]["github"]["enabled"])
             self.assertIsNone(state.read_proxy_github_token())
             _, metadata = self.request("GET", "/v1/network-tools/github-credential")
             self.assertEqual(metadata["validation"]["status"], "error")
@@ -2112,7 +2105,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
             status, _ = self.request(
                 "PUT",
                 "/v1/network/policy",
-                {"managed_network_integrations": {"github": {"enabled": True}}, "allowed_network_access": {}},
+                {"network_integrations": {"github": {"enabled": True}}},
             )
         self.assertEqual(status, 200)
         self.assertEqual(state.read_proxy_github_token(), "ghs_read_only")
@@ -2129,7 +2122,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         status, _ = self.request(
             "PUT",
             "/v1/network/policy",
-            {"managed_network_integrations": {}, "allowed_network_access": {}},
+            {"network_integrations": {}},
         )
         self.assertEqual(status, 200)
         self.assertIsNone(state.read_proxy_github_token())
@@ -2196,7 +2189,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         state.save_proxy_github_token("github_pat_leftover")
         self.assertIsNotNone(state.read_proxy_github_token())
         save_policy(
-            {"managed_network_integrations": {}, "allowed_network_access": {}},
+            {"network_integrations": {}},
             "2026-06-08T00:00:02Z",
         )
         save_github_credential(
@@ -2232,10 +2225,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
             "PUT",
             "/v1/network/policy",
             {
-                "managed_network_integrations": {
+                "network_integrations": {
                     "github": {"enabled": True, "write_repositories": [{"owner": "infiloop2", "repo": "trustyclaw"}]}
                 },
-                "allowed_network_access": {},
             },
         )
         self.assertEqual(status, 200)
@@ -2244,7 +2236,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.request(
             "PUT",
             "/v1/network/policy",
-            {"managed_network_integrations": {}, "allowed_network_access": {}},
+            {"network_integrations": {}},
         )
         self.assertIsNone(state.read_proxy_github_token())
         _, cleared = self.request("DELETE", "/v1/network-tools/github-credential")
@@ -2275,8 +2267,8 @@ class AdminApiIntegrationTests(unittest.TestCase):
         # No dedicated policy lock: the DB write is atomic under the mutation
         # lock, both requests succeed, and the stored policy is one of the two
         # submitted bodies (never a blend).
-        enabled = {"managed_network_integrations": {"openai": {"enabled": True}}, "allowed_network_access": {}}
-        disabled = {"managed_network_integrations": {"openai": {"enabled": False}}, "allowed_network_access": {}}
+        enabled = {"network_integrations": {"openai": {"enabled": True}}}
+        disabled = {"network_integrations": {"openai": {"enabled": False}}}
         results: list[dict[str, object]] = []
         threads = [
             threading.Thread(target=lambda body=body: results.append(admin_api.replace_network_policy(body)))
@@ -2387,8 +2379,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
     def test_runtime_expiry_clears_claude_proxy_pin_only(self) -> None:
         save_policy(
             {
-                "managed_network_integrations": {"claude": {"enabled": True}},
-                "allowed_network_access": {},
+                "network_integrations": {"claude": {"enabled": True}},
             },
             "2026-06-08T00:00:01Z",
         )
@@ -2412,8 +2403,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         # anchored.
         save_policy(
             {
-                "managed_network_integrations": {"claude": {"enabled": True}},
-                "allowed_network_access": {},
+                "network_integrations": {"claude": {"enabled": True}},
             },
             "2026-06-08T00:00:01Z",
         )
@@ -2447,8 +2437,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
     def test_active_claude_runtime_refresh_rejects_rotation_to_another_account(self) -> None:
         save_policy(
             {
-                "managed_network_integrations": {"claude": {"enabled": True}},
-                "allowed_network_access": {},
+                "network_integrations": {"claude": {"enabled": True}},
             },
             "2026-06-08T00:00:01Z",
         )
@@ -2773,7 +2762,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 409)
 
     def test_oauth_start_rejects_disabled_provider_before_spawning_helper(self) -> None:
-        save_policy({"managed_network_integrations": {}, "allowed_network_access": {}}, "t")
+        save_policy({"network_integrations": {}}, "t")
         state = load_state()
         state["agent_runtime_statuses"]["codex"]["status"] = "awaiting_login"
         state["agent_runtime_statuses"]["claude_code"]["status"] = "awaiting_login"
@@ -2795,7 +2784,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 self.assertEqual(error.exception.code, 409)
 
     def test_current_oauth_rejects_disabled_provider_even_with_stale_oauth_state(self) -> None:
-        save_policy({"managed_network_integrations": {}, "allowed_network_access": {}}, "t")
+        save_policy({"network_integrations": {}}, "t")
         state = load_state()
         state["agent_runtime_statuses"]["codex"]["status"] = "awaiting_login"
         state["agent_runtime_statuses"]["claude_code"]["status"] = "awaiting_login"
@@ -2841,7 +2830,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertIsNone(load_state().get("codex_oauth"))
 
     def test_claude_oauth_complete_rejects_disabled_provider_before_touching_helper(self) -> None:
-        save_policy({"managed_network_integrations": {}, "allowed_network_access": {}}, "t")
+        save_policy({"network_integrations": {}}, "t")
 
         with (
             patch(
@@ -2857,8 +2846,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
     def test_claude_oauth_complete_keeps_pending_login_for_trusted_account_capture(self) -> None:
         save_policy(
             {
-                "managed_network_integrations": {"claude": {"enabled": True}},
-                "allowed_network_access": {},
+                "network_integrations": {"claude": {"enabled": True}},
             },
             "2026-06-08T00:00:00Z",
         )
@@ -2899,7 +2887,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
     def test_claude_oauth_complete_clears_pending_login_after_non_active_refresh(self) -> None:
         save_policy(
-            {"managed_network_integrations": {"claude": {"enabled": True}}, "allowed_network_access": {}},
+            {"network_integrations": {"claude": {"enabled": True}}},
             "2026-06-08T00:00:00Z",
         )
         snapshot = load_state()
@@ -2927,7 +2915,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
     def test_reset_linked_account_clears_anchor_pin_and_pending_oauth(self) -> None:
         save_policy(
-            {"managed_network_integrations": {"openai": {"enabled": True}}, "allowed_network_access": {}},
+            {"network_integrations": {"openai": {"enabled": True}}},
             "2026-06-08T00:00:00Z",
         )
         snapshot = load_state()
@@ -2974,7 +2962,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
     def test_reset_linked_account_clears_claude_anchor_and_pin(self) -> None:
         save_policy(
-            {"managed_network_integrations": {"claude": {"enabled": True}}, "allowed_network_access": {}},
+            {"network_integrations": {"claude": {"enabled": True}}},
             "2026-06-08T00:00:00Z",
         )
         snapshot = load_state()
@@ -3018,7 +3006,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
     def test_reset_linked_account_kills_running_tasks_and_clears_auth(self) -> None:
         save_policy(
-            {"managed_network_integrations": {"openai": {"enabled": True}}, "allowed_network_access": {}},
+            {"network_integrations": {"openai": {"enabled": True}}},
             "2026-06-08T00:00:00Z",
         )
         snapshot = load_state()
@@ -3068,7 +3056,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
     def test_reset_linked_account_helper_failure_leaves_anchor_cleared_and_refreshes(self) -> None:
         save_policy(
-            {"managed_network_integrations": {"openai": {"enabled": True}}, "allowed_network_access": {}},
+            {"network_integrations": {"openai": {"enabled": True}}},
             "2026-06-08T00:00:00Z",
         )
         save_approved_openai_account("acct_old")
@@ -3133,7 +3121,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
     def test_claude_oauth_start_reuses_existing_login(self) -> None:
         save_policy(
-            {"managed_network_integrations": {"claude": {"enabled": True}}, "allowed_network_access": {}},
+            {"network_integrations": {"claude": {"enabled": True}}},
             "2026-06-08T00:00:01Z",
         )
         state = load_state()
@@ -3291,19 +3279,21 @@ class AdminApiIntegrationTests(unittest.TestCase):
         save_policy(
             parse_network_controls(
                 {
-                    "managed_network_integrations": {"openai": {"enabled": True}},
-                    "allowed_network_access": {
-                        "api.example.com": {"allow_http_methods": ["GET"]},
+                    "network_integrations": {
+                        "openai": {"enabled": True},
+                        "custom": {"domains": {"api.example.com": {"allow_http_methods": ["GET"]}}},
                     },
                 }
             ).to_json(),
             "2026-06-08T00:00:03Z",
         )
         _, body = self.request("GET", "/v1/network/policy")
-        self.assertEqual(body["network_controls"]["managed_network_integrations"], {"openai": {"enabled": True}})
         self.assertEqual(
-            body["network_controls"]["allowed_network_access"],
-            {"api.example.com": {"allow_http_methods": ["GET"]}},
+            body["network_controls"]["network_integrations"],
+            {
+                "openai": {"enabled": True},
+                "custom": {"domains": {"api.example.com": {"allow_http_methods": ["GET"]}}},
+            },
         )
         self.assertEqual(body["updated_at"], "2026-06-08T00:00:03Z")
 

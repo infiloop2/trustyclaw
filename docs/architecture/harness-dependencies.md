@@ -231,7 +231,7 @@ local or project settings out of the task harness while still allowing
 source.
 
 WebSearch availability follows the operator's
-`managed_network_integrations.claude.web_search` toggle (default off) and is
+`network_integrations.claude.web_search` toggle (default off) and is
 applied at launch, not written to disk. The orchestrator — the only side with a
 database role — reads the toggle in `run()` and states the decision to the
 launcher as its required first argument (`web-search=on`/`web-search=off`). The
@@ -255,11 +255,11 @@ fetch as nonessential, so the probe must omit this environment variable or it
 exits successfully without returning any usage windows.
 
 The network proxy is the ultimate layer and enforces the same toggle
-independently: `anthropic_external_url_request_guard` on `api.anthropic.com`
-always denies server-side `web_fetch`/`code_execution`/remote-MCP declarations,
-and denies `web_search` unless `anthropic_allow_web_search` (expanded from the
-toggle) is set. So even if the harness settings layer were bypassed, web search
-stays off unless the operator enabled it.
+independently: the Claude integration guard on `api.anthropic.com` always
+denies server-side `web_fetch`/`code_execution`/remote-MCP declarations, and
+reads `web_search` directly from its typed config. So even if the harness
+settings layer were bypassed, web search stays off unless the operator enabled
+it.
 
 `--strict-mcp-config` plus the inline `--mcp-config` make the bundled tools
 shim (`host.runtime.tools_mcp_shim`, spawned as `trustyclaw-agent`) the only

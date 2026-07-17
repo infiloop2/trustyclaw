@@ -885,7 +885,7 @@ Network endpoints:
 | `GET` | `/v1/network/events?before=<seq>&decision=<allowed\|denied\|all>&limit=<n>` | query parameters optional | Network event response | Lists newest network decision events before an optional sequence cursor. |
 
 The `github-credential` routes work whether or not
-`managed_network_integrations.github` is enabled, so the credential can be
+`network_integrations.github` is enabled, so the credential can be
 staged before the integration is turned on; the proxy-injected working token
 is only ever published while GitHub is enabled.
 
@@ -893,19 +893,21 @@ Network policy request:
 
 ```json
 {
-  "managed_network_integrations": {
+  "network_integrations": {
     "openai": {"enabled": true},
     "github": {
       "enabled": true,
       "write_repositories": [
         {"owner": "infiloop2", "repo": "trustyclaw"}
       ]
-    }
-  },
-  "allowed_network_access": {
-    "example.com": {
-      "allow_http_methods": ["GET", "HEAD"],
-      "path_guards": ["^/$", "^/docs(?:/.*)?$"]
+    },
+    "custom": {
+      "domains": {
+        "example.com": {
+          "allow_http_methods": ["GET", "HEAD"],
+          "path_guards": ["^/$", "^/docs(?:/.*)?$"]
+        }
+      }
     }
   }
 }
@@ -921,26 +923,28 @@ the stored policy is always exactly one submitted body, never a blend.
 Network policy response:
 
 The API response uses the operator-facing network controls shape. Managed
-integration domains are not listed in `allowed_network_access`; they are
-expanded only in the internal enforcement policy, and credential secrets are
-never included.
+integration domains are not listed under the custom integration; the proxy maps
+each public field directly to its typed integration config, and credential
+secrets are never included.
 
 ```json
 {
   "network_controls": {
-    "managed_network_integrations": {
+    "network_integrations": {
       "openai": {"enabled": true},
       "github": {
         "enabled": true,
         "write_repositories": [
           {"owner": "infiloop2", "repo": "trustyclaw"}
         ]
-      }
-    },
-    "allowed_network_access": {
-      "example.com": {
-        "allow_http_methods": ["GET", "HEAD"],
-        "path_guards": ["^/$", "^/docs(?:/.*)?$"]
+      },
+      "custom": {
+        "domains": {
+          "example.com": {
+            "allow_http_methods": ["GET", "HEAD"],
+            "path_guards": ["^/$", "^/docs(?:/.*)?$"]
+          }
+        }
       }
     }
   },
@@ -1081,9 +1085,10 @@ discarded and can no longer be listed.
 }
 ```
 
-A denied event additionally carries a `reason` string explaining the denial
-(e.g. `host is not in the allowed network policy`, `live web search is disabled
-for this domain`); allowed events omit it.
+A denied event additionally carries a stable snake_case `reason_code` (e.g.
+`host_not_allowed`, `openai_web_tool_denied`) identifying the denial class;
+allowed events omit it. The same code is the proxy's 403 response body, and
+the agent-facing `recent_network_denials` tool maps it to guidance.
 
 Network event response fields:
 
@@ -1104,7 +1109,7 @@ Network event fields:
 | `path` | string |  | Request path without the query string. |
 | `query` | string |  | Request query string without the leading `?`, or an empty string when no query was present. |
 | `decision` | enum | `allowed`, `denied` | Network decision. |
-| `reason` | string | optional | Present only on denied events: why the request was refused. |
+| `reason_code` | string | optional | Present only on denied events: the stable snake_case code for the denial class. The agent-facing `recent_network_denials` tool joins it against per-integration guidance. |
 
 ## Apps
 

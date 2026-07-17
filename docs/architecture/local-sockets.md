@@ -15,8 +15,9 @@ place.
 
 | Socket | Server (uid) | Allowed client uids | Purpose |
 | --- | --- | --- | --- |
-| `/var/run/postgresql/.s.PGSQL.5432` | `postgres` | `trustyclaw-admin`, `trustyclaw-proxy`, `trustyclaw-tools`, `postgres`, and per-app uids, each mapped to its matching database role | Admin, network, tool, and per-app state. `pg_hba.conf` admits these named peer identities and then explicitly rejects everyone else; table/schema grants narrow each non-owner role. There is no TCP listener. |
+| `/var/run/postgresql/.s.PGSQL.5432` | `postgres` | `trustyclaw-admin`, `trustyclaw-proxy`, `trustyclaw-tools`, `trustyclaw-agent-network`, `postgres`, and per-app uids, each mapped to its matching database role | Admin, network, tool, and per-app state. `pg_hba.conf` admits these named peer identities and then explicitly rejects everyone else; table/schema grants narrow each non-owner role. There is no TCP listener. |
 | `/run/trustyclaw-tools/tools.sock` | `trustyclaw-tools` (tools service) | `trustyclaw-agent`, `trustyclaw-admin` (each path-scoped) | Agent-facing tools surface plus operator delegation, scoped strictly by path per peer. Only `trustyclaw-agent` reaches `GET /tools`, JSON `POST /call`, and raw-byte `POST /assets/video` and `POST /assets/image`; the MCP shim forwards calls and streams agent-opened media without sending its pathname. Only `trustyclaw-admin` reaches `/operator/...` for OAuth, revoke, and approved execution. Neither peer can call the other's routes. |
+| `/run/trustyclaw-agent-network/agent-network.sock` | `trustyclaw-agent-network` (network-introspection service) | `trustyclaw-agent` | Agent-facing `list_network_integrations` and `recent_network_denials` tools. The service has no egress and a SELECT-only Postgres role for policy and network-event tables; the MCP shim aggregates its listing with the tools and app services. |
 | `/run/trustyclaw-admin-api/app-backend.sock` | `trustyclaw-admin` (admin API) | per-app `trustyclaw-app-<app_id>` uids | App-backend → host admin API, server-to-server. The admin API checks the peer uid against the installed app's Linux user, then applies a narrow app-backend route allowlist (task/thread shapes only). Lets an app backend reach host resources without a second app secret. |
 | `/run/trustyclaw-agent-app/agent-app.sock` | `trustyclaw-agent-app` (agent-app service) | `trustyclaw-agent` | Agent → app backend agent API (`POST /call`, used by the MCP shim's stable `app_api` tool). The peer uid proves "an agent"; the caller's app-prefixed host thread is read from `trustyclaw-agent-thread-<thread_id>.scope`, resolved through the installed manifest, then proxied to that app's `/agent/` routes over its loopback port. See [`agent-app-api.md`](apps/agent-app-api.md). |
 
@@ -24,7 +25,8 @@ place.
 
 - **Directories are world-traversable, the sockets are peer-gated.** Bootstrap
   gives the admin-api unit `RuntimeDirectory=trustyclaw-admin-api`, the tools
-  unit `RuntimeDirectory=trustyclaw-tools`, and the agent-app unit
+  unit `RuntimeDirectory=trustyclaw-tools`, the network-introspection unit
+  `RuntimeDirectory=trustyclaw-agent-network`, and the agent-app unit
   `RuntimeDirectory=trustyclaw-agent-app`, all at mode `0755`, so the agent/app
   uids can `connect(2)`; access control is the server's peer-uid check, not
   filesystem permissions.

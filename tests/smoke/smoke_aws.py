@@ -222,11 +222,11 @@ def managed_integrations(providers: dict[str, bool]) -> dict:
     return {provider: {"enabled": True} for provider, enabled in providers.items() if enabled}
 
 
-def network_policy(providers: dict[str, bool], allowed_network_access: dict | None = None) -> dict:
-    return {
-        "managed_network_integrations": managed_integrations(providers),
-        "allowed_network_access": allowed_network_access or {},
-    }
+def network_policy(providers: dict[str, bool], custom_domains: dict | None = None) -> dict:
+    integrations = managed_integrations(providers)
+    if custom_domains:
+        integrations["custom"] = {"domains": custom_domains}
+    return {"network_integrations": integrations}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -342,7 +342,7 @@ class AwsSmoke:
                 "*.example.com": {"allow_http_methods": ["GET"]},
             },
         )
-        policy["managed_network_integrations"]["github"] = json.loads(json.dumps(SMOKE_GITHUB_INTEGRATION))
+        policy["network_integrations"]["github"] = json.loads(json.dumps(SMOKE_GITHUB_INTEGRATION))
         return policy
 
     # --- lifecycle ---------------------------------------------------------
@@ -707,10 +707,10 @@ class AwsSmoke:
         self._api("PUT", "/v1/network/policy", self.enforcement_policy())
         policy = self._api("GET", "/v1/network/policy")
         controls = policy["network_controls"]
-        expected_provider = self.enforcement_policy()["managed_network_integrations"]
-        if controls.get("managed_network_integrations") != expected_provider:
-            raise AssertionError(f"policy did not preserve explicit managed provider: {controls}")
-        rules = controls["allowed_network_access"]
+        expected_integrations = self.enforcement_policy()["network_integrations"]
+        if controls.get("network_integrations") != expected_integrations:
+            raise AssertionError(f"policy did not preserve explicit integrations: {controls}")
+        rules = controls["network_integrations"].get("custom", {}).get("domains", {})
         if "example.com" not in rules:
             raise AssertionError("replaced policy not reflected in GET")
         for host in self.managed_domains:
@@ -720,7 +720,10 @@ class AwsSmoke:
         stored_integrations = set(self._ssh_code(
             "sudo -u postgres psql -tA -d trustyclaw_admin -c 'SELECT integration FROM managed_integrations'"
         ).split())
-        expected_enabled = set(expected_provider)
+        expected_enabled = {
+            name for name, config in expected_integrations.items()
+            if name != "custom" and config.get("enabled") is True
+        }
         if stored_integrations != expected_enabled:
             raise AssertionError(
                 f"stored policy did not preserve enabled integrations: {sorted(stored_integrations)}"
@@ -743,7 +746,7 @@ class AwsSmoke:
             if host in stored_domains:
                 raise AssertionError(f"managed integration rule {host} leaked into stored policy: {sorted(stored_domains)}")
         self._check_github_credential_lifecycle()
-        self._ok("policy read back and stored user-facing; proxy expands managed AI provider rules in memory")
+        self._ok("policy read back and stored user-facing; proxy dispatches typed integration config directly")
 
     def _check_github_credential_lifecycle(self) -> None:
         smoke_token = f"github_pat_smoke_{time.time_ns()}"
@@ -805,10 +808,7 @@ class AwsSmoke:
 
     def check_initial_disabled_provider_deploy(self) -> None:
         self._step("initial deploy with managed providers disabled")
-        expected_empty_policy = {
-            "managed_network_integrations": {},
-            "allowed_network_access": {},
-        }
+        expected_empty_policy = {"network_integrations": {}}
         stored_rows = self._ssh_code(
             "sudo -u postgres psql -tA -d trustyclaw_admin -c 'SELECT count(*) FROM network_policy'"
         ).strip()
@@ -822,10 +822,8 @@ class AwsSmoke:
         health = self._api("GET", "/v1/health")
         if health["network_controls"]["status"] != "active":
             raise AssertionError(f"empty valid policy should report derived active network status: {health}")
-        if policy.get("managed_network_integrations", {}) != {}:
-            raise AssertionError(f"initial policy should keep managed providers disabled: {policy}")
-        if policy.get("allowed_network_access") != {}:
-            raise AssertionError(f"initial policy should not have user network rules: {policy}")
+        if policy.get("network_integrations", {}) != {}:
+            raise AssertionError(f"initial policy should be empty: {policy}")
         for runtime in SMOKE_RUNTIMES:
             status = self._wait_for_runtime_status({"deactivated"}, runtime=runtime, timeout=90)
             if status != "deactivated":
@@ -1276,7 +1274,7 @@ class AwsSmoke:
         status, body = self._api_status("PUT", "/v1/network/policy", invalid)
         if status != 400:
             raise AssertionError(f"invalid policy returned {status}, expected 400: {body}")
-        disabled_provider_policy = {"allowed_network_access": {}}
+        disabled_provider_policy = {"network_integrations": {}}
         status, body = self._api_status(
             "PUT", "/v1/network/policy", disabled_provider_policy
         )
@@ -1333,44 +1331,32 @@ class AwsSmoke:
         for label, bad_policy, expected_error in (
             (
                 "self-managed-openai-domain",
-                {
-                    "managed_network_integrations": managed_integrations({"openai": True, "claude": True}),
-                    "allowed_network_access": {"chatgpt.com": {"allow_http_methods": ["GET"]}},
-                },
-                "managed_network_integrations.openai",
+                network_policy({"openai": True, "claude": True}, {"chatgpt.com": {"allow_http_methods": ["GET"]}}),
+                "network_integrations.openai",
             ),
             (
                 "self-managed-claude-domain",
-                {
-                    "managed_network_integrations": managed_integrations({"openai": True, "claude": True}),
-                    "allowed_network_access": {"api.anthropic.com": {"allow_http_methods": ["POST"]}},
-                },
-                "managed_network_integrations.claude",
+                network_policy({"openai": True, "claude": True}, {"api.anthropic.com": {"allow_http_methods": ["POST"]}}),
+                "network_integrations.claude",
             ),
             (
                 "user-openai-managed-flag",
-                {
-                    "managed_network_integrations": managed_integrations(SMOKE_MANAGED_PROVIDERS),
-                    "allowed_network_access": {
-                        "api.example.com": {
-                            "allow_http_methods": ["GET"],
-                            "openai_external_url_request_guard": True,
-                        }
-                    },
-                },
+                network_policy(SMOKE_MANAGED_PROVIDERS, {
+                    "api.example.com": {
+                        "allow_http_methods": ["GET"],
+                        "openai_external_url_request_guard": True,
+                    }
+                }),
                 "unsupported fields",
             ),
             (
                 "user-openai-account-guard-flag",
-                {
-                    "managed_network_integrations": managed_integrations(SMOKE_MANAGED_PROVIDERS),
-                    "allowed_network_access": {
-                        "api.example.com": {
-                            "allow_http_methods": ["GET"],
-                            "openai_account_guard": True,
-                        }
-                    },
-                },
+                network_policy(SMOKE_MANAGED_PROVIDERS, {
+                    "api.example.com": {
+                        "allow_http_methods": ["GET"],
+                        "openai_account_guard": True,
+                    }
+                }),
                 "unsupported fields",
             ),
         ):
@@ -2013,13 +1999,13 @@ class AwsSmoke:
             raise AssertionError(f"plain HTTP through the proxy returned {plain!r}, expected 403")
 
         events = self._network_events(since=baseline)
-        reasons = {event.get("reason") for event in events if event["decision"] == "denied"}
-        if "only port 443 is allowed for CONNECT" not in reasons:
-            raise AssertionError(f"non-443 CONNECT denial not logged; denied reasons: {reasons}")
-        if "host is not in the allowed network policy" not in reasons:
-            raise AssertionError(f"unknown-host denial not logged; denied reasons: {reasons}")
-        if "plain HTTP is not supported; use HTTPS" not in reasons:
-            raise AssertionError(f"plain HTTP denial not logged; denied reasons: {reasons}")
+        reasons = {event.get("reason_code") for event in events if event["decision"] == "denied"}
+        if "connect_port_denied" not in reasons:
+            raise AssertionError(f"non-443 CONNECT denial not logged; denied reason codes: {reasons}")
+        if "host_not_allowed" not in reasons:
+            raise AssertionError(f"unknown-host denial not logged; denied reason codes: {reasons}")
+        if "plain_http_denied" not in reasons:
+            raise AssertionError(f"plain HTTP denial not logged; denied reason codes: {reasons}")
         if not any(event["host"] == "www.example.com" and event["decision"] == "allowed" for event in events):
             raise AssertionError("wildcard-matched request did not produce an allowed event")
         if not any(event["path"] == "/%7A%65%6E" and event["decision"] == "allowed" for event in events):
@@ -2032,12 +2018,13 @@ class AwsSmoke:
             "PUT",
             "/v1/network/policy",
             {
-                "managed_network_integrations": {},
-                "allowed_network_access": {
-                    "example.com": {
-                        "allow_http_methods": ["GET"],
-                        "path_guards": ["^/$"],
-                    },
+                "network_integrations": {
+                    "custom": {"domains": {
+                        "example.com": {
+                            "allow_http_methods": ["GET"],
+                            "path_guards": ["^/$"],
+                        },
+                    }},
                 },
             },
         )
@@ -2091,7 +2078,7 @@ class AwsSmoke:
             f"--data {shlex.quote(openai_payload)} {shlex.quote(openai_url)}"
         )
         print(f"  -> {openai_response[:200]!r}", flush=True)
-        if "OpenAI account id is not available" not in openai_response:
+        if "openai_account_unavailable" not in openai_response:
             raise AssertionError(f"OpenAI data-plane request did not fail closed; proxy returned {openai_response!r}")
 
         claude_hello = self._ssh_code(
@@ -2111,21 +2098,21 @@ class AwsSmoke:
             f"--data {shlex.quote(claude_payload)} {shlex.quote(claude_url)}"
         )
         print(f"  -> {claude_response[:200]!r}", flush=True)
-        if "Claude account token is not available" not in claude_response:
+        if "anthropic_token_unavailable" not in claude_response:
             raise AssertionError(f"Anthropic API request did not fail closed before login; proxy returned {claude_response!r}")
 
         events = self._network_events(since=baseline)
         if not any(
             event["host"] == "chatgpt.com"
             and event["decision"] == "denied"
-            and event.get("reason") == "OpenAI account id is not available"
+            and event.get("reason_code") == "openai_account_unavailable"
             for event in events
         ):
             raise AssertionError("no account-id-missing chatgpt.com network denial was logged")
         if not any(
             event["host"] == "api.anthropic.com"
             and event["decision"] == "denied"
-            and event.get("reason") == "Claude account token is not available"
+            and event.get("reason_code") == "anthropic_token_unavailable"
             for event in events
         ):
             raise AssertionError("no token-missing api.anthropic.com network denial was logged")
@@ -2205,6 +2192,8 @@ class AwsSmoke:
             raise AssertionError(f"MCP shim listing missing expected tools: {shim_listing!r}")
         if "list_bundled_tools" not in shim_listing:
             raise AssertionError(f"MCP shim listing missing list_bundled_tools: {shim_listing!r}")
+        if "list_network_integrations" not in shim_listing or "recent_network_denials" not in shim_listing:
+            raise AssertionError(f"MCP shim listing missing network introspection: {shim_listing!r}")
         if "gmail_search_messages" in shim_listing:
             raise AssertionError("MCP shim listed a disabled tool")
 
@@ -2241,6 +2230,24 @@ class AwsSmoke:
         )
         if "TC_OPEN" not in tools_egress:
             raise AssertionError(f"tools uid must reach the internet for tool APIs: {tools_egress!r}")
+        network_egress = self._ssh_code(
+            "sudo -u trustyclaw-agent-network timeout 6 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>&1 "
+            "&& echo TC_OPEN || echo TC_BLOCKED"
+        )
+        if "TC_BLOCKED" not in network_egress:
+            raise AssertionError(
+                f"agent-network uid must have no internet egress: {network_egress!r}"
+            )
+        network_proxy_loopback = self._ssh_code(
+            f"sudo -u trustyclaw-agent-network timeout 6 bash -c "
+            f"'exec 3<>/dev/tcp/127.0.0.1/{PROXY_PORT}' 2>&1 "
+            "&& echo TC_OPEN || echo TC_BLOCKED"
+        )
+        if "TC_BLOCKED" not in network_proxy_loopback:
+            raise AssertionError(
+                "agent-network uid must not reach the loopback policy proxy: "
+                f"{network_proxy_loopback!r}"
+            )
 
         # The agent-facing tools socket is owned by the dedicated tools service.
         service_active = self._ssh_code("systemctl is-active trustyclaw-tools.service 2>&1 || true")
@@ -2249,6 +2256,20 @@ class AwsSmoke:
         socket_owner = self._ssh_code("stat -c '%U' /run/trustyclaw-tools/tools.sock 2>&1 || true")
         if "trustyclaw-tools" not in socket_owner:
             raise AssertionError(f"tools socket must be owned by trustyclaw-tools: {socket_owner!r}")
+        network_service = self._ssh_code(
+            "systemctl is-active trustyclaw-agent-network.service 2>&1 || true"
+        )
+        if network_service.strip() != "active":
+            raise AssertionError(
+                f"trustyclaw-agent-network.service must be active: {network_service!r}"
+            )
+        network_socket_owner = self._ssh_code(
+            "stat -c '%U' /run/trustyclaw-agent-network/agent-network.sock 2>&1 || true"
+        )
+        if "trustyclaw-agent-network" not in network_socket_owner:
+            raise AssertionError(
+                f"network socket must be owned by trustyclaw-agent-network: {network_socket_owner!r}"
+            )
 
         # Peers are scoped strictly by path: other service users are rejected
         # outright, and even the admin uid is rejected on the agent MCP routes
@@ -2267,6 +2288,37 @@ class AwsSmoke:
                 raise AssertionError(
                     f"tools socket must reject {probe_user} on agent routes, got {peer_probe!r}"
                 )
+
+        network_probe_script = (
+            "from host.runtime.tools_mcp_shim import UnixHTTPConnection; "
+            "c = UnixHTTPConnection('/run/trustyclaw-agent-network/agent-network.sock'); "
+            "c.request('GET', '/tools'); print(c.getresponse().status)"
+        )
+        for probe_user in ("trustyclaw-tools", "trustyclaw-proxy", "trustyclaw-admin"):
+            peer_probe = self._ssh_code(
+                f"sudo -u {probe_user} env PYTHONPATH=/opt/trustyclaw-host "
+                f"python3 -c {shlex.quote(network_probe_script)}"
+            )
+            if peer_probe.strip() != "403":
+                raise AssertionError(
+                    f"network socket must reject {probe_user}, got {peer_probe!r}"
+                )
+
+        network_roles = self._ssh_code(
+            "sudo -u trustyclaw-agent-network psql -tA -d trustyclaw_admin "
+            "-c 'SELECT count(*) >= 0 FROM network_events' && "
+            "sudo -u trustyclaw-agent-network bash -c "
+            "'! psql -tA -d trustyclaw_admin -c \"DELETE FROM network_events\" 2>/dev/null' && "
+            "sudo -u trustyclaw-agent-network bash -c "
+            "'! psql -tA -d trustyclaw_admin -c \"SELECT count(*) FROM tool_events\" 2>/dev/null' && "
+            "sudo -u trustyclaw-tools bash -c "
+            "'! psql -tA -d trustyclaw_admin -c \"SELECT count(*) FROM network_events\" 2>/dev/null' && "
+            "echo ok"
+        ).strip().splitlines()
+        if network_roles != ["t", "ok"]:
+            raise AssertionError(
+                f"network/tools database roles are not isolated: {network_roles}"
+            )
 
         # The fresh host starts with no approvals or tool config whatsoever.
         approvals = self._api("GET", "/v1/tools/gmail/approvals")
@@ -2513,7 +2565,7 @@ class AwsSmoke:
             if current["status"] != "running":
                 raise AssertionError(f"{runtime} deactivation target never started: {current}")
 
-        self._api("PUT", "/v1/network/policy", {"allowed_network_access": {}})
+        self._api("PUT", "/v1/network/policy", {"network_integrations": {}})
         for runtime in SMOKE_RUNTIMES:
             status = self._wait_for_runtime_status({"deactivated"}, runtime=runtime, timeout=90)
             if status != "deactivated":
@@ -3160,8 +3212,8 @@ LEFT JOIN proxy_provider_pins USING (provider)
             return
         print(f"  {label}: {len(events)} event(s) after seq {since}", flush=True)
         for event in events:
-            reason = event.get("reason")
-            suffix = f" reason={reason!r}" if reason else ""
+            reason = event.get("reason_code")
+            suffix = f" reason_code={reason!r}" if reason else ""
             print(
                 f"    seq={event.get('seq')} {event.get('decision')} "
                 f"{event.get('method')} {event.get('protocol')}://{event.get('host')}{event.get('path')}{suffix}",

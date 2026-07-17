@@ -9,7 +9,7 @@ import { CUSTOM_DOMAIN_GUIDE, MANAGED_INTEGRATIONS, integrationInfo } from "./in
 
 const GITHUB_REPO_INPUT_RE = /^([a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?)\/([a-z0-9._-]{1,100})$/;
 
-let activeNetworkPolicy = {"managed_network_integrations": {}, "allowed_network_access": {}};
+let activeNetworkPolicy = {"network_integrations": {}};
 let expandedIntegrations = new Set();
 let expandedGithubRepoAudits = new Set();
 let customDomainExpanded = false;
@@ -108,12 +108,12 @@ export async function loadPolicy() {
 }
 
 function normalizePolicy(policy) {
-  const managed = objectValue(policy && policy.managed_network_integrations);
-  const rules = objectValue(policy && policy.allowed_network_access);
-  return {
-    "managed_network_integrations": JSON.parse(JSON.stringify(managed)),
-    "allowed_network_access": rules,
-  };
+  const integrations = objectValue(policy && policy.network_integrations);
+  return {"network_integrations": JSON.parse(JSON.stringify(integrations))};
+}
+
+function customDomains(policy) {
+  return objectValue(objectValue(objectValue(policy.network_integrations).custom).domains);
 }
 
 function clonePolicy(policy) {
@@ -148,7 +148,7 @@ async function publishPolicy(integration, mutate, message) {
 
 function renderManagedIntegrations() {
   closeIntegrationInfo();
-  const managed = objectValue(activeNetworkPolicy.managed_network_integrations);
+  const managed = objectValue(activeNetworkPolicy.network_integrations);
   // Park the expansion node outside the list before the innerHTML swap below
   // would destroy it (it was moved under the GitHub details on the previous
   // render).
@@ -213,7 +213,7 @@ function integrationDetailsHtml(name, enabled) {
         <div class="provider-oauth" data-provider-oauth="${esc(name)}"></div>
       </div>`;
     if (name === "claude" && enabled) {
-      const webSearch = objectValue(objectValue(activeNetworkPolicy.managed_network_integrations).claude).web_search === true;
+      const webSearch = objectValue(objectValue(activeNetworkPolicy.network_integrations).claude).web_search === true;
       return `${accountCard}
       <div class="detail-card">
         <div class="detail-card-head">
@@ -247,7 +247,7 @@ function integrationDetailsHtml(name, enabled) {
 export function renderIntegrationAccounts() {
   for (const node of document.querySelectorAll("[data-provider-status]")) {
     const provider = node.dataset.providerStatus;
-    const enabled = objectValue(objectValue(activeNetworkPolicy.managed_network_integrations)[provider]).enabled === true;
+    const enabled = objectValue(objectValue(activeNetworkPolicy.network_integrations)[provider]).enabled === true;
     if (!enabled) {
       setHtml(node, "");
       continue;
@@ -268,7 +268,7 @@ export function renderIntegrationAccounts() {
     const runtime = provider === "claude" ? "claude_code" : "codex";
     const runtimeLabel = runtime === "claude_code" ? "Claude Code" : "Codex";
     const record = runtimeRecords().find(entry => entry.type === runtime) || { status: account.status || "loading" };
-    const enabled = objectValue(objectValue(activeNetworkPolicy.managed_network_integrations)[provider]).enabled === true;
+    const enabled = objectValue(objectValue(activeNetworkPolicy.network_integrations)[provider]).enabled === true;
     const identity = account.email || account.account_id;
     const summary = !enabled && !identity
       ? ""
@@ -339,7 +339,7 @@ export async function setIntegrationEnabled(name, enabled) {
   if (!enabled && !confirm(prompt)) return;
   if (name === "github" && enabled) expandedIntegrations.add("github");
   await publishPolicy(name, policy => {
-    const managed = policy.managed_network_integrations;
+    const managed = policy.network_integrations;
     // A disabled integration carries no other state: disabling GitHub also
     // removes its write repositories (the stored credential stays).
     const value = enabled ? { ...objectValue(managed[name]), "enabled": true } : { "enabled": false };
@@ -353,7 +353,7 @@ export async function setIntegrationEnabled(name, enabled) {
 
 export async function setClaudeWebSearch(webSearch) {
   await publishPolicy("claude", policy => {
-    const managed = policy.managed_network_integrations;
+    const managed = policy.network_integrations;
     const value = { ...objectValue(managed.claude), "enabled": true };
     if (webSearch) value.web_search = true; else delete value.web_search;
     managed.claude = value;
@@ -361,12 +361,12 @@ export async function setClaudeWebSearch(webSearch) {
 }
 
 function githubRepositories(policy) {
-  const github = objectValue(objectValue(policy.managed_network_integrations).github);
+  const github = objectValue(objectValue(policy.network_integrations).github);
   return Array.isArray(github.write_repositories) ? github.write_repositories : [];
 }
 
 function githubRequireApproval(policy) {
-  return objectValue(objectValue(policy.managed_network_integrations).github).require_dot_github_approval === true;
+  return objectValue(objectValue(policy.network_integrations).github).require_dot_github_approval === true;
 }
 
 function githubIntegrationObject(enabled, writeRepositories, requireApproval) {
@@ -376,7 +376,7 @@ function githubIntegrationObject(enabled, writeRepositories, requireApproval) {
 }
 
 function renderGithubRepos() {
-  const managed = objectValue(activeNetworkPolicy.managed_network_integrations);
+  const managed = objectValue(activeNetworkPolicy.network_integrations);
   const enabled = objectValue(managed.github).enabled === true;
   $("github-repo").disabled = !enabled;
   const addButton = document.querySelector('[data-action="add-github-repo"]');
@@ -445,7 +445,7 @@ export function toggleGithubRepoAudit(key) {
 }
 
 export async function addGithubRepo() {
-  const managed = objectValue(activeNetworkPolicy.managed_network_integrations);
+  const managed = objectValue(activeNetworkPolicy.network_integrations);
   if (objectValue(managed.github).enabled !== true) {
     policyMessage("github", "Enable the GitHub integration before adding write repositories.", true);
     return;
@@ -455,7 +455,7 @@ export async function addGithubRepo() {
   if (!match) { policyMessage("github", "Enter a GitHub repository as owner/repo.", true); return; }
   const entry = {"owner": match[1], "repo": match[2]};
   await publishPolicy("github", policy => {
-    const managed = policy.managed_network_integrations;
+    const managed = policy.network_integrations;
     const github = objectValue(managed.github);
     const remaining = githubRepositories(policy).filter(repo =>
       !(objectValue(repo).owner === entry.owner && objectValue(repo).repo === entry.repo));
@@ -468,7 +468,7 @@ export async function addGithubRepo() {
 export async function removeGithubRepo(owner, repo) {
   if (!confirm(`Remove ${owner}/${repo} from the GitHub write repositories?`)) return;
   await publishPolicy("github", policy => {
-    const managed = policy.managed_network_integrations;
+    const managed = policy.network_integrations;
     const github = objectValue(managed.github);
     const remaining = githubRepositories(policy).filter(entry =>
       !(objectValue(entry).owner === owner && objectValue(entry).repo === repo));
@@ -477,7 +477,7 @@ export async function removeGithubRepo(owner, repo) {
 }
 
 function renderGithubApproval() {
-  const managed = objectValue(activeNetworkPolicy.managed_network_integrations);
+  const managed = objectValue(activeNetworkPolicy.network_integrations);
   const enabled = objectValue(managed.github).enabled === true;
   const required = githubRequireApproval(activeNetworkPolicy);
   const status = $("github-require-approval-status");
@@ -502,13 +502,13 @@ function renderGithubApproval() {
 }
 
 export async function setGithubRequireApproval(requireApproval) {
-  const managed = objectValue(activeNetworkPolicy.managed_network_integrations);
+  const managed = objectValue(activeNetworkPolicy.network_integrations);
   if (objectValue(managed.github).enabled !== true) {
     policyMessage("github", "Enable the GitHub integration before changing .github push approval.", true);
     return;
   }
   await publishPolicy("github", policy => {
-    const managed = policy.managed_network_integrations;
+    const managed = policy.network_integrations;
     const github = objectValue(managed.github);
     managed.github = githubIntegrationObject(github.enabled === true, githubRepositories(policy), requireApproval);
   }, `.github push approval ${requireApproval ? "enabled" : "disabled"}.`);
@@ -648,7 +648,7 @@ export async function deleteGithubCredential() {
 }
 
 function renderDomainRules() {
-  const rules = objectValue(activeNetworkPolicy.allowed_network_access);
+  const rules = customDomains(activeNetworkPolicy);
   const domains = Object.keys(rules).sort();
   const count = domains.length;
   $("domain-rule-count").textContent = `${count} domain${count === 1 ? "" : "s"} enabled`;
@@ -684,7 +684,9 @@ export async function addDomainRule() {
   const rule = {"allow_http_methods": methods};
   if (pathGuards.length) rule.path_guards = pathGuards;
   await publishPolicy("custom_domain", policy => {
-    policy.allowed_network_access[domain] = rule;
+    const domains = customDomains(policy);
+    domains[domain] = rule;
+    policy.network_integrations.custom = {"domains": domains};
   }, `Domain rule for ${domain} saved.`);
   $("policy-domain").value = "";
   $("policy-methods").value = "";
@@ -694,6 +696,12 @@ export async function addDomainRule() {
 export async function removeDomainRule(domain) {
   if (!confirm(`Remove the domain rule for ${domain}?`)) return;
   await publishPolicy("custom_domain", policy => {
-    delete policy.allowed_network_access[domain];
+    const domains = customDomains(policy);
+    delete domains[domain];
+    if (Object.keys(domains).length) {
+      policy.network_integrations.custom = {"domains": domains};
+    } else {
+      delete policy.network_integrations.custom;
+    }
   }, `Domain rule for ${domain} removed.`);
 }

@@ -295,13 +295,13 @@ class StateStorageTests(unittest.TestCase):
         # The agent's own request stream feeds this log; without field caps a
         # hostile client could turn the row cap into unbounded disk growth.
         state.append_network_event(
-            "https", "GET", "h" * 600, 443, "/" + "p" * 5000, "q" * 5000, False, reason="r" * 900
+            "https", "GET", "h" * 600, 443, "/" + "p" * 5000, "q" * 5000, False, reason_code="r" * 900
         )
         event = read_network_events()[-1]
         self.assertEqual(len(event["host"]), 512)
         self.assertEqual(len(event["path"]), 2048)
         self.assertEqual(len(event["query"]), 2048)
-        self.assertEqual(len(event["reason"]), 512)
+        self.assertEqual(len(event["reason_code"]), 128)
 
     def test_proxy_cert_files_can_be_split_from_admin_state(self) -> None:
         # TLS material is the one proxy-owned file family left: the ssl module
@@ -321,7 +321,7 @@ class StateStorageTests(unittest.TestCase):
         self.assertEqual(read_proxy_openai_account_id(), "acct_pin")
         self.assertEqual(read_proxy_claude_account(), {"access_token_sha256": "d" * 64})
         self.assertIsNone(state.network_policy_record())
-        state.save_network_policy({"managed_network_integrations": {}, "allowed_network_access": {}}, "2026-06-08T00:00:00Z")
+        state.save_network_policy({"network_integrations": {}}, "2026-06-08T00:00:00Z")
         record = state.network_policy_record()
         assert record is not None
         self.assertEqual(record["updated_at"], "2026-06-08T00:00:00Z")
@@ -363,8 +363,7 @@ class StateStorageTests(unittest.TestCase):
 
     def test_network_policy_round_trips_claude_web_search(self) -> None:
         controls = {
-            "managed_network_integrations": {"claude": {"enabled": True, "web_search": True}},
-            "allowed_network_access": {},
+            "network_integrations": {"claude": {"enabled": True, "web_search": True}},
         }
         state.save_network_policy(controls, "2026-06-08T00:00:00Z")
         record = state.network_policy_record()
@@ -373,17 +372,17 @@ class StateStorageTests(unittest.TestCase):
         self.assertTrue(state.read_claude_web_search())
         # Disabling web search clears the row and the read helper reports off.
         state.save_network_policy(
-            {"managed_network_integrations": {"claude": {"enabled": True}}, "allowed_network_access": {}},
+            {"network_integrations": {"claude": {"enabled": True}}},
             "2026-06-08T00:00:01Z",
         )
         self.assertFalse(state.read_claude_web_search())
         record = state.network_policy_record()
         assert record is not None
-        self.assertNotIn("web_search", record["controls"]["managed_network_integrations"]["claude"])
+        self.assertNotIn("web_search", record["controls"]["network_integrations"]["claude"])
 
     def test_network_policy_round_trips_integrations_and_github_repos(self) -> None:
         controls = {
-            "managed_network_integrations": {
+            "network_integrations": {
                 "openai": {"enabled": True},
                 "github": {
                     "enabled": True,
@@ -393,8 +392,8 @@ class StateStorageTests(unittest.TestCase):
                     ],
                 },
                 "npm_packages": {"enabled": True},
+                "custom": {"domains": {"example.com": {"allow_http_methods": ["GET"]}}},
             },
-            "allowed_network_access": {"example.com": {"allow_http_methods": ["GET"]}},
         }
         state.save_network_policy(controls, "2026-06-08T00:00:00Z")
         record = state.network_policy_record()
@@ -402,10 +401,9 @@ class StateStorageTests(unittest.TestCase):
         self.assertEqual(record["controls"], controls)
         # Narrowing the repository list round-trips too.
         narrowed = {
-            "managed_network_integrations": {
+            "network_integrations": {
                 "github": {"enabled": True, "write_repositories": [{"owner": "infiloop2", "repo": "trustyclaw"}]},
             },
-            "allowed_network_access": {},
         }
         state.save_network_policy(narrowed, "2026-06-08T00:00:01Z")
         record = state.network_policy_record()
@@ -413,25 +411,24 @@ class StateStorageTests(unittest.TestCase):
         self.assertEqual(record["controls"], narrowed)
         # Replacing with a github-free policy clears the repository rows too.
         state.save_network_policy(
-            {"managed_network_integrations": {"claude": {"enabled": True}}, "allowed_network_access": {}},
+            {"network_integrations": {"claude": {"enabled": True}}},
             "2026-06-08T00:00:02Z",
         )
         record = state.network_policy_record()
         assert record is not None
         self.assertEqual(
-            record["controls"]["managed_network_integrations"], {"claude": {"enabled": True}}
+            record["controls"]["network_integrations"], {"claude": {"enabled": True}}
         )
 
     def test_require_dot_github_approval_round_trips(self) -> None:
         controls = {
-            "managed_network_integrations": {
+            "network_integrations": {
                 "github": {
                     "enabled": True,
                     "write_repositories": [{"owner": "infiloop2", "repo": "trustyclaw"}],
                     "require_dot_github_approval": True,
                 }
             },
-            "allowed_network_access": {},
         }
         state.save_network_policy(controls, "2026-06-08T00:00:00Z")
         record = state.network_policy_record()
@@ -522,7 +519,7 @@ class StateStorageTests(unittest.TestCase):
         self.assertEqual(state.read_github_credential_metadata(), {"configured": False})
 
     def test_proxy_github_token_round_trips_and_drives_injection_headers(self) -> None:
-        from host.runtime.network_policy import github_credential_headers
+        from host.network_integrations.github.guard import rewrite_request_headers as github_credential_headers
 
         self.assertIsNone(state.read_proxy_github_token())
         # Without a working token: agent-supplied Authorization is stripped

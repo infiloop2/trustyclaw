@@ -1192,7 +1192,7 @@ def _live_key(runtime_type: str, thread_id: Any) -> str:
 
 def _runtime_network_enabled(runtime_type: str) -> bool:
     provider = _MANAGED_PROVIDER_BY_RUNTIME.get(runtime_type)
-    integrations = network_policy.load_policy().get("managed_network_integrations", {})
+    integrations = network_policy.load_policy().get("network_integrations", {})
     if not provider or not isinstance(integrations, dict):
         return False
     integration = integrations.get(provider)

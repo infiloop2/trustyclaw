@@ -10,7 +10,12 @@ from unittest.mock import patch
 import pg_harness
 
 from host.runtime import orchestrator, state
-from host.runtime.network_policy import anthropic_request_denied
+from host.network_integrations.claude import guard as claude_guard
+from host.network_integrations.claude.manifest import ClaudeIntegration
+
+
+def anthropic_request_denied(config, method, host, path, headers):
+    return claude_guard.request_denied(config, method, host, path, "", headers, b"")
 from host.runtime.state import save_network_policy as save_policy
 from host.runtime.state import (
     read_claude_account,
@@ -95,8 +100,7 @@ class OrchestratorTests(unittest.TestCase):
         self.addCleanup(orchestrator._LIVE.clear)
         save_policy(
             {
-                "managed_network_integrations": {"openai": {"enabled": True}, "claude": {"enabled": True}},
-                "allowed_network_access": {},
+                "network_integrations": {"openai": {"enabled": True}, "claude": {"enabled": True}},
             },
             "2026-06-08T00:00:00Z",
         )
@@ -299,7 +303,7 @@ class OrchestratorTests(unittest.TestCase):
         # both providers: the task must fail as deactivated before any runtime
         # process spawns, never start against a disabled provider.
         save_policy(
-            {"managed_network_integrations": {}, "allowed_network_access": {}},
+            {"network_integrations": {}},
             "2026-06-08T00:00:01Z",
         )
         self.seed_tasks(make_task(1, "stale-active-codex"), make_task(2, "stale-active-claude", runtime="claude_code"))
@@ -518,11 +522,7 @@ class OrchestratorTests(unittest.TestCase):
         self.seed_tasks(make_task(1, "chat", runtime="claude_code"))
         old_token = "old-token"
         fresh_token = "fresh-token"
-        policy = {
-            "allowed_network_access": {
-                "api.anthropic.com": {"allow_http_methods": ["GET", "POST"], "anthropic_account_guard": True}
-            }
-        }
+        policy = ClaudeIntegration(enabled=True, web_search=False)
         save_attested_claude_account("acct", access_token_sha256=hashlib.sha256(old_token.encode()).hexdigest())
         save_proxy_claude_account(
             {
@@ -1454,7 +1454,7 @@ class OrchestratorTests(unittest.TestCase):
 
         def status_after_policy_flip():
             save_policy(
-                {"managed_network_integrations": {}, "allowed_network_access": {}},
+                {"network_integrations": {}},
                 "2026-06-08T00:00:02Z",
             )
             return "awaiting_login", None, None
@@ -1632,8 +1632,7 @@ class OrchestratorTests(unittest.TestCase):
     def test_policy_change_refreshes_reenabled_runtime_without_waiting_for_poll_cadence(self) -> None:
         save_policy(
             {
-                "managed_network_integrations": {"openai": {"enabled": True}},
-                "allowed_network_access": {},
+                "network_integrations": {"openai": {"enabled": True}},
             },
             "2026-06-08T00:00:01Z",
         )

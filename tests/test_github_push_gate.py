@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from host.runtime import approve_github_push, github_push_gate as gate
+from host.network_integrations.github.push_gate import approve as approve_github_push, engine as gate
 
 
 def _pkt(payload: bytes) -> bytes:

@@ -752,11 +752,10 @@ def network_policy_record() -> dict[str, Any] | None:
         cur.execute("SELECT domain, pattern FROM domain_path_guards ORDER BY domain, position")
         for domain, pattern in cur.fetchall():
             allowed[str(domain)].setdefault("path_guards", []).append(pattern)
+        if allowed:
+            integrations["custom"] = {"domains": allowed}
     return {
-        "controls": {
-            "managed_network_integrations": integrations,
-            "allowed_network_access": allowed,
-        },
+        "controls": {"network_integrations": integrations},
         "updated_at": updated_at,
     }
 
@@ -792,8 +791,10 @@ def save_network_policy(controls: dict[str, Any], updated_at: str) -> None:
             " ON CONFLICT (singleton) DO UPDATE SET updated_at = EXCLUDED.updated_at",
             (updated_at,),
         )
-        integrations = controls.get("managed_network_integrations") or {}
+        integrations = controls.get("network_integrations") or {}
         for integration, value in integrations.items():
+            if integration == "custom":
+                continue  # custom's domains live in the domain tables below
             if isinstance(value, dict) and value.get("enabled") is True:
                 cur.execute("INSERT INTO managed_integrations (integration) VALUES (%s)", (integration,))
         github = integrations.get("github")
@@ -810,7 +811,9 @@ def save_network_policy(controls: dict[str, Any], updated_at: str) -> None:
         claude = integrations.get("claude")
         if isinstance(claude, dict) and claude.get("web_search") is True:
             cur.execute("INSERT INTO claude_settings (singleton, web_search) VALUES (TRUE, TRUE)")
-        for domain, rule in (controls.get("allowed_network_access") or {}).items():
+        custom = integrations.get("custom")
+        custom_domains = custom.get("domains") if isinstance(custom, dict) else {}
+        for domain, rule in (custom_domains or {}).items():
             cur.execute("INSERT INTO allowed_domains (domain) VALUES (%s)", (domain,))
             for position, method in enumerate(rule.get("allow_http_methods") or []):
                 cur.execute(
@@ -1089,7 +1092,7 @@ def get_pending_push(push_id: str) -> dict[str, Any] | None:
 def resolve_pending_push(push_id: str, status: str, detail: str | None = None) -> dict[str, Any]:
     """Mark a pending push resolved (approved/rejected/failed) with an optional
     detail message, and return the resolved row. The caller
-    (github_pending_push) holds RESOLVE_LOCK and has just read the row as
+    (push_gate.pending) holds RESOLVE_LOCK and has just read the row as
     pending, so the conditional update always matches; a vanished row would be
     a programming error and fails loudly."""
     with mutation() as cur:
@@ -1134,7 +1137,7 @@ def append_network_event(
     path: str,
     query: str,
     allowed: bool,
-    reason: str | None = None,
+    reason_code: str | None = None,
 ) -> None:
     """Record one allow/deny decision. Runs in the proxy process under its own
     database role, whose event-table grant permits this operation. A failure
@@ -1145,12 +1148,12 @@ def append_network_event(
     host = host[:512]
     path = path[:2048]
     query = query[:2048]
-    if reason is not None:
-        reason = reason[:512]
+    if reason_code is not None:
+        reason_code = reason_code[:128]
     with db.transaction() as cur:
         cur.execute(
             "INSERT INTO network_events (created_at, protocol, method, host, port, path,"
-            " query, decision, reason) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            " query, decision, reason_code) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
             " RETURNING seq",
             (
                 utc_now(),
@@ -1161,7 +1164,7 @@ def append_network_event(
                 path,
                 query,
                 "allowed" if allowed else "denied",
-                reason,
+                reason_code,
             ),
         )
         row = cur.fetchone()
@@ -1178,7 +1181,7 @@ def prune_network_events(cur: Any) -> None:
 
 
 def _network_event_dict(row: Any) -> dict[str, Any]:
-    seq, created_at, protocol, method, host, port, path, query, decision, reason = row
+    seq, created_at, protocol, method, host, port, path, query, decision, reason_code = row
     event: dict[str, Any] = {
         "seq": int(seq),
         "timestamp": created_at,
@@ -1190,12 +1193,12 @@ def _network_event_dict(row: Any) -> dict[str, Any]:
         "query": query,
         "decision": decision,
     }
-    if reason is not None:
-        event["reason"] = reason
+    if reason_code is not None:
+        event["reason_code"] = reason_code
     return event
 
 
-_NETWORK_EVENT_FIELDS = "seq, created_at, protocol, method, host, port, path, query, decision, reason"
+_NETWORK_EVENT_FIELDS = "seq, created_at, protocol, method, host, port, path, query, decision, reason_code"
 
 
 def page_network_events_before(

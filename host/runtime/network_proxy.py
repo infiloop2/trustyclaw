@@ -32,20 +32,10 @@ import threading
 from typing import Any
 import urllib.parse
 
-from host.config import expand_network_controls, parse_network_controls
+from host.config import NetworkControls, parse_network_controls
 from host.constants import LOOPBACK, PROXY_PORT
-from host.runtime.network_policy import (
-    decide_http_request,
-    anthropic_request_denied,
-    github_credential_headers,
-    github_push_gate_response,
-    github_request_denied,
-    host_allowed,
-    load_policy,
-    openai_request_denied,
-    openai_ws_message_denied,
-    websocket_inspection_required,
-)
+from host.network_integrations import runtime as integrations
+from host.runtime.network_policy import load_policy
 from host.runtime.state import (
     append_network_event,
     network_proxy_cert_files,
@@ -61,12 +51,10 @@ MAX_CONNECTIONS = 64  # cap concurrent handlers so buffered bodies cannot OOM th
 IDLE_TIMEOUT = 310.0
 
 
-def _load_enforcement_policy() -> dict[str, Any]:
-    """Load, validate, and expand the stored policy for this request.
+def _load_enforcement_policy() -> NetworkControls:
+    """Load and validate typed integration configs for this request.
 
-    The stored policy is the operator-facing config; managed provider domains
-    are expanded only inside the proxy process so the stored config never
-    contains generated OpenAI rules. There is deliberately no fallback cache:
+    There is deliberately no fallback cache:
     any failure — an unavailable database exactly like an invalid policy —
     propagates and the request is denied. The other enforcement inputs
     (account pins) and the decision log live in the same database, so a
@@ -74,14 +62,14 @@ def _load_enforcement_policy() -> dict[str, Any]:
     denying everything until the database returns is the simple, fail-safe
     behavior.
     """
-    return expand_network_controls(parse_network_controls(load_policy()))
+    return parse_network_controls(load_policy())
 
 
-def _policy_load_denial() -> tuple[dict[str, Any], str | None]:
+def _policy_load_denial() -> tuple[NetworkControls | None, str | None]:
     try:
         return _load_enforcement_policy(), None
-    except Exception as exc:
-        return {}, f"network policy unavailable: {exc}"
+    except Exception:
+        return None, "network_policy_unavailable"
 
 
 CERT_LOCK = threading.Lock()
@@ -117,7 +105,7 @@ def connect_public(host: str, port: int, timeout: float) -> socket.socket:
 
 
 def request_denial_reason(
-    policy: dict,
+    policy: NetworkControls | None,
     protocol: str,
     method: str,
     host: str,
@@ -126,29 +114,27 @@ def request_denial_reason(
     headers: list[tuple[str, str]],
     body: bytes,
 ) -> str | None:
-    """Why this request is denied, or None if it is allowed. The specific reason
-    (e.g. a live web search denial) is returned to the client and logged."""
-    if not decide_http_request(policy, protocol, method, host, path, query):
-        return "network policy denied request"
-    return (
-        openai_request_denied(policy, host, headers, body, path=path)
-        or anthropic_request_denied(policy, method, host, path, headers, body)
-        or github_request_denied(policy, method, host, path, query, body)
-    )
+    """The denial code for this request, or None if it is allowed. The code is
+    returned in the 403 body and logged to network events; the denial catalog
+    maps it to guidance. After the core domain/method/path decision, the
+    request is decided by exactly the integration that owns the host (if any)
+    — see ``host.network_integrations.runtime``."""
+    del protocol
+    if policy is None:
+        return "network_policy_unavailable"
+    return integrations.request_denied(policy, method, host, path, query, headers, body)
 
 
 def host_header_denial(headers: list[tuple[str, str]], expected_host: str, expected_port: int) -> str | None:
     presented = [value for key, value in headers if key.lower() == "host"]
-    if not presented:
-        return "Host header is required"
-    if len(presented) != 1:
-        return "exactly one Host header is required"
+    if not presented or len(presented) != 1:
+        return "host_header_invalid"
     try:
         host, port = _split_host_port(presented[0], expected_port)
     except ValueError:
-        return "Host header port is invalid"
+        return "host_header_invalid"
     if host.lower() != expected_host.lower() or port != expected_port:
-        return "Host header does not match the vetted upstream host"
+        return "host_header_invalid"
     return None
 
 
@@ -165,16 +151,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Deny before any DNS or upstream connection happens for this host.
         policy, policy_error = _policy_load_denial()
         if port != 443:
-            reason = "only port 443 is allowed for CONNECT"
+            denial = "connect_port_denied"
         elif policy_error is not None:
-            reason = policy_error
-        elif not host_allowed(policy, host):
-            reason = "host is not in the allowed network policy"
+            denial = policy_error
+        elif policy is None or not integrations.host_allowed(policy, host):
+            denial = "host_not_allowed"
         else:
-            reason = None
-        if reason is not None:
-            append_network_event("https", "CONNECT", host, port, "", "", False, reason)
-            self.send_error(403, reason)
+            denial = None
+        if denial is not None:
+            append_network_event("https", "CONNECT", host, port, "", "", False, denial)
+            self.send_error(403, denial)
             return
         try:
             cert_path, key_path = ensure_host_cert(host)
@@ -212,9 +198,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             query = parsed.query
         except ValueError:
             pass  # malformed authority: log the denial with the defaults
-        reason = "plain HTTP is not supported; use HTTPS"
-        append_network_event("http", self.command, host, port, path, query, False, reason)
-        self.send_error(403, reason)
+        denial = "plain_http_denied"
+        append_network_event("http", self.command, host, port, path, query, False, denial)
+        self.send_error(403, denial)
 
     # Every plain (non-CONNECT) method is denied the same way.
     do_GET = do_HEAD = do_POST = do_PUT = do_PATCH = do_DELETE = _deny_plain_http
@@ -240,32 +226,34 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 path = parsed.path or "/"
                 query = parsed.query
             else:
-                target_denial = "request target must be origin-form"
+                target_denial = "request_target_invalid"
             is_websocket = any(key.lower() == "upgrade" and value.lower() == "websocket" for key, value in headers)
             protocol = "wss" if is_websocket else "https"
             body, body_deny = read_body(reader, headers)
             policy, policy_error = _policy_load_denial()
-            reason = (
+            denial = (
                 body_deny
                 or target_denial
                 or host_header_denial(headers, host, port)
                 or policy_error
                 or request_denial_reason(policy, protocol, method, host, path, query, headers, body)
             )
-            # The .github approval gate runs after the write guard passes: a
-            # gated push that changes .github/ is answered with a git
-            # report-status ("queued for approval") instead of being forwarded.
+            # The owning integration's gate runs after the deny decision
+            # passes: a gated push that changes .github/ is answered with a
+            # git report-status ("queued for approval") instead of being
+            # forwarded.
             gate_response = None
-            if reason is None:
-                gate_response, gate_reason = github_push_gate_response(policy, method, host, path, body)
-                if gate_reason is not None:
-                    reason = gate_reason
-            append_network_event(protocol, method, host, port, path, query, reason is None, reason)
+            if denial is None:
+                assert policy is not None
+                gate_response, gate_denial = integrations.gate_response(policy, method, host, path, body)
+                if gate_denial is not None:
+                    denial = gate_denial
+            append_network_event(protocol, method, host, port, path, query, denial is None, denial)
             if gate_response is not None:
                 client_tls.sendall(gate_response)
                 return
-            if reason is not None:
-                message = reason.encode()
+            if denial is not None:
+                message = denial.encode()
                 client_tls.sendall(
                     b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: "
                     + str(len(message)).encode()
@@ -273,10 +261,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     + message
                 )
                 return
-            # After the allow decision: on GitHub domains the proxy
-            # authenticates the request itself (agent Authorization stripped,
-            # the working token injected) — the agent never holds the token.
-            headers = github_credential_headers(host, headers)
+            # After the allow decision, the owning integration may rewrite
+            # headers: on GitHub domains the proxy authenticates the request
+            # itself (agent Authorization stripped, the working token
+            # injected) — the agent never holds the token.
+            assert policy is not None
+            headers = integrations.rewrite_request_headers(policy, host, headers)
             upstream_raw = connect_public(host, port, timeout=15)
             upstream_tls = ssl.create_default_context().wrap_socket(upstream_raw, server_hostname=host)
             upstream_tls.settimeout(IDLE_TIMEOUT)
@@ -393,7 +383,7 @@ def read_request_head(reader: Any) -> tuple[str, str, list[tuple[str, str]]]:
 
 def read_body(reader: Any, headers: list[tuple[str, str]]) -> tuple[bytes, str | None]:
     """Read the full request body (Content-Length or chunked) from anything
-    with ``read``/``readline``. Returns (body, deny reason). The body is
+    with ``read``/``readline``. Returns (body, denial code). The body is
     buffered and capped so the policy check always sees it completely."""
     header_map = {key.lower(): value for key, value in headers}
     if "chunked" in header_map.get("transfer-encoding", "").lower():
@@ -401,11 +391,11 @@ def read_body(reader: Any, headers: list[tuple[str, str]]) -> tuple[bytes, str |
     try:
         length = int(header_map.get("content-length", "0") or "0")
     except ValueError:
-        return b"", "malformed Content-Length"
+        return b"", "request_body_malformed"
     if length < 0:
-        return b"", "malformed Content-Length"
+        return b"", "request_body_malformed"
     if length > MAX_BODY_BYTES:
-        return b"", "request body too large"
+        return b"", "request_body_too_large"
     return reader.read(length), None
 
 
@@ -416,7 +406,7 @@ def read_chunked_body(reader: Any) -> tuple[bytes, str | None]:
         try:
             size = int(size_line.split(b";")[0].strip() or b"0", 16)
         except ValueError:
-            return b"", "malformed chunked request body"
+            return b"", "request_body_malformed"
         if size == 0:
             while True:  # consume optional trailers up to the blank line
                 line = reader.readline(MAX_HEADER_BYTES)
@@ -424,7 +414,7 @@ def read_chunked_body(reader: Any) -> tuple[bytes, str | None]:
                     break
             return body, None
         if len(body) + size > MAX_BODY_BYTES:
-            return b"", "request body too large"
+            return b"", "request_body_too_large"
         body += reader.read(size)
         reader.read(2)  # CRLF after each chunk
 
@@ -483,9 +473,9 @@ def forward_until_close(source: socket.socket, target: socket.socket) -> None:
 
 
 class WebSocketDenied(Exception):
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
-        self.reason = reason
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 class WebSocketClientGuard:
@@ -496,7 +486,8 @@ class WebSocketClientGuard:
     oversized is denied rather than blindly forwarded — the same fail-closed
     posture as the HTTP body guard."""
 
-    def __init__(self) -> None:
+    def __init__(self, message_denied: Any) -> None:
+        self._message_denied = message_denied
         self._buffer = bytearray()
         self._message = bytearray()
         self._frames: list[bytes] = []  # raw frames of the in-progress message
@@ -515,21 +506,21 @@ class WebSocketClientGuard:
                 continue
             if opcode == 0x0:  # continuation
                 if not self._fragmented:
-                    raise WebSocketDenied("unexpected websocket continuation frame")
+                    raise WebSocketDenied("websocket_uninspectable")
             elif opcode in (0x1, 0x2):  # text/binary
                 if self._fragmented:
-                    raise WebSocketDenied("interleaved websocket data frames")
+                    raise WebSocketDenied("websocket_uninspectable")
             else:
-                raise WebSocketDenied(f"unsupported websocket opcode {opcode}")
+                raise WebSocketDenied("websocket_uninspectable")
             self._message.extend(payload)
             if len(self._message) > MAX_BODY_BYTES:
-                raise WebSocketDenied("websocket message too large to inspect")
+                raise WebSocketDenied("websocket_uninspectable")
             self._frames.append(raw)
             self._fragmented = not fin
             if fin:
-                reason = openai_ws_message_denied(bytes(self._message))
-                if reason is not None:
-                    raise WebSocketDenied(reason)
+                denial = self._message_denied(bytes(self._message))
+                if denial is not None:
+                    raise WebSocketDenied(denial)
                 cleared += b"".join(self._frames)
                 self._frames.clear()
                 self._message.clear()
@@ -540,11 +531,11 @@ class WebSocketClientGuard:
         if len(buffer) < 2:
             return None
         if buffer[0] & 0x70:
-            raise WebSocketDenied("websocket frame uses RSV bits; extensions are not supported")
+            raise WebSocketDenied("websocket_uninspectable")
         fin = bool(buffer[0] & 0x80)
         opcode = buffer[0] & 0x0F
         if not buffer[1] & 0x80:
-            raise WebSocketDenied("client websocket frame is not masked")
+            raise WebSocketDenied("websocket_uninspectable")
         length = buffer[1] & 0x7F
         offset = 2
         if length == 126:
@@ -556,7 +547,7 @@ class WebSocketClientGuard:
                 return None
             length, offset = int.from_bytes(buffer[2:10], "big"), 10
         if length > MAX_BODY_BYTES:
-            raise WebSocketDenied("websocket frame too large to inspect")
+            raise WebSocketDenied("websocket_uninspectable")
         total = offset + 4 + length
         if len(buffer) < total:
             return None
@@ -575,22 +566,24 @@ def _websocket_close_frame(status_code: int, reason: str) -> bytes:
 def tunnel_websocket(
     client: socket.socket,
     upstream: socket.socket,
-    policy: dict[str, Any],
+    policy: NetworkControls,
     protocol: str,
     host: str,
     port: int,
     path: str,
     initial_client_bytes: bytes = b"",
 ) -> None:
-    """Relay a WebSocket connection. When the domain rule requires message
+    """Relay a WebSocket connection. When the owning integration requires message
     inspection (external URL request guard), each client→upstream message is
     policy-checked before forwarding; a violation is logged, answered with a
     1008 close frame, and ends the connection. Upstream→client frames pass
     through untouched. Domains with no message-dependent rule keep the plain
     opaque tunnel."""
-    # One relay loop for both modes: with no message-dependent rule the guard
-    # is None and the tunnel stays byte-opaque (feed() can then never raise).
-    guard = WebSocketClientGuard() if websocket_inspection_required(policy, host) else None
+    # One relay loop for both modes: when the owning integration needs no
+    # message inspection the guard is None and the tunnel stays byte-opaque
+    # (feed() can then never raise).
+    message_denied = integrations.ws_message_guard(policy, host)
+    guard = WebSocketClientGuard(message_denied) if message_denied is not None else None
     try:
         if initial_client_bytes:
             cleared = guard.feed(initial_client_bytes) if guard else initial_client_bytes
@@ -612,9 +605,9 @@ def tunnel_websocket(
                 else:
                     client.sendall(data)
     except WebSocketDenied as denied:
-        append_network_event(protocol, "MESSAGE", host, port, path, "", False, denied.reason)
+        append_network_event(protocol, "MESSAGE", host, port, path, "", False, denied.code)
         try:
-            client.sendall(_websocket_close_frame(1008, denied.reason))
+            client.sendall(_websocket_close_frame(1008, denied.code))
         except OSError:
             pass
     finally:

@@ -9,6 +9,8 @@ and forwards both over Unix sockets whose services authenticate the calling
 user by kernel peer credentials:
 
 - Bundled tool actions go to the tools socket (``host.runtime.tools_api``).
+- Network introspection goes to the agent-network socket
+  (``host.runtime.network_introspection_api``).
 - The ``app_api`` tool goes to the agent-app socket
   (``host.runtime.agent_app_api``), which derives the app-prefixed host thread
   of this shim process from its cgroup and proxies the call to that app
@@ -37,7 +39,12 @@ SOCKET_PATH = os.environ.get("TRUSTYCLAW_TOOLS_SOCKET", "/run/trustyclaw-tools/t
 AGENT_APP_SOCKET_PATH = os.environ.get(
     "TRUSTYCLAW_AGENT_APP_SOCKET", "/run/trustyclaw-agent-app/agent-app.sock"
 )
+AGENT_NETWORK_SOCKET_PATH = os.environ.get(
+    "TRUSTYCLAW_AGENT_NETWORK_SOCKET",
+    "/run/trustyclaw-agent-network/agent-network.sock",
+)
 APP_API_TOOL_NAME = "app_api"
+NETWORK_TOOL_NAMES = frozenset({"list_network_integrations", "recent_network_denials"})
 REQUEST_TIMEOUT_SECONDS = 120
 PENDING_APPROVAL_HINT = (
     "This action needs operator approval. Tell the user to approve or deny it "
@@ -130,14 +137,14 @@ def _tools_request(
         connection.close()
 
 
-def _list_tools() -> list[dict[str, Any]]:
+def _listed_socket_tools(socket_path: str) -> list[dict[str, Any]]:
     try:
-        tools = _tools_request("GET", "/tools").get("tools")
+        tools = _tools_request("GET", "/tools", socket_path=socket_path).get("tools")
     except Exception:
         tools = []
     if not isinstance(tools, list):
         tools = []
-    listed = [
+    return [
         {
             "name": tool["name"],
             "description": tool["description"],
@@ -146,10 +153,15 @@ def _list_tools() -> list[dict[str, Any]]:
         for tool in tools
         if isinstance(tool, dict)
     ]
+
+
+def _list_tools() -> list[dict[str, Any]]:
+    listed = _listed_socket_tools(SOCKET_PATH)
+    listed.extend(_listed_socket_tools(AGENT_NETWORK_SOCKET_PATH))
     # Staging only makes sense alongside a tool that consumes that media type.
     # Advertise each action only when such a tool is actually listed, so the
     # model is never steered into an upload it cannot use.
-    names = [str(tool.get("name", "")) for tool in tools if isinstance(tool, dict)]
+    names = [str(tool.get("name", "")) for tool in listed]
     if any(name.startswith("runway_") for name in names):
         listed.append(STAGE_IMAGE_TOOL)
     if any(name.startswith(("runway_", "instagram_")) for name in names):
@@ -290,8 +302,12 @@ def _call_tool(params: dict[str, Any]) -> dict[str, Any]:
                 raise RuntimeError(f"{name} arguments must be an object.")
             stage = _stage_image if name == "stage_image" else _stage_video
             return _tool_text(json.dumps(stage(arguments), indent=2))
+        socket_path = AGENT_NETWORK_SOCKET_PATH if name in NETWORK_TOOL_NAMES else SOCKET_PATH
         result = _tools_request(
-            "POST", "/call", {"name": name, "input": arguments if isinstance(arguments, dict) else {}}
+            "POST",
+            "/call",
+            {"name": name, "input": arguments if isinstance(arguments, dict) else {}},
+            socket_path=socket_path,
         )
     except Exception as exc:
         return _tool_text(f"Tool call failed: {exc}", is_error=True)
