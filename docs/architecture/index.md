@@ -22,7 +22,7 @@ so operators and contributors can jump to the trust boundary they need.
 | [App: Agent Chat](apps/agent-chat.md) | The threaded chat app: thread index, task references, and its display-only agent surface. |
 | [App: Mission Pursuit](apps/mission-pursuit.md) | The agent-furnished workspace app: action protocol, scheduling, artifacts, memory, and its structured agent boundary. |
 | [Agent App API](apps/agent-app-api.md) | The `app_api` tool: kernel-attributed agent → app backend calls through the dedicated agent-app service. |
-| [Network controls](network-controls.md) | nftables, proxy policy, managed integration guards (AI providers, GitHub, packages), internal guard fields, and fail-closed behavior. |
+| [Network controls](network-controls.md) | nftables, typed integration guards (AI providers, GitHub, packages, custom domains), agent introspection, and fail-closed behavior. |
 | [GitHub write-path controls](github-write-path-controls.md) | The implemented `.github` push-inspection, quarantine, approval, replay, and failure model. |
 | [Tools](tools/README.md) | Bundled tool framework: the host-neutral tool contract, this host's integration, approvals, and the bundled tool packages. |
 | [Local sockets](local-sockets.md) | Peer-credentialed Unix-domain sockets (tools, agent-app, app-backend, Postgres) and their trust boundaries. |

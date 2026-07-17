@@ -17,7 +17,7 @@ Actions that do not require approval run immediately and return their result. Ap
 
 The `trustyclaw` MCP server always exposes `app_api`, but listing the tool grants no app access. Use it only when the current app instructions document routes and request shapes; do not guess or probe routes. The host rejects calls outside an app-scoped thread whose manifest enables the API. Within one, it reaches only that app's `/agent/` routes. Treat returned HTTP statuses and JSON bodies as app responses, correcting and retrying validation failures when the app instructions call for it.
 
-Network access is controlled by TrustyClaw, not by the local agent sandbox. Agent traffic goes through the TrustyClaw network policy proxy. If a domain, API, or package source is blocked, report the exact host and path and ask the operator to allow it.
+Network access is controlled by TrustyClaw, not by the local agent sandbox. Agent traffic goes through the TrustyClaw network policy proxy. When a request fails with a 403, or `git`/`pip`/`npm`/`curl` fail with an unclear network error, call the `recent_network_denials` tool: it returns the proxy's denial code for each recent blocked request with guidance on what would change the outcome. Use `list_network_integrations` to see which managed integrations (OpenAI, Claude, GitHub, package registries) and domain rules are enabled. Denials are the policy failing closed, not host errors; report the specific denial and ask the operator for the named integration or domain rule instead of working around the proxy.
 
 When GitHub access is configured, TrustyClaw injects credentials through the proxy. Use normal `git` and REST-backed `gh api` commands from this host.
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from contextlib import contextmanager, ExitStack
 import json
+import hashlib
 from pathlib import Path
 import socket
 import ssl
@@ -14,6 +15,10 @@ from unittest.mock import patch
 
 import pg_harness
 
+from host.network_integrations.claude import guard as claude_guard
+from host.network_integrations.claude.manifest import ClaudeIntegration
+from host.config import parse_network_controls
+from host.network_integrations.openai import guard as openai_guard
 from host.runtime import network_policy
 from host.runtime.network_policy import load_policy
 from host.runtime.state import save_network_policy as save_policy
@@ -63,14 +68,11 @@ class NetworkProxyTests(unittest.TestCase):
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
 
-    def save_policy(self, allowed_network_access: dict) -> None:
-        save_policy(
-            {
-                "managed_network_integrations": {"openai": {"enabled": True}},
-                "allowed_network_access": allowed_network_access,
-            },
-            "2026-06-08T00:00:00Z",
-        )
+    def save_policy(self, custom_domains: dict) -> None:
+        integrations: dict = {"openai": {"enabled": True}}
+        if custom_domains:
+            integrations["custom"] = {"domains": custom_domains}
+        save_policy({"network_integrations": integrations}, "2026-06-08T00:00:00Z")
 
     def start_http_server(self, tls: bool = False) -> ThreadingHTTPServer:
         server = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
@@ -93,15 +95,15 @@ class NetworkProxyTests(unittest.TestCase):
         self.addCleanup(server.shutdown)
         return server
 
-    def test_proxy_expands_managed_openai_rules_in_memory_only(self) -> None:
+    def test_proxy_loads_typed_openai_config_without_generated_domain_rules(self) -> None:
         self.save_policy({})
 
         stored = load_policy()
         enforcement = network_proxy._load_enforcement_policy()
 
-        for host in ("api.openai.com", "auth.openai.com", "chatgpt.com"):
-            self.assertNotIn(host, stored["allowed_network_access"])
-            self.assertIn(host, enforcement["allowed_network_access"])
+        self.assertNotIn("custom", stored["network_integrations"])
+        self.assertTrue(enforcement.integrations["openai"].enabled)
+        self.assertEqual(enforcement.to_json(), stored)
 
     def test_proxy_loads_valid_policy_without_status_file(self) -> None:
         self.save_policy({})
@@ -109,7 +111,8 @@ class NetworkProxyTests(unittest.TestCase):
         policy, denial = network_proxy._policy_load_denial()
 
         self.assertIsNone(denial)
-        self.assertIn("api.openai.com", policy["allowed_network_access"])
+        self.assertIsNotNone(policy)
+        self.assertTrue(policy.integrations["openai"].enabled)
 
     def test_proxy_denies_on_invalid_stored_policy(self) -> None:
         # The typed schema cannot hold a malformed policy document, so the
@@ -136,30 +139,31 @@ class NetworkProxyTests(unittest.TestCase):
 
         policy, denial = network_proxy._policy_load_denial()
 
-        self.assertEqual(policy, {})
+        self.assertIsNone(policy)
         self.assertIsNotNone(denial)
-        self.assertIn("network policy unavailable", denial)
+        self.assertEqual(denial, "network_policy_unavailable")
 
     def test_proxy_denies_everything_through_database_outages(self) -> None:
         # No fallback cache by design: the pins and the decision log live in
         # the same database, so nothing could keep flowing anyway — an outage
         # denies every request until the database returns. Simple, fail safe.
-        save_policy({"managed_network_integrations": {}, "allowed_network_access": {
+        save_policy({"network_integrations": {"custom": {"domains": {
             "api.example.com": {"allow_http_methods": ["GET"]}
-        }}, "2026-06-08T00:00:00Z")
+        }}}}, "2026-06-08T00:00:00Z")
         loaded = network_proxy._load_enforcement_policy()
-        self.assertIn("api.example.com", loaded["allowed_network_access"])
+        self.assertIn("api.example.com", loaded.to_json()["network_integrations"]["custom"]["domains"])
 
         with patch("host.runtime.network_proxy.load_policy", side_effect=OSError("db down")):
             empty, denial = network_proxy._policy_load_denial()
-        self.assertEqual(empty, {})
+        self.assertIsNone(empty)
         self.assertIsNotNone(denial)
-        self.assertIn("network policy unavailable", denial)
+        self.assertEqual(denial, "network_policy_unavailable")
 
         # The database coming back restores enforcement immediately.
         restored, denial = network_proxy._policy_load_denial()
         self.assertIsNone(denial)
-        self.assertIn("api.example.com", restored["allowed_network_access"])
+        self.assertIsNotNone(restored)
+        self.assertIn("api.example.com", restored.to_json()["network_integrations"]["custom"]["domains"])
 
     def self_signed_cert(self, name: str) -> tuple[str, str]:
         cert = Path(self.temp_dir.name) / f"{name}.crt"
@@ -221,13 +225,13 @@ class NetworkProxyTests(unittest.TestCase):
         )
 
         self.assertIn(b"403", allowed_domain)
-        self.assertIn(b"plain HTTP is not supported", allowed_domain)
+        self.assertIn(b"plain_http_denied", allowed_domain)
         self.assertIn(b"403", other_port)
         events = read_network_events()
         self.assertEqual([event["decision"] for event in events], ["denied", "denied"])
         self.assertEqual(events[0]["protocol"], "http")
         self.assertEqual(events[0]["query"], "x=1")
-        self.assertEqual(events[0]["reason"], "plain HTTP is not supported; use HTTPS")
+        self.assertEqual(events[0]["reason_code"], "plain_http_denied")
         self.assertEqual(events[1]["port"], 8080)
         self.assertEqual(events[1]["seq"], events[0]["seq"] + 1)
 
@@ -258,11 +262,11 @@ class NetworkProxyTests(unittest.TestCase):
 
         self.assertEqual(
             network_proxy.read_body(Reader(), [("Content-Length", "not-a-number")]),
-            (b"", "malformed Content-Length"),
+            (b"", "request_body_malformed"),
         )
         self.assertEqual(
             network_proxy.read_body(Reader(), [("Content-Length", "-1")]),
-            (b"", "malformed Content-Length"),
+            (b"", "request_body_malformed"),
         )
 
     def test_tunnel_body_parse_denial_is_logged(self) -> None:
@@ -277,10 +281,10 @@ class NetworkProxyTests(unittest.TestCase):
             b"Content-Length: nope\r\n\r\n",
         )
 
-        self.assertIn(b"malformed Content-Length", response)
+        self.assertIn(b"request_body_malformed", response)
         event = read_network_events()[-1]
         self.assertEqual(event["decision"], "denied")
-        self.assertEqual(event["reason"], "malformed Content-Length")
+        self.assertEqual(event["reason_code"], "request_body_malformed")
         self.assertEqual(event["host"], "127.0.0.1")
 
     def test_malformed_request_line_raises_controlled_parse_error(self) -> None:
@@ -335,8 +339,8 @@ class NetworkProxyTests(unittest.TestCase):
         self.assertEqual(event["decision"], "denied")
         self.assertEqual(event["host"], "evil.example.org")
         self.assertEqual(event["method"], "CONNECT")
-        # Denied events carry a reason so a failed request is diagnosable.
-        self.assertIn("policy", event["reason"])
+        # Denied events carry a reason code so a failed request is diagnosable.
+        self.assertEqual(event["reason_code"], "host_not_allowed")
 
     def test_https_request_is_inspected_and_logged(self) -> None:
         self.proxy_ca()
@@ -374,7 +378,7 @@ class NetworkProxyTests(unittest.TestCase):
         self.assertIn(b"403 Forbidden", response)
         event = read_network_events()[-1]
         self.assertEqual(event["decision"], "denied")
-        self.assertIn("Host header", event["reason"])
+        self.assertEqual(event["reason_code"], "host_header_invalid")
 
     def test_https_non_origin_form_targets_are_denied(self) -> None:
         # Only origin-form targets are served inside the TLS tunnel: an
@@ -393,7 +397,7 @@ class NetworkProxyTests(unittest.TestCase):
                 self.assertIn(b"403 Forbidden", response)
                 event = read_network_events()[-1]
                 self.assertEqual(event["decision"], "denied")
-                self.assertIn("request target must be origin-form", event["reason"])
+                self.assertEqual(event["reason_code"], "request_target_invalid")
 
     def test_connect_client_tls_abort_gets_no_http_response_bytes(self) -> None:
         # After "200 Connection Established" the client speaks TLS or nothing.
@@ -451,7 +455,7 @@ class NetworkProxyTests(unittest.TestCase):
         self.proxy_ca()
         proxy = self.start_proxy()
         save_policy(
-            {"managed_network_integrations": {"openai": {"enabled": True}}, "allowed_network_access": {}},
+            {"network_integrations": {"openai": {"enabled": True}}},
             "2026-06-08T00:00:00Z",
         )
         save_proxy_openai_account_id("acct-test")
@@ -466,7 +470,7 @@ class NetworkProxyTests(unittest.TestCase):
         response = self.https_via_proxy(proxy.server_address[1], request, host="chatgpt.com")
 
         self.assertIn(b"403", response)
-        self.assertIn(b"live web search is disabled", response)
+        self.assertIn(b"openai_web_tool_denied", response)
         self.assertEqual(read_network_events()[-1]["decision"], "denied")
 
     def test_wss_handshake_is_classified_as_wss_and_keeps_upgrade_headers(self) -> None:
@@ -608,12 +612,14 @@ class WebSocketHandshakeTests(unittest.TestCase):
 
 
 class WebSocketGuardTests(unittest.TestCase):
-    POLICY = {
-        "allowed_network_access": {
-            "chatgpt.com": {"allow_http_methods": ["GET"], "openai_external_url_request_guard": True},
-            "example.com": {"allow_http_methods": ["GET"]},
-        },
-    }
+    POLICY = parse_network_controls(
+        {
+            "network_integrations": {
+                "openai": {"enabled": True},
+                "custom": {"domains": {"example.com": {"allow_http_methods": ["GET"]}}},
+            },
+        }
+    )
 
     def setUp(self) -> None:
         pg_harness.reset_database()
@@ -624,7 +630,7 @@ class WebSocketGuardTests(unittest.TestCase):
         self.addCleanup(self.env_patch.stop)
 
     def guard(self) -> network_proxy.WebSocketClientGuard:
-        return network_proxy.WebSocketClientGuard()
+        return network_proxy.WebSocketClientGuard(openai_guard.ws_message_denied)
 
     def test_cached_web_search_message_is_forwarded_unchanged(self) -> None:
         frame = masked_frame(CACHED_SEARCH)
@@ -633,7 +639,7 @@ class WebSocketGuardTests(unittest.TestCase):
     def test_live_web_search_message_is_denied(self) -> None:
         with self.assertRaises(network_proxy.WebSocketDenied) as denied:
             self.guard().feed(masked_frame(LIVE_SEARCH))
-        self.assertIn("live web search is disabled", denied.exception.reason)
+        self.assertEqual(denied.exception.code, "openai_web_tool_denied")
 
     def test_non_json_message_mentioning_web_search_is_forwarded(self) -> None:
         # The upstream parses messages as JSON; a frame it cannot parse cannot
@@ -653,7 +659,7 @@ class WebSocketGuardTests(unittest.TestCase):
             self.guard().feed(
                 masked_frame(b'{"tools":[{"type":"web_search_preview_2025_03_11"}]}')
             )
-        self.assertIn("web_search_preview is disabled", denied.exception.reason)
+        self.assertEqual(denied.exception.code, "openai_web_tool_denied")
 
     def test_remote_mcp_tool_is_denied(self) -> None:
         with self.assertRaises(network_proxy.WebSocketDenied) as denied:
@@ -663,7 +669,7 @@ class WebSocketGuardTests(unittest.TestCase):
                     b'"server_url":"https://evil.example/mcp"}]}'
                 )
             )
-        self.assertIn("remote MCP tools are disabled", denied.exception.reason)
+        self.assertEqual(denied.exception.code, "openai_remote_mcp_denied")
 
     def test_indexed_web_search_message_is_denied(self) -> None:
         # external_web_access is false, but indexed_web_access authorizes the
@@ -675,7 +681,7 @@ class WebSocketGuardTests(unittest.TestCase):
                     b'"indexed_web_access":true}]}'
                 )
             )
-        self.assertIn("indexed web search is disabled", denied.exception.reason)
+        self.assertEqual(denied.exception.code, "openai_web_tool_denied")
 
     def test_bare_web_and_browse_tools_are_denied(self) -> None:
         for body in (
@@ -761,7 +767,7 @@ class WebSocketGuardTests(unittest.TestCase):
         event = read_network_events()[-1]
         self.assertEqual(event["decision"], "denied")
         self.assertEqual(event["method"], "MESSAGE")
-        self.assertIn("live web search is disabled", event["reason"])
+        self.assertEqual(event["reason_code"], "openai_web_tool_denied")
 
     def test_tunnel_forwards_allowed_messages_both_ways(self) -> None:
         client, upstream, thread = self.run_tunnel("chatgpt.com")
@@ -789,7 +795,7 @@ class ExternalUrlRequestGuardTests(unittest.TestCase):
     JSON = [("content-type", "application/json")]
 
     def deny(self, payload: dict, path: str | None = None) -> str | None:
-        return network_policy._external_url_request_denial(self.JSON, json.dumps(payload).encode(), path)
+        return openai_guard._external_url_request_denial(self.JSON, json.dumps(payload).encode(), path)
 
     def test_standalone_search_cached_is_allowed(self) -> None:
         for path in ("/backend-api/codex/alpha/search", "/v1/alpha/search"):
@@ -797,14 +803,14 @@ class ExternalUrlRequestGuardTests(unittest.TestCase):
 
     def test_standalone_search_live_is_denied(self) -> None:
         reason = self.deny({"settings": {"external_web_access": True}}, "/v1/alpha/search")
-        self.assertIn("live web search is disabled", reason or "")
+        self.assertEqual(reason, "openai_web_tool_denied")
 
     def test_standalone_search_indexed_is_denied(self) -> None:
         reason = self.deny(
             {"settings": {"external_web_access": False, "indexed_web_access": True}},
             "/backend-api/codex/alpha/search",
         )
-        self.assertIn("indexed web search is disabled", reason or "")
+        self.assertEqual(reason, "openai_web_tool_denied")
 
     def test_standalone_search_missing_settings_is_denied(self) -> None:
         self.assertIsNotNone(self.deny({}, "/v1/alpha/search"))
@@ -813,7 +819,7 @@ class ExternalUrlRequestGuardTests(unittest.TestCase):
         reason = self.deny(
             {"tools": [{"type": "web_search", "external_web_access": False, "indexed_web_access": True}]}
         )
-        self.assertIn("indexed web search is disabled", reason or "")
+        self.assertEqual(reason, "openai_web_tool_denied")
 
     def test_unknown_web_tool_fails_closed(self) -> None:
         for tool_type in ("web", "web_fetch", "browser", "computer_use", "computer_use_preview", "code_interpreter"):
@@ -841,21 +847,18 @@ class ExternalUrlRequestGuardTests(unittest.TestCase):
 class AnthropicServerToolGuardTests(unittest.TestCase):
     """The api.anthropic.com body guard denies Anthropic server-side tools that
     run off-box (web search/fetch, code execution, remote MCP). Client-executed
-    built-ins and user-defined tools pass. Only fires when the domain rule sets
-    ``anthropic_external_url_request_guard``."""
+    built-ins and user-defined tools pass."""
 
-    JSON = [("content-type", "application/json")]
+    JSON = [("content-type", "application/json"), ("authorization", "Bearer test-token")]
+    ACCOUNT = {"access_token_sha256": hashlib.sha256(b"test-token").hexdigest()}
 
-    def deny(self, payload: dict, guard: bool = True, allow_web_search: bool = False) -> str | None:
-        rule: dict = {"allow_http_methods": ["POST"]}
-        if guard:
-            rule["anthropic_external_url_request_guard"] = True
-        if allow_web_search:
-            rule["anthropic_allow_web_search"] = True
-        policy = {"allowed_network_access": {"api.anthropic.com": rule}}
-        return network_policy.anthropic_request_denied(
-            policy, "POST", "api.anthropic.com", "/v1/messages", self.JSON, json.dumps(payload).encode()
-        )
+    def deny(self, payload: dict, allow_web_search: bool = False) -> str | None:
+        with patch.object(claude_guard, "read_proxy_claude_account", return_value=self.ACCOUNT):
+            return claude_guard.request_denied(
+                ClaudeIntegration(True, allow_web_search),
+                "POST", "api.anthropic.com", "/v1/messages", "", self.JSON,
+                json.dumps(payload).encode(),
+            )
 
     def test_server_side_web_tools_are_denied(self) -> None:
         for tool_type in ("web_search_20250305", "web_search_20260209", "web_fetch_20250910", "code_execution_20260120"):
@@ -882,23 +885,23 @@ class AnthropicServerToolGuardTests(unittest.TestCase):
     def test_empty_mcp_servers_is_allowed(self) -> None:
         self.assertIsNone(self.deny({"mcp_servers": []}))
 
-    def test_guard_only_fires_when_flagged(self) -> None:
-        self.assertIsNone(self.deny({"tools": [{"type": "web_search_20250305"}]}, guard=False))
-
     def test_undecodable_body_fails_closed(self) -> None:
-        policy = {"allowed_network_access": {"api.anthropic.com": {"allow_http_methods": ["POST"], "anthropic_external_url_request_guard": True}}}
-        headers = [("content-type", "application/json"), ("content-encoding", "br")]
-        reason = network_policy.anthropic_request_denied(policy, "POST", "api.anthropic.com", "/v1/messages", headers, b"\x00\x01\x02")
+        headers = self.JSON + [("content-encoding", "br")]
+        reason = claude_guard.request_denied(
+            ClaudeIntegration(True), "POST", "api.anthropic.com", "/v1/messages", "",
+            headers, b"\x00\x01\x02",
+        )
         self.assertIsNotNone(reason)
 
     def test_non_json_body_is_not_inspected(self) -> None:
-        policy = {"allowed_network_access": {"api.anthropic.com": {"allow_http_methods": ["POST"], "anthropic_external_url_request_guard": True}}}
-        self.assertIsNone(
-            network_policy.anthropic_request_denied(
-                policy, "POST", "api.anthropic.com", "/v1/messages",
-                [("content-type", "text/plain")], b"plain text mentioning web_search",
+        with patch.object(claude_guard, "read_proxy_claude_account", return_value=self.ACCOUNT):
+            self.assertIsNone(
+                claude_guard.request_denied(
+                    ClaudeIntegration(True), "POST", "api.anthropic.com", "/v1/messages", "",
+                    [("content-type", "text/plain"), ("authorization", "Bearer test-token")],
+                    b"plain text mentioning web_search",
+                )
             )
-        )
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ way.
 | `TagOnlyDuringTrustyClawResourceCreation` | Lets AWS apply tag specifications during `RunInstances`, `CreateVolume`, and `CreateSecurityGroup`. | Requires `aws:RequestTag/trustyclaw-host=true` and `ec2:CreateAction` so the permission only covers tag-on-create, not standalone tagging of arbitrary existing resources. |
 | `ManageOnlyTrustyClawResources` | Lets deploy read console output, attach volumes, mark durable data volumes not to delete on instance termination, update security group rules, start, stop, or terminate instances, and delete cleanup resources. | Uses `Resource: "*"` because these EC2 APIs have mixed resource behavior, but requires `aws:ResourceTag/trustyclaw-host=true` so only TrustyClaw-owned resources can be managed. |
 | `UbuntuAmiLookup` | Lets deploy resolve the Canonical Ubuntu SSM parameter used to find the base AMI. | Scoped to Canonical public SSM parameters; it does not grant broad SSM parameter access. |
+| `AwsLogin` | Lets an IAM user or federated role exchange an authenticated AWS console session for temporary CLI credentials with `aws login`. | Grants only the two AWS Sign-In OAuth actions and scopes them to local-development public clients. It does not add AWS service permissions to the identity. |
 
 The policy intentionally uses both tag condition types:
 

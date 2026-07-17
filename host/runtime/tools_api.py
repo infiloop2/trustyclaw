@@ -12,7 +12,9 @@ routes, no admin password involved and none required.
 The agent-facing HTTP surface is four routes:
 
 - ``GET /tools`` — the callable tool actions for the enabled tools, named
-  ``<tool_id>_<action>``, plus the built-in ``check_tool_approval``.
+  ``<tool_id>_<action>``, plus the built-ins: ``list_bundled_tools``,
+  and ``check_tool_approval``. The MCP shim separately aggregates the network
+  introspection and app services into the stable agent-facing tool list.
 - ``POST /call`` — ``{"name": ..., "input": {...}}`` executes one action and
   returns the result shape from ``tools_host`` (``executed`` /
   ``pending_approval`` / ``failed``).

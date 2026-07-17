@@ -122,6 +122,9 @@ non-owner roles with table or schema grants:
 - `trustyclaw-tools` reads enablement/config and the shared secret key, and
   reads/writes tool credentials, approvals, and events. It cannot enable a
   tool, rewrite config, or reach non-tool state.
+- `trustyclaw-agent-network` reads only network policy and `network_events` for
+  the agent-facing introspection tools. It cannot mutate those tables, read
+  credentials, or reach tool state.
 - Every app role owns only its derived `app_<app_id>` schema. The host-owned
   `app_schema_migrations` table records what bootstrap applied.
 - The `postgres` superuser is reachable only by the `postgres` OS user, i.e.

@@ -127,7 +127,7 @@ export const netLog = createPagedLog({
       <td class="mono">${esc(event.method)}</td>
       <td class="mono">${esc(networkEventTarget(event))}</td>
       <td>${badge(event.decision)}</td>
-      <td>${event.decision === "denied" && event.reason ? esc(formatNetworkReason(event.reason)) : ""}</td>
+      <td>${event.decision === "denied" && event.reason_code ? esc(formatNetworkReason(event.reason_code)) : ""}</td>
     </tr>`,
 });
 

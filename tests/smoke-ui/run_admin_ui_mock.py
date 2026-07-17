@@ -119,10 +119,7 @@ class MockState:
     task_events: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     network_events: list[dict[str, Any]] = field(default_factory=list)
     policy: dict[str, Any] = field(
-        default_factory=lambda: {
-            "managed_network_integrations": {},
-            "allowed_network_access": {},
-        }
+        default_factory=lambda: {"network_integrations": {}}
     )
     logged_in: dict[str, bool] = field(default_factory=lambda: {"codex": False, "claude_code": False})
     github_credential: dict[str, Any] | None = None
@@ -193,7 +190,7 @@ class MockState:
             "decision": decision,
         }
         if decision == "denied":
-            event["reason"] = "host is not in the allowed network policy"
+            event["reason_code"] = "host_not_allowed"
         self.network_events.append(event)
         self.next_network_event_seq += 1
 
@@ -225,7 +222,7 @@ class MockState:
 
     def runtime_status(self, runtime: str) -> str:
         provider = PROVIDER_BY_RUNTIME[runtime]
-        managed = self.policy.get("managed_network_integrations", {})
+        managed = self.policy.get("network_integrations", {})
         integration = managed.get(provider) if isinstance(managed, dict) else None
         if not isinstance(integration, dict) or integration.get("enabled") is not True:
             return "deactivated"
@@ -301,7 +298,7 @@ def seed_state() -> None:
             "agent_runtime": "claude_code",
             "status": "failed",
             "input_message": "Push the responsive fixes to staging and verify the deploy.",
-            "error_message": "network access to deploy.acme.dev denied by policy (no allowed_network_access rule)",
+            "error_message": "network access to deploy.acme.dev denied by policy (no custom domain rule)",
             "created_min": 81,
             "started_min": 80,
             "completed_min": 78,
@@ -1359,8 +1356,9 @@ def read_agent_file(path: str) -> dict[str, Any]:
             "You are runnign with full permissions. Do not prompt the operator for local approvals.\n\n"
             "Network access is controlled by TrustyClaw, not by the local agent sandbox. "
             "Agent traffic goes through the TrustyClaw network policy proxy. If a "
-            "domain, API, or package source is blocked, report the exact host and path "
-            "and ask the operator to allow it.\n\n"
+            "request is blocked, call the recent_network_denials tool for the denial "
+            "code and guidance, and ask the operator for the named integration or "
+            "domain rule.\n\n"
             "When GitHub access is configured, TrustyClaw injects credentials through "
             "the proxy. Use normal `git` and REST-backed `gh api` commands from this host.\n\n"
             "GitHub GraphQL requests are denied by policy because repository scope cannot be "
@@ -1374,8 +1372,9 @@ def read_agent_file(path: str) -> dict[str, Any]:
             "You are runnign with full permissions. Do not prompt the operator for local approvals.\n\n"
             "Network access is controlled by TrustyClaw, not by the local agent sandbox. "
             "Agent traffic goes through the TrustyClaw network policy proxy. If a "
-            "domain, API, or package source is blocked, report the exact host and path "
-            "and ask the operator to allow it.\n\n"
+            "request is blocked, call the recent_network_denials tool for the denial "
+            "code and guidance, and ask the operator for the named integration or "
+            "domain rule.\n\n"
             "When GitHub access is configured, TrustyClaw injects credentials through "
             "the proxy. Use normal `git` and REST-backed `gh api` commands from this host.\n\n"
             "GitHub GraphQL requests are denied by policy because repository scope cannot be "
@@ -1485,7 +1484,7 @@ def github_repo_audits_locked() -> list[dict[str, Any]]:
     Each repository cycles through a different outcome so the UI's renderings
     (critical warnings, plain warnings, a clean audit, failed fetches, and
     incomplete audits) are all visible with a few repositories configured."""
-    integrations = STATE.policy.get("managed_network_integrations", {})
+    integrations = STATE.policy.get("network_integrations", {})
     github = integrations.get("github") if isinstance(integrations, dict) else None
     repositories = (github or {}).get("write_repositories") or []
     if STATE.github_credential is None:
@@ -1621,7 +1620,7 @@ def replace_policy(body: Any) -> dict[str, Any]:
 
 
 def github_integration_locked() -> dict[str, Any]:
-    managed = STATE.policy.get("managed_network_integrations")
+    managed = STATE.policy.get("network_integrations")
     github = managed.get("github") if isinstance(managed, dict) else None
     return github if isinstance(github, dict) else {}
 
@@ -1783,7 +1782,7 @@ def seed_demo_state() -> None:
     repositories cycling through every audit outcome, a GitHub App
     credential, and a couple of manual domain rules."""
     STATE.policy = {
-        "managed_network_integrations": {
+        "network_integrations": {
             "github": {
                 "enabled": True,
                 "write_repositories": [
@@ -1795,10 +1794,12 @@ def seed_demo_state() -> None:
                     {"owner": "acme", "repo": "pages-source"},
                 ],
             },
-        },
-        "allowed_network_access": {
-            "api.example.com": {"allow_http_methods": ["GET", "HEAD"], "path_guards": ["^/v1(?:/.*)?$"]},
-            "*.assets.example.com": {"allow_http_methods": ["GET"]},
+            "custom": {
+                "domains": {
+                    "api.example.com": {"allow_http_methods": ["GET", "HEAD"], "path_guards": ["^/v1(?:/.*)?$"]},
+                    "*.assets.example.com": {"allow_http_methods": ["GET"]},
+                },
+            },
         },
     }
     STATE.github_credential = {

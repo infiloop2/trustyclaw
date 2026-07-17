@@ -382,6 +382,16 @@ class DeployUnitTests(unittest.TestCase):
         self.assertNotIn("aws:RequestedRegion", json.dumps(policy))
         statements = {statement["Sid"]: statement for statement in policy["Statement"]}
 
+        aws_login_statement = statements["AwsLogin"]
+        self.assertEqual(
+            aws_login_statement["Action"],
+            ["signin:AuthorizeOAuth2Access", "signin:CreateOAuth2Token"],
+        )
+        self.assertEqual(
+            aws_login_statement["Resource"],
+            "arn:aws:signin:*:*:oauth2/public-client/*",
+        )
+
         discovery_actions = statements["Ec2Discovery"]["Action"]
         self.assertNotIn("ec2:RunInstances", discovery_actions)
         self.assertNotIn("ec2:CreateVolume", discovery_actions)
@@ -1344,6 +1354,16 @@ class DeployUnitTests(unittest.TestCase):
             bootstrap.index('oif lo meta skuid "trustyclaw-agent-app" drop'),
             bootstrap.index("oif lo accept"),
         )
+        # The read-only agent-network service reaches Postgres and the agent
+        # over Unix sockets only. It cannot turn the local policy proxy into
+        # an egress path through the broad loopback accept.
+        self.assertNotIn('meta skuid "trustyclaw-agent-network" tcp dport 443 accept', bootstrap)
+        self.assertNotIn('meta skuid "trustyclaw-agent-network" udp dport 53 accept', bootstrap)
+        self.assertIn('oif lo meta skuid "trustyclaw-agent-network" drop', bootstrap)
+        self.assertLess(
+            bootstrap.index('oif lo meta skuid "trustyclaw-agent-network" drop'),
+            bootstrap.index("oif lo accept"),
+        )
         # The dedicated tools service runs the bundled tool packages, so it gets
         # DNS and HTTPS egress for their third-party APIs; the admin service holds
         # no internet egress, and the agent path is unchanged.
@@ -1418,6 +1438,8 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("check_tool_approval", agent_instructions)
         self.assertIn("approval_id", agent_instructions)
         self.assertIn("TrustyClaw network policy proxy", agent_instructions)
+        self.assertIn("recent_network_denials", agent_instructions)
+        self.assertIn("list_network_integrations", agent_instructions)
         self.assertIn("github_push_queued_for_approval", agent_instructions)
         self.assertIn("queued for approval as push-<id>", agent_instructions)
         self.assertIn("github_dot_github_rest_write_denied", agent_instructions)
@@ -1473,9 +1495,22 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("User=trustyclaw-agent-app", bootstrap)
         self.assertIn("RuntimeDirectory=trustyclaw-agent-app\n", bootstrap)
         self.assertIn("systemctl enable --now trustyclaw-agent-app.service", bootstrap)
+        # Network introspection has a separate non-egress uid, socket, and
+        # read-only database role. The egress-capable tools service cannot read
+        # network policy or decision-log tables.
+        self.assertIn(
+            'ensure_user trustyclaw-agent-network "$TRUSTYCLAW_AGENT_NETWORK_UID" '
+            "trustyclaw-agent-network /nonexistent",
+            bootstrap,
+        )
+        self.assertIn("TRUSTYCLAW_AGENT_NETWORK_UID=47748", bootstrap)
+        self.assertIn("ExecStart=/usr/bin/python3 -m host.runtime.network_introspection_service", bootstrap)
+        self.assertIn("User=trustyclaw-agent-network", bootstrap)
+        self.assertIn("RuntimeDirectory=trustyclaw-agent-network\n", bootstrap)
+        self.assertIn("systemctl enable --now trustyclaw-agent-network.service", bootstrap)
         self.assertIn(
             "Wants=network-online.target trustyclaw-network-proxy.service trustyclaw-postgres.service "
-            "trustyclaw-tools.service trustyclaw-agent-app.service",
+            "trustyclaw-tools.service trustyclaw-agent-network.service trustyclaw-agent-app.service",
             bootstrap,
         )
         # The bootstrap runs with umask 077: the npm-installed CLI and the
@@ -1692,12 +1727,13 @@ class DeployUnitTests(unittest.TestCase):
         # roles only, and an explicit reject for everyone else (the agent user
         # has no role and no pg_hba rule that admits it).
         self.assertIn("listen_addresses = ''", bootstrap)
-        # The three core DB clients plus every bundled app fit below the server
+        # The four core DB clients plus every bundled app fit below the server
         # cap with explicit room for operator, superuser, and deploy sessions.
         self.assertIn("max_connections = 100", bootstrap)
         self.assertEqual(db.MAX_ACTIVE_CONNECTIONS, 14)
-        self.assertEqual((3 + len(app_platform.installed_apps())) * db.MAX_ACTIVE_CONNECTIONS, 70)
+        self.assertEqual((4 + len(app_platform.installed_apps())) * db.MAX_ACTIVE_CONNECTIONS, 84)
         self.assertIn("local  trustyclaw_admin  trustyclaw-admin  peer", bootstrap)
+        self.assertIn("local  trustyclaw_admin  trustyclaw-agent-network  peer", bootstrap)
         self.assertNotIn("local  trustyclaw_admin  trustyclaw-agent-app  peer", bootstrap)
         self.assertIn("local  all               postgres          peer", bootstrap)
         self.assertIn("local  all               all               reject", bootstrap)
@@ -1712,6 +1748,10 @@ class DeployUnitTests(unittest.TestCase):
         # database CONNECT before migrations run; the table grants live in the
         # schema migration (0007), the same pattern as the proxy role's grants.
         self.assertIn('GRANT CONNECT ON DATABASE trustyclaw_admin TO \\"trustyclaw-tools\\";', bootstrap)
+        self.assertIn(
+            'GRANT CONNECT ON DATABASE trustyclaw_admin TO \\"trustyclaw-agent-network\\";',
+            bootstrap,
+        )
         self.assertNotIn('GRANT SELECT ON enabled_tools', bootstrap)
         # Thread-scope attribution needs no agent-app database identity.
         self.assertNotIn('CREATE ROLE "trustyclaw-agent-app" LOGIN;', bootstrap)
@@ -1731,6 +1771,11 @@ class DeployUnitTests(unittest.TestCase):
         )
         self.assertIn('GRANT USAGE ON SEQUENCE tool_approvals_number_seq, tool_events_seq_seq TO "trustyclaw-tools";', migration)
         self.assertIn('GRANT SELECT ON secret_keys TO "trustyclaw-tools";', migration)
+        network_migration = (
+            Path(__file__).resolve().parents[1] / "host" / "migrations" / "0012_network_introspection.sql"
+        ).read_text()
+        self.assertIn('TO "trustyclaw-agent-network";', network_migration)
+        self.assertNotIn('"trustyclaw-tools"', network_migration)
         # PG14 leaves the public schema creatable by PUBLIC; only the
         # schema-owning admin role may create objects.
         self.assertIn("REVOKE CREATE ON SCHEMA public FROM PUBLIC;", bootstrap)
@@ -1740,7 +1785,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("systemctl enable --now trustyclaw-postgres.service", bootstrap)
         self.assertIn(
             "After=network-online.target trustyclaw-network-proxy.service trustyclaw-postgres.service "
-            "trustyclaw-tools.service trustyclaw-agent-app.service",
+            "trustyclaw-tools.service trustyclaw-agent-network.service trustyclaw-agent-app.service",
             bootstrap,
         )
         # Schema migrations and config seeding run as trustyclaw-admin, after

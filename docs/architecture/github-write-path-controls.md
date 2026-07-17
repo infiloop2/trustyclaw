@@ -7,7 +7,7 @@ sent to GitHub.
 
 ## Policy Surface
 
-The toggle lives under `managed_network_integrations.github` next to
+The toggle lives under `network_integrations.github` next to
 `write_repositories`. Reads are unchanged, and normal writes to configured write
 repositories still pass. The guard denies REST write paths that can create or
 move `.github` changes without entering `git-receive-pack`, including
@@ -17,7 +17,7 @@ APIs. Those denials use `github_dot_github_rest_write_denied`.
 ## Push Flow
 
 For smart-HTTP `git-receive-pack` pushes to a configured write repository, the
-proxy buffers the request body and asks `host/runtime/github_push_gate.py` to
+proxy buffers the request body and asks `host/network_integrations/github/push_gate/` to
 inspect it. The gate resolves thin packs against a per-repo quarantine mirror
 and uses real `git` plumbing (`index-pack` and `diff-tree`) to compute changed
 paths.

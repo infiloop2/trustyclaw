@@ -31,14 +31,14 @@ import subprocess
 import sys
 from typing import Any, NoReturn
 
-from host.runtime import github_push_gate
+from host.network_integrations.github.push_gate import engine
 
 GIT_BIN = "/usr/bin/git"
 PUSH_TIMEOUT_SECONDS = 120
 OWNER_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$")
 REPO_RE = re.compile(r"^[a-z0-9._-]{1,100}$")
 PUSH_ID_RE = re.compile(r"^[a-f0-9]{6,64}$")
-REF_RE = github_push_gate.REF_RE
+REF_RE = engine.REF_RE
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -66,7 +66,7 @@ def main() -> None:
             _fail("token is required")
         token_value = token
 
-    mirror = github_push_gate.QUARANTINE_ROOT / owner.lower() / f"{repo.lower()}.git"
+    mirror = engine.QUARANTINE_ROOT / owner.lower() / f"{repo.lower()}.git"
     if not (mirror / "HEAD").exists():
         _fail("quarantine mirror is missing (the held objects are gone)")
 
@@ -94,8 +94,8 @@ def main() -> None:
             _fail("ref_updates[].old must be an object id")
         if not isinstance(new, str) or not SHA_RE.fullmatch(new):
             _fail("ref_updates[].new must be an object id")
-        leases.append(f"--force-with-lease={ref}:{'' if old == github_push_gate.ZERO_OID else old}")
-        if new == github_push_gate.ZERO_OID:
+        leases.append(f"--force-with-lease={ref}:{'' if old == engine.ZERO_OID else old}")
+        if new == engine.ZERO_OID:
             refspecs.append(f":{ref}")
             continue
         pending = f"refs/pending/{push_id}/{index}"
@@ -106,7 +106,7 @@ def main() -> None:
         refspecs.append(f"{pending}:{ref}")
 
     url = f"https://github.com/{owner}/{repo}.git"
-    with github_push_gate.git_auth_env(mirror, token_value) as env:
+    with engine.git_auth_env(mirror, token_value) as env:
         push = _run(_git_cmd(mirror, "push", "--atomic", *leases, url, *refspecs), env=env)
     if push.returncode != 0:
         _fail(f"git push was rejected: {push.stderr.decode('utf-8', 'replace')[:300].strip()}")

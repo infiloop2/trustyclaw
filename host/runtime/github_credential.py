@@ -18,7 +18,7 @@ track, verify, or chase the repository list.
 The agent never holds the token. The active working token lives in the
 proxy-readable ``proxy_github_token`` row, and the proxy injects it into
 policy-approved GitHub requests (stripping whatever ``Authorization`` the
-agent sent) — see ``network_policy.github_credential_headers``. There is no
+agent sent) — see the GitHub guard's ``rewrite_request_headers``. There is no
 agent-readable credential file, so there is nothing the agent can copy and
 exfiltrate through other allowed egress, and revocation is one row delete.
 

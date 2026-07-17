@@ -12,22 +12,58 @@ from unittest.mock import patch
 
 from host.config import (
     ConfigError,
-    expand_network_controls,
-    managed_domain_owner,
+    NetworkControls,
     parse_input_config,
     parse_network_controls,
     runtime_operator_connections_from_input,
 )
 from host.cli.lifecycle import _subnet_has_public_ipv4_route
-from host.runtime.network_policy import (
-    anthropic_request_denied,
-    decide_http_request,
-    find_domain_rule,
-    github_push_gate_response,
-    github_request_denied,
-    host_allowed,
-    openai_request_denied,
-)
+from host.network_integrations.claude import guard as claude_guard
+from host.network_integrations.github import guard as github_guard
+from host.network_integrations.openai import guard as openai_guard
+from host.network_integrations.registry import managed_domain_owner
+from host.network_integrations import runtime as network_integrations
+from host.network_integrations.custom.manifest import CustomIntegration, rule_for_host
+from host.network_integrations.base import PROXY_DENIAL_REASONS
+
+
+def _controls(policy: NetworkControls | dict) -> NetworkControls:
+    return policy if isinstance(policy, NetworkControls) else parse_network_controls(policy)
+
+
+def _custom_policy(domains: dict) -> dict:
+    """A network policy whose only integration is custom, with ``domains``."""
+    return {"network_integrations": {"custom": {"domains": domains}}}
+
+
+def openai_request_denied(policy, host, headers, body, path="/"):
+    return openai_guard.request_denied(
+        _controls(policy).integrations["openai"], "POST", host, path, "", headers, body
+    )
+
+
+def anthropic_request_denied(policy, method, host, path, headers, body=b""):
+    return claude_guard.request_denied(
+        _controls(policy).integrations["claude"], method, host, path, "", headers, body
+    )
+
+
+def github_request_denied(policy, method, host, path, query, body):
+    return github_guard.request_denied(
+        _controls(policy).integrations["github"], method, host, path, query, [], body
+    )
+
+
+def github_push_gate_response(policy, method, host, path, body):
+    return github_guard.gate_response(
+        _controls(policy).integrations["github"], method, host, path, body
+    )
+
+
+def request_allowed(policy, method, host, path, query=""):
+    return network_integrations.request_denied(
+        _controls(policy), method, host, path, query, [], b""
+    ) is None
 from host.runtime.network_proxy import read_request_head
 from host.runtime.state import save_proxy_claude_account, save_proxy_openai_account_id
 
@@ -235,118 +271,120 @@ class ConfigTests(unittest.TestCase):
                         }
                     ],
                     "network_controls": {
-                        "managed_network_integrations": {"openai": {"enabled": True}},
-                        "allowed_network_access": {},
+                        "network_integrations": {"openai": {"enabled": True}},
                     },
                 }
             )
 
     def test_agent_name_restrictions(self) -> None:
         with self.assertRaises(ConfigError):
-            parse_network_controls({"managed_network_integrations": {"openai": {"enabled": True}}, "allowed_network_access": {"*": {}}})
+            parse_network_controls({"network_integrations": { "openai": {"enabled": True}, "custom": {"domains": {"*": {}}} }})
 
     def test_managed_providers_are_independently_optional(self) -> None:
         for controls in (
-            {"allowed_network_access": {}},
-            {"managed_network_integrations": {}, "allowed_network_access": {}},
+            {},
+            {"network_integrations": {}},
             {
-                "managed_network_integrations": {"openai": {"enabled": False}, "claude": {"enabled": False}},
-                "allowed_network_access": {},
+                "network_integrations": {"openai": {"enabled": False}, "claude": {"enabled": False}},
             },
-            {"managed_network_integrations": {"openai": {"enabled": True}}, "allowed_network_access": {}},
-            {"managed_network_integrations": {"claude": {"enabled": True}}, "allowed_network_access": {}},
+            {"network_integrations": {"openai": {"enabled": True}}},
+            {"network_integrations": {"claude": {"enabled": True}}},
         ):
             with self.subTest(controls=controls):
                 parsed = parse_network_controls(controls)
-                self.assertIsInstance(parsed.managed_network_integrations.openai.enabled, bool)
-                self.assertIsInstance(parsed.managed_network_integrations.claude.enabled, bool)
+                self.assertIsInstance(parsed.integrations["openai"].enabled, bool)
+                self.assertIsInstance(parsed.integrations["claude"].enabled, bool)
 
-        disabled = parse_network_controls({"allowed_network_access": {}})
-        self.assertEqual(disabled.to_json()["managed_network_integrations"], {})
-        self.assertEqual(expand_network_controls(disabled)["allowed_network_access"], {})
+        disabled = parse_network_controls({"network_integrations": {"custom": {"domains": {}}}})
+        self.assertEqual(disabled.to_json()["network_integrations"], {})
 
-    def test_claude_web_search_toggle_expands_guard(self) -> None:
-        off = expand_network_controls(parse_network_controls(
-            {"managed_network_integrations": {"claude": {"enabled": True}}, "allowed_network_access": {}}))
-        rule = off["allowed_network_access"]["api.anthropic.com"]
-        self.assertTrue(rule["anthropic_account_guard"])
-        self.assertTrue(rule["anthropic_external_url_request_guard"])
-        self.assertNotIn("anthropic_allow_web_search", rule)
-        on = expand_network_controls(parse_network_controls(
-            {"managed_network_integrations": {"claude": {"enabled": True, "web_search": True}}, "allowed_network_access": {}}))
-        on_rule = on["allowed_network_access"]["api.anthropic.com"]
-        self.assertTrue(on_rule["anthropic_external_url_request_guard"])
-        self.assertTrue(on_rule["anthropic_allow_web_search"])
+    def test_claude_web_search_toggle_stays_in_typed_config(self) -> None:
+        off = parse_network_controls(
+            {"network_integrations": {"claude": {"enabled": True}}}
+        )
+        self.assertFalse(off.integrations["claude"].web_search)
+        on = parse_network_controls(
+            {"network_integrations": {"claude": {"enabled": True, "web_search": True}}}
+        )
+        self.assertTrue(on.integrations["claude"].web_search)
 
     def test_claude_web_search_requires_enabled(self) -> None:
         with self.assertRaisesRegex(ConfigError, r"web_search requires enabled"):
             parse_network_controls(
-                {"managed_network_integrations": {"claude": {"enabled": False, "web_search": True}}, "allowed_network_access": {}})
+                {"network_integrations": {"claude": {"enabled": False, "web_search": True}}})
+
+    def test_custom_domains_rejects_present_non_object(self) -> None:
+        # A present-but-invalid domains value must 400, not silently reset to
+        # an empty custom integration (which would erase existing rules on a
+        # policy replace). Absent/null defaults to empty.
+        for bad in ([], False, 0, "", "x"):
+            with self.subTest(domains=bad), self.assertRaisesRegex(
+                ConfigError, r"network_integrations\.custom\.domains must be an object"
+            ):
+                parse_network_controls({"network_integrations": {"custom": {"domains": bad}}})
+        for empty in (None, {}):
+            controls = parse_network_controls({"network_integrations": {"custom": {"domains": empty}}})
+            self.assertFalse(controls.integrations["custom"].enabled)
+        controls = parse_network_controls({"network_integrations": {"custom": {}}})
+        self.assertFalse(controls.integrations["custom"].enabled)
+
+    def test_custom_rejects_enabled_field(self) -> None:
+        # custom has no enabled toggle; enablement is non-empty domains.
+        with self.assertRaisesRegex(ConfigError, "unsupported fields: enabled"):
+            parse_network_controls({"network_integrations": {"custom": {"enabled": True}}})
 
     def test_disabled_github_rejects_write_repositories(self) -> None:
         # A disabled integration carries no other state: write repositories (or
         # require_dot_github_approval) require the integration to be enabled. An
         # enabled integration with an empty list stays valid (a read-only agent).
         with self.assertRaisesRegex(
-            ConfigError, r"managed_network_integrations\.github\.write_repositories and require_dot_github_approval require enabled to be true"
+            ConfigError, r"network_integrations\.github\.write_repositories and require_dot_github_approval require enabled to be true"
         ):
             parse_network_controls(
                 {
-                    "managed_network_integrations": {
+                    "network_integrations": {
                         "github": {"enabled": False, "write_repositories": [{"owner": "infiloop2", "repo": "trustyclaw"}]}
                     },
-                    "allowed_network_access": {},
                 }
             )
         read_only = parse_network_controls(
             {
-                "managed_network_integrations": {"github": {"enabled": True, "write_repositories": []}},
-                "allowed_network_access": {},
+                "network_integrations": {"github": {"enabled": True, "write_repositories": []}},
             }
         )
-        self.assertEqual(read_only.to_json()["managed_network_integrations"], {"github": {"enabled": True}})
+        self.assertEqual(read_only.to_json()["network_integrations"], {"github": {"enabled": True}})
         # A disabled integration serializes away.
         bare = parse_network_controls(
-            {"managed_network_integrations": {"github": {"enabled": False}}, "allowed_network_access": {}}
+            {"network_integrations": {"github": {"enabled": False}}}
         )
-        self.assertEqual(bare.to_json()["managed_network_integrations"], {})
+        self.assertEqual(bare.to_json()["network_integrations"], {})
 
     def test_runtime_network_controls_reject_ssh_port_field(self) -> None:
         with self.assertRaisesRegex(ConfigError, "network_controls has unsupported fields: ssh_port_opened"):
             parse_network_controls(
-                {"ssh_port_opened": True, "managed_network_integrations": {}, "allowed_network_access": {}}
+                {"ssh_port_opened": True, "network_integrations": {}}
             )
 
-    def test_parse_preserves_user_policy_and_expansion_adds_managed_domain_rules(self) -> None:
+    def test_parse_preserves_public_policy_without_generated_rules(self) -> None:
         controls = parse_network_controls(
             {
-                "managed_network_integrations": {"openai": {"enabled": True}},
-                "allowed_network_access": {},
+                "network_integrations": {"openai": {"enabled": True}},
             }
         )
         user_policy = controls.to_json()
-        self.assertEqual(user_policy["managed_network_integrations"], {"openai": {"enabled": True}})
-        self.assertEqual(user_policy["allowed_network_access"], {})
+        self.assertEqual(user_policy["network_integrations"], {"openai": {"enabled": True}})
 
-        policy = expand_network_controls(controls)
-        rules = policy["allowed_network_access"]
-        self.assertEqual(rules["api.openai.com"]["allow_http_methods"], ["POST"])
-        self.assertTrue(rules["api.openai.com"]["openai_account_guard"])
-        self.assertTrue(rules["api.openai.com"]["openai_external_url_request_guard"])
-        self.assertEqual(rules["auth.openai.com"]["allow_http_methods"], ["GET", "POST"])
-        self.assertNotIn("openai_account_guard", rules["auth.openai.com"])
-        self.assertNotIn("openai_external_url_request_guard", rules["auth.openai.com"])
-        self.assertEqual(rules["chatgpt.com"]["allow_http_methods"], ["GET", "POST"])
-        self.assertTrue(rules["chatgpt.com"]["openai_account_guard"])
-        self.assertTrue(rules["chatgpt.com"]["openai_external_url_request_guard"])
+        self.assertTrue(network_integrations.host_allowed(controls, "api.openai.com"))
+        self.assertTrue(network_integrations.host_allowed(controls, "auth.openai.com"))
+        self.assertTrue(network_integrations.host_allowed(controls, "chatgpt.com"))
+        self.assertFalse(network_integrations.host_allowed(controls, "other.openai.com"))
 
     def test_openai_domains_are_reserved_for_managed_integration(self) -> None:
         for domain in ("api.openai.com", "auth.openai.com", "chatgpt.com", "*.chatgpt.com"):
-            with self.subTest(domain=domain), self.assertRaisesRegex(ConfigError, "managed_network_integrations.openai"):
+            with self.subTest(domain=domain), self.assertRaisesRegex(ConfigError, "network_integrations.openai"):
                 parse_network_controls(
                     {
-                        "managed_network_integrations": {"openai": {"enabled": True}},
-                        "allowed_network_access": {domain: {"allow_http_methods": ["GET"]}},
+                        "network_integrations": { "openai": {"enabled": True}, "custom": {"domains": {domain: {"allow_http_methods": ["GET"]}}} },
                     }
                 )
 
@@ -354,40 +392,37 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaisesRegex(ConfigError, "unsupported fields"):
                 parse_network_controls(
                     {
-                        "managed_network_integrations": {"openai": {"enabled": True}},
-                        "allowed_network_access": {"api.example.com": {"allow_http_methods": ["GET"], field: True}},
+                        "network_integrations": { "openai": {"enabled": True}, "custom": {"domains": {"api.example.com": {"allow_http_methods": ["GET"], field: True}}} },
                     }
                 )
 
-    def test_claude_provider_expands_and_rejects_managed_domains(self) -> None:
+    def test_claude_provider_owns_routes_and_rejects_custom_overlap(self) -> None:
         controls = parse_network_controls(
             {
-                "managed_network_integrations": {"claude": {"enabled": True}},
-                "allowed_network_access": {},
+                "network_integrations": {"claude": {"enabled": True}},
             }
         )
-        self.assertEqual(controls.to_json()["managed_network_integrations"], {"claude": {"enabled": True}})
-        rules = expand_network_controls(controls)["allowed_network_access"]
-        self.assertTrue(rules["api.anthropic.com"]["anthropic_account_guard"])
-        self.assertNotIn("claude.ai", rules)
-        self.assertEqual(rules["platform.claude.com"]["allow_http_methods"], ["GET", "POST"])
-        self.assertEqual(rules["platform.claude.com"]["path_guards"], ["^/v1/oauth(?:/.*)?$"])
+        self.assertEqual(controls.to_json()["network_integrations"], {"claude": {"enabled": True}})
+        self.assertTrue(network_integrations.host_allowed(controls, "api.anthropic.com"))
+        self.assertTrue(network_integrations.host_allowed(controls, "platform.claude.com"))
+        self.assertFalse(network_integrations.host_allowed(controls, "claude.ai"))
+        self.assertTrue(request_allowed(controls, "GET", "platform.claude.com", "/v1/oauth/token"))
+        self.assertFalse(request_allowed(controls, "GET", "platform.claude.com", "/api/account"))
 
         for domain in ("api.anthropic.com", "claude.ai", "platform.claude.com", "*.anthropic.com"):
             with self.subTest(domain=domain), self.assertRaisesRegex(
-                ConfigError, "managed_network_integrations.claude"
+                ConfigError, "network_integrations.claude"
             ):
                 parse_network_controls(
                     {
-                        "managed_network_integrations": {"claude": {"enabled": True}},
-                        "allowed_network_access": {domain: {"allow_http_methods": ["GET"]}},
+                        "network_integrations": { "claude": {"enabled": True}, "custom": {"domains": {domain: {"allow_http_methods": ["GET"]}}} },
                     }
                 )
 
-    def test_managed_network_integrations_parse_expand_and_reserve_domains(self) -> None:
+    def test_network_integrations_own_routes_and_reserve_domains(self) -> None:
         controls = parse_network_controls(
             {
-                "managed_network_integrations": {
+                "network_integrations": {
                     "openai": {"enabled": True},
                     "github": {
                         "enabled": True,
@@ -399,35 +434,27 @@ class ConfigTests(unittest.TestCase):
                     "python_packages": {"enabled": True},
                     "npm_packages": {"enabled": True},
                 },
-                "allowed_network_access": {},
             }
         )
 
         self.assertEqual(
-            controls.to_json()["managed_network_integrations"]["github"]["write_repositories"],
+            controls.to_json()["network_integrations"]["github"]["write_repositories"],
             [
                 {"owner": "infiversehq", "repo": "trustyclaw"},
                 {"owner": "infiversehq", "repo": "trustyclaw-tools"},
             ],
         )
-        rules = expand_network_controls(controls)["allowed_network_access"]
-        self.assertIn("api.github.com", rules)
-        self.assertIn("github_repo_guard", rules["api.github.com"])
-        self.assertIn("uploads.github.com", rules)
-        self.assertIn("github_repo_guard", rules["uploads.github.com"])
-        # The signed-URL domains are plain GET/HEAD rules: presigned S3 paths
-        # carry no owner/repo, so no repo guard rides them — structurally.
+        self.assertTrue(network_integrations.host_allowed(controls, "api.github.com"))
+        self.assertTrue(network_integrations.host_allowed(controls, "uploads.github.com"))
         for signed_domain in (
             "objects.githubusercontent.com",
             "github-cloud.githubusercontent.com",
             "release-assets.githubusercontent.com",
         ):
-            self.assertEqual(
-                rules[signed_domain],
-                {"allow_http_methods": ["GET", "HEAD"]},
-            )
-        self.assertIn("pypi.org", rules)
-        self.assertIn("registry.npmjs.org", rules)
+            self.assertTrue(request_allowed(controls, "GET", signed_domain, "/asset"))
+            self.assertFalse(request_allowed(controls, "POST", signed_domain, "/asset"))
+        self.assertTrue(request_allowed(controls, "GET", "pypi.org", "/simple/pkg"))
+        self.assertTrue(request_allowed(controls, "GET", "registry.npmjs.org", "/pkg"))
 
         for domain, owner in (
             ("github.com", "github"),
@@ -436,18 +463,17 @@ class ConfigTests(unittest.TestCase):
             ("pypi.org", "python_packages"),
             ("registry.npmjs.org", "npm_packages"),
         ):
-            with self.subTest(domain=domain), self.assertRaisesRegex(ConfigError, f"managed_network_integrations.{owner}"):
+            with self.subTest(domain=domain), self.assertRaisesRegex(ConfigError, f"network_integrations.{owner}"):
                 parse_network_controls(
                     {
-                        "managed_network_integrations": {},
-                        "allowed_network_access": {domain: {"allow_http_methods": ["GET"]}},
+                        "network_integrations": { "custom": {"domains": {domain: {"allow_http_methods": ["GET"]}}} },
                     }
                 )
 
         with self.assertRaisesRegex(ConfigError, "duplicate repository"):
             parse_network_controls(
                 {
-                    "managed_network_integrations": {
+                    "network_integrations": {
                         "github": {
                             "enabled": True,
                             "write_repositories": [
@@ -456,7 +482,6 @@ class ConfigTests(unittest.TestCase):
                             ],
                         }
                     },
-                    "allowed_network_access": {},
                 }
             )
 
@@ -470,26 +495,25 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaises(ConfigError):
                     parse_network_controls(
                         {
-                            "managed_network_integrations": {},
-                            "allowed_network_access": {domain: {"allow_http_methods": ["GET"]}},
+                            "network_integrations": { "custom": {"domains": {domain: {"allow_http_methods": ["GET"]}}} },
                         }
                     )
                 self.assertIsNotNone(managed_domain_owner(domain))
-        with self.assertRaisesRegex(ConfigError, "managed_network_integrations"):
+        with self.assertRaisesRegex(ConfigError, "network_integrations"):
             parse_network_controls(
                 {
-                    "managed_network_integrations": {},
-                    "allowed_network_access": {"*.githubusercontent.com": {"allow_http_methods": ["GET"]}},
+                    "network_integrations": { "custom": {"domains": {"*.githubusercontent.com": {"allow_http_methods": ["GET"]}}} },
                 }
             )
         # An unrelated wildcard still works.
         controls = parse_network_controls(
             {
-                "managed_network_integrations": {},
-                "allowed_network_access": {"*.example.com": {"allow_http_methods": ["GET"]}},
+                "network_integrations": { "custom": {"domains": {"*.example.com": {"allow_http_methods": ["GET"]}}} },
             }
         )
-        self.assertIn("*.example.com", controls.allowed_network_access)
+        custom = controls.integrations["custom"]
+        self.assertIsInstance(custom, CustomIntegration)
+        self.assertIn("*.example.com", custom.domains)
         self.assertIsNone(managed_domain_owner("*.example.com"))
 
     def test_github_repository_git_suffix_is_normalized_away(self) -> None:
@@ -497,20 +521,19 @@ class ConfigTests(unittest.TestCase):
         # segment is .git-stripped before lookup.
         controls = parse_network_controls(
             {
-                "managed_network_integrations": {
+                "network_integrations": {
                     "github": {
                         "enabled": True,
                         "write_repositories": [{"owner": "infiloop2", "repo": "TrustyClaw.git"}],
                     }
                 },
-                "allowed_network_access": {},
             }
         )
         self.assertEqual(
-            controls.to_json()["managed_network_integrations"]["github"]["write_repositories"],
+            controls.to_json()["network_integrations"]["github"]["write_repositories"],
             [{"owner": "infiloop2", "repo": "trustyclaw"}],
         )
-        policy = expand_network_controls(controls)
+        policy = (controls)
         # The write repo matches a push whose repo segment is .git-stripped.
         self.assertIsNone(
             github_request_denied(
@@ -521,7 +544,7 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "duplicate repository"):
             parse_network_controls(
                 {
-                    "managed_network_integrations": {
+                    "network_integrations": {
                         "github": {
                             "enabled": True,
                             "write_repositories": [
@@ -530,31 +553,26 @@ class ConfigTests(unittest.TestCase):
                             ],
                         }
                     },
-                    "allowed_network_access": {},
                 }
             )
 
     def test_legacy_managed_ai_provider_field_is_rejected(self) -> None:
         with self.assertRaisesRegex(ConfigError, "unsupported fields: managed_ai_provider_network_access"):
             parse_network_controls(
-                {
-                    "managed_ai_provider_network_access": {"openai": True},
-                    "allowed_network_access": {},
-                }
+                {"managed_ai_provider_network_access": {"openai": True}}
             )
 
     def test_github_credential_field_is_rejected_in_policy(self) -> None:
         with self.assertRaisesRegex(ConfigError, "unsupported fields: credential"):
             parse_network_controls(
                 {
-                    "managed_network_integrations": {
+                    "network_integrations": {
                         "github": {
                             "enabled": True,
                             "write_repositories": [{"owner": "infiloop2", "repo": "demo"}],
                             "credential": {"mode": "token"},
                         }
                     },
-                    "allowed_network_access": {},
                 }
             )
 
@@ -562,126 +580,111 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "wildcard domains must not overlap"):
             parse_network_controls(
                 {
-                    "managed_network_integrations": {"openai": {"enabled": True}},
-                    "allowed_network_access": {
-                        "*.example.com": {"allow_http_methods": ["GET"]},
-                        "*.api.example.com": {"allow_http_methods": ["POST"]},
-                    },
+                    "network_integrations": { "openai": {"enabled": True}, "custom": {"domains": {"*.example.com": {"allow_http_methods": ["GET"]},
+                        "*.api.example.com": {"allow_http_methods": ["POST"]},}} },
                 }
             )
 
     def test_non_overlapping_wildcard_domain_rules_are_allowed(self) -> None:
         controls = parse_network_controls(
             {
-                "managed_network_integrations": {"openai": {"enabled": True}},
-                "allowed_network_access": {
-                    "*.api.example.com": {"allow_http_methods": ["GET"]},
-                    "*.static.example.com": {"allow_http_methods": ["POST"]},
-                },
+                "network_integrations": { "openai": {"enabled": True}, "custom": {"domains": {"*.api.example.com": {"allow_http_methods": ["GET"]},
+                    "*.static.example.com": {"allow_http_methods": ["POST"]},}} },
             }
         )
 
-        self.assertEqual(controls.allowed_network_access["*.api.example.com"].allow_http_methods, ("GET",))
-        self.assertEqual(controls.allowed_network_access["*.static.example.com"].allow_http_methods, ("POST",))
+        custom = controls.integrations["custom"]
+        self.assertIsInstance(custom, CustomIntegration)
+        self.assertEqual(custom.domains["*.api.example.com"].allow_http_methods, ("GET",))
+        self.assertEqual(custom.domains["*.static.example.com"].allow_http_methods, ("POST",))
 
     def test_exact_domain_override_under_wildcard_is_allowed(self) -> None:
         controls = parse_network_controls(
             {
-                "managed_network_integrations": {"openai": {"enabled": True}},
-                "allowed_network_access": {
-                    "*.example.com": {"allow_http_methods": ["GET"]},
-                    "api.example.com": {"allow_http_methods": ["POST"]},
-                },
+                "network_integrations": { "openai": {"enabled": True}, "custom": {"domains": {"*.example.com": {"allow_http_methods": ["GET"]},
+                    "api.example.com": {"allow_http_methods": ["POST"]},}} },
             }
         )
 
-        self.assertEqual(controls.allowed_network_access["api.example.com"].allow_http_methods, ("POST",))
+        custom = controls.integrations["custom"]
+        self.assertIsInstance(custom, CustomIntegration)
+        self.assertEqual(custom.domains["api.example.com"].allow_http_methods, ("POST",))
 
     def test_domain_keys_are_normalized_and_case_duplicates_rejected(self) -> None:
         controls = parse_network_controls(
             {
-                "managed_network_integrations": {"openai": {"enabled": True}},
-                "allowed_network_access": {
-                    "API.Example.COM": {"allow_http_methods": ["GET"]},
-                },
+                "network_integrations": { "openai": {"enabled": True}, "custom": {"domains": {"API.Example.COM": {"allow_http_methods": ["GET"]},}} },
             }
         )
-        self.assertIn("api.example.com", controls.allowed_network_access)
-        self.assertNotIn("API.Example.COM", controls.allowed_network_access)
+        custom = controls.integrations["custom"]
+        self.assertIsInstance(custom, CustomIntegration)
+        self.assertIn("api.example.com", custom.domains)
+        self.assertNotIn("API.Example.COM", custom.domains)
 
         with self.assertRaisesRegex(ConfigError, "duplicate domain rules"):
             parse_network_controls(
                 {
-                    "managed_network_integrations": {"openai": {"enabled": True}},
-                    "allowed_network_access": {
-                        "api.example.com": {"allow_http_methods": ["GET"]},
-                        "API.EXAMPLE.COM": {"allow_http_methods": ["POST"]},
-                    },
+                    "network_integrations": { "openai": {"enabled": True}, "custom": {"domains": {"api.example.com": {"allow_http_methods": ["GET"]},
+                        "API.EXAMPLE.COM": {"allow_http_methods": ["POST"]},}} },
                 }
             )
 
 
 class PolicyTests(unittest.TestCase):
     def test_policy_matches_domain_method_and_path(self) -> None:
-        policy = {
-            "allowed_network_access": {
-                "*.example.com": {
-                    "allow_http_methods": ["GET"],
-                    "path_guards": ["^/dist(?:/.*)?$"],
-                }
-            },
-        }
+        policy = _custom_policy({
+            "*.example.com": {
+                "allow_http_methods": ["GET"],
+                "path_guards": ["^/dist(?:/.*)?$"],
+            }
+        })
 
-        self.assertTrue(decide_http_request(policy, "https", "GET", "cdn.example.com", "/dist/app.js", ""))
-        self.assertFalse(decide_http_request(policy, "https", "POST", "cdn.example.com", "/dist/app.js", ""))
-        self.assertFalse(decide_http_request(policy, "https", "GET", "cdn.example.com", "/admin", ""))
+        self.assertTrue(request_allowed(policy, "GET", "cdn.example.com", "/dist/app.js", ""))
+        self.assertFalse(request_allowed(policy, "POST", "cdn.example.com", "/dist/app.js", ""))
+        self.assertFalse(request_allowed(policy, "GET", "cdn.example.com", "/admin", ""))
 
     def test_path_guard_resists_traversal_and_encoding(self) -> None:
-        policy = {
-            "allowed_network_access": {
-                "api.example.com": {"allow_http_methods": ["GET"], "path_guards": ["^/v1/threads(?:/.*)?$"]}
-            }
-        }
+        policy = _custom_policy({
+            "api.example.com": {"allow_http_methods": ["GET"], "path_guards": ["^/v1/threads(?:/.*)?$"]}
+        })
         # A legitimate guarded path is allowed.
-        self.assertTrue(decide_http_request(policy, "https", "GET", "api.example.com", "/v1/threads/abc", ""))
+        self.assertTrue(request_allowed(policy, "GET", "api.example.com", "/v1/threads/abc", ""))
         # ../ traversal that the upstream would resolve to /admin is denied,
         # both raw and percent-encoded.
         self.assertFalse(
-            decide_http_request(policy, "https", "GET", "api.example.com", "/v1/threads/../../admin", "")
+            request_allowed(policy, "GET", "api.example.com", "/v1/threads/../../admin", "")
         )
         self.assertFalse(
-            decide_http_request(policy, "https", "GET", "api.example.com", "/v1/threads/%2e%2e/%2e%2e/admin", "")
+            request_allowed(policy, "GET", "api.example.com", "/v1/threads/%2e%2e/%2e%2e/admin", "")
         )
 
     def test_exact_domain_rule_wins_over_wildcard(self) -> None:
-        policy = {
-            "allowed_network_access": {
-                "*.example.com": {"allow_http_methods": ["GET", "POST"]},
-                "api.example.com": {"allow_http_methods": ["GET"]},
-            }
-        }
+        policy = _custom_policy({
+            "*.example.com": {"allow_http_methods": ["GET", "POST"]},
+            "api.example.com": {"allow_http_methods": ["GET"]},
+        })
 
-        self.assertIs(find_domain_rule(policy, "api.example.com"), policy["allowed_network_access"]["api.example.com"])
-        self.assertFalse(decide_http_request(policy, "https", "POST", "api.example.com", "/", ""))
-        self.assertTrue(decide_http_request(policy, "https", "POST", "other.example.com", "/", ""))
+        custom = _controls(policy).integrations["custom"]
+        self.assertIsInstance(custom, CustomIntegration)
+        self.assertIs(rule_for_host(custom, "api.example.com"), custom.domains["api.example.com"])
+        self.assertFalse(request_allowed(policy, "POST", "api.example.com", "/", ""))
+        self.assertTrue(request_allowed(policy, "POST", "other.example.com", "/", ""))
 
     def test_host_allowed_requires_listed_domain_with_methods(self) -> None:
-        policy = {
-            "allowed_network_access": {
-                "allowed.example.com": {"allow_http_methods": ["GET"]},
-                "closed.example.com": {"allow_http_methods": []},
-            }
-        }
+        policy = _custom_policy({
+            "allowed.example.com": {"allow_http_methods": ["GET"]},
+            "closed.example.com": {"allow_http_methods": []},
+        })
 
-        self.assertTrue(host_allowed(policy, "allowed.example.com"))
-        self.assertFalse(host_allowed(policy, "closed.example.com"))
-        self.assertFalse(host_allowed(policy, "unlisted.example.com"))
+        self.assertTrue(network_integrations.host_allowed(_controls(policy), "allowed.example.com"))
+        self.assertFalse(network_integrations.host_allowed(_controls(policy), "closed.example.com"))
+        self.assertFalse(network_integrations.host_allowed(_controls(policy), "unlisted.example.com"))
 
     def test_github_guard_allows_all_reads_and_scopes_writes(self) -> None:
-        policy = expand_network_controls(
+        policy = (
             parse_network_controls(
                 {
-                    "managed_network_integrations": {
+                    "network_integrations": {
                         "github": {
                             "enabled": True,
                             "write_repositories": [
@@ -689,7 +692,6 @@ class PolicyTests(unittest.TestCase):
                             ],
                         }
                     },
-                    "allowed_network_access": {},
                 }
             )
         )
@@ -878,27 +880,25 @@ class PolicyTests(unittest.TestCase):
     def test_require_dot_github_approval_rides_into_guard(self) -> None:
         controls = parse_network_controls(
             {
-                "managed_network_integrations": {
+                "network_integrations": {
                     "github": {
                         "enabled": True,
                         "require_dot_github_approval": True,
                         "write_repositories": [{"owner": "infiversehq", "repo": "trustyclaw-tools"}],
                     }
                 },
-                "allowed_network_access": {},
             }
         )
-        self.assertEqual(controls.to_json()["managed_network_integrations"]["github"]["require_dot_github_approval"], True)
-        policy = expand_network_controls(controls)
-        guard = policy["allowed_network_access"]["github.com"]["github_repo_guard"]
-        self.assertTrue(guard["require_dot_github_approval"])
+        self.assertEqual(controls.to_json()["network_integrations"]["github"]["require_dot_github_approval"], True)
+        policy = controls
+        self.assertTrue(policy.integrations["github"].require_dot_github_approval)
         # The gate triggers only on receive-pack POSTs (it runs after the
         # write guard allowed the push, so the repo is a write repo by
         # construction); a read probe never reaches inspect().
         clean = type("R", (), {"touches_github": False})()
         with (
-            patch("host.runtime.network_policy.read_proxy_github_token", return_value="ghs_test"),
-            patch("host.runtime.network_policy.github_push_gate.inspect", return_value=clean) as inspect_fn,
+            patch("host.network_integrations.github.guard.read_proxy_github_token", return_value="ghs_test"),
+            patch("host.network_integrations.github.guard.push_gate.inspect", return_value=clean) as inspect_fn,
         ):
             response, reason = github_push_gate_response(
                 policy, "POST", "github.com", "/infiversehq/trustyclaw-tools.git/git-receive-pack", b"body"
@@ -910,8 +910,8 @@ class PolicyTests(unittest.TestCase):
         # trigger (and the write guard before it) matched: dot segments and
         # percent-encoding cannot smuggle a different identity into the gate.
         with (
-            patch("host.runtime.network_policy.read_proxy_github_token", return_value="ghs_test"),
-            patch("host.runtime.network_policy.github_push_gate.inspect", return_value=clean) as inspect_fn,
+            patch("host.network_integrations.github.guard.read_proxy_github_token", return_value="ghs_test"),
+            patch("host.network_integrations.github.guard.push_gate.inspect", return_value=clean) as inspect_fn,
         ):
             response, reason = github_push_gate_response(
                 policy, "POST", "github.com", "/x/../infiversehq/trustyclaw-tools.git/git-receive-pack", b"body"
@@ -919,7 +919,7 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual((response, reason), (None, None))
             inspect_fn.assert_called_once()
             self.assertEqual(inspect_fn.call_args.args[:2], ("infiversehq", "trustyclaw-tools"))
-        with patch("host.runtime.network_policy.github_push_gate.inspect") as inspect_fn:
+        with patch("host.network_integrations.github.guard.push_gate.inspect") as inspect_fn:
             self.assertEqual(
                 github_push_gate_response(
                     policy, "GET", "github.com", "/infiversehq/trustyclaw-tools.git/info/refs", b""
@@ -928,19 +928,17 @@ class PolicyTests(unittest.TestCase):
             )
             inspect_fn.assert_not_called()
         # Off by default: no require_dot_github_approval means no gating.
-        off = expand_network_controls(
+        off = (
             parse_network_controls(
                 {
-                    "managed_network_integrations": {
+                    "network_integrations": {
                         "github": {"enabled": True, "write_repositories": [{"owner": "infiversehq", "repo": "trustyclaw-tools"}]}
                     },
-                    "allowed_network_access": {},
                 }
             )
         )
-        off_guard = off["allowed_network_access"]["github.com"]["github_repo_guard"]
-        self.assertNotIn("require_dot_github_approval", off_guard)
-        with patch("host.runtime.network_policy.github_push_gate.inspect") as inspect_fn:
+        self.assertFalse(off.integrations["github"].require_dot_github_approval)
+        with patch("host.network_integrations.github.guard.push_gate.inspect") as inspect_fn:
             self.assertEqual(
                 github_push_gate_response(
                     off, "POST", "github.com", "/infiversehq/trustyclaw-tools.git/git-receive-pack", b"body"
@@ -988,21 +986,20 @@ class PolicyTests(unittest.TestCase):
                 self.cleaned.append(push_id)
 
         result = FakeResult()
-        policy = {
-            "allowed_network_access": {
-                "github.com": {
-                    "github_repo_guard": {
-                        "require_dot_github_approval": True,
-                        "write_repositories": [{"owner": "infiversehq", "repo": "trustyclaw-tools"}],
-                    }
+        policy = parse_network_controls({
+            "network_integrations": {
+                "github": {
+                    "enabled": True,
+                    "require_dot_github_approval": True,
+                    "write_repositories": [{"owner": "infiversehq", "repo": "trustyclaw-tools"}],
                 }
-            }
-        }
+            },
+        })
         with (
-            patch("host.runtime.network_policy.read_proxy_github_token", return_value=None),
-            patch("host.runtime.network_policy.github_push_gate.inspect", return_value=result),
-            patch("host.runtime.network_policy.github_push_gate.new_push_id", return_value="abc123"),
-            patch("host.runtime.network_policy.enqueue_pending_push", side_effect=RuntimeError("db down")),
+            patch("host.network_integrations.github.guard.read_proxy_github_token", return_value=None),
+            patch("host.network_integrations.github.guard.push_gate.inspect", return_value=result),
+            patch("host.network_integrations.github.guard.push_gate.new_push_id", return_value="abc123"),
+            patch("host.network_integrations.github.guard.enqueue_pending_push", side_effect=RuntimeError("db down")),
         ):
             response, reason = github_push_gate_response(
                 policy, "POST", "github.com", "/infiversehq/trustyclaw-tools.git/git-receive-pack", b"body"
@@ -1028,20 +1025,19 @@ class PolicyTests(unittest.TestCase):
                 self.cleaned.append(push_id)
 
         result = FakeResult()
-        policy = {
-            "allowed_network_access": {
-                "github.com": {
-                    "github_repo_guard": {
-                        "require_dot_github_approval": True,
-                        "write_repositories": [{"owner": "infiversehq", "repo": "trustyclaw-tools"}],
-                    }
+        policy = parse_network_controls({
+            "network_integrations": {
+                "github": {
+                    "enabled": True,
+                    "require_dot_github_approval": True,
+                    "write_repositories": [{"owner": "infiversehq", "repo": "trustyclaw-tools"}],
                 }
-            }
-        }
+            },
+        })
         with (
-            patch("host.runtime.network_policy.read_proxy_github_token", return_value=None),
-            patch("host.runtime.network_policy.github_push_gate.inspect", return_value=result),
-            patch("host.runtime.network_policy.github_push_gate.new_push_id", return_value="abc123"),
+            patch("host.network_integrations.github.guard.read_proxy_github_token", return_value=None),
+            patch("host.network_integrations.github.guard.push_gate.inspect", return_value=result),
+            patch("host.network_integrations.github.guard.push_gate.new_push_id", return_value="abc123"),
         ):
             response, reason = github_push_gate_response(
                 policy, "POST", "github.com", "/infiversehq/trustyclaw-tools.git/git-receive-pack", b"body"
@@ -1052,10 +1048,10 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(result.cleaned, ["abc123"])
 
     def test_github_lfs_batch_allows_download_denies_upload(self) -> None:
-        policy = expand_network_controls(
+        policy = (
             parse_network_controls(
                 {
-                    "managed_network_integrations": {
+                    "network_integrations": {
                         "github": {
                             "enabled": True,
                             "write_repositories": [
@@ -1063,7 +1059,6 @@ class PolicyTests(unittest.TestCase):
                             ],
                         }
                     },
-                    "allowed_network_access": {},
                 }
             )
         )
@@ -1091,16 +1086,15 @@ class PolicyTests(unittest.TestCase):
                 )
 
     def test_github_graphql_requests_fail_closed(self) -> None:
-        policy = expand_network_controls(
+        policy = (
             parse_network_controls(
                 {
-                    "managed_network_integrations": {
+                    "network_integrations": {
                         "github": {
                             "enabled": True,
                             "write_repositories": [{"owner": "infiversehq", "repo": "trustyclaw"}],
                         }
                     },
-                    "allowed_network_access": {},
                 }
             )
         )
@@ -1126,15 +1120,9 @@ class PolicyTests(unittest.TestCase):
 
     def test_openai_guard_pins_account_and_blocks_external_url_requests(self) -> None:
         pg_harness.reset_database()
-        policy = {
-            "allowed_network_access": {
-                "chatgpt.com": {
-                    "allow_http_methods": ["POST"],
-                    "openai_account_guard": True,
-                    "openai_external_url_request_guard": True,
-                }
-            }
-        }
+        policy = parse_network_controls({
+            "network_integrations": {"openai": {"enabled": True}},
+        })
         host = "chatgpt.com"
         # Subsequent web-search checks carry the valid account header so they
         # isolate the web-search logic from the account pin.
@@ -1152,13 +1140,6 @@ class PolicyTests(unittest.TestCase):
             # bypassable by omission.
             self.assertIsNotNone(openai_request_denied(policy, host, [("Content-Type", "application/json")], b"{}"))
             self.assertIsNone(openai_request_denied(policy, "auth.openai.com", [], b"{}"))
-            self.assertIsNone(openai_request_denied({"allowed_network_access": {}}, "github.com", [], b"{}"))
-            unpinned_policy = {
-                "allowed_network_access": {
-                    "chatgpt.com": {"allow_http_methods": ["POST"], "openai_external_url_request_guard": True}
-                }
-            }
-            self.assertIsNone(openai_request_denied(unpinned_policy, host, [], b'{"input": "hello"}'))
 
             # Live web search (external access on, or unset) is denied; cached is allowed.
             live = b'{"tools": [{"type": "web_search", "external_web_access": true}]}'
@@ -1287,9 +1268,6 @@ class PolicyTests(unittest.TestCase):
             ]
             self.assertIsNotNone(openai_request_denied(policy, host, gz_headers, gzip.compress(live)))
 
-            # The guard only applies where the flag is set.
-            self.assertIsNone(openai_request_denied({"allowed_network_access": {}}, "github.com", json_header, live))
-
     def test_external_url_guard_caps_gzip_and_deflate_decoded_size(self) -> None:
         pg_harness.reset_database()
         import gzip
@@ -1297,15 +1275,9 @@ class PolicyTests(unittest.TestCase):
 
         from host.runtime import network_policy
 
-        policy = {
-            "allowed_network_access": {
-                "chatgpt.com": {
-                    "allow_http_methods": ["POST"],
-                    "openai_account_guard": True,
-                    "openai_external_url_request_guard": True,
-                }
-            }
-        }
+        policy = parse_network_controls({
+            "network_integrations": {"openai": {"enabled": True}},
+        })
         with (
             tempfile.TemporaryDirectory() as tmp,
             patch.dict(os.environ, {"TRUSTYCLAW_STATE_DIR": tmp}),
@@ -1329,15 +1301,9 @@ class PolicyTests(unittest.TestCase):
         # Only stdlib-decodable encodings are inspected; zstd and brotli fail
         # closed (clients essentially never compress request bodies, and a
         # live denial is the signal to add an encoding, not a fallback path).
-        policy = {
-            "allowed_network_access": {
-                "chatgpt.com": {
-                    "allow_http_methods": ["POST"],
-                    "openai_account_guard": True,
-                    "openai_external_url_request_guard": True,
-                }
-            }
-        }
+        policy = parse_network_controls({
+            "network_integrations": {"openai": {"enabled": True}},
+        })
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TRUSTYCLAW_STATE_DIR": tmp}):
             save_proxy_openai_account_id("acct_good")
             for encoding in ("zstd", "br"):
@@ -1353,15 +1319,9 @@ class PolicyTests(unittest.TestCase):
 
     def test_unsupported_content_encoding_fails_closed(self) -> None:
         pg_harness.reset_database()
-        policy = {
-            "allowed_network_access": {
-                "chatgpt.com": {
-                    "allow_http_methods": ["POST"],
-                    "openai_account_guard": True,
-                    "openai_external_url_request_guard": True,
-                }
-            }
-        }
+        policy = parse_network_controls({
+            "network_integrations": {"openai": {"enabled": True}},
+        })
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TRUSTYCLAW_STATE_DIR": tmp}):
             save_proxy_openai_account_id("acct_good")
             headers = [
@@ -1373,16 +1333,14 @@ class PolicyTests(unittest.TestCase):
 
     def test_anthropic_guard_pins_oauth_bearer_hash(self) -> None:
         pg_harness.reset_database()
-        policy = {
-            "allowed_network_access": {
-                "api.anthropic.com": {"allow_http_methods": ["GET", "POST"], "anthropic_account_guard": True}
-            }
-        }
+        policy = parse_network_controls({
+            "network_integrations": {"claude": {"enabled": True}},
+        })
         headers = [("Authorization", "Bearer token-good")]
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TRUSTYCLAW_STATE_DIR": tmp}):
             self.assertEqual(
                 anthropic_request_denied(policy, "POST", "api.anthropic.com", "/v1/messages", headers),
-                "Claude account token is not available",
+                "anthropic_token_unavailable",
             )
             for path in (
                 "/api/oauth/profile",
@@ -1431,6 +1389,128 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(method, "GET")
         self.assertEqual(target, "/v1/health?check=1")
         self.assertEqual(headers, [("Host", "api.example.com"), ("Upgrade", "websocket")])
+
+
+class DenialReasonCatalogTests(unittest.TestCase):
+    def test_every_emitted_denial_code_has_catalog_guidance(self) -> None:
+        # Anti-drift: a denial code added to a guard (or the proxy core)
+        # without a catalog entry would surface to the agent with no guidance.
+        # Codes are the only snake_case string literals in these modules apart
+        # from request/config vocabulary, which is excluded by name.
+        import inspect
+        import re as re_module
+
+        from host.network_integrations import registry
+        from host.network_integrations.custom import guard as custom_guard
+        from host.network_integrations.npm_packages import guard as npm_guard
+        from host.network_integrations.python_packages import guard as python_guard
+        from host.runtime import network_proxy
+
+        catalog = registry.denial_reason_catalog()
+        emitted: set[str] = set()
+        for module in (
+            openai_guard, claude_guard, github_guard, custom_guard,
+            npm_guard, python_guard, network_proxy,
+        ):
+            source = inspect.getsource(module)
+            emitted |= set(re_module.findall(r'"([a-z][a-z0-9]*(?:_[a-z0-9]+)+)"', source))
+        # Non-code snake_case vocabulary these modules legitimately mention.
+        emitted -= {
+            "write_repositories", "require_dot_github_approval", "external_web_access",
+            "indexed_web_access", "server_url", "web_search_options", "web_search",
+            "web_search_call", "web_fetch", "code_execution", "mcp_servers",
+            "computer_use", "computer_use_preview", "code_interpreter",
+            "allow_http_methods", "path_guards", "network_integrations",
+            "access_token_sha256",
+            "pending_deployments", "deployment_protection_rule",
+        }
+        self.assertGreater(len(emitted), 15)
+        self.assertEqual(emitted - set(catalog), set())
+        for code, reason in catalog.items():
+            with self.subTest(code=code):
+                self.assertTrue(reason.guidance.strip())
+
+    def test_registry_rejects_duplicate_integration_ids(self) -> None:
+        # A duplicate id must fail loudly at registry construction: a silent
+        # dict overwrite would pair the surviving manifest's apex claims with
+        # the wrong guard and drop the original claim entirely.
+        from host.network_integrations import registry
+        from host.network_integrations.openai import manifest as openai_manifest
+
+        with self.assertRaisesRegex(ValueError, "duplicate integration id 'openai'"):
+            registry._build_registry((openai_manifest, openai_manifest))
+
+    def test_registry_packages_validation_and_guard_pairing(self) -> None:
+        from host.network_integrations import runtime as integrations_runtime
+        from host.network_integrations import registry
+
+        package_root = Path(registry.__file__).parent
+        package_ids = {
+            path.parent.name
+            for path in package_root.glob("*/manifest.py")
+            if (path.parent / "__init__.py").exists()
+        }
+        self.assertEqual(package_ids, set(registry.NETWORK_INTEGRATIONS))
+        self.assertEqual(set(integrations_runtime.GUARDS), set(registry.NETWORK_INTEGRATIONS))
+
+        apex_owners: dict[str, str] = {}
+        codes = [reason.code for reason in PROXY_DENIAL_REASONS]
+        for integration_id, registered in registry.NETWORK_INTEGRATIONS.items():
+            for apex in registered.manifest.owned_apexes:
+                self.assertFalse(
+                    any(apex.endswith(f".{seen}") or seen.endswith(f".{apex}") for seen in apex_owners),
+                    f"{integration_id} apex {apex} overlaps {apex_owners}",
+                )
+                apex_owners[apex] = integration_id
+            codes.extend(reason.code for reason in registered.manifest.denial_reasons)
+        self.assertEqual(len(codes), len(set(codes)))
+        self.assertIsNone(managed_domain_owner("example.com"))
+
+
+class DisabledIntegrationDispatchTests(unittest.TestCase):
+    def test_disabled_integrations_are_denied_at_dispatch(self) -> None:
+        # The enabled gate lives in the dispatch layer, not in the guards
+        # (their contract is that hooks run only for enabled configs). A
+        # disabled integration must fail closed for every hook, pre-DNS
+        # included, for each host it owns.
+        controls = parse_network_controls({"network_integrations": {}})
+        for host in (
+            "api.openai.com", "chatgpt.com", "auth.openai.com",
+            "api.anthropic.com", "platform.claude.com",
+            "github.com", "api.github.com", "raw.githubusercontent.com",
+            "pypi.org", "registry.npmjs.org",
+            "custom.example.com",
+        ):
+            with self.subTest(host=host):
+                self.assertFalse(network_integrations.host_allowed(controls, host))
+                self.assertEqual(
+                    network_integrations.request_denied(controls, "GET", host, "/", "", [], b""),
+                    "network_policy_denied",
+                )
+                self.assertEqual(
+                    network_integrations.gate_response(controls, "POST", host, "/x/y.git/git-receive-pack", b""),
+                    (None, None),
+                )
+                self.assertIsNone(network_integrations.ws_message_guard(controls, host))
+
+    def test_enabled_integrations_allow_their_hosts_at_dispatch(self) -> None:
+        controls = parse_network_controls(
+            {
+                "network_integrations": {
+                    "openai": {"enabled": True},
+                    "claude": {"enabled": True},
+                    "github": {"enabled": True},
+                    "python_packages": {"enabled": True},
+                    "npm_packages": {"enabled": True},
+                "custom": {"domains": {"custom.example.com": {"allow_http_methods": ["GET"]}}},},
+            }
+        )
+        for host in (
+            "api.openai.com", "api.anthropic.com", "github.com",
+            "pypi.org", "registry.npmjs.org", "custom.example.com",
+        ):
+            with self.subTest(host=host):
+                self.assertTrue(network_integrations.host_allowed(controls, host))
 
 
 class DeployNetworkTests(unittest.TestCase):

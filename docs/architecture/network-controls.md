@@ -29,7 +29,7 @@ Defense in depth, fail closed at each layer:
    never even resolved (host names are otherwise an exfiltration channel).
 
 Deployment config does not include runtime network controls. The active
-policy lives in the `network_policy` database row; a missing row (fresh
+policy lives in the normalized network policy tables; a missing policy (fresh
 deploy) is the fail-closed empty default, and a preserved database keeps its
 policy across redeploys. Operators then enable managed network integrations or
 website/domain rules through the admin UI/API. See
@@ -45,7 +45,7 @@ The proxy enforces, per request:
   is not supported: every request gets a logged 403 before any body read, DNS
   resolution, or upstream connection.
 - `path_guards` regexes against path plus query.
-- OpenAI guards: `managed_network_integrations.openai` expands to the required OpenAI domains,
+- OpenAI guards: the OpenAI integration owns the required OpenAI domains,
   denies requests that would make OpenAI reach an external URL with request
   data (any web/browse tool other than `web_search` with
   `external_web_access: false` and `indexed_web_access` false-or-absent —
@@ -63,7 +63,7 @@ The proxy enforces, per request:
   `tool_suggest`, `computer_use`, `remote_plugin`, `plugin_sharing`) so the
   agent does not attempt a tool the proxy would deny. The proxy remains the
   ultimate enforcement layer.
-- Anthropic guards: `managed_network_integrations.claude` expands to the
+- Anthropic guards: the Claude integration owns the
   Claude Code OAuth path on `platform.claude.com` and the Anthropic API domain.
   The API domain fails closed until Claude Code OAuth has produced a locally
   readable account file; after that, API requests must carry the exact bearer
@@ -72,10 +72,10 @@ The proxy enforces, per request:
   also applies a structural body guard that denies Anthropic server-side tools
   which run off-box and reach external URLs with request data: `web_fetch`,
   `code_execution`, and remote `mcp_servers` are always denied, and `web_search`
-  is denied unless the operator set `managed_network_integrations.claude.web_search`
+  is denied unless the operator set `network_integrations.claude.web_search`
   (default off). Claude Code's client-side WebFetch and Bash egress stay gated by
   the domain allow-list instead.
-- GitHub guards: `managed_network_integrations.github` expands to the GitHub
+- GitHub guards: the GitHub integration owns the GitHub
   domain set with an all-reads, scoped-writes guard. When enabled, every read
   is allowed (the agent may read any repository the injected token reaches);
   the guard only gates writes, which must target a repository in
@@ -87,7 +87,7 @@ The proxy enforces, per request:
   references in request bodies cannot be verified with path rules. Denials
   carry write-scope reasons in network events. The decision tables live in
   [`../api/NetworkControls.md`](../api/NetworkControls.md#access-enforcement).
-- Package guards: `python_packages` and `npm_packages` expand to fixed
+- Package guards: `python_packages` and `npm_packages` own fixed
   read-only domain and path rules for PyPI, pythonhosted, the npm registry,
   and Node.js downloads.
 
@@ -140,28 +140,93 @@ fallback cache: a database outage denies every request until the database
 returns, and an invalid stored policy equally denies all requests. Fail
 closed in every state.
 
-## Internal Guard Fields
+## Integration Packages
 
-Managed integrations are stored as operator intent only. Before enforcement the
-proxy expands them, in memory, into domain rules carrying internal guard fields
-that are never exposed through the admin API, never accepted in
-`allowed_network_access`, and never persisted. This section is the canonical
-reference for those fields.
+Each network integration is a package under
+`host/network_integrations/<id>/` with two modules:
 
-| Internal field | Set by | Implementation |
-| --- | --- | --- |
-| `allow_http_methods` (generated) | every integration | Same mechanics as manual rules; the integration registry fixes the method list per generated domain (for example `POST` only on `api.openai.com`, `GET`/`HEAD` only on `raw.githubusercontent.com`). |
-| `path_guards` (generated) | `claude`, `python_packages`, `npm_packages` | Same regex mechanics as manual rules, with registry-fixed patterns (for example `^/v1/oauth(?:/.*)?$` on `platform.claude.com`, `^/packages(?:/.*)?$` on `files.pythonhosted.org`). Request paths are percent-decoded and dot-segment-normalized before matching so `..` segments cannot escape a guard. |
-| `openai_account_guard` | `openai` | Requires a `chatgpt-account-id` header on data-plane requests that is present and equal to the account id inferred from Codex login status (stored as the openai row in `proxy_provider_pins`). Missing id or missing header fails closed. |
-| `openai_external_url_request_guard` | `openai` | Denies requests that would make OpenAI reach an external URL with request data. Buffers and decodes the request body (gzip/deflate in-process, decoded output capped at 128 MiB; any other encoding is denied outright), then enforces the rule structurally on the parsed JSON. The rule fails closed — only the cache-backed `web_search` shape is forwarded and every other collected web/browse tool is denied. A guarded tool object is collected when its `type` is `mcp`, starts with `web` (except the `web_search_call` history item), is a network-reaching hosted type (`browser`, `computer_use`, `computer_use_preview`, `code_interpreter`), or, so a renamed web tool is still caught, carries any truthy `*_web_access` flag. Of those, only a tool that is exactly `web_search` with `external_web_access: false` **and** `indexed_web_access` false-or-absent is allowed; `indexed` mode (server-approved external URL fetch), `web_search_preview`/dated variants, a bare `web`/`web_fetch`/`browser`/`computer_use`/`code_interpreter` tool, and any other truthy `*_web_access` flag are all denied. Chat Completions search (`web_search_options`, `*-search*` models) is denied outright, remote MCP tools (`type: mcp` by `server_url` or hosted `connector_id`, or a `server_url` key anywhere) are denied outright, and the Codex standalone search endpoints (`/backend-api/codex/alpha/search`, `/v1/alpha/search`) must set `settings.external_web_access: false` and must not set `settings.indexed_web_access: true` because the server default there is live. Prompt text mentioning a tool name carries no capability and never matches; JSON-looking bodies that fail to parse are denied. Also applied to each client-to-upstream WebSocket message on guarded domains. |
-| `anthropic_account_guard` | `claude` | Denies `api.anthropic.com` requests unless the presented bearer token's SHA-256 hash equals the hash stored in the claude `proxy_provider_pins` row after Claude OAuth. Allows the unauthenticated `GET /api/hello` readiness probe and a fixed set of bearer-authenticated pre-pin bootstrap `GET` paths. The proxy stores and compares only the hash. |
-| `anthropic_external_url_request_guard` | `claude` | Denies `api.anthropic.com` requests whose JSON body declares an Anthropic server-side tool that reaches an external URL or runs code off-box. Decodes the body (reusing the gzip/deflate-capped decoder), and if it parses as JSON, inspects the top-level `tools` array by `type` prefix: `web_fetch` and `code_execution` (and a non-empty top-level `mcp_servers` array) are always denied; `web_search` is denied unless the companion `anthropic_allow_web_search` flag is set (expanded from `managed_network_integrations.claude.web_search`, default off). Client-executed built-ins (`bash_*`, `text_editor_*`, `memory_*`) and user-defined tools (which carry a `name` but no `type`) do not match. A body that cannot be decoded or that is declared JSON but fails to parse is denied (fail-closed). |
-| `github_repo_guard` | `github` | Carries the normalized `write_repositories` list and `require_dot_github_approval` toggle. Applies the access decision tables — every read allowed on `github.com` web/smart-HTTP, `api.github.com` REST, and `codeload`/`raw`; writes gated to the write list, with repository administration denied outright, GraphQL denied outright, and REST content-write bypasses denied when `.github` approval is required. The signed-URL domains carry no guard: they expand to plain `GET`/`HEAD` rules (presigned S3 paths have no owner/repo; the signed URL is the access control). Runs after the generic domain/method/path checks, before upstream connection, with no DNS dependency. |
+- `manifest.py` (pure, importable from config/CLI context): the integration's
+  identity and description, the fixed domain apexes it owns, its typed config
+  parser, and the denial reasons its guard can emit with agent-facing guidance.
+- `guard.py` (proxy runtime): the integration's exact host, method, path, and
+  provider-specific request decisions. Integrations can also provide a
+  post-allow gate response (the GitHub `.github` push gate), header rewriting
+  (GitHub credential injection), and per-message WebSocket inspection (the
+  OpenAI external-URL guard).
+
+The registry is hand-written, not discovered: `registry.py` maps integration
+ids to manifests and `runtime.py` maps them to guards. This is deliberately
+the opposite of apps and bundled tools, which auto-discover — integration
+code runs inside the proxy with the proxy's privileges and sees every
+request including bearer credentials, so adding one is a reviewed edit to a
+registry a security reviewer can read top to bottom, never a drop-in. Unit
+tests discover every package containing `manifest.py` and fail if it lacks an
+explicit registry or guard entry. The same tests enforce unique ids, unique
+denial codes, and disjoint managed apex claims.
+
+The public policy remains operator-oriented: managed provider config is under
+`network_integrations.<id>`, with operator-defined domains as the `custom`
+integration's `domains` map. Parsing maps each entry one-to-one into typed
+integration config. Managed hosts resolve to their fixed integration; every
+other host resolves to the `custom` integration, which owns the typed custom
+domain rules. A custom rule cannot overlap a managed apex. There is no generic
+expanded rule blob or cross-integration guard field.
+
+The proxy owns the pipeline order. Per request it resolves exactly one
+integration and calls its hooks: allow decision, then gate response, then
+header rewrite before forwarding. The selected integration reads its typed
+config directly, including options such as Claude web search and GitHub write
+repositories. Fixed routes live beside the provider guard rather than being
+generated into a second policy shape.
+Cross-cutting security machinery stays in the proxy core — path
+canonicalization, bounded body buffering and decompression, the fail-closed
+policy load, the public-address connect check — so guards receive normalized,
+fully buffered inputs and make one direct decision over typed config plus any
+proxy-readable state.
+
+An integration may need tables within the proxy's existing database identity.
+Its package owns the runtime logic; the admin-owned migration directory owns
+schema creation and narrow grants. The GitHub push gate uses this pattern for
+`pending_pushes` and quarantined payloads. Integrations do not run migrations
+or gain an independent database identity.
+
+## Denial Reasons and Agent Introspection
+
+Every proxy denial is one stable snake_case code — the 403 response body, the
+WebSocket close reason, and the `network_events.reason_code` column are all
+that code, with no parallel prose message. The code is the contract: each
+integration manifest catalogs its codes with agent-facing guidance naming the
+operator action that would change the outcome, and proxy-core codes
+(`network_policy_denied`, `host_not_allowed`, `plain_http_denied`, ...) carry
+the same catalog treatment. The admin UI events page renders the code; the
+guidance is the human explanation wherever one is needed.
+
+The agent reads this through two always-listed tools on the dedicated
+`/run/trustyclaw-agent-network/agent-network.sock` socket. The MCP shim combines
+them with bundled tools and `app_api` into one stable server (see
+[tools host integration](tools/host-integration.md)):
+
+- `list_network_integrations` — each registered integration with its
+  manifest description, whether it is enabled, and its policy options
+  (for GitHub: the write repositories and the `.github` approval toggle),
+  plus the custom-domain integration.
+- `recent_network_denials` — the newest denied decisions from
+  `network_events`, each joined against the denial catalog for guidance. The
+  answer is what enforcement actually decided, not a reconstruction: most
+  HTTP clients (git, pip, npm) swallow the proxy's 403 reason body, so this
+  is how the agent learns why a request failed and what to ask the operator
+  for. Probing by real request is safe by construction — a denied request is
+  refused before DNS resolution or any upstream connection, and logged.
+
+The `trustyclaw-agent-network` service has no internet egress. Its Postgres role
+has SELECT-only access to the normalized policy and `network_events`; the
+egress-capable `trustyclaw-tools` role has no access to those tables. Policy and
+decision logs carry no secret material.
 
 ### Path canonicalization
 
 Every guarded path — `path_guards` regexes and the GitHub repository match
-alike — is canonicalized before matching (`_normalized_path`): one
+alike — is canonicalized before matching (`normalized_path`): one
 percent-decode pass, then dot-segment collapse (`posixpath.normpath`), with
 the leading slash restored and a trailing slash preserved. The principle is
 that the guard must evaluate the path in the form the upstream server will
@@ -209,8 +274,8 @@ itself, one reason to prefer app mode. Two narrow root helpers
 carry the egress the admin service does not have: `mint-github-app-token`
 (short-lived, installation-wide App tokens) and `audit-github-repo` (the
 repository facts behind the operator warnings). Minted tokens are
-deliberately not scoped to the policy's repository list — the
-`github_repo_guard` above is the per-repository boundary on every request,
+deliberately not scoped to the policy's repository list — the GitHub
+integration guard above is the per-repository boundary on every request,
 and the App installation bounds what the token could reach if the proxy were
 bypassed.
 

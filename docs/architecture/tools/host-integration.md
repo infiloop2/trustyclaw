@@ -99,6 +99,17 @@ The listed actions are the enabled tools' manifest actions, named
   in the Tools tab) from *not bundled at all* (no host integration exists; the
   agent tells the operator the tool is not implemented and to file a feature
   request), instead of inferring from an empty list.
+- **`list_network_integrations`** and **`recent_network_denials`** are the
+  agent's read-only view of the host's network controls. A separate non-egress
+  `trustyclaw-agent-network` service serves them from
+  `/run/trustyclaw-agent-network/agent-network.sock`; the MCP shim aggregates
+  that listing with the tools socket. The first describes each integration and
+  its typed policy options, and the second returns the newest denied requests
+  from the proxy's decision log with each denial's code and guidance. They
+  exist because agent HTTP clients usually swallow the proxy's 403 body. The
+  network service reads only policy and event tables under SELECT grants; the
+  egress-capable tools role cannot read those tables. See
+  [network controls](../network-controls.md#denial-reasons-and-agent-introspection).
 - **`check_tool_approval`** is how the host meets its contract obligation to let
   the agent query an approval's status and terminal result: an approval-gated
   call returns a single token-bearing `approval_id` (`approval_<number>.<token>`),
