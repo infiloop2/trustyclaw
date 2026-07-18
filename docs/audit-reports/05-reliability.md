@@ -74,8 +74,8 @@ below names it.
 - `docs/architecture/services-and-runtimes.md`,
   `docs/architecture/admin-state-storage.md`,
   `docs/architecture/filesystem.md`, `docs/architecture/admin-api.md`
-- `host/runtime/admin_api.py`, `host/runtime/orchestrator.py`,
-  `host/runtime/state.py`, `host/runtime/db.py`, `host/runtime/pgclient.py`
+- `host/runtime/admin_api/service.py`, `host/runtime/admin_api/orchestrator.py`,
+  `host/runtime/core/state.py`, `host/runtime/core/db.py`, `host/runtime/core/pgclient.py`
 - systemd units, slice definitions, and volume setup in `host/bootstrap/`
 
 ## Audit entries
@@ -96,24 +96,24 @@ a live host.
   (`CPUWeight`/`MemoryHigh`/`MemoryMax`/`MemorySwapMax`/`TasksMax`), the
   network-proxy/admin-api/postgres units and restart policies, the volume
   layout, `postgresql.conf` (`max_connections=50`), and `pg_hba.conf`.
-- `host/runtime/admin_api.py` locks (mutation lock usage, `NETWORK_POLICY_LOCK`,
+- `host/runtime/admin_api/service.py` locks (mutation lock usage, `NETWORK_POLICY_LOCK`,
   `OAUTH_LOGIN_LOCK`), helper timeouts, the maintenance loop, and the
   queue/steer caps.
-- `host/runtime/state.py` (`mutation()` RLock, event caps + amortized prune,
-  task/thread-session pruning), `host/runtime/db.py` (pool, `MAX_ACTIVE_CONNECTIONS`,
-  checkout timeout), `host/runtime/pgclient.py` (socket handling),
-  `host/runtime/orchestrator.py` (worker pool, claim caps, lock ordering).
-- `host/runtime/network_proxy.py` for proxy-side resource bounds.
+- `host/runtime/core/state.py` (`mutation()` RLock, event caps + amortized prune,
+  task/thread-session pruning), `host/runtime/core/db.py` (pool, `MAX_ACTIVE_CONNECTIONS`,
+  checkout timeout), `host/runtime/core/pgclient.py` (socket handling),
+  `host/runtime/admin_api/orchestrator.py` (worker pool, claim caps, lock ordering).
+- `host/runtime/network_proxy/service.py` for proxy-side resource bounds.
 
 ### Findings
 
 | ID | Status | Severity | Location | Summary |
 | --- | --- | --- | --- | --- |
 | REL-1 | Open | High | `host/bootstrap/bootstrap.sh:396,443` (postgres unit/conf) | The Postgres Unix socket in `/var/run/postgresql` is reachable by the agent uid (nftables filters IP, not `AF_UNIX`; default `unix_socket_permissions=0777`, `RuntimeDirectory` mode `0755`), and `pg_hba` only *rejects* the agent after a backend is forked. With `max_connections=50` and the default `authentication_timeout=60s`, a malicious agent that opens ~50 socket connections and stalls before the startup packet holds every backend slot for 60s at a time, so the admin service and proxy get `53300` "too many connections". The proxy fails closed (safe), but the admin API's operator requests error out for as long as the agent sustains the flood — the operator loses control with no special policy needed. Restrict the socket dir/group (e.g. `unix_socket_group` + `0770` to a group excluding the agent) or lower `authentication_timeout`. |
-| REL-2 | Open | High | `host/runtime/network_proxy.py:362`, `host/runtime/state.py:112` | Under any wildcard allow rule (a first-class, documented feature — the manual-domain field literally suggests `*.example.com`), `ensure_host_cert` mints and stores a per-SNI-host keypair (`.crt`+`.key`+`.csr`+`.ext`, two `openssl` runs) with no eviction or cap, in `proxy-state/generated-certs` on the **admin** volume that also holds Postgres. The agent, by connecting to unbounded distinct sub-domains matching the wildcard, grows this directory without limit until the admin volume fills; Postgres writes then stall (see REL-3), wedging the admin API. The cache is only cleared on redeploy, not reboot. Cap/evict the cert cache, or move it off the admin volume. |
-| REL-3 | Open | Medium | `host/runtime/pgclient.py:139`, `host/runtime/db.py:164` | The wire client opens the `AF_UNIX` socket with no `settimeout()` and issues blocking `recv`s, and no `statement_timeout` is set on connections. Connection *checkout* is bounded (10s semaphore), but once a transaction is in flight a stalled Postgres (from REL-1, a full admin volume per REL-2, or otherwise) blocks the thread indefinitely. Because `state.mutation()` holds a process-wide RLock across its transaction, one stuck write freezes *all* admin-state mutations — policy replace, task cancel/kill — so the operator cannot regain control until Postgres recovers. Set a socket timeout and a `statement_timeout` so a wedged query fails instead of holding the mutation lock. |
-| REL-4 | Open | Medium | `host/runtime/orchestrator.py:390`, `host/runtime/state.py:606` | Agent-streamed output is stored via `record_agent_event("task.message", …, {"message": message})` with no per-row size cap, unlike `network_events` whose fields are explicitly truncated (`host[:512]`, `path[:2048]`, …). The 1,000,000-row retention bounds the event *count* but not per-row size, so an agent emitting very large messages can grow `agent_events` on the admin volume far beyond the intuitive bound (feeding the same volume-fill path as REL-2). Cap the stored message length. |
-| REL-5 | Open | Medium | `host/runtime/network_proxy.py:55,56` | `MAX_CONNECTIONS=64` handlers each buffer up to `MAX_BODY_BYTES=128 MiB` for inspection (and each web-search-inspected request may additionally hold a 128 MiB decoded body), i.e. up to ~8 GiB resident, yet the proxy service has no `MemoryMax` (only the *agent* slice is memory-limited). On a small instance the agent can OOM the proxy — its own sole egress path — by driving concurrent large POSTs. Put the proxy in a memory-limited cgroup or lower the body/connection product. |
+| REL-2 | Open | High | `host/runtime/network_proxy/service.py:362`, `host/runtime/core/state.py:112` | Under any wildcard allow rule (a first-class, documented feature — the manual-domain field literally suggests `*.example.com`), `ensure_host_cert` mints and stores a per-SNI-host keypair (`.crt`+`.key`+`.csr`+`.ext`, two `openssl` runs) with no eviction or cap, in `proxy-state/generated-certs` on the **admin** volume that also holds Postgres. The agent, by connecting to unbounded distinct sub-domains matching the wildcard, grows this directory without limit until the admin volume fills; Postgres writes then stall (see REL-3), wedging the admin API. The cache is only cleared on redeploy, not reboot. Cap/evict the cert cache, or move it off the admin volume. |
+| REL-3 | Open | Medium | `host/runtime/core/pgclient.py:139`, `host/runtime/core/db.py:164` | The wire client opens the `AF_UNIX` socket with no `settimeout()` and issues blocking `recv`s, and no `statement_timeout` is set on connections. Connection *checkout* is bounded (10s semaphore), but once a transaction is in flight a stalled Postgres (from REL-1, a full admin volume per REL-2, or otherwise) blocks the thread indefinitely. Because `state.mutation()` holds a process-wide RLock across its transaction, one stuck write freezes *all* admin-state mutations — policy replace, task cancel/kill — so the operator cannot regain control until Postgres recovers. Set a socket timeout and a `statement_timeout` so a wedged query fails instead of holding the mutation lock. |
+| REL-4 | Open | Medium | `host/runtime/admin_api/orchestrator.py:390`, `host/runtime/core/state.py:606` | Agent-streamed output is stored via `record_agent_event("task.message", …, {"message": message})` with no per-row size cap, unlike `network_events` whose fields are explicitly truncated (`host[:512]`, `path[:2048]`, …). The 1,000,000-row retention bounds the event *count* but not per-row size, so an agent emitting very large messages can grow `agent_events` on the admin volume far beyond the intuitive bound (feeding the same volume-fill path as REL-2). Cap the stored message length. |
+| REL-5 | Open | Medium | `host/runtime/network_proxy/service.py:55,56` | `MAX_CONNECTIONS=64` handlers each buffer up to `MAX_BODY_BYTES=128 MiB` for inspection (and each web-search-inspected request may additionally hold a 128 MiB decoded body), i.e. up to ~8 GiB resident, yet the proxy service has no `MemoryMax` (only the *agent* slice is memory-limited). On a small instance the agent can OOM the proxy — its own sole egress path — by driving concurrent large POSTs. Put the proxy in a memory-limited cgroup or lower the body/connection product. |
 
 ### Coverage and confidence
 
@@ -163,17 +163,17 @@ and filesystem growth paths. I did not run stress tests or a live host.
 - `host/bootstrap/bootstrap.sh`: agent slice limits, swapfile, service units,
   restart policies, nftables ordering, Postgres setup, volume ownership, proxy
   CA/cert directories, sudoers, and reboot helper.
-- `host/runtime/network_proxy.py` and `host/runtime/network_policy.py`: body
+- `host/runtime/network_proxy/service.py` and `host/runtime/core/network_policy.py`: body
   buffering, connection caps, WebSocket inspection, decompression limits,
   generated certificate cache, DNS/connect behavior, and fail-closed policy
   loads.
-- `host/runtime/admin_api.py`: idempotency caps, queued/steer caps,
+- `host/runtime/admin_api/service.py`: idempotency caps, queued/steer caps,
   maintenance loop, helper subprocess timeouts, reboot endpoint, process/file
   listing bounds, health, and startup recovery.
-- `host/runtime/orchestrator.py`: worker counts, per-runtime caps, pool lock
+- `host/runtime/admin_api/orchestrator.py`: worker counts, per-runtime caps, pool lock
   discipline, task claiming, kill/deactivate behavior, runtime status polling,
   and warm-server lifecycle.
-- `host/runtime/state.py`, `host/runtime/db.py`, `host/runtime/pgclient.py`,
+- `host/runtime/core/state.py`, `host/runtime/core/db.py`, `host/runtime/core/pgclient.py`,
   and `host/migrations/0001_admin_state_schema.sql`: table growth paths,
   pruning, transaction lock discipline, connection budgets, proxy grants, and
   Postgres schema/indexes.
@@ -185,8 +185,8 @@ and filesystem growth paths. I did not run stress tests or a live host.
 
 | ID | Status | Severity | Location | Summary |
 | --- | --- | --- | --- | --- |
-| REL-001 | Open | High | `host/runtime/network_proxy.py:55` | The proxy can buffer up to 128 MiB per handler and allows 64 concurrent handlers, so a malicious agent can force roughly 8 GiB of request-body buffers in `trustyclaw-proxy`, which is outside `trustyclaw_agent.slice`. Plain HTTP reads the body before policy validation (`host/runtime/network_proxy.py:230`), so even the fail-closed empty policy does not prevent this memory pressure. On the documented small host, this can OOM or swap-storm non-agent services and break operator control. Move cheap host/method/policy denial before body reads where possible, add an aggregate body-memory semaphore well below host reserve, and/or put the proxy service itself under a memory limit that preserves admin/Postgres/sshd. |
-| REL-002 | Open | Medium | `host/runtime/network_proxy.py:362` | Per-host MITM certificates are generated into the durable admin volume and are never pruned or capped. With a wildcard rule such as `*.example.com`, the agent can CONNECT to unbounded unique subdomains; each accepted host writes `.key`, `.csr`, `.ext`, and `.crt` files under `proxy-state/generated-certs` (`host/runtime/state.py:112`). Over time this can fill the admin volume that also holds Postgres state. Add an LRU/count/size cap, prune on startup/maintenance, or generate short-lived certs outside durable admin storage. |
+| REL-001 | Open | High | `host/runtime/network_proxy/service.py:55` | The proxy can buffer up to 128 MiB per handler and allows 64 concurrent handlers, so a malicious agent can force roughly 8 GiB of request-body buffers in `trustyclaw-proxy`, which is outside `trustyclaw_agent.slice`. Plain HTTP reads the body before policy validation (`host/runtime/network_proxy/service.py:230`), so even the fail-closed empty policy does not prevent this memory pressure. On the documented small host, this can OOM or swap-storm non-agent services and break operator control. Move cheap host/method/policy denial before body reads where possible, add an aggregate body-memory semaphore well below host reserve, and/or put the proxy service itself under a memory limit that preserves admin/Postgres/sshd. |
+| REL-002 | Open | Medium | `host/runtime/network_proxy/service.py:362` | Per-host MITM certificates are generated into the durable admin volume and are never pruned or capped. With a wildcard rule such as `*.example.com`, the agent can CONNECT to unbounded unique subdomains; each accepted host writes `.key`, `.csr`, `.ext`, and `.crt` files under `proxy-state/generated-certs` (`host/runtime/core/state.py:112`). Over time this can fill the admin volume that also holds Postgres state. Add an LRU/count/size cap, prune on startup/maintenance, or generate short-lived certs outside durable admin storage. |
 
 ### Coverage and confidence
 

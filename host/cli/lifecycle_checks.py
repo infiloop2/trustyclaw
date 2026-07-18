@@ -95,27 +95,27 @@ def _version_hint_error(
     if command.mode == "upgrade":
         if comparison >= 0:
             return (
-                f"upgrade requires preserved state older than local VERSION {target_version}; "
-                "run recover for same-version repair, or use a newer checkout for newer preserved state"
+                f"upgrade requires preserved state older than target VERSION {target_version}; "
+                "run recover for same-version repair, or target a newer TrustyClaw version for newer preserved state"
             )
         return None
     if command.mode == "recover":
         if command.allow_upgrade:
             if comparison > 0:
                 return (
-                    f"recover --allow-upgrade cannot move preserved state backward to local VERSION {target_version}; "
-                    "use a checkout at the same or newer TrustyClaw version"
+                    f"recover --allow-upgrade cannot move preserved state backward to target VERSION {target_version}; "
+                    "target the same or a newer TrustyClaw version"
                 )
             return None
         if comparison != 0:
             return (
-                f"recover requires preserved state to match local VERSION {target_version}; "
-                "use recover --allow-upgrade to advance older state, or use a newer checkout for newer preserved state"
+                f"recover requires preserved state to match target VERSION {target_version}; "
+                "use recover --allow-upgrade to advance older state, or target a newer TrustyClaw version for newer preserved state"
             )
     if command.mode == "reconfigure":
         if comparison != 0:
             return (
-                f"{command.mode} requires preserved state to match local VERSION {target_version}; "
-                "run upgrade first, or use a checkout matching the preserved state"
+                f"{command.mode} requires preserved state to match target VERSION {target_version}; "
+                "run upgrade first, or target the version matching the preserved state"
             )
     return None

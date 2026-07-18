@@ -18,15 +18,15 @@ import time
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from host.constants import LOOPBACK, MAX_REQUEST_BODY_BYTES as ADMIN_MAX_REQUEST_BODY_BYTES
-from host.runtime import db
+from host.constants import APP_BACKEND_ADMIN_SOCKET_PATH, LOOPBACK, MAX_REQUEST_BODY_BYTES as ADMIN_MAX_REQUEST_BODY_BYTES
+from host.runtime.core import db
 from host.session_options import public_session_options, session_config_error
 
 
 HOST = os.environ.get("TRUSTYCLAW_APP_HOST", LOOPBACK)
 PORT = int(os.environ.get("TRUSTYCLAW_APP_PORT", "7450"))
 DB_SCHEMA = os.environ.get("TRUSTYCLAW_APP_DB_SCHEMA", "app_agent_chat")
-ADMIN_API_SOCKET = os.environ.get("TRUSTYCLAW_APP_ADMIN_API_SOCKET", "/run/trustyclaw-admin-api/app-backend.sock")
+ADMIN_API_SOCKET = os.environ.get("TRUSTYCLAW_APP_ADMIN_API_SOCKET", APP_BACKEND_ADMIN_SOCKET_PATH)
 MAX_REQUEST_BODY_BYTES = 128 * 1024
 # Admin API responses (a thread's full task history) can exceed the inbound
 # request-body cap; size the response cap to the admin API's own body limit.

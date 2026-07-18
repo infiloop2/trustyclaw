@@ -3,7 +3,7 @@
 Admin, network, app, and tool state live in a local PostgreSQL database,
 `trustyclaw_admin`, served by `trustyclaw-postgres.service`. TrustyClaw
 services use the in-repo standard-library wire-protocol client
-(`host/runtime/pgclient.py`), which implements only Unix sockets, peer auth,
+(`host/runtime/core/pgclient.py`), which implements only Unix sockets, peer auth,
 and text-format values. PostgreSQL has no TCP listener
 (`listen_addresses = ''`); the socket is
 `/var/run/postgresql/.s.PGSQL.5432`.
@@ -56,7 +56,7 @@ tool-owned metadata and approval payloads (JSON by the tool contract).
 
 Stored secrets include the Cloudflare tunnel token, GitHub PAT or App private
 key and working token, every tool config value, and OAuth provider token
-material. `host/runtime/secretbox.py` encrypts them with AES-256-CBC through
+material. `host/runtime/core/secretbox.py` encrypts them with AES-256-CBC through
 OpenSSL using the key in `secret_keys`, which the schema creates from
 Postgres's CSPRNG. Upgrade and recovery carry ciphertext and key together on
 the admin volume. This is an accidental-exposure control, not a root or
@@ -76,7 +76,7 @@ data files with new binaries.
 
 ## How runtime code uses it
 
-`host/runtime/state.py` exposes per-operation accessors that run real queries
+`host/runtime/core/state.py` exposes per-operation accessors that run real queries
 against normalized tables; no request materializes the complete state. Hot
 paths are indexed for task status/thread/runtime lookup, per-thread history,
 event paging, and pruning. Reads use MVCC transactions and fetch only the rows
@@ -87,7 +87,7 @@ races such as approval decisions use conditional SQL transitions. Events
 written inside a mutation share its transaction; serial event ids are unique
 and increasing with harmless gaps after aborts.
 
-`host/runtime/db.py` owns a small pool in each service process, capped at 14
+`host/runtime/core/db.py` owns a small pool in each service process, capped at 14
 active sessions per process. PostgreSQL allows 100 connections: the three core
 database clients and two bundled apps can use at most 70, leaving 30 for operator,
 superuser, and deployment access. Each app has its own 14-session semaphore,
@@ -151,8 +151,8 @@ ALTER TABLE tasks ADD COLUMN priority BIGINT;
 ALTER TABLE tasks DROP COLUMN priority;
 ```
 
-`host/runtime/migrate.py` is the runner
-(`python3 -m host.runtime.migrate {up|down|status} [--to VERSION]`). Applied
+`host/runtime/deploy/migrate.py` is the runner
+(`python3 -m host.runtime.deploy.migrate {up|down|status} [--to VERSION]`). Applied
 versions are recorded in `schema_migrations`; `up` applies only pending files,
 all in one transaction (PostgreSQL DDL is transactional), under an advisory
 lock so concurrent runners serialize. It is an in-repo runner rather than
@@ -171,7 +171,7 @@ schema/code mismatch (unsupported) fails loudly instead of being papered
 over.
 
 `migrate down` is a manual operator action only
-(`sudo -u trustyclaw-admin env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.migrate down`).
+(`sudo -u trustyclaw-admin env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.deploy.migrate down`).
 
 Rules for changing persisted state shape from now on:
 

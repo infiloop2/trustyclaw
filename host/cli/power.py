@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
+import os
 import subprocess
 import sys
 from typing import Any
 
-from host.config import ConfigError, InputConfig, load_input_config
+from host.config import ConfigError, InputConfig, build_input_config
 from host.constants import ADMIN_API_PORT
 from host.cli.lifecycle_aws import _aws, _aws_env, _existing_storage_roles, _find_existing_instances, _find_storage_volume
 from host.cli.lifecycle_constants import SSH_USER
@@ -20,19 +20,19 @@ def main_for_power_mode(mode: str, argv: list[str] | None = None) -> int:
         raise ValueError(f"unsupported power mode: {mode}")
     parser = argparse.ArgumentParser(
         prog=f"python3 -m host.cli.{mode}",
-        description=(
-            f"{mode.capitalize()} an existing TrustyClaw EC2 instance. The config must contain "
-            "agent_name, aws_region, aws_access_key_id_env, and aws_secret_access_key_env only."
-        ),
+        description=f"{mode.capitalize()} an existing TrustyClaw EC2 instance.",
     )
-    parser.add_argument("--config", required=True, help="Path to input config JSON")
     parser.add_argument(
-        "--result-file",
-        help=f"Path for the local result JSON. Defaults to <agent_name>-{mode}.json.",
+        "--agent-name",
+        required=True,
+        help="Stable host name: 1-50 characters of letters, numbers, '-' or '_'.",
     )
     args = parser.parse_args(argv)
     try:
-        config = load_input_config(args.config, require_operator_connections=False)
+        region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+        if not region:
+            raise ConfigError("set AWS_REGION to the agent's AWS region")
+        config = build_input_config(args.agent_name, region)
         env = _aws_env(config)
         instance_id = _single_existing_instance(config, env)
         _require_preserved_storage(config, env)
@@ -42,18 +42,14 @@ def main_for_power_mode(mode: str, argv: list[str] | None = None) -> int:
             final = _start_instance(env, instance_id, initial_state)
         else:
             final = _stop_instance(env, instance_id, initial_state)
-        output_path = Path(args.result_file or f"{config.agent_name}-{mode}.json")
-        output_path.touch(mode=0o600)
-        output_path.chmod(0o600)
-        output_path.write_text(
+        # stdout carries only this result JSON.
+        print(
             json.dumps(
                 _result(config, env, final, mode=mode, initial_state=initial_state),
                 indent=2,
                 sort_keys=True,
             )
-            + "\n"
         )
-        print(f"Wrote {mode} result to {output_path}")
         return 0
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)

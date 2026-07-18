@@ -7,7 +7,8 @@ import re
 import tempfile
 import unittest
 
-from host.runtime import app_platform, migrate
+from host.runtime.core import app_platform
+from host.runtime.deploy import migrate
 from host.constants import APP_PORT_BASE
 
 

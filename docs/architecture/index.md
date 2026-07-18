@@ -45,5 +45,5 @@ terminate, and recreate them when the operator upgrades or recovers the host.
 TrustyClaw's Python runtime uses only the Python 3 standard library. Admin,
 network, app, and tool state live in a local Postgres database on the durable
 admin volume, spoken to by an in-repo wire-protocol client
-(`host/runtime/pgclient.py`). The proxy keeps only file-oriented TLS and Git
+(`host/runtime/core/pgclient.py`). The proxy keeps only file-oriented TLS and Git
 quarantine state in its own durable directory.

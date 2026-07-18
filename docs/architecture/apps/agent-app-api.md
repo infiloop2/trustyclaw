@@ -111,7 +111,7 @@ does not store or expose a second ledger of agent-to-app calls.
 
 ## The agent-facing tool
 
-The tools MCP shim (`host.runtime.tools_mcp_shim`) always serves one extra
+The tools MCP shim (`host.runtime.agent_shim.mcp_shim`) always serves one extra
 tool, `app_api`. Its stable presence grants no authority and avoids changing
 the MCP tool list between ordinary and app-created tasks. There is nothing to
 configure and no secret to deliver: the shim is a child of the runtime CLI,

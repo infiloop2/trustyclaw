@@ -23,20 +23,13 @@ import pg_harness
 
 from host.config import parse_network_controls
 from host.network_integrations.github.push_gate import pending as github_pending_push
-from host.runtime import (
-    app_api_proxy,
-    app_backend_admin_api,
-    admin_api,
-    github_credential,
-    orchestrator,
-    tools_admin_api,
-    tools_api,
-)
-from host.runtime.network_policy import load_policy
-from host.runtime.state import save_network_policy as save_policy
-from host.runtime.state import save_github_credential
-from host.runtime import state
-from host.runtime.state import (
+from host.runtime.admin_api import app_api_proxy, app_backend_api as app_backend_admin_api, service as admin_api, github_credential, orchestrator, tools_client as tools_admin_api
+from host.runtime.tools import api as tools_api
+from host.runtime.core.network_policy import load_policy
+from host.runtime.core.state import save_network_policy as save_policy
+from host.runtime.core.state import save_github_credential
+from host.runtime.core import state
+from host.runtime.core.state import (
     append_network_event,
     read_claude_account,
     read_openai_account,
@@ -70,7 +63,7 @@ class AdminUiStaticTests(unittest.TestCase):
         AdminApiIntegrationTests.test_admin_ui_has_thread_task_event_smoke_path(self)
 
     def test_connection_guide_preserves_network_and_data_disclosure_contracts(self) -> None:
-        runtime = Path(__file__).parents[1] / "host/runtime"
+        runtime = Path(__file__).parents[1] / "host/runtime/admin_api"
         catalog = (runtime / "admin_ui" / "integration_catalog.js").read_text()
         guide = (runtime / "admin_ui" / "connection_guide.js").read_text()
         html = (runtime / "admin_ui.html").read_text()
@@ -120,7 +113,7 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertFalse((repo / "host/runtime/admin_ui/guide_assets").exists())
 
     def test_disabled_integrations_omit_irrelevant_connection_state(self) -> None:
-        runtime = Path(__file__).parents[1] / "host/runtime"
+        runtime = Path(__file__).parents[1] / "host/runtime/admin_api"
         network_js = (runtime / "admin_ui" / "network.js").read_text()
         tools_js = (runtime / "admin_ui" / "tools.js").read_text()
         css = (runtime / "admin_ui.css").read_text()
@@ -132,7 +125,7 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertIn("color: var(--text-dim);", css)
 
     def test_mobile_navigation_uses_an_accessible_drawer(self) -> None:
-        runtime = Path(__file__).parents[1] / "host/runtime"
+        runtime = Path(__file__).parents[1] / "host/runtime/admin_api"
         html = (runtime / "admin_ui.html").read_text()
         app_js = (runtime / "admin_ui" / "app.js").read_text()
         css = (runtime / "admin_ui.css").read_text()
@@ -147,7 +140,7 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertIn(".sidebar.mobile-open { transform: translateX(0); }", css)
 
     def test_provider_usage_rings_have_warning_and_critical_thresholds(self) -> None:
-        runtime = Path(__file__).parents[1] / "host/runtime"
+        runtime = Path(__file__).parents[1] / "host/runtime/admin_api"
         health_js = (runtime / "admin_ui" / "health.js").read_text()
         css = (runtime / "admin_ui.css").read_text()
 
@@ -158,7 +151,7 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertIn(".usage-ring.usage-critical .usage-ring-value { stroke: var(--usage-critical); }", css)
 
     def test_provider_usage_rings_show_compact_reset_countdowns(self) -> None:
-        runtime = Path(__file__).parents[1] / "host/runtime"
+        runtime = Path(__file__).parents[1] / "host/runtime/admin_api"
         health_js = (runtime / "admin_ui" / "health.js").read_text()
         css = (runtime / "admin_ui.css").read_text()
 
@@ -173,7 +166,7 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertIn(".usage-window {", css)
 
     def test_upgrade_notice_is_compact_accessible_and_version_driven(self) -> None:
-        runtime = Path(__file__).parents[1] / "host/runtime"
+        runtime = Path(__file__).parents[1] / "host/runtime/admin_api"
         html = (runtime / "admin_ui.html").read_text()
         health_js = (runtime / "admin_ui" / "health.js").read_text()
         css = (runtime / "admin_ui.css").read_text()
@@ -192,7 +185,7 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertIn(".upgrade-notice:hover .upgrade-popover", css)
 
     def test_icons_have_intrinsic_sizes_and_share_the_favicon_asset(self) -> None:
-        runtime = Path(__file__).parents[1] / "host/runtime"
+        runtime = Path(__file__).parents[1] / "host/runtime/admin_api"
         html = (runtime / "admin_ui.html").read_text()
         css = (runtime / "admin_ui.css").read_text()
 
@@ -241,7 +234,7 @@ class AdminUiStaticTests(unittest.TestCase):
         class User:
             pw_uid = 12345
 
-        with patch("host.runtime.app_backend_admin_api.pwd.getpwnam", return_value=User()):
+        with patch("host.runtime.admin_api.app_backend_api.pwd.getpwnam", return_value=User()):
             self.assertEqual(app_backend_admin_api.app_id_for_peer_uid(12345), "agent_chat")
             self.assertIsNone(app_backend_admin_api.app_id_for_peer_uid(54321))
 
@@ -254,8 +247,8 @@ class AdminUiStaticTests(unittest.TestCase):
             request = Request()
 
         with (
-            patch("host.runtime.app_backend_admin_api._peer_uid", return_value=12345),
-            patch("host.runtime.app_backend_admin_api.app_id_for_peer_uid", return_value="other_app"),
+            patch("host.runtime.admin_api.app_backend_api._peer_uid", return_value=12345),
+            patch("host.runtime.admin_api.app_backend_api.app_id_for_peer_uid", return_value="other_app"),
             self.assertRaises(admin_api.ApiError) as error,
         ):
             app_backend_admin_api.Handler._authenticate_app_backend_id(Handler())  # type: ignore[arg-type]
@@ -322,7 +315,7 @@ class AdminUiStaticTests(unittest.TestCase):
 
     def test_app_backend_thread_task_listing_uses_app_prefixed_thread_path(self) -> None:
         with patch(
-            "host.runtime.app_backend_admin_api.admin_api.route",
+            "host.runtime.admin_api.app_backend_api.admin_api.route",
             return_value={"tasks": [{"task_id": "task_1", "thread_id": "agent_chat__chat"}]},
         ) as route:
             response = app_backend_admin_api.route_app_backend_request(
@@ -334,7 +327,7 @@ class AdminUiStaticTests(unittest.TestCase):
 
     def test_app_backend_thread_events_use_app_prefixed_thread_path(self) -> None:
         with patch(
-            "host.runtime.app_backend_admin_api.admin_api.route",
+            "host.runtime.admin_api.app_backend_api.admin_api.route",
             return_value={"events": [{"seq": 4, "task_id": "task_1", "event_type": "task.message"}]},
         ) as route:
             response = app_backend_admin_api.route_app_backend_request(
@@ -348,7 +341,7 @@ class AdminUiStaticTests(unittest.TestCase):
 
     def test_app_backend_bulk_thread_list_is_filtered_to_the_calling_app(self) -> None:
         with patch(
-            "host.runtime.app_backend_admin_api.admin_api.route",
+            "host.runtime.admin_api.app_backend_api.admin_api.route",
             return_value={
                 "threads": [
                     {"thread_id": "agent_chat__chat", "task_count": 2},
@@ -379,7 +372,7 @@ class AdminUiStaticTests(unittest.TestCase):
 
     def test_app_backend_task_scope_rejects_other_thread_prefixes(self) -> None:
         with (
-            patch("host.runtime.app_backend_admin_api.state.get_task", return_value={"thread_id": "other_app__chat"}),
+            patch("host.runtime.admin_api.app_backend_api.state.get_task", return_value={"thread_id": "other_app__chat"}),
             self.assertRaises(admin_api.ApiError) as error,
         ):
             app_backend_admin_api._require_app_task_scope("agent_chat", "GET", "/v1/tasks/task_1")
@@ -388,9 +381,9 @@ class AdminUiStaticTests(unittest.TestCase):
 
     def test_app_backend_task_routes_scope_raw_task_ids_before_forwarding(self) -> None:
         with (
-            patch("host.runtime.app_backend_admin_api.state.get_task", return_value={"thread_id": "agent_chat__chat"}),
+            patch("host.runtime.admin_api.app_backend_api.state.get_task", return_value={"thread_id": "agent_chat__chat"}),
             patch(
-                "host.runtime.app_backend_admin_api.admin_api.route",
+                "host.runtime.admin_api.app_backend_api.admin_api.route",
                 return_value={"task_id": "task_1", "thread_id": "agent_chat__chat"},
             ) as route,
         ):
@@ -413,7 +406,7 @@ class AdminUiStaticTests(unittest.TestCase):
             "created_at": "2026-06-08T00:00:00Z",
             "updated_at": "2026-06-08T00:00:00Z",
         }
-        with patch("host.runtime.admin_api.state.get_task", return_value=task) as get_task:
+        with patch("host.runtime.admin_api.service.state.get_task", return_value=task) as get_task:
             response = admin_api.get_task("task_1")
 
         get_task.assert_called_once_with("task_1")
@@ -466,8 +459,8 @@ class AgentProcessSnapshotTests(unittest.TestCase):
             (proc_123 / "cmdline").write_bytes(b"codex\0app-server\0--listen\0stdio://\0")
 
             with (
-                patch("host.runtime.admin_api.AGENT_CGROUP_ROOT", root / "cgroup"),
-                patch("host.runtime.admin_api.PROC_ROOT", proc),
+                patch("host.runtime.admin_api.service.AGENT_CGROUP_ROOT", root / "cgroup"),
+                patch("host.runtime.admin_api.service.PROC_ROOT", proc),
             ):
                 snapshot = admin_api.agent_processes()
 
@@ -514,7 +507,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         state["agent_runtime_statuses"]["claude_code"]["status"] = "deactivated"
         save_state(state)
         self.reconcile_patch = patch(
-            "host.runtime.admin_api.orchestrator.reconcile_runtime_status_after_policy_change"
+            "host.runtime.admin_api.service.orchestrator.reconcile_runtime_status_after_policy_change"
         )
         self.mock_reconcile = self.reconcile_patch.start()
         self.addCleanup(self.reconcile_patch.stop)
@@ -556,11 +549,11 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
     def health(self, proxy_alive: bool = True):
         with (
-            patch("host.runtime.admin_api.host_metrics", return_value={"cpu": {}, "memory": {}, "filesystem": {}, "swap": {}}),
-            patch("host.runtime.admin_api.proxy_alive", return_value=proxy_alive),
-            patch("host.runtime.admin_api.version_status", return_value={"status": "ok", "runtime": "0.2.0", "state": "0.2.0"}),
+            patch("host.runtime.admin_api.service.host_metrics", return_value={"cpu": {}, "memory": {}, "filesystem": {}, "swap": {}}),
+            patch("host.runtime.admin_api.service.proxy_alive", return_value=proxy_alive),
+            patch("host.runtime.admin_api.service.version_status", return_value={"status": "ok", "runtime": "0.2.0", "state": "0.2.0"}),
             patch(
-                "host.runtime.admin_api.upgrade_check.status",
+                "host.runtime.admin_api.service.upgrade_check.status",
                 return_value={"available": True, "latest": "0.3.0"},
             ),
         ):
@@ -818,7 +811,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         app = admin_api.app_platform.app_by_id("agent_chat")
         if app is None:
             self.fail("agent_chat app should be installed")
-        with patch("host.runtime.app_api_proxy.http.client.HTTPConnection", FakeConnection):
+        with patch("host.runtime.admin_api.app_api_proxy.http.client.HTTPConnection", FakeConnection):
             body = app_api_proxy.proxy_app_api(app, "GET", "/health", {}, None)
 
         self.assertEqual(body, {"status": "ok"})
@@ -841,7 +834,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
             }
             return values[path]
 
-        with patch("host.runtime.admin_api.shutil.disk_usage", side_effect=fake_disk_usage):
+        with patch("host.runtime.admin_api.service.shutil.disk_usage", side_effect=fake_disk_usage):
             metrics = admin_api.filesystem_metrics()
 
         self.assertEqual(metrics["mounts"], {
@@ -881,7 +874,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         state["agent_runtime_statuses"]["codex"]["status"] = "loading"
         save_state(state)
         with patch(
-            "host.runtime.orchestrator.codex_app_server.account_status",
+            "host.runtime.admin_api.orchestrator.codex_app_server.account_status",
             side_effect=AssertionError("health must not call Codex"),
         ):
             _, body = self.health()
@@ -892,7 +885,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         state["agent_runtime_statuses"]["codex"]["status"] = "loading"
         save_state(state)
         with patch(
-            "host.runtime.orchestrator.codex_app_server.account_status",
+            "host.runtime.admin_api.orchestrator.codex_app_server.account_status",
             return_value=("awaiting_login", None, None),
         ):
             self.assertEqual(orchestrator.refresh_runtime_status("codex"), "awaiting_login")
@@ -902,7 +895,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
     def test_runtime_status_error_surfaces_error_message(self) -> None:
         with patch(
-            "host.runtime.orchestrator.codex_app_server.account_status",
+            "host.runtime.admin_api.orchestrator.codex_app_server.account_status",
             return_value=("error", "timed out waiting for Codex app-server; app-server stderr: boom", None),
         ):
             self.assertEqual(orchestrator.refresh_runtime_status("codex"), "error")
@@ -911,7 +904,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertIn("boom", self.runtime({"agent_runtime": body})["error_message"])
         # The error message clears once the runtime recovers.
         with patch(
-            "host.runtime.orchestrator.codex_app_server.account_status",
+            "host.runtime.admin_api.orchestrator.codex_app_server.account_status",
             return_value=("awaiting_login", None, None),
         ):
             orchestrator.refresh_runtime_status("codex")
@@ -931,7 +924,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         save_state(state)
 
         with patch(
-            "host.runtime.orchestrator.claude_code.account_status",
+            "host.runtime.admin_api.orchestrator.claude_code.account_status",
             side_effect=AssertionError("disabled Claude runtime must not touch Claude Code"),
         ):
             self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "deactivated")
@@ -975,9 +968,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
         request = urllib.request.Request(f"{self.base_url}/v1/health")
         request.add_header("Authorization", "Bearer admin-secret")
         with (
-            patch("host.runtime.admin_api.host_metrics", return_value={"cpu": {}, "memory": {}, "filesystem": {}, "swap": {}}),
-            patch("host.runtime.admin_api.proxy_alive", return_value=True),
-            patch("host.runtime.admin_api.version_status", return_value={"status": "ok", "runtime": "0.2.0", "state": "0.2.0"}),
+            patch("host.runtime.admin_api.service.host_metrics", return_value={"cpu": {}, "memory": {}, "filesystem": {}, "swap": {}}),
+            patch("host.runtime.admin_api.service.proxy_alive", return_value=True),
+            patch("host.runtime.admin_api.service.version_status", return_value={"status": "ok", "runtime": "0.2.0", "state": "0.2.0"}),
             urllib.request.urlopen(request, timeout=5) as response,
         ):
             self.assertEqual(response.status, 200)
@@ -1015,7 +1008,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 "",
             )
 
-        with patch("host.runtime.admin_api.subprocess.run", side_effect=fake_run):
+        with patch("host.runtime.admin_api.service.subprocess.run", side_effect=fake_run):
             status, listed = self.request("GET", "/v1/agent-files?path=/")
             self.assertEqual(status, 200)
             self.assertEqual(listed["entries"][0]["name"], ".codex")
@@ -1052,7 +1045,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         )
         request.add_header("Authorization", "Bearer admin-secret")
         with (
-            patch("host.runtime.admin_api.subprocess.Popen", return_value=process) as popen,
+            patch("host.runtime.admin_api.service.subprocess.Popen", return_value=process) as popen,
             urllib.request.urlopen(request, timeout=5) as response,
         ):
             self.assertEqual(response.status, 200)
@@ -1079,7 +1072,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         process.poll.return_value = 0
         process.wait.return_value = 0
 
-        with patch("host.runtime.admin_api.subprocess.Popen", return_value=process):
+        with patch("host.runtime.admin_api.service.subprocess.Popen", return_value=process):
             with self.assertRaises(urllib.error.HTTPError) as error:
                 self.request("GET", "/v1/agent-files/content?path=%2Fworkspace%2Fpayload.mp4")
 
@@ -1087,7 +1080,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertIn("invalid metadata", error.exception.read().decode())
 
     def test_agent_file_content_rejects_non_video_path_before_helper(self) -> None:
-        with patch("host.runtime.admin_api.subprocess.Popen") as popen:
+        with patch("host.runtime.admin_api.service.subprocess.Popen") as popen:
             with self.assertRaises(urllib.error.HTTPError) as error:
                 self.request("GET", "/v1/agent-files/content?path=%2Fworkspace%2Fpayload.html")
 
@@ -1104,14 +1097,14 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 "",
             )
 
-        with patch("host.runtime.admin_api.subprocess.run", side_effect=missing):
+        with patch("host.runtime.admin_api.service.subprocess.run", side_effect=missing):
             with self.assertRaises(urllib.error.HTTPError) as error:
                 self.request("GET", "/v1/agent-files?path=/missing")
         self.assertEqual(error.exception.code, 404)
         self.assertIn("path not found", error.exception.read().decode())
 
     def test_agent_file_helper_permission_error_during_timeout_returns_504(self) -> None:
-        with patch("host.runtime.admin_api.subprocess.run", side_effect=PermissionError("kill denied")):
+        with patch("host.runtime.admin_api.service.subprocess.run", side_effect=PermissionError("kill denied")):
             with self.assertRaises(urllib.error.HTTPError) as error:
                 self.request("GET", "/v1/agent-files?path=/")
         self.assertEqual(error.exception.code, 504)
@@ -1454,14 +1447,14 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(second["events"], [])
 
     def test_admin_ui_has_thread_task_event_smoke_path(self) -> None:
-        runtime = Path(__file__).parents[1] / "host/runtime"
+        runtime = Path(__file__).parents[1] / "host/runtime/admin_api"
         html = (runtime / "admin_ui.html").read_text()
         ui = "\n".join(
             path.read_text()
             for path in [runtime / "admin_ui.html", runtime / "admin_ui.css",
                          *sorted((runtime / "admin_ui").glob("*.js"))]
         )
-        api = (runtime / "admin_api.py").read_text()
+        api = (runtime / "service.py").read_text()
         self.assertIn("<h2>Sessions</h2>", html)
         self.assertIn('<link rel="stylesheet" href="/admin_ui.css">', html)
         self.assertIn('<link rel="icon" type="image/svg+xml" href="/favicon.svg">', html)
@@ -1705,7 +1698,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
     def test_network_policy_rejects_ssh_port_field(self) -> None:
         body = {"ssh_port_opened": False, "network_integrations": {"openai": {"enabled": True}}}
-        with patch("host.runtime.admin_api.subprocess.run") as run:
+        with patch("host.runtime.admin_api.service.subprocess.run") as run:
             with self.assertRaises(urllib.error.HTTPError) as error:
                 self.request("PUT", "/v1/network/policy", body)
         self.assertEqual(error.exception.code, 400)
@@ -1925,7 +1918,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 return {"token": f"ghs_minted_{len(mints)}", "expires_at": "2999-01-01T00:00:00Z"}
             raise AssertionError(f"unexpected helper call: {command}")
 
-        with patch("host.runtime.github_credential._run_helper_json", side_effect=fake_helper):
+        with patch("host.runtime.admin_api.github_credential._run_helper_json", side_effect=fake_helper):
             _, saved = self.request(
                 "PUT",
                 "/v1/network-tools/github-credential",
@@ -1974,7 +1967,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         # A failing mint keeps the credential configured and lands the
         # failure in the validation status instead of an HTTP error.
         with patch(
-            "host.runtime.github_credential._run_helper_json",
+            "host.runtime.admin_api.github_credential._run_helper_json",
             side_effect=github_credential.HelperError("mint upstream down"),
         ):
             _, saved = self.request(
@@ -2016,7 +2009,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 return {"token": "ghs_recovered", "expires_at": "2999-01-01T00:00:00Z"}
             raise AssertionError(f"unexpected helper call: {command}")
 
-        with patch("host.runtime.github_credential._run_helper_json", side_effect=fake_helper):
+        with patch("host.runtime.admin_api.github_credential._run_helper_json", side_effect=fake_helper):
             github_credential.reconcile()
             self.assertIsNone(state.read_proxy_github_token())
             _, metadata = self.request("GET", "/v1/network-tools/github-credential")
@@ -2044,7 +2037,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 raise github_credential.HelperError("mint upstream 503")
             raise AssertionError(f"unexpected helper call: {command}")
 
-        with patch("host.runtime.github_credential._run_helper_json", side_effect=fake_helper):
+        with patch("host.runtime.admin_api.github_credential._run_helper_json", side_effect=fake_helper):
             _, saved = self.request(
                 "PUT",
                 "/v1/network-tools/github-credential",
@@ -2086,7 +2079,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 return {"token": "ghs_post_grant", "expires_at": "2999-01-01T00:00:00Z"}
             raise AssertionError(f"unexpected helper call: {command}")
 
-        with patch("host.runtime.github_credential._run_helper_json", side_effect=fake_helper):
+        with patch("host.runtime.admin_api.github_credential._run_helper_json", side_effect=fake_helper):
             status, _ = self.request(
                 "PUT",
                 "/v1/network/policy",
@@ -2103,7 +2096,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         # since an installation token only covers repositories granted at mint
         # time.
         with patch(
-            "host.runtime.github_credential._run_helper_json",
+            "host.runtime.admin_api.github_credential._run_helper_json",
             return_value={"token": "ghs_widened", "expires_at": "2999-01-01T00:00:00Z"},
         ):
             self.request(
@@ -2126,7 +2119,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         # Any GitHub-integration change mints fresh — removals included — one
         # simple rule instead of widening-only bookkeeping.
         with patch(
-            "host.runtime.github_credential._run_helper_json",
+            "host.runtime.admin_api.github_credential._run_helper_json",
             return_value={"token": "ghs_narrowed", "expires_at": "2999-01-01T00:00:00Z"},
         ):
             status, _ = self.request(
@@ -2145,7 +2138,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         # healthy published token: no mint, so a transient mint outage cannot
         # break working access.
         with patch(
-            "host.runtime.github_credential._run_helper_json",
+            "host.runtime.admin_api.github_credential._run_helper_json",
             side_effect=AssertionError("a github-untouched publish must not mint"),
         ):
             status, _ = self.request(
@@ -2192,7 +2185,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 return {"token": "ghs_post_grant", "expires_at": "2999-01-01T00:00:00Z"}
             raise AssertionError(f"unexpected helper call: {command}")
 
-        with patch("host.runtime.github_credential._run_helper_json", side_effect=fake_helper):
+        with patch("host.runtime.admin_api.github_credential._run_helper_json", side_effect=fake_helper):
             status, _ = self.request("PUT", "/v1/network/policy", enabling_policy)
             self.assertEqual(status, 200)
             # Enabled, but failed closed: the previously published token is
@@ -2227,7 +2220,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 return {"token": "ghs_read_only", "expires_at": "2999-01-01T00:00:00Z"}
             raise AssertionError(f"unexpected helper call: {command}")
 
-        with patch("host.runtime.github_credential._run_helper_json", side_effect=fake_helper):
+        with patch("host.runtime.admin_api.github_credential._run_helper_json", side_effect=fake_helper):
             status, _ = self.request(
                 "PUT",
                 "/v1/network/policy",
@@ -2268,7 +2261,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 }
             raise AssertionError(f"unexpected helper call: {command}")
 
-        with patch("host.runtime.github_credential._run_helper_json", side_effect=fake_helper):
+        with patch("host.runtime.admin_api.github_credential._run_helper_json", side_effect=fake_helper):
             # Seed an app credential whose token needs minting, then start a
             # refresh that blocks inside the mint helper.
             save_github_credential(
@@ -2411,12 +2404,12 @@ class AdminApiIntegrationTests(unittest.TestCase):
         # A timed-out helper may still reboot the host, so neither timeout shape
         # (nor the PermissionError an unkillable root child produces) is an error.
         for effect in (subprocess.TimeoutExpired(cmd="reboot-host", timeout=10), PermissionError("not permitted")):
-            with patch("host.runtime.admin_api.subprocess.run", side_effect=effect):
+            with patch("host.runtime.admin_api.service.subprocess.run", side_effect=effect):
                 self.assertEqual(admin_api.reboot_host(), {"status": "accepted"})
 
     def test_reboot_helper_failure_returns_500(self) -> None:
         failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="sudo: not allowed")
-        with patch("host.runtime.admin_api.subprocess.run", return_value=failed):
+        with patch("host.runtime.admin_api.service.subprocess.run", return_value=failed):
             with self.assertRaises(admin_api.ApiError) as error:
                 admin_api.reboot_host()
         self.assertEqual(error.exception.status, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -2474,11 +2467,11 @@ class AdminApiIntegrationTests(unittest.TestCase):
         save_state(state)
         with (
             patch(
-                "host.runtime.orchestrator.codex_app_server.read_completed_device_login_account_id",
+                "host.runtime.admin_api.orchestrator.codex_app_server.read_completed_device_login_account_id",
                 return_value="acct_smoke",
             ),
             patch(
-                "host.runtime.orchestrator.codex_app_server.account_status",
+                "host.runtime.admin_api.orchestrator.codex_app_server.account_status",
                 return_value=("active", None, "acct_smoke"),
             ),
         ):
@@ -2494,7 +2487,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         save_approved_openai_account("acct_smoke")
 
         with patch(
-            "host.runtime.orchestrator.codex_app_server.account_status",
+            "host.runtime.admin_api.orchestrator.codex_app_server.account_status",
             return_value=("awaiting_login", None, None),
         ):
             self.assertEqual(orchestrator.refresh_runtime_status("codex"), "awaiting_login")
@@ -2515,7 +2508,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         save_claude_account({"account_id": "acct_smoke", "access_token_sha256": "f" * 64})
 
         with patch(
-            "host.runtime.orchestrator.claude_code.account_status",
+            "host.runtime.admin_api.orchestrator.claude_code.account_status",
             return_value=("awaiting_login", None, None),
         ):
             self.assertEqual(orchestrator.refresh_runtime_status("claude_code"), "awaiting_login")
@@ -2542,7 +2535,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
         with (
             patch(
-                "host.runtime.orchestrator.claude_code.account_status",
+                "host.runtime.admin_api.orchestrator.claude_code.account_status",
                 return_value=(
                     "active",
                     None,
@@ -2550,7 +2543,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 ),
             ),
             patch(
-                "host.runtime.orchestrator.claude_code.read_attested_identity",
+                "host.runtime.admin_api.orchestrator.claude_code.read_attested_identity",
                 return_value={"access_token_sha256": "1" * 64, "account_uuid": "acct_smoke"},
             ),
         ):
@@ -2574,7 +2567,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
         with (
             patch(
-                "host.runtime.orchestrator.claude_code.account_status",
+                "host.runtime.admin_api.orchestrator.claude_code.account_status",
                 return_value=(
                     "active",
                     None,
@@ -2582,7 +2575,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 ),
             ),
             patch(
-                "host.runtime.orchestrator.claude_code.read_attested_identity",
+                "host.runtime.admin_api.orchestrator.claude_code.read_attested_identity",
                 return_value={"access_token_sha256": "f" * 64, "account_uuid": "acct_attacker"},
             ),
         ):
@@ -2834,7 +2827,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         )
 
     def test_agent_runtime_refresh_endpoint_refreshes_requested_runtime(self) -> None:
-        with patch("host.runtime.admin_api.orchestrator.refresh_runtime_status") as refresh:
+        with patch("host.runtime.admin_api.service.orchestrator.refresh_runtime_status") as refresh:
             _, body = self.request(
                 "POST",
                 "/v1/agent-runtime/refresh",
@@ -2845,7 +2838,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual([account["agent_runtime"] for account in body["accounts"]], ["codex", "claude_code"])
 
     def test_agent_runtime_refresh_endpoint_refreshes_all_runtimes_by_default(self) -> None:
-        with patch("host.runtime.admin_api.orchestrator.refresh_runtime_status") as refresh:
+        with patch("host.runtime.admin_api.service.orchestrator.refresh_runtime_status") as refresh:
             self.request("POST", "/v1/agent-runtime/refresh", {})
 
         self.assertEqual(
@@ -2896,11 +2889,11 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
         with (
             patch(
-                "host.runtime.admin_api.codex_app_server.start_device_login",
+                "host.runtime.admin_api.service.codex_app_server.start_device_login",
                 side_effect=AssertionError("disabled Codex provider must not spawn login helper"),
             ),
             patch(
-                "host.runtime.admin_api.claude_code.start_oauth_login",
+                "host.runtime.admin_api.service.claude_code.start_oauth_login",
                 side_effect=AssertionError("disabled Claude provider must not spawn login helper"),
             ),
         ):
@@ -2944,9 +2937,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
         )
 
         with (
-            patch("host.runtime.admin_api.orchestrator.runtime_network_enabled", side_effect=[True, False]),
-            patch("host.runtime.admin_api.codex_app_server.start_device_login", return_value=login),
-            patch("host.runtime.admin_api.codex_app_server.close_login_server") as close_login,
+            patch("host.runtime.admin_api.service.orchestrator.runtime_network_enabled", side_effect=[True, False]),
+            patch("host.runtime.admin_api.service.codex_app_server.start_device_login", return_value=login),
+            patch("host.runtime.admin_api.service.codex_app_server.close_login_server") as close_login,
             self.assertRaises(admin_api.ApiError) as error,
         ):
             admin_api.start_codex_oauth_login()
@@ -2960,7 +2953,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
         with (
             patch(
-                "host.runtime.admin_api.claude_code.complete_oauth_login",
+                "host.runtime.admin_api.service.claude_code.complete_oauth_login",
                 side_effect=AssertionError("disabled Claude provider must not complete OAuth"),
             ),
             self.assertRaises(admin_api.ApiError) as error,
@@ -2998,12 +2991,12 @@ class AdminApiIntegrationTests(unittest.TestCase):
             return "active"
 
         with (
-            patch("host.runtime.admin_api.claude_code.complete_oauth_login") as complete,
+            patch("host.runtime.admin_api.service.claude_code.complete_oauth_login") as complete,
             patch(
-                "host.runtime.admin_api.claude_code.read_claude_account",
+                "host.runtime.admin_api.service.claude_code.read_claude_account",
                 return_value={"access_token_sha256": "a" * 64},
             ),
-            patch("host.runtime.admin_api.orchestrator.refresh_runtime_status", side_effect=refresh) as refresh_status,
+            patch("host.runtime.admin_api.service.orchestrator.refresh_runtime_status", side_effect=refresh) as refresh_status,
         ):
             self.assertEqual(admin_api.complete_claude_oauth_login({"code": "browser-code"}), {"status": "accepted"})
 
@@ -3026,10 +3019,10 @@ class AdminApiIntegrationTests(unittest.TestCase):
         save_state(snapshot)
 
         with (
-            patch("host.runtime.admin_api.claude_code.complete_oauth_login") as complete,
-            patch("host.runtime.admin_api.claude_code.read_claude_account", return_value=None),
+            patch("host.runtime.admin_api.service.claude_code.complete_oauth_login") as complete,
+            patch("host.runtime.admin_api.service.claude_code.read_claude_account", return_value=None),
             patch(
-                "host.runtime.admin_api.orchestrator.refresh_runtime_status",
+                "host.runtime.admin_api.service.orchestrator.refresh_runtime_status",
                 return_value="awaiting_login",
             ) as refresh_status,
         ):
@@ -3061,9 +3054,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
             [*admin_api.AGENT_AUTH_CLEAR_HELPER_COMMAND, "codex"], 0, stdout='{"removed":[]}', stderr=""
         )
         with (
-            patch("host.runtime.admin_api.subprocess.run", return_value=completed) as run,
+            patch("host.runtime.admin_api.service.subprocess.run", return_value=completed) as run,
             patch(
-                "host.runtime.admin_api.orchestrator.refresh_runtime_status",
+                "host.runtime.admin_api.service.orchestrator.refresh_runtime_status",
                 return_value="awaiting_login",
             ) as refresh_status,
         ):
@@ -3101,9 +3094,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
             [*admin_api.AGENT_AUTH_CLEAR_HELPER_COMMAND, "claude"], 0, stdout='{"removed":[]}', stderr=""
         )
         with (
-            patch("host.runtime.admin_api.subprocess.run", return_value=completed) as run,
+            patch("host.runtime.admin_api.service.subprocess.run", return_value=completed) as run,
             patch(
-                "host.runtime.admin_api.orchestrator.refresh_runtime_status",
+                "host.runtime.admin_api.service.orchestrator.refresh_runtime_status",
                 return_value="awaiting_login",
             ) as refresh_status,
         ):
@@ -3165,9 +3158,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
             [*admin_api.AGENT_AUTH_CLEAR_HELPER_COMMAND, "codex"], 0, stdout='{"removed":[]}', stderr=""
         )
         with (
-            patch("host.runtime.admin_api.subprocess.run", return_value=completed),
+            patch("host.runtime.admin_api.service.subprocess.run", return_value=completed),
             patch(
-                "host.runtime.admin_api.orchestrator.refresh_runtime_status",
+                "host.runtime.admin_api.service.orchestrator.refresh_runtime_status",
                 return_value="awaiting_login",
             ) as refresh_status,
         ):
@@ -3195,9 +3188,9 @@ class AdminApiIntegrationTests(unittest.TestCase):
         )
 
         with (
-            patch("host.runtime.admin_api.subprocess.run", return_value=failed),
+            patch("host.runtime.admin_api.service.subprocess.run", return_value=failed),
             patch(
-                "host.runtime.admin_api.orchestrator.refresh_runtime_status",
+                "host.runtime.admin_api.service.orchestrator.refresh_runtime_status",
                 return_value="awaiting_login",
             ) as refresh_status,
             self.assertRaises(admin_api.ApiError) as error,
@@ -3223,7 +3216,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
             user_code="CODE-1",
         )
 
-        with patch("host.runtime.admin_api.codex_app_server.start_device_login", return_value=login):
+        with patch("host.runtime.admin_api.service.codex_app_server.start_device_login", return_value=login):
             response = admin_api.start_codex_oauth_login()
 
         self.assertEqual(response["device_code"], "CODE-1")
@@ -3238,7 +3231,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
             user_code="CODE-1",
         )
 
-        with patch("host.runtime.admin_api.codex_app_server.start_device_login", return_value=login) as start:
+        with patch("host.runtime.admin_api.service.codex_app_server.start_device_login", return_value=login) as start:
             first = admin_api.start_codex_oauth_login()
             second = admin_api.start_codex_oauth_login()
 
@@ -3255,7 +3248,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         save_state(state)
         login = admin_api.claude_code.ClaudeLogin(login_url="https://claude.com/cai/oauth/authorize?code=true")
 
-        with patch("host.runtime.admin_api.claude_code.start_oauth_login", return_value=login) as start:
+        with patch("host.runtime.admin_api.service.claude_code.start_oauth_login", return_value=login) as start:
             first = admin_api.start_claude_oauth_login()
             second = admin_api.start_claude_oauth_login()
 
@@ -3389,7 +3382,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
 
     def test_reboot_uses_privileged_helper(self) -> None:
         succeeded = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
-        with patch("host.runtime.admin_api.subprocess.run", return_value=succeeded) as run:
+        with patch("host.runtime.admin_api.service.subprocess.run", return_value=succeeded) as run:
             _, body = self.request("POST", "/v1/host-runtime/reboot")
         self.assertEqual(body["status"], "accepted")
         run.assert_called_with(
@@ -3439,7 +3432,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         ]
         save_state(state)
 
-        with patch("host.runtime.admin_api.orchestrator.close_task_server") as close:
+        with patch("host.runtime.admin_api.service.orchestrator.close_task_server") as close:
             _, body = self.request("POST", "/v1/tasks/task_1/kill")
         self.assertEqual(body["status"], "accepted")
         close.assert_called_once_with("task_1")
@@ -3542,7 +3535,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         # never runs migrations (that is bootstrap's job), so a stray start
         # also cannot move the schema under the live instance.
         with patch(
-            "host.runtime.admin_api.ThreadingHTTPServer",
+            "host.runtime.admin_api.service.ThreadingHTTPServer",
             side_effect=OSError("address already in use"),
         ):
             with self.assertRaises(OSError):

@@ -890,5 +890,5 @@ class XTool:
             return ActionFailed(str(exc) or "X post failed after approval.")
 
 
-# The instance the host discovers (see host.runtime.tools_host).
+# The instance the host discovers (see host.runtime.tools.tools_host).
 BUNDLED_TOOL = XTool()

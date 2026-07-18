@@ -20,8 +20,8 @@ from urllib.parse import parse_qs
 
 from host.network_integrations.github import push_gate
 from host.network_integrations.github.manifest import GitHubIntegration
-from host.runtime.network_policy import normalized_path, route_allowed
-from host.runtime.state import enqueue_pending_push, read_proxy_github_token
+from host.runtime.core.network_policy import normalized_path, route_allowed
+from host.runtime.core.state import enqueue_pending_push, read_proxy_github_token
 
 # The domains where the proxy injects the active GitHub credential after the
 # repo guard has passed, keyed by the auth scheme each host expects: git

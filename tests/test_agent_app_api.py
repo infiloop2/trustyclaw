@@ -21,8 +21,9 @@ import unittest
 from unittest.mock import patch
 
 from host.constants import LOOPBACK
-from host.runtime import agent_app_api, app_platform
-from host.runtime.tools_mcp_shim import UnixHTTPConnection
+from host.runtime.agent_app import api as agent_app_api
+from host.runtime.core import app_platform
+from host.runtime.agent_shim.mcp_shim import UnixHTTPConnection
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # A high slot keeps the stub backend's derived port away from the bundled
@@ -317,7 +318,7 @@ class McpShimAppApiTests(AgentAppApiTestCase):
         env["TRUSTYCLAW_TOOLS_SOCKET"] = tools_socket or str(Path(agent_app_socket).parent / "no-tools.sock")
         env["PYTHONPATH"] = str(REPO_ROOT)
         shim = subprocess.Popen(
-            [sys.executable, "-m", "host.runtime.tools_mcp_shim"],
+            [sys.executable, "-m", "host.runtime.agent_shim.mcp_shim"],
             cwd=REPO_ROOT,
             env=env,
             stdin=subprocess.PIPE,

@@ -8,7 +8,15 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class LifecycleCommand:
     mode: str
-    config_path: str
-    admin_password_env: str | None = None
+    agent_name: str
+    # SHA-256 hex digest of the admin password; the CLI never handles the
+    # password itself. Required for deploy and reconfigure.
+    admin_password_sha256: str | None = None
     allow_upgrade: bool = False
-    result_file: str | None = None
+    # GitHub delivery: a full 40-hex public-repo commit to pin, or "" to pin
+    # the latest main commit. None selects the SSH delivery of the local
+    # checkout.
+    github_commit_sha: str | None = None
+    # Operator endpoints for deploy and reconfigure; at least one is required.
+    operator_ssh_public_key: str | None = None
+    operator_cloudflare_hostname: str | None = None

@@ -9,8 +9,8 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from host.runtime.tool_assets import ASSET_TTL_SECONDS, AssetError, ToolAssetStore
-from host.runtime import tools_mcp_shim
+from host.runtime.tools.assets import ASSET_TTL_SECONDS, AssetError, ToolAssetStore
+from host.runtime.agent_shim import mcp_shim as tools_mcp_shim
 from host.tools.host_api import AssetMetadata
 
 
@@ -112,8 +112,8 @@ class ToolAssetStoreTests(unittest.TestCase):
                     outcome["error"] = exc
 
             with (
-                patch("host.runtime.tool_assets.secrets.token_urlsafe", return_value=asset_id),
-                patch("host.runtime.tool_assets.MAX_STAGED_ASSETS", 1),
+                patch("host.runtime.tools.assets.secrets.token_urlsafe", return_value=asset_id),
+                patch("host.runtime.tools.assets.MAX_STAGED_ASSETS", 1),
             ):
                 worker = threading.Thread(target=stage)
                 worker.start()
@@ -194,8 +194,8 @@ class ToolAssetStoreTests(unittest.TestCase):
                     outcome["error"] = exc
 
             with (
-                patch("host.runtime.tool_assets.secrets.token_urlsafe", return_value=asset_id),
-                patch("host.runtime.tool_assets.time.time", return_value=1_000),
+                patch("host.runtime.tools.assets.secrets.token_urlsafe", return_value=asset_id),
+                patch("host.runtime.tools.assets.time.time", return_value=1_000),
             ):
                 worker = threading.Thread(target=stage)
                 worker.start()
@@ -243,7 +243,7 @@ class ToolAssetStoreTests(unittest.TestCase):
     def test_recurring_cleanup_removes_expired_unused_asset(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "assets"
-            with patch("host.runtime.tool_assets.time.time", return_value=1_000):
+            with patch("host.runtime.tools.assets.time.time", return_value=1_000):
                 store = ToolAssetStore(root)
                 metadata = store.stage(
                     kind="video",

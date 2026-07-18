@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import pg_harness
 
-from host.runtime import db, pgclient
+from host.runtime.core import db, pgclient
 
 
 def connect() -> pgclient.Connection:

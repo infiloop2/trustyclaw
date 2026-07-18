@@ -18,7 +18,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from host.runtime import github_credential, mint_github_app_token
+from host.runtime.admin_api import github_credential
+from host.runtime.root_helpers import mint_github_app_token
 
 
 class MintGithubAppTokenTests(unittest.TestCase):
@@ -87,7 +88,7 @@ class MintGithubAppTokenTests(unittest.TestCase):
             captured["auth"] = request.get_header("Authorization")
             return FakeResponse()
 
-        with patch("host.runtime.mint_github_app_token.urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("host.runtime.root_helpers.mint_github_app_token.urllib.request.urlopen", side_effect=fake_urlopen):
             result = mint_github_app_token.mint_installation_token("12345", "67890", private_key)
 
         self.assertEqual(result, {"token": "ghs_minted", "expires_at": "2026-06-08T01:00:00Z"})
@@ -112,7 +113,7 @@ class MintGithubAppTokenTests(unittest.TestCase):
             def __exit__(self, *args):  # type: ignore[no-untyped-def]
                 return None
 
-        with patch("host.runtime.mint_github_app_token.urllib.request.urlopen", return_value=BadResponse()):
+        with patch("host.runtime.root_helpers.mint_github_app_token.urllib.request.urlopen", return_value=BadResponse()):
             with self.assertRaises(mint_github_app_token.MintError):
                 mint_github_app_token.mint_installation_token("12345", "67890", private_key)
 
@@ -134,8 +135,8 @@ class MintGithubAppTokenTests(unittest.TestCase):
             calls.append({"command": command, "input": kwargs.get("input")})
             return real_run(command, **kwargs)
 
-        with patch("host.runtime.mint_github_app_token.tempfile.NamedTemporaryFile", side_effect=tracking_named):
-            with patch("host.runtime.mint_github_app_token.subprocess.run", side_effect=tracking_run):
+        with patch("host.runtime.root_helpers.mint_github_app_token.tempfile.NamedTemporaryFile", side_effect=tracking_named):
+            with patch("host.runtime.root_helpers.mint_github_app_token.subprocess.run", side_effect=tracking_run):
                 mint_github_app_token._rs256_sign(b"data", private_key)
         self.assertEqual(len(calls), 1)
         self.assertIn("/dev/stdin", calls[0]["command"])
@@ -148,7 +149,7 @@ class MintGithubAppTokenTests(unittest.TestCase):
 
 class WorkflowTriggerParsingTests(unittest.TestCase):
     def test_pages_facts_distinguish_no_site_from_unreadable_site(self) -> None:
-        from host.runtime import audit_github_repo
+        from host.runtime.root_helpers import audit_github_repo
 
         def not_found() -> audit_github_repo.AuditError:
             exc = audit_github_repo.AuditError("not found")
@@ -163,7 +164,7 @@ class WorkflowTriggerParsingTests(unittest.TestCase):
                 return {"visibility": "private", "has_pages": False}
             raise not_found()
 
-        with patch("host.runtime.audit_github_repo._get", side_effect=fake_no_pages_get):
+        with patch("host.runtime.root_helpers.audit_github_repo._get", side_effect=fake_no_pages_get):
             facts = audit_github_repo.audit_repository("token", "infiloop2", "trustyclaw")
         # pages_public is the single stored Pages fact (tri-state); has_pages
         # only decides locally whether the /pages endpoint is queried.
@@ -176,13 +177,14 @@ class WorkflowTriggerParsingTests(unittest.TestCase):
                 return {"visibility": "private", "has_pages": True}
             raise not_found()
 
-        with patch("host.runtime.audit_github_repo._get", side_effect=fake_unreadable_pages_get):
+        with patch("host.runtime.root_helpers.audit_github_repo._get", side_effect=fake_unreadable_pages_get):
             facts = audit_github_repo.audit_repository("token", "infiloop2", "trustyclaw")
         self.assertNotIn("has_pages", facts)
         self.assertIsNone(facts["pages_public"])
 
     def test_trigger_shapes(self) -> None:
-        from host.runtime import audit_github_repo, github_repo_audit
+        from host.runtime.root_helpers import audit_github_repo
+        from host.runtime.admin_api import github_repo_audit
 
         # A plain substring search for the dangerous trigger names, whatever
         # the YAML shape; benign triggers are not collected (the workflow's

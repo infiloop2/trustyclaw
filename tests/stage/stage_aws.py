@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from host.constants import PROXY_PORT
-from host.runtime.tools_host import BUNDLED_TOOLS
+from host.runtime.tools.tools_host import BUNDLED_TOOLS
 from tests.smoke.smoke_aws import SMOKE_RUNTIMES, AwsSmoke
 
 
@@ -524,7 +524,7 @@ class StageAwsSmoke(AwsSmoke):
         output = self._ssh_code(
             f"printf '%s\\n' {shlex.quote(line)} | "
             "sudo -u trustyclaw-agent env PYTHONPATH=/opt/trustyclaw-host "
-            "python3 -m host.runtime.tools_mcp_shim"
+            "python3 -m host.runtime.agent_shim.mcp_shim"
         )
         try:
             return json.loads(output)

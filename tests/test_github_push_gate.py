@@ -1,4 +1,4 @@
-"""Unit tests for the .github push-approval gate core (host.runtime.github_push_gate).
+"""Unit tests for the .github push-approval gate core (host.network_integrations.github.push_gate).
 
 The pkt-line parsing and report-status synthesis are pure; the change detection
 runs real git against temp repositories, so it validates the actual index-pack +

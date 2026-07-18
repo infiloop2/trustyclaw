@@ -11,8 +11,9 @@ import unittest
 
 import pg_harness
 
-from host.runtime import network_introspection_api, state
-from host.runtime.tools_mcp_shim import UnixHTTPConnection
+from host.runtime.agent_network import api as network_introspection_api
+from host.runtime.core import state
+from host.runtime.agent_shim.mcp_shim import UnixHTTPConnection
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -126,7 +127,7 @@ class NetworkIntrospectionTests(unittest.TestCase):
         env["TRUSTYCLAW_AGENT_NETWORK_SOCKET"] = network_socket
         env["PYTHONPATH"] = str(REPO_ROOT)
         shim = subprocess.Popen(
-            [sys.executable, "-m", "host.runtime.tools_mcp_shim"],
+            [sys.executable, "-m", "host.runtime.agent_shim.mcp_shim"],
             cwd=REPO_ROOT,
             env=env,
             stdin=subprocess.PIPE,

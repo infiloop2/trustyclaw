@@ -12,7 +12,8 @@ from unittest.mock import patch
 import pg_harness
 
 import host.tools as tool_packages
-from host.runtime import db, state, tools_host
+from host.runtime.core import db, state
+from host.runtime.tools import tools_host
 from host.tools import (
     ActionExecuted,
     ActionFailed,
@@ -283,7 +284,7 @@ class ToolRegistryTests(unittest.TestCase):
             )
             module = SimpleNamespace(BUNDLED_TOOL=SimpleNamespace(manifest=mismatched))
 
-            with patch("host.runtime.tools_host.importlib.import_module", return_value=module):
+            with patch("host.runtime.tools.tools_host.importlib.import_module", return_value=module):
                 with self.assertRaisesRegex(RuntimeError, "tool_id must match the package directory"):
                     tools_host._discover_bundled_tools(root, "test.tools")
 
@@ -447,7 +448,7 @@ class ExecuteActionTests(ToolsHostTestCase):
 
     def test_pending_approvals_are_capped(self) -> None:
         self.prepare_fake_tool()
-        with patch("host.runtime.tools_host.PENDING_APPROVAL_LIMIT", 2):
+        with patch("host.runtime.tools.tools_host.PENDING_APPROVAL_LIMIT", 2):
             first = tools_host.execute_action("fake_notes", "write_note", {"text": "one"})
             second = tools_host.execute_action("fake_notes", "write_note", {"text": "two"})
             third = tools_host.execute_action("fake_notes", "write_note", {"text": "three"})

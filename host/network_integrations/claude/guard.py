@@ -24,8 +24,8 @@ import json
 from typing import Any
 
 from host.network_integrations.claude.manifest import ClaudeIntegration
-from host.runtime.network_policy import decode_body, normalized_path, route_allowed
-from host.runtime.state import read_proxy_claude_account
+from host.runtime.core.network_policy import decode_body, normalized_path, route_allowed
+from host.runtime.core.state import read_proxy_claude_account
 
 ANTHROPIC_PRE_PIN_BOOTSTRAP_GET_PATHS = {
     "/api/oauth/profile",

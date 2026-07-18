@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from host.network_integrations.base import ManagedIntegration
-from host.runtime.network_policy import route_allowed
+from host.runtime.core.network_policy import route_allowed
 
 ROUTES = {
     "pypi.org": (("GET", "HEAD"), (r"^/simple(?:/.*)?$", r"^/pypi/[^/]+/json$")),

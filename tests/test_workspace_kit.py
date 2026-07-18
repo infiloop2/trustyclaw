@@ -15,7 +15,7 @@ from typing import Any
 import unittest
 
 from host.apps.workspace_kit import engine, views
-from host.runtime import app_platform
+from host.runtime.core import app_platform
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 APPS_ROOT = REPO_ROOT / "host" / "apps"
@@ -334,7 +334,7 @@ class ConnectionStatusTests(unittest.TestCase):
         # reporting every provider as disabled.
         from unittest.mock import patch
 
-        from host.runtime import network_policy
+        from host.runtime.core import network_policy
 
         with patch.object(network_policy, "network_policy_record", return_value=None):
             fail_closed = network_policy.network_policy_response()
@@ -352,7 +352,7 @@ class ConnectionStatusTests(unittest.TestCase):
         # The engine cannot import the host orchestrator at runtime, so its
         # copy of the runtime-to-integration mapping must be pinned here: a
         # wrong integration id silently reports every provider as disabled.
-        from host.runtime import orchestrator
+        from host.runtime.admin_api import orchestrator
 
         self.assertEqual(dict(engine.RUNTIME_PROVIDERS), orchestrator._MANAGED_PROVIDER_BY_RUNTIME)
 

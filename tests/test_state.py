@@ -1,4 +1,4 @@
-"""Tests for the admin-state storage accessors (host.runtime.state).
+"""Tests for the admin-state storage accessors (host.runtime.core.state).
 
 These pin the contracts the rest of the runtime is built on: mutation() spans
 whole check-then-act cycles (no lost updates), an exception rolls the whole
@@ -18,9 +18,9 @@ from unittest.mock import patch
 
 import pg_harness
 
-from host.runtime import db, pgclient, secretbox, state
+from host.runtime.core import db, pgclient, secretbox, state
 from state_seed import read_agent_events, read_network_events
-from host.runtime.state import (
+from host.runtime.core.state import (
     load_config,
     network_proxy_cert_files,
     read_claude_account,
@@ -618,7 +618,7 @@ class StateStorageTests(unittest.TestCase):
         )
         # An errored row is never fresh: the poller retries it on the next
         # pass instead of waiting out the TTL.
-        from host.runtime import github_repo_audit
+        from host.runtime.admin_api import github_repo_audit
 
         audits = state.read_github_repo_audits()
         self.assertTrue(github_repo_audit._stale(audits[("infiloop2", "infibot")]))

@@ -4,7 +4,7 @@
 This is for browser/UI development only. It does not import the real admin API
 handler because the real handler reads host state and invokes privileged helper
 paths. The mock keeps just enough in-memory state to exercise the single-page
-admin UI at ``host/runtime/admin_ui.html``, and ships with seeded history plus
+admin UI at ``host/runtime/admin_api/admin_ui.html``, and ships with seeded history plus
 time-based task progression so the UI looks and behaves like a live host.
 """
 
@@ -32,10 +32,10 @@ import app_mocks
 from host.config import ConfigError, parse_network_controls
 from host.constants import LOOPBACK
 from host.session_options import session_config_error
-from host.runtime import app_platform
-from host.runtime.tools_host import BUNDLED_TOOLS
+from host.runtime.core import app_platform
+from host.runtime.tools.tools_host import BUNDLED_TOOLS
 
-RUNTIME_DIR = REPO_ROOT / "host/runtime"
+RUNTIME_DIR = REPO_ROOT / "host/runtime/admin_api"
 TOOLS_DIR = REPO_ROOT / "host/tools"
 VERSION = (REPO_ROOT / "VERSION").read_text().strip()
 UI_ASSETS = {

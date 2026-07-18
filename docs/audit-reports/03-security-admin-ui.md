@@ -62,7 +62,7 @@ below names it.
 - `docs/architecture/admin-api.md`
 - `host/runtime/admin_ui.html`, `host/runtime/admin_ui/*.js`,
   `host/runtime/admin_ui.css`
-- `host/runtime/admin_api.py` (static serving, auth, headers)
+- `host/runtime/admin_api/service.py` (static serving, auth, headers)
 
 ## Audit entries
 
@@ -80,7 +80,7 @@ can request. No browser-driven test.
   favicon), `host/runtime/admin_ui.js` (every `innerHTML`/`setHtml` sink, the
   `esc()`/`badge()` helpers, cookie handling, the `api()` fetch wrapper), and
   `host/runtime/admin_ui.css` by reference.
-- `host/runtime/admin_api.py`: `_send_ui_asset`, `_authenticate`,
+- `host/runtime/admin_api/service.py`: `_send_ui_asset`, `_authenticate`,
   `SECURITY_HEADERS`, `_send_security_headers`, `_send_json`, cache headers.
 
 ### Findings
@@ -149,7 +149,7 @@ or a live XSS/CSRF PoC.
   renderer, `fetch` wrapper, cookie read/write, OAuth link rendering, agent
   output rendering, file explorer rendering, network event rendering, provider
   metadata rendering, and click delegation.
-- `host/runtime/admin_api.py`: UI asset serving, JSON responses, auth, request
+- `host/runtime/admin_api/service.py`: UI asset serving, JSON responses, auth, request
   body limits, CSP, referrer policy, frame denial, MIME sniffing header, and
   lack of CORS headers.
 - `tests/smoke-ui/admin_ui_smoke.py` and `tests/smoke-ui/run_admin_ui_mock.py`

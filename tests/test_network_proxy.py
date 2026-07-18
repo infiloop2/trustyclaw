@@ -19,12 +19,12 @@ from host.network_integrations.claude import guard as claude_guard
 from host.network_integrations.claude.manifest import ClaudeIntegration
 from host.config import parse_network_controls
 from host.network_integrations.openai import guard as openai_guard
-from host.runtime import network_policy
-from host.runtime.network_policy import load_policy
-from host.runtime.state import save_network_policy as save_policy
-from host.runtime.state import save_proxy_claude_account, save_proxy_openai_account_id
+from host.runtime.core import network_policy
+from host.runtime.core.network_policy import load_policy
+from host.runtime.core.state import save_network_policy as save_policy
+from host.runtime.core.state import save_proxy_claude_account, save_proxy_openai_account_id
 from state_seed import read_network_events
-from host.runtime import network_proxy
+from host.runtime.network_proxy import service as network_proxy
 
 
 class UpstreamHandler(BaseHTTPRequestHandler):
@@ -120,7 +120,7 @@ class NetworkProxyTests(unittest.TestCase):
         # policy (here: an uncompilable path-guard regex). Still a policy
         # problem, not an availability blip: it must deny (never fall back to
         # a stale cached policy).
-        from host.runtime import db
+        from host.runtime.core import db
 
         with db.transaction() as cur:
             cur.execute(
@@ -153,7 +153,7 @@ class NetworkProxyTests(unittest.TestCase):
         loaded = network_proxy._load_enforcement_policy()
         self.assertIn("api.example.com", loaded.to_json()["network_integrations"]["custom"]["domains"])
 
-        with patch("host.runtime.network_proxy.load_policy", side_effect=OSError("db down")):
+        with patch("host.runtime.network_proxy.service.load_policy", side_effect=OSError("db down")):
             empty, denial = network_proxy._policy_load_denial()
         self.assertIsNone(empty)
         self.assertIsNotNone(denial)
@@ -329,7 +329,7 @@ class NetworkProxyTests(unittest.TestCase):
         def must_not_dial(*args, **kwargs):  # type: ignore[no-untyped-def]
             raise AssertionError("proxy dialed upstream for a denied host")
 
-        with patch("host.runtime.network_proxy.socket.create_connection", must_not_dial):
+        with patch("host.runtime.network_proxy.service.socket.create_connection", must_not_dial):
             with real_create_connection(("127.0.0.1", proxy.server_address[1]), timeout=5) as sock:
                 sock.sendall(b"CONNECT evil.example.org:443 HTTP/1.1\r\nHost: evil.example.org:443\r\n\r\n")
                 response = sock.recv(4096)
@@ -444,8 +444,8 @@ class NetworkProxyTests(unittest.TestCase):
         # An allowed domain pointed at the metadata IP must not be dialed.
         resolved = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 443))]
         with (
-            patch("host.runtime.network_proxy.socket.getaddrinfo", return_value=resolved),
-            patch("host.runtime.network_proxy.socket.create_connection") as create_connection,
+            patch("host.runtime.network_proxy.service.socket.getaddrinfo", return_value=resolved),
+            patch("host.runtime.network_proxy.service.socket.create_connection") as create_connection,
         ):
             with self.assertRaises(OSError):
                 network_proxy.connect_public("metadata.evil.test", 443, 5)
@@ -533,10 +533,10 @@ class NetworkProxyTests(unittest.TestCase):
         # would otherwise refuse; allow it here. connect_public's own refusal is
         # covered by dedicated tests below.
         with ExitStack() as stack:
-            stack.enter_context(patch("host.runtime.network_proxy.socket.create_connection", mapped_create_connection))
-            stack.enter_context(patch("host.runtime.network_proxy._is_public_ip", lambda ip: True))
+            stack.enter_context(patch("host.runtime.network_proxy.service.socket.create_connection", mapped_create_connection))
+            stack.enter_context(patch("host.runtime.network_proxy.service._is_public_ip", lambda ip: True))
             if tls:
-                stack.enter_context(patch("host.runtime.network_proxy.ssl.create_default_context", ssl._create_unverified_context))
+                stack.enter_context(patch("host.runtime.network_proxy.service.ssl.create_default_context", ssl._create_unverified_context))
             yield
 
     def https_via_proxy(self, proxy_port: int, request: bytes, *, host: str = "127.0.0.1") -> bytes:

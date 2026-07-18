@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from host.runtime import task_status as ts
+from host.runtime.admin_api import task_status as ts
 
 
 class TaskStatusTests(unittest.TestCase):

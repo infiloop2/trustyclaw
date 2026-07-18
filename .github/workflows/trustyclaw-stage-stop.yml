@@ -55,15 +55,7 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
         run: |
           set -euo pipefail
-          cat > stage_config.json <<JSON
-          {
-            "agent_name": "trustyclaw-stage",
-            "aws_region": "us-east-1",
-            "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
-            "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY"
-          }
-          JSON
-          if python3 -m host.cli.stop --config stage_config.json --result-file trustyclaw-stage-stop.json; then
+          if python3 -m host.cli.stop --agent-name trustyclaw-stage > trustyclaw-stage-stop.json; then
             result="stopped"
           else
             result="failed"

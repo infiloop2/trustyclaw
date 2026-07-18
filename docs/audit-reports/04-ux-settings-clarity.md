@@ -61,7 +61,7 @@ below names it.
 ## Key code and docs
 
 - `host/runtime/admin_ui.html`, `host/runtime/admin_ui.js`
-- `host/runtime/admin_api.py`, `host/runtime/network_policy.py` (actual
+- `host/runtime/admin_api/service.py`, `host/runtime/core/network_policy.py` (actual
   semantics to compare against presented semantics)
 - `example_config.json`, `host/config.py`, `README.md`, `docs/api/`
 
@@ -87,10 +87,10 @@ fresh-deploy empty-policy default.
 
 | ID | Status | Severity | Location | Summary |
 | --- | --- | --- | --- | --- |
-| UX-1 | Open | Medium | `host/runtime/admin_ui.js:1111`, `host/runtime/orchestrator.py:282,309` | Replacing the active policy to disable a managed provider (untoggling OpenAI/Claude) synchronously fails every *running* task on that runtime and closes its runtime process (`reconcile_runtime_status_after_policy_change` → `deactivate_runtime` → `fail_running_tasks`), but the only confirmation is "Replace the active network policy with the proposed policy?" — an operator narrowing network access to tighten security can unexpectedly kill in-flight agent work with no warning and no undo. Name the affected runtime(s) and the running-task kill in the confirm dialog. |
-| UX-2 | Open | Low | `host/runtime/network_policy.py:66`, `host/runtime/admin_ui.html:267` | A wildcard rule `*.example.com` matches sub-domains but **not** the apex `example.com` (`domain_matches` requires `host != pattern[2:]`), and the UI's only hint is the placeholder text `api.example.com or *.example.com`. An operator who adds `*.example.com` expecting the bare domain to be covered will get surprise denials for `example.com`. State the apex exclusion near the domain field or in the preset-info popover. |
+| UX-1 | Open | Medium | `host/runtime/admin_ui.js:1111`, `host/runtime/admin_api/orchestrator.py:282,309` | Replacing the active policy to disable a managed provider (untoggling OpenAI/Claude) synchronously fails every *running* task on that runtime and closes its runtime process (`reconcile_runtime_status_after_policy_change` → `deactivate_runtime` → `fail_running_tasks`), but the only confirmation is "Replace the active network policy with the proposed policy?" — an operator narrowing network access to tighten security can unexpectedly kill in-flight agent work with no warning and no undo. Name the affected runtime(s) and the running-task kill in the confirm dialog. |
+| UX-2 | Open | Low | `host/runtime/core/network_policy.py:66`, `host/runtime/admin_ui.html:267` | A wildcard rule `*.example.com` matches sub-domains but **not** the apex `example.com` (`domain_matches` requires `host != pattern[2:]`), and the UI's only hint is the placeholder text `api.example.com or *.example.com`. An operator who adds `*.example.com` expecting the bare domain to be covered will get surprise denials for `example.com`. State the apex exclusion near the domain field or in the preset-info popover. |
 | UX-3 | Open | Low | `host/runtime/admin_ui.js:1100` | Editing the "Proposed policy" JSON textarea silently swallows parse errors (`loadPolicyFromJsonEditor` catches and ignores), so while typing invalid JSON the preset buttons/status reflect the last *valid* proposal. The proposal only re-validates on Replace. An operator can believe an edit is staged when it is not; a subtle inline "unparsed JSON" indicator would remove the ambiguity. |
-| UX-4 | Open | Low | `host/runtime/network_policy.py:49`, `host/runtime/admin_ui.html:235` | On a fresh deploy the policy is empty, which is fail-closed deny-all: the agent has **no** internet access until the operator adds rules. The active-policy panel shows `{}` with no statement that an empty policy blocks all agent traffic. The default is the safe one, but a first-time operator may read `{}` as "unrestricted" rather than "blocked"; one line of copy would prevent the misread. |
+| UX-4 | Open | Low | `host/runtime/core/network_policy.py:49`, `host/runtime/admin_ui.html:235` | On a fresh deploy the policy is empty, which is fail-closed deny-all: the agent has **no** internet access until the operator adds rules. The active-policy panel shows `{}` with no statement that an empty policy blocks all agent traffic. The default is the safe one, but a first-time operator may read `{}` as "unrestricted" rather than "blocked"; one line of copy would prevent the misread. |
 
 ### Coverage and confidence
 
@@ -121,8 +121,8 @@ Reviewer: GPT-5.5 (gpt-5.5)
 Commit: `f28b50e87b61507db372d288d971487f55cb2121`
 Methodology: static UI/code/doc comparison and grep sweeps. I compared
 operator-facing README/API/architecture copy and admin UI labels against
-`host/config.py`, `host/runtime/admin_ui.js`, `host/runtime/admin_api.py`,
-`host/runtime/network_policy.py`, and lifecycle behavior. I did not run the UI
+`host/config.py`, `host/runtime/admin_ui.js`, `host/runtime/admin_api/service.py`,
+`host/runtime/core/network_policy.py`, and lifecycle behavior. I did not run the UI
 in a browser.
 
 ### What was reviewed
@@ -135,8 +135,8 @@ in a browser.
   `docs/architecture/*.md`: deploy config tables, lifecycle descriptions,
   network policy API semantics, runtime status, reboot/restart behavior,
   storage/lifecycle promises, and managed provider descriptions.
-- `host/config.py`, `host/runtime/network_policy.py`,
-  `host/runtime/admin_api.py`, and `host/runtime/orchestrator.py`: actual
+- `host/config.py`, `host/runtime/core/network_policy.py`,
+  `host/runtime/admin_api/service.py`, and `host/runtime/admin_api/orchestrator.py`: actual
   validation, provider expansion, task lifecycle, policy replacement effects,
   and reboot recovery.
 
@@ -145,7 +145,7 @@ in a browser.
 | ID | Status | Severity | Location | Summary |
 | --- | --- | --- | --- | --- |
 | UX-001 | Open | Medium | `host/runtime/admin_ui.html:151` | The first-task UI presents an ordinary "Agent chat" composer and "Create task" button, but it does not tell the operator at the point of use that tasks run in autonomous auto-approve mode. The README states "No permission prompts" (`README.md:18`), but an operator who reaches the UI through an existing deploy can start a task without seeing that posture. Add concise copy near the composer or runtime panel that the agent can execute commands without per-command prompts and is constrained by the active network policy. |
-| UX-002 | Open | Medium | `host/runtime/admin_ui.js:526` | The reboot confirmation says only "Reboot the host machine?", while the actual startup recovery marks every task that was `running` as `failed` (`host/runtime/admin_api.py:1239`). An operator may reboot expecting in-flight work to resume because queued tasks and data survive. Mention in the confirmation that running tasks will fail and queued tasks/data survive. |
+| UX-002 | Open | Medium | `host/runtime/admin_ui.js:526` | The reboot confirmation says only "Reboot the host machine?", while the actual startup recovery marks every task that was `running` as `failed` (`host/runtime/admin_api/service.py:1239`). An operator may reboot expecting in-flight work to resume because queued tasks and data survive. Mention in the confirmation that running tasks will fail and queued tasks/data survive. |
 | UX-003 | Open | Low | `host/runtime/admin_ui.html:95` | The network tab is labeled "Internet Access and Tools" and includes buttons like "Add GitHub" (`host/runtime/admin_ui.html:252`), but the current presets only add network domain/method rules; they do not configure credentials, repo scopes, or tools. The info popover lists domains, so this is not a hidden security behavior, but the primary labels can still overpromise. Rename the tab/presets or add a short "network access only" note until managed tools/apps exist. |
 
 ### Coverage and confidence

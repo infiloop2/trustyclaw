@@ -9,7 +9,11 @@ be spoofed by a process running as another uid, and Unix sockets are invisible t
 the nftables loopback rules, so adding one does not widen the network surface.
 
 The complete inventory keeps the local trust boundaries auditable in one
-place.
+place. Every socket path is defined once in `host/constants.py` and served by
+exactly one package under `host/runtime/` (the runtime's boundary rule: the
+package that binds a socket is the only code that parses messages arriving on
+it); servers, clients, and the end-of-deploy verifier all import the same
+definition.
 
 ## Inventory
 
@@ -40,7 +44,7 @@ place.
   transports. Admin → app (serving an app UI request): each installed app
   backend listens on a host-assigned **loopback TCP port**, and the admin API
   reverse-proxies `/v1/apps/<app_id>/api/...` to `127.0.0.1:<app port>`
-  (`host/runtime/app_api_proxy.py`); nftables restricts connecting to app
+  (`host/runtime/admin_api/app_api_proxy.py`); nftables restricts connecting to app
   backend ports to the admin API uid, so the port needs no shared secret. App →
   admin (an app backend calling host resources): all apps share the single
   `app-backend.sock` above, where the peer uid identifies which app is calling

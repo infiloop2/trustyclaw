@@ -13,22 +13,10 @@ CLOUDFLARED_VERSION=2026.6.1
 # major so a future base-image bump gets an explicit pg_upgrade step instead
 # of a silent mismatch.
 PG_MAJOR=14
-TRUSTYCLAW_ADMIN_UID=47741
-TRUSTYCLAW_ADMIN_GID=47741
-TRUSTYCLAW_PROXY_UID=47742
-TRUSTYCLAW_PROXY_GID=47742
-TRUSTYCLAW_AGENT_UID=47743
-TRUSTYCLAW_AGENT_GID=47743
-CLOUDFLARED_UID=47744
-CLOUDFLARED_GID=47744
-POSTGRES_UID=47745
-POSTGRES_GID=47745
-TRUSTYCLAW_TOOLS_UID=47746
-TRUSTYCLAW_TOOLS_GID=47746
-TRUSTYCLAW_AGENT_APP_UID=47747
-TRUSTYCLAW_AGENT_APP_GID=47747
-TRUSTYCLAW_AGENT_NETWORK_UID=47748
-TRUSTYCLAW_AGENT_NETWORK_GID=47748
+# Service accounts with pinned ids (rendered from host.constants
+# SERVICE_ACCOUNTS, which host.bootstrap.verify_deploy re-checks against the
+# live /etc/passwd at the end of this script).
+@SERVICE_ACCOUNT_CONSTANTS@
 @APP_UID_GID_CONSTANTS@
 PROXY_PORT=@PROXY_PORT@
 @APP_PORT_CONSTANTS@
@@ -103,10 +91,12 @@ prepare_volume() {
 
 # Mount durable admin and agent volumes before creating service users; their
 # home directories live on those volumes.
+mount_durable_volumes() {
 admin_volume_id="$(payload_value storage_volumes.admin)"
 agent_volume_id="$(payload_value storage_volumes.agent)"
 prepare_volume "$admin_volume_id" "$ADMIN_MOUNT" TRUSTYCLAW_ADMIN
 prepare_volume "$agent_volume_id" "$AGENT_MOUNT" TRUSTYCLAW_AGENT
+}
 
 # Stable IDs keep durable EBS file owners meaningful across root-volume
 # replacement. If an image already uses one of these IDs, fail instead of
@@ -153,6 +143,7 @@ ensure_user() {
   useradd --uid "$uid" --gid "$group" $extra_args --home-dir "$home" --no-create-home --shell /usr/sbin/nologin "$name"
 }
 
+provision_service_accounts() {
 ensure_group trustyclaw-admin "$TRUSTYCLAW_ADMIN_GID"
 ensure_group trustyclaw-proxy "$TRUSTYCLAW_PROXY_GID"
 ensure_group trustyclaw-agent "$TRUSTYCLAW_AGENT_GID"
@@ -182,10 +173,12 @@ ensure_user trustyclaw-agent-network "$TRUSTYCLAW_AGENT_NETWORK_UID" trustyclaw-
 # packaging reuses an existing postgres user as-is.
 ensure_group postgres "$POSTGRES_GID"
 ensure_user postgres "$POSTGRES_UID" postgres /var/lib/postgresql
+}
 
 # Sanitize managed paths on reused durable volumes before root writes anything
 # there. Symlinks planted by a compromised previous service are removed;
 # unexpected non-file/non-directory nodes fail the deploy.
+sanitize_durable_paths() {
 PG_MAJOR="$PG_MAJOR" python3 - <<'PY'
 import os
 from pathlib import Path
@@ -275,10 +268,12 @@ for path in (
 ):
     ensure_regular_file_slot(path)
 PY
+}
 
 # Enforce the deploy operation against the authoritative admin disk version.
 # The EC2 tag is only a discovery hint; this check runs after the durable admin
 # volume is mounted, before preserved state is modified.
+enforce_version_gate() {
 python3 - <<'PY'
 import json
 import pathlib
@@ -364,9 +359,11 @@ elif mode != "deploy":
 
 print(f"version check passed: mode={mode}, state={state_version or 'new'}, local={target_version}")
 PY
+}
 
 # Install the Python runtime package copied by deploy. Runtime code is root
 # owned but readable by service users.
+install_runtime_code() {
 mkdir -p /opt/trustyclaw-host
 tar -xzf /tmp/trustyclaw-host-code.tar.gz -C /opt/trustyclaw-host
 payload_value operation.target_version > /opt/trustyclaw-host/VERSION
@@ -375,8 +372,10 @@ payload_value operation.target_version > /opt/trustyclaw-host/VERSION
 chown -R root:root /opt/trustyclaw-host
 chmod -R a+rX /opt/trustyclaw-host
 chmod 644 /opt/trustyclaw-host/VERSION
+}
 
 # Base OS packages and security updates.
+install_system_packages() {
 echo "== installing system packages =="
 # Node.js (and npm) come from the official tarball below, not apt: the Ubuntu
 # npm package pulls in hundreds of node-* dependencies. -qq keeps the output to
@@ -399,7 +398,9 @@ systemctl disable --now postgresql.service >/dev/null 2>&1 || true
 # the next reboot; userspace (setuid binaries, libraries) is patched immediately.
 echo "== applying security updates =="
 unattended-upgrade || true
+}
 
+setup_postgres() {
 echo "== setting up admin-state PostgreSQL =="
 PG_BIN="/usr/lib/postgresql/${PG_MAJOR}/bin"
 install -d -o postgres -g postgres -m 700 "$(dirname "$PGDATA_DIR")" "$PGDATA_DIR"
@@ -523,6 +524,7 @@ runuser -u postgres -- psql -d trustyclaw_admin -v ON_ERROR_STOP=1 --quiet \
 # tools, or agent-network service can use only its granted tables, not mint new
 # objects. The owning trustyclaw-admin role keeps its database privileges
 # implicitly.
+}
 
 # Apply schema migrations, then compute and store the effective host config.
 # Both run as trustyclaw-admin: migrations are owned by the same role the
@@ -531,24 +533,27 @@ runuser -u postgres -- psql -d trustyclaw_admin -v ON_ERROR_STOP=1 --quiet \
 # operator connections over from the existing config table. write_config echoes
 # the effective config, which is staged root-only for the later bootstrap steps
 # (SSH keys, cloudflared) that need it without database access.
+migrate_admin_state_and_write_config() {
 echo "== migrating admin state schema =="
 # The trustyclaw-tools role's table grants live in the schema migration
 # (0007_tool_state.sql), the same pattern as the trustyclaw-proxy grants;
 # bootstrap only provisions the role, its pg_hba line, and database CONNECT
 # above, before migrations run.
-runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.migrate up
+runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.deploy.migrate up
 echo "== migrating app schemas =="
 @APP_MIGRATION_COMMANDS@
-python3 - <<'PY' | runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.write_config > /tmp/trustyclaw_effective_config.json
+python3 - <<'PY' | runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host python3 -m host.runtime.deploy.write_config > /tmp/trustyclaw_effective_config.json
 import json, pathlib
 payload = json.loads(pathlib.Path('/tmp/trustyclaw_payload.json').read_text())
 print(json.dumps({'mode': payload['operation']['mode'], 'runtime_config': payload['runtime_config']}))
 PY
 chmod 600 /tmp/trustyclaw_effective_config.json
+}
 
 # Apply or remove persistent SSH operator access from the effective config.
 # EC2 user data installs only the generated deploy key long enough for
 # bootstrap to start.
+configure_operator_ssh() {
 python3 - <<'PY'
 import json, pathlib
 
@@ -571,8 +576,10 @@ chmod 700 /home/trustyclaw-operator/.ssh
 if [ -f /home/trustyclaw-operator/.ssh/authorized_keys ]; then
   chmod 600 /home/trustyclaw-operator/.ssh/authorized_keys
 fi
+}
 
 # Runtime CLIs used by the unprivileged agent user.
+install_agent_clis() {
 echo "== installing Node.js ${NODE_VERSION} =="
 arch="$(dpkg --print-architecture)"
 case "$arch" in
@@ -591,7 +598,9 @@ npm install -g --no-fund --no-audit --loglevel=error "@anthropic-ai/claude-code@
 # npm inherits the script's umask 077, which would leave the CLI root-only;
 # the agent user must be able to run it.
 chmod -R a+rX /usr/local/lib/node_modules
+}
 
+configure_cloudflared() {
 cloudflare_connection_count="$(python3 - <<'PY'
 import json, pathlib
 config = json.loads(pathlib.Path('/tmp/trustyclaw_effective_config.json').read_text())
@@ -635,6 +644,7 @@ PY
 else
   rm -f /etc/systemd/system/trustyclaw-cloudflared.service /etc/trustyclaw/cloudflared.token /etc/trustyclaw/cloudflare_hostname
 fi
+}
 
 # Managed Codex policy: restrict the agent to cached web search and disable
 # Codex-hosted app/plugin/browse surfaces so the agent does not even attempt a
@@ -644,6 +654,7 @@ fi
 # fetching live — so no separate knob is needed for those. The network proxy is
 # the ultimate layer: it denies any non-cached web/browse tool on OpenAI domains
 # regardless of what the client requests.
+write_codex_policy() {
 mkdir -p /etc/codex
 chmod 755 /etc/codex
 cat > /etc/codex/requirements.toml <<'EOF'
@@ -668,11 +679,13 @@ chmod 644 /etc/codex/requirements.toml
 cat > /etc/codex/managed_config.toml <<'EOF'
 [mcp_servers.trustyclaw]
 command = "/usr/bin/python3"
-args = ["-m", "host.runtime.tools_mcp_shim"]
+args = ["-m", "host.runtime.agent_shim.mcp_shim"]
 env = { PYTHONPATH = "/opt/trustyclaw-host" }
 EOF
 chmod 644 /etc/codex/managed_config.toml
+}
 
+harden_base_os() {
 # Reduce the root-daemon attack surface reachable by the agent. snapd ships in
 # the base image but is unused here, and its socket is world-accessible; stop
 # and mask it so the agent has no snapd API to reach for privilege escalation.
@@ -687,9 +700,11 @@ if [ ! -f /swapfile ]; then
   swapon /swapfile
   echo '/swapfile none swap sw 0 0' >> /etc/fstab
 fi
+}
 
 # Persistent proxy CA. The proxy user owns the private key after ownership is
 # fixed below; the public CA is installed into the system trust store.
+setup_proxy_ca() {
 if [ ! -f "$PROXY_STATE_DIR/network_proxy_ca.key" ] || [ ! -f "$PROXY_STATE_DIR/network_proxy_ca.crt" ]; then
   openssl req -x509 -newkey rsa:4096 -nodes \
     -keyout "$PROXY_STATE_DIR/network_proxy_ca.key" \
@@ -699,9 +714,11 @@ fi
 cp "$PROXY_STATE_DIR/network_proxy_ca.crt" /usr/local/share/ca-certificates/trustyclaw-network-proxy.crt
 chmod 644 /usr/local/share/ca-certificates/trustyclaw-network-proxy.crt
 update-ca-certificates
+}
 
 # Narrow root-owned helper scripts. Admin may invoke these exact paths through
 # sudo, and helpers demote to agent/proxy users for runtime work.
+install_sudo_helpers() {
 mkdir -p /usr/local/lib/trustyclaw-host "$PROXY_STATE_DIR/generated-certs"
 chmod 755 /usr/local/lib/trustyclaw-host
 HELPER_SOURCE_DIR=/opt/trustyclaw-host/host/bootstrap/helpers
@@ -736,37 +753,43 @@ chmod 755 /usr/local/lib/trustyclaw-host/*
 sed "s/@""PROXY_PORT@/${PROXY_PORT}/g" "$HELPER_SOURCE_DIR/gh-shim.sh" > /usr/local/bin/gh
 chown root:root /usr/local/bin/gh
 chmod 755 /usr/local/bin/gh
+}
 
-# Final durable-volume ownership. Avoid recursive chown across preserved mutable
+# Final durable-volume ownership, one declarative row per managed path:
+# "path owner:group mode". Avoid recursive chown across preserved mutable
 # trees; only directory roots and known managed files are adjusted.
-chown root:root /mnt/trustyclaw-admin
-chmod 711 /mnt/trustyclaw-admin
-chown root:root /mnt/trustyclaw-agent
-chmod 711 /mnt/trustyclaw-agent
-chown trustyclaw-admin:trustyclaw-admin /mnt/trustyclaw-admin/admin-state
-chmod 700 /mnt/trustyclaw-admin/admin-state
-chown trustyclaw-admin:trustyclaw-admin /mnt/trustyclaw-admin/admin-home
-chmod 700 /mnt/trustyclaw-admin/admin-home
-chown trustyclaw-agent:trustyclaw-agent /mnt/trustyclaw-agent/agent-home
-chmod 700 /mnt/trustyclaw-agent/agent-home
-install -d -m 700 -o trustyclaw-agent -g trustyclaw-agent "$AGENT_HOME_PATH/.codex" "$AGENT_HOME_PATH/.claude"
-chown trustyclaw-proxy:trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state
-chmod 700 /mnt/trustyclaw-admin/proxy-state
-chown trustyclaw-tools:trustyclaw-tools /mnt/trustyclaw-admin/tools-state
-chmod 700 /mnt/trustyclaw-admin/tools-state
-chown trustyclaw-tools:trustyclaw-tools /mnt/trustyclaw-admin/tools-state/assets
-chmod 700 /mnt/trustyclaw-admin/tools-state/assets
-chown trustyclaw-proxy:trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state/generated-certs
-chmod 700 /mnt/trustyclaw-admin/proxy-state/generated-certs
-chown trustyclaw-proxy:trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state/network_proxy_ca.key /mnt/trustyclaw-admin/proxy-state/network_proxy_ca.crt
-chmod 600 /mnt/trustyclaw-admin/proxy-state/network_proxy_ca.key
-chmod 644 /mnt/trustyclaw-admin/proxy-state/network_proxy_ca.crt
-# No initial network policy is seeded: a missing policy row is the fail-closed
-# empty default (deny everything).
+# host.bootstrap.verify_deploy independently re-checks these facts after the
+# services start.
+DURABLE_PATH_OWNERSHIP="
+/mnt/trustyclaw-admin root:root 711
+/mnt/trustyclaw-agent root:root 711
+/mnt/trustyclaw-admin/admin-state trustyclaw-admin:trustyclaw-admin 700
+/mnt/trustyclaw-admin/admin-home trustyclaw-admin:trustyclaw-admin 700
+/mnt/trustyclaw-agent/agent-home trustyclaw-agent:trustyclaw-agent 700
+/mnt/trustyclaw-admin/proxy-state trustyclaw-proxy:trustyclaw-proxy 700
+/mnt/trustyclaw-admin/proxy-state/generated-certs trustyclaw-proxy:trustyclaw-proxy 700
+/mnt/trustyclaw-admin/proxy-state/network_proxy_ca.key trustyclaw-proxy:trustyclaw-proxy 600
+/mnt/trustyclaw-admin/proxy-state/network_proxy_ca.crt trustyclaw-proxy:trustyclaw-proxy 644
+/mnt/trustyclaw-admin/tools-state trustyclaw-tools:trustyclaw-tools 700
+/mnt/trustyclaw-admin/tools-state/assets trustyclaw-tools:trustyclaw-tools 700
+"
+
+apply_durable_ownership() {
+  local row_path row_owner row_mode
+  while read -r row_path row_owner row_mode; do
+    [ -n "$row_path" ] || continue
+    chown "$row_owner" "$row_path"
+    chmod "$row_mode" "$row_path"
+  done <<< "$DURABLE_PATH_OWNERSHIP"
+  install -d -m 700 -o trustyclaw-agent -g trustyclaw-agent "$AGENT_HOME_PATH/.codex" "$AGENT_HOME_PATH/.claude"
+  # No initial network policy is seeded: a missing policy row is the
+  # fail-closed empty default (deny everything).
+}
 
 # Durable agent runtime config and instructions. The files live in this repo so
 # harness expectations are reviewable, and bootstrap installs them root-owned,
 # world-readable, and immutable so the agent can read but not alter them.
+install_agent_home_files() {
 for managed_agent_file in \
   "$AGENT_HOME_PATH/AGENTS.md" \
   "$AGENT_HOME_PATH/CLAUDE.md" \
@@ -785,14 +808,21 @@ chattr +i \
   "$AGENT_HOME_PATH/CLAUDE.md" \
   "$AGENT_HOME_PATH/.codex/config.toml" \
   "$AGENT_HOME_PATH/.claude/settings.json"
+}
 
+write_sudoers_policy() {
 cat > /etc/sudoers.d/trustyclaw-host <<'SUDOERS'
 trustyclaw-admin ALL=(root) NOPASSWD: /usr/local/lib/trustyclaw-host/reboot-host, /usr/local/lib/trustyclaw-host/run-codex-app-server, /usr/local/lib/trustyclaw-host/read-codex-account-id, /usr/local/lib/trustyclaw-host/run-claude-code, /usr/local/lib/trustyclaw-host/read-claude-account, /usr/local/lib/trustyclaw-host/clear-agent-auth, /usr/local/lib/trustyclaw-host/read-agent-file, /usr/local/lib/trustyclaw-host/check-for-upgrade, /usr/local/lib/trustyclaw-host/mint-github-app-token, /usr/local/lib/trustyclaw-host/audit-github-repo, /usr/local/lib/trustyclaw-host/approve-github-push
 SUDOERS
 chmod 440 /etc/sudoers.d/trustyclaw-host
+  # A malformed sudoers drop-in would otherwise surface only when the admin
+  # service first invokes a helper; validate it now.
+  visudo -c -q -f /etc/sudoers.d/trustyclaw-host
+}
 
 # Fail deploy now, not at first login, if the pinned CLIs are not executable by
 # the agent user from its home directory.
+assert_agent_clis() {
 codex_cli_version="$(runuser -u trustyclaw-agent -- env HOME=/mnt/trustyclaw-agent/agent-home \
   /usr/local/bin/codex --version)"
 if [ "$codex_cli_version" != "codex-cli ${CODEX_CLI_VERSION}" ]; then
@@ -805,6 +835,7 @@ if [ "$claude_code_version" != "${CLAUDE_CODE_VERSION} (Claude Code)" ]; then
   echo "unexpected Claude Code version: ${claude_code_version}" >&2
   exit 1
 fi
+}
 
 # Host firewall. Root, the dedicated proxy user, and the optional cloudflared
 # connector can reach their narrow external dependencies; the agent can only
@@ -820,6 +851,7 @@ fi
 # nothing else. The trustyclaw-agent-network service communicates only over
 # Unix sockets; its explicit loopback drop prevents the local policy proxy
 # from becoming an indirect egress path before the broad loopback accept.
+write_firewall() {
 python3 - <<'PY'
 import json, pathlib
 config = json.loads(pathlib.Path('/tmp/trustyclaw_effective_config.json').read_text())
@@ -870,7 +902,9 @@ $(cat /tmp/trustyclaw_cloudflare_rules)
 NFT
 rm -f /tmp/trustyclaw_ssh_rule /tmp/trustyclaw_cloudflare_rules
 systemctl enable --now nftables
+}
 
+install_service_units() {
 # Systemd services.
 # All agent runtime processes run in transient scopes under this slice (the
 # run-* helpers launch them with systemd-run --scope), so the agent competes
@@ -933,7 +967,7 @@ StartLimitIntervalSec=0
 User=trustyclaw-proxy
 UMask=0077
 Environment=PYTHONPATH=/opt/trustyclaw-host
-ExecStart=/usr/bin/python3 -m host.runtime.network_proxy
+ExecStart=/usr/bin/python3 -m host.runtime.network_proxy.service
 Restart=always
 RestartSec=3
 
@@ -959,7 +993,7 @@ UMask=0077
 RuntimeDirectory=trustyclaw-tools
 RuntimeDirectoryMode=0755
 Environment=PYTHONPATH=/opt/trustyclaw-host
-ExecStart=/usr/bin/python3 -m host.runtime.tools_service
+ExecStart=/usr/bin/python3 -m host.runtime.tools.service
 Restart=always
 RestartSec=3
 
@@ -983,7 +1017,7 @@ UMask=0077
 RuntimeDirectory=trustyclaw-agent-network
 RuntimeDirectoryMode=0755
 Environment=PYTHONPATH=/opt/trustyclaw-host
-ExecStart=/usr/bin/python3 -m host.runtime.network_introspection_service
+ExecStart=/usr/bin/python3 -m host.runtime.agent_network.service
 Restart=always
 RestartSec=3
 
@@ -1011,7 +1045,7 @@ UMask=0077
 RuntimeDirectory=trustyclaw-agent-app
 RuntimeDirectoryMode=0755
 Environment=PYTHONPATH=/opt/trustyclaw-host
-ExecStart=/usr/bin/python3 -m host.runtime.agent_app_service
+ExecStart=/usr/bin/python3 -m host.runtime.agent_app.service
 Restart=always
 RestartSec=3
 
@@ -1038,7 +1072,7 @@ RuntimeDirectoryMode=0755
 Environment=PYTHONPATH=/opt/trustyclaw-host
 Environment=HOME=/mnt/trustyclaw-admin/admin-home
 WorkingDirectory=/mnt/trustyclaw-admin/admin-home
-ExecStart=/usr/bin/python3 -m host.runtime.admin_api
+ExecStart=/usr/bin/python3 -m host.runtime.admin_api.service
 Restart=always
 RestartSec=3
 
@@ -1066,7 +1100,9 @@ RestartSec=5
 WantedBy=multi-user.target
 UNIT
 fi
+}
 
+start_services() {
 systemctl daemon-reload
 systemctl enable --now trustyclaw-network-proxy.service
 systemctl enable --now trustyclaw-tools.service
@@ -1112,22 +1148,27 @@ if [ "$cloudflare_connection_count" -gt 0 ]; then
       ;;
   esac
 fi
+}
 
-# Provisioning is almost done: capture the non-secret target version and emit
-# only the non-secret access facts the lifecycle CLI needs for AWS security group
-# cleanup, then drop the single-use deploy key and staged files before starting
-# arbitrary app service code.
+# Independent end-of-deploy verification: pinned identities, path ownership,
+# service sockets, loopback listeners, active units, database peer auth, and
+# live firewall probes in both directions (allowed paths connect, denied
+# paths drop) must match the constants the services themselves run with. Any
+# mismatch fails the deploy here, before the staged secrets are dropped.
+verify_deployment() {
+  echo "== verifying deployed state =="
+  local cloudflare_flag=no
+  if [ "$cloudflare_connection_count" -gt 0 ]; then
+    cloudflare_flag=yes
+  fi
+  env PYTHONPATH=/opt/trustyclaw-host python3 -m host.bootstrap.verify_deploy --cloudflare "$cloudflare_flag"
+}
+
+# Provisioning is almost done: capture the non-secret target version, then
+# drop the single-use deploy key and staged files before starting arbitrary
+# app service code.
+finalize_deploy() {
 target_version="$(payload_value operation.target_version)"
-python3 - <<'PY'
-import json, pathlib
-
-config = json.loads(pathlib.Path('/tmp/trustyclaw_effective_config.json').read_text())
-connections = config['operator_connections']
-print('TRUSTYCLAW_BOOTSTRAP_ACCESS_SUMMARY ' + json.dumps({
-    'ssh_enabled': any(connection.get('mode') == 'ssh' for connection in connections),
-    'cloudflare_enabled': any(connection.get('mode') == 'cloudflare_access' for connection in connections),
-}, sort_keys=True))
-PY
 rm -f /home/trustyclaw-operator/.ssh/authorized_keys2
 rm -f /tmp/trustyclaw_payload.json /tmp/trustyclaw_effective_config.json /tmp/trustyclaw-host-code.tar.gz /tmp/trustyclaw_bootstrap.sh
 @APP_ENABLE_START_COMMANDS@
@@ -1145,3 +1186,33 @@ version_path.write_text(json.dumps({
 PY
 chown trustyclaw-admin:trustyclaw-admin /mnt/trustyclaw-admin/admin-state/version.json
 chmod 600 /mnt/trustyclaw-admin/admin-state/version.json
+}
+
+main() {
+  mount_durable_volumes
+  provision_service_accounts
+  sanitize_durable_paths
+  enforce_version_gate
+  install_runtime_code
+  install_system_packages
+  setup_postgres
+  migrate_admin_state_and_write_config
+  configure_operator_ssh
+  install_agent_clis
+  configure_cloudflared
+  write_codex_policy
+  harden_base_os
+  setup_proxy_ca
+  install_sudo_helpers
+  apply_durable_ownership
+  install_agent_home_files
+  write_sudoers_policy
+  assert_agent_clis
+  write_firewall
+  install_service_units
+  start_services
+  verify_deployment
+  finalize_deploy
+}
+
+main

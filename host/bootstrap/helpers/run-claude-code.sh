@@ -13,7 +13,7 @@ cd /mnt/trustyclaw-agent/agent-home
 #   web-search=on  -> add nothing; the tool stays available to Claude.
 #
 # The orchestrator derives on/off from the operator toggle for agent turns (see
-# host/runtime/claude_code.py). Non-agent maintenance calls (auth, usage) run no
+# host/runtime/admin_api/claude_code.py). Non-agent maintenance calls (auth, usage) run no
 # model turn that could use the tool, so they pass web-search=off to keep the
 # deny-by-default posture. The network proxy enforces the same operator toggle
 # independently, so a mistake here cannot let web search past the proxy.

@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from host.constants import LOOPBACK
+from host.constants import APP_BACKEND_ADMIN_SOCKET_PATH, LOOPBACK
 from host.apps import workspace_kit
 from host.apps.workspace_kit import engine
 from host.apps.workspace_kit.config import WorkspaceAppConfig
@@ -92,7 +92,7 @@ CONFIG = WorkspaceAppConfig(
     title="Software Builder",
     host=os.environ.get("TRUSTYCLAW_APP_HOST", LOOPBACK),
     admin_api_socket=os.environ.get(
-        "TRUSTYCLAW_APP_ADMIN_API_SOCKET", "/run/trustyclaw-admin-api/app-backend.sock"
+        "TRUSTYCLAW_APP_ADMIN_API_SOCKET", APP_BACKEND_ADMIN_SOCKET_PATH
     ),
     setup_brief=SETUP_BRIEF,
     seed=seed,

@@ -8,24 +8,23 @@ across upgrades.
 
 The stage workflow uses the lifecycle commands in this order:
 
-1. `python3 -m host.cli.upgrade --config stage_upgrade_config.json --result-file trustyclaw-stage.json`
+1. `python3 -m host.cli.upgrade --agent-name trustyclaw-stage > trustyclaw-stage.json`
 2. If upgrade fails only because the preserved state is already at the repo
    `VERSION`, the workflow starts the tagged EC2 instance with
-   `python3 -m host.cli.start --config stage_upgrade_config.json --result-file trustyclaw-stage.json`,
+   `python3 -m host.cli.start --agent-name trustyclaw-stage > trustyclaw-stage.json`,
    without changing password or operator access.
 3. If the instance is missing but preserved volumes exist,
-   `python3 -m host.cli.recover --config stage_upgrade_config.json --allow-upgrade --result-file trustyclaw-stage.json`
+   `python3 -m host.cli.recover --agent-name trustyclaw-stage --allow-upgrade > trustyclaw-stage.json`
 4. If this is the first-ever stage run and no preserved volumes exist,
-   `python3 -m host.cli.deploy --config stage_deploy_config.json --admin-password-env TRUSTYCLAW_STAGE_ADMIN_PASSWORD --result-file trustyclaw-stage.json`
+   `python3 -m host.cli.deploy --agent-name trustyclaw-stage --operator-ssh-public-key "$TRUSTYCLAW_STAGE_SSH_PUBLIC_KEY" --admin-password-sha256 "$(printf %s "$TRUSTYCLAW_STAGE_ADMIN_PASSWORD" | sha256sum | cut -d' ' -f1)" > trustyclaw-stage.json`
 
 Normal release runs should take the upgrade path, which preserves the existing
 admin password and operator endpoints from admin state. Same-version reruns
 start the existing instance and test it as-is. First deploy installs the
-configured stage SSH endpoint. Because upgrade, recovery, and power configs
-intentionally omit operator endpoints and upgrade/start result files omit the
-preserved admin password, the stage workflow keeps separate upgrade/recovery
-and deploy config files. The stage test receives
-`TRUSTYCLAW_STAGE_ADMIN_PASSWORD` through `--admin-password-env`, and the
+configured stage SSH endpoint. Upgrade, recovery, and power commands
+intentionally take no operator endpoints and the CLI only ever sees the
+password hash. The stage test receives `TRUSTYCLAW_STAGE_ADMIN_PASSWORD`
+through its own `--admin-password-env` flag for admin API auth, and the
 workflow passes the generated stage SSH key path through `--ssh-key-env
 TRUSTYCLAW_STAGE_SSH_KEY`.
 

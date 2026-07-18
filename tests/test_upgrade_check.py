@@ -4,7 +4,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from host.runtime import upgrade_check
+from host.runtime.admin_api import upgrade_check
 
 
 class UpgradeCheckTests(unittest.TestCase):
@@ -14,8 +14,8 @@ class UpgradeCheckTests(unittest.TestCase):
     def test_refresh_publishes_a_newer_valid_version(self) -> None:
         proc = subprocess.CompletedProcess(upgrade_check.HELPER_COMMAND, 0, "2.4.0\n", "")
         with (
-            patch("host.runtime.upgrade_check.subprocess.run", return_value=proc) as run,
-            patch("host.runtime.upgrade_check.read_root_version", return_value="2.3.1"),
+            patch("host.runtime.admin_api.upgrade_check.subprocess.run", return_value=proc) as run,
+            patch("host.runtime.admin_api.upgrade_check.read_root_version", return_value="2.3.1"),
         ):
             upgrade_check.refresh()
             result = upgrade_check.status()
@@ -32,7 +32,7 @@ class UpgradeCheckTests(unittest.TestCase):
 
     def test_equal_public_version_is_not_an_upgrade(self) -> None:
         upgrade_check._latest_version = "2.3.1"
-        with patch("host.runtime.upgrade_check.read_root_version", return_value="2.3.1"):
+        with patch("host.runtime.admin_api.upgrade_check.read_root_version", return_value="2.3.1"):
             self.assertEqual(
                 upgrade_check.status(),
                 {"available": False, "latest": "2.3.1"},
@@ -40,7 +40,7 @@ class UpgradeCheckTests(unittest.TestCase):
 
     def test_private_build_ahead_of_public_version_is_current(self) -> None:
         upgrade_check._latest_version = "2.2.9"
-        with patch("host.runtime.upgrade_check.read_root_version", return_value="2.3.1"):
+        with patch("host.runtime.admin_api.upgrade_check.read_root_version", return_value="2.3.1"):
             self.assertEqual(
                 upgrade_check.status(),
                 {"available": False, "latest": "2.2.9"},
@@ -54,9 +54,9 @@ class UpgradeCheckTests(unittest.TestCase):
         ):
             with self.subTest(stdout=proc.stdout, returncode=proc.returncode):
                 upgrade_check._latest_version = "2.4.0"
-                with patch("host.runtime.upgrade_check.subprocess.run", return_value=proc):
+                with patch("host.runtime.admin_api.upgrade_check.subprocess.run", return_value=proc):
                     upgrade_check.refresh()
-                with patch("host.runtime.upgrade_check.read_root_version", return_value="2.3.1"):
+                with patch("host.runtime.admin_api.upgrade_check.read_root_version", return_value="2.3.1"):
                     self.assertEqual(
                         upgrade_check.status(),
                         {"available": True, "latest": "2.4.0"},
@@ -65,12 +65,12 @@ class UpgradeCheckTests(unittest.TestCase):
     def test_timed_out_check_preserves_the_last_successful_result(self) -> None:
         upgrade_check._latest_version = "2.4.0"
         with patch(
-            "host.runtime.upgrade_check.subprocess.run",
+            "host.runtime.admin_api.upgrade_check.subprocess.run",
             side_effect=subprocess.TimeoutExpired(upgrade_check.HELPER_COMMAND, 15),
         ):
             upgrade_check.refresh()
 
-        with patch("host.runtime.upgrade_check.read_root_version", return_value="2.3.1"):
+        with patch("host.runtime.admin_api.upgrade_check.read_root_version", return_value="2.3.1"):
             self.assertEqual(
                 upgrade_check.status(),
                 {"available": True, "latest": "2.4.0"},
@@ -78,13 +78,13 @@ class UpgradeCheckTests(unittest.TestCase):
 
     def test_missing_running_version_hides_a_successful_public_check(self) -> None:
         upgrade_check._latest_version = "2.4.0"
-        with patch("host.runtime.upgrade_check.read_root_version", return_value=None):
+        with patch("host.runtime.admin_api.upgrade_check.read_root_version", return_value=None):
             self.assertEqual(upgrade_check.status(), {"available": False, "latest": None})
 
     def test_poller_checks_immediately_then_waits_four_hours(self) -> None:
         with (
-            patch("host.runtime.upgrade_check.refresh") as refresh,
-            patch("host.runtime.upgrade_check.time.sleep", side_effect=RuntimeError("stop")) as sleep,
+            patch("host.runtime.admin_api.upgrade_check.refresh") as refresh,
+            patch("host.runtime.admin_api.upgrade_check.time.sleep", side_effect=RuntimeError("stop")) as sleep,
             self.assertRaisesRegex(RuntimeError, "stop"),
         ):
             upgrade_check.poll()

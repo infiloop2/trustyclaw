@@ -6,7 +6,7 @@ import unittest
 
 import pg_harness
 
-from host.runtime import db, secretbox, state
+from host.runtime.core import db, secretbox, state
 
 
 class SecretBoxTests(unittest.TestCase):
