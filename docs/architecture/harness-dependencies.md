@@ -10,8 +10,8 @@ break when a harness package is upgraded.
 
 | Harness | Package | Pinned version | Runtime id | Adapter |
 | --- | --- | --- | --- | --- |
-| Codex | `@openai/codex` | `0.144.0` | `codex` | `host/runtime/codex_app_server.py` |
-| Claude Code | `@anthropic-ai/claude-code` | `2.1.206` | `claude_code` | `host/runtime/claude_code.py` |
+| Codex | `@openai/codex` | `0.144.0` | `codex` | `host/runtime/admin_api/codex_app_server.py` |
+| Claude Code | `@anthropic-ai/claude-code` | `2.1.206` | `claude_code` | `host/runtime/admin_api/claude_code.py` |
 
 Bootstrap installs these packages globally with npm and verifies the exact CLI
 version strings before completing. A version bump should be treated as an
@@ -198,7 +198,7 @@ to cached (`allowed_web_search_modes = ["cached"]`, which excludes `live` and
 and immutable so the agent cannot edit or delete the active policy file. The
 proxy guard is still required as the web-search enforcement layer. The root-owned
 managed config layer `/etc/codex/managed_config.toml` also registers the bundled
-tools MCP server (`mcp_servers.trustyclaw` spawning `host.runtime.tools_mcp_shim`),
+tools MCP server (`mcp_servers.trustyclaw` spawning `host.runtime.agent_shim.mcp_shim`),
 so Codex must keep reading both root-owned `/etc/codex` layers and spawning
 configured stdio MCP servers as the runtime user.
 
@@ -262,7 +262,7 @@ settings layer were bypassed, web search stays off unless the operator enabled
 it.
 
 `--strict-mcp-config` plus the inline `--mcp-config` make the bundled tools
-shim (`host.runtime.tools_mcp_shim`, spawned as `trustyclaw-agent`) the only
+shim (`host.runtime.agent_shim.mcp_shim`, spawned as `trustyclaw-agent`) the only
 MCP server; with no tools enabled it lists nothing. The invocation
 deliberately does not pass `--safe-mode`: the pinned CLI drops every non-SDK
 MCP server in safe mode, which would disable the bundled tools entirely. The
@@ -414,7 +414,7 @@ Properties this depends on:
 
 - This is the same private endpoint Claude Code itself calls during login
   bootstrap — it is one of the pre-pin allowlisted paths in
-  `host/runtime/network_policy.py` — so the pinned harness version already
+  `host/runtime/core/network_policy.py` — so the pinned harness version already
   requires it to exist and accept the OAuth bearer.
 - The attest call runs as root over direct host egress, not through the proxy:
   the agent uid can only reach the local proxy (whose account guard would
@@ -480,7 +480,7 @@ request shapes:
 - Data-plane Anthropic API calls carry `Authorization: Bearer <token>` matching
   the OAuth token hash read from Claude Code credentials.
 - Before the token hash is known, only the narrow Claude Code bootstrap profile
-  and settings endpoints listed in `host/runtime/network_policy.py` are allowed.
+  and settings endpoints listed in `host/runtime/core/network_policy.py` are allowed.
 
 If Claude Code changes its auth domain, token storage, bearer-token use, or
 pre-pin bootstrap endpoints, the managed Claude policy must be updated with the

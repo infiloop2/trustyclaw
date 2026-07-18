@@ -13,7 +13,7 @@ install, or from ``TRUSTYCLAW_TEST_PG_BIN``. If the binaries are unavailable
 the calling test is skipped with instructions; CI installs PostgreSQL in the
 sandbox image, so the suite never silently loses this coverage there. No
 Python driver is needed anywhere: the runtime brings its own protocol client
-(host.runtime.pgclient) and cluster administration uses the createdb/dropdb
+(host.runtime.core.pgclient) and cluster administration uses the createdb/dropdb
 binaries.
 """
 
@@ -159,7 +159,7 @@ def ensure_database() -> None:
         env=env,
     )
 
-    from host.runtime import migrate
+    from host.runtime.deploy import migrate
 
     migrate.up(quiet=True)
     _STARTED = True
@@ -169,10 +169,10 @@ def reset_database() -> None:
     """Truncate every state table and clear the in-process stores (test
     setUp); the schema stays migrated."""
     ensure_database()
-    from host.runtime import orchestrator
+    from host.runtime.admin_api import orchestrator
 
     orchestrator._RUNTIME_STATUSES.clear()
-    from host.runtime import db
+    from host.runtime.core import db
 
     with db.transaction() as cur:
         cur.execute(
@@ -197,7 +197,7 @@ def create_database(name: str) -> None:
     tests use their own so they can migrate down without disturbing the shared
     schema)."""
     ensure_database()
-    from host.runtime import db
+    from host.runtime.core import db
 
     # Pooled connections from a previous test would keep the database busy
     # and fail the DROP below.

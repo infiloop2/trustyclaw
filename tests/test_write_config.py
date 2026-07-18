@@ -1,4 +1,4 @@
-"""Tests for host.runtime.write_config: the bootstrap step that computes the
+"""Tests for host.runtime.deploy.write_config: the bootstrap step that computes the
 effective host config, stores it in the config table, and echoes it for the
 root-only bootstrap steps.
 
@@ -16,8 +16,8 @@ from unittest.mock import patch
 
 import pg_harness
 
-from host.runtime import write_config
-from host.runtime.state import load_config, save_config
+from host.runtime.deploy import write_config
+from host.runtime.core.state import load_config, save_config
 
 # The config table constrains the hash to 64 hex characters.
 PAYLOAD_HASH = "a" * 64

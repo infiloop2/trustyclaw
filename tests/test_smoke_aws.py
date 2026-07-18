@@ -7,8 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from host.config import parse_input_config
-from host.runtime.tools_host import BUNDLED_TOOLS, validate_against_schema
+from host.runtime.tools.tools_host import BUNDLED_TOOLS, validate_against_schema
 from tests.smoke.smoke_aws import SMOKE_TOOL_CALLS, AwsSmoke
 from tests.stage.stage_aws import (
     STAGE_SUITES,
@@ -21,46 +20,32 @@ from tests.stage.stage_aws import (
 
 
 class AwsSmokeTeardownTests(unittest.TestCase):
-    def test_fresh_smoke_uses_strict_deploy_command_and_result_file(self) -> None:
+    def test_fresh_smoke_uses_strict_deploy_command_and_stdout_result(self) -> None:
         smoke = AwsSmoke()
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             smoke.workdir = tmp_path
-            smoke.effective_config = tmp_path / "effective_config.json"
-            smoke.effective_config.write_text(
-                json.dumps(
+            smoke.public_key = "ssh-ed25519 AAAATEST operator@example"
+            smoke.ssh_key = str(tmp_path / "operator_key")
+            calls: list[list[str]] = []
+
+            class _Proc:
+                stdout = json.dumps(
                     {
                         "agent_name": "trustyclaw-smoke",
-                        "aws_region": "us-east-1",
-                        "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
-                        "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
-                        "operator_connections": [
-                            {
-                                "mode": "ssh",
-                                "ssh_public_key": "ssh-ed25519 AAAATEST operator@example",
-                            }
-                        ],
+                        "instance_id": "i-smoke",
+                        "region": "us-east-1",
+                        "public_dns": "smoke.example.com",
                     }
                 )
-            )
-            smoke.config = parse_input_config(json.loads(smoke.effective_config.read_text()))
-            calls: list[list[str]] = []
 
             def fake_run(args: list[str], **kwargs: object) -> object:
                 calls.append(args)
                 if kwargs.get("cwd") != tmp_path:
                     raise AssertionError(f"fresh smoke deploy used unexpected cwd: {kwargs.get('cwd')!r}")
-                (tmp_path / "trustyclaw-smoke.json").write_text(
-                    json.dumps(
-                        {
-                            "agent_name": "trustyclaw-smoke",
-                            "instance_id": "i-smoke",
-                            "region": "us-east-1",
-                            "public_dns": "smoke.example.com",
-                        }
-                    )
-                )
-                return object()
+                env = kwargs.get("env")
+                assert isinstance(env, dict) and env.get("AWS_REGION") == "us-east-1"
+                return _Proc()
 
             with (
                 patch.object(smoke, "_destroy_tagged_smoke_resources"),
@@ -69,11 +54,16 @@ class AwsSmokeTeardownTests(unittest.TestCase):
                 smoke.deploy()
 
         self.assertEqual(calls[0][1:3], ["-m", "host.cli.deploy"])
-        self.assertIn("--config", calls[0])
-        self.assertEqual(calls[0][calls[0].index("--config") + 1], str(smoke.effective_config))
-        self.assertIn("--result-file", calls[0])
-        self.assertEqual(calls[0][calls[0].index("--result-file") + 1], "trustyclaw-smoke.json")
+        self.assertIn("--agent-name", calls[0])
+        self.assertEqual(calls[0][calls[0].index("--agent-name") + 1], "trustyclaw-smoke")
+        self.assertIn("--operator-ssh-public-key", calls[0])
+        self.assertIn("--admin-password-sha256", calls[0])
+        self.assertNotIn("--config", calls[0])
+        self.assertNotIn("--result-file", calls[0])
+        assert smoke.result is not None
         self.assertEqual(smoke.result["instance_id"], "i-smoke")
+        # The harness injects its own generated password for admin API auth.
+        self.assertIn("admin_password", smoke.result)
 
     def test_teardown_destroys_tagged_resources_without_deploy_result(self) -> None:
         smoke = AwsSmoke()
@@ -395,10 +385,15 @@ class WorkflowSmokeTests(unittest.TestCase):
         self.assertIn("steps.upgrade_stage.outcome == 'failure' && steps.start_current.outcome != 'success'", stage)
         self.assertIn("python3 -m host.cli.start", stage_start)
         self.assertIn("python3 -m host.cli.stop", stage_stop)
-        self.assertNotIn("operator_connections", _workflow_json_heredoc(stage, "stage_upgrade_config.json"))
-        self.assertIn("operator_connections", _workflow_json_heredoc(stage, "stage_deploy_config.json"))
-        self.assertNotIn("operator_connections", _workflow_json_heredoc(stage_start, "stage_config.json"))
-        self.assertNotIn("operator_connections", _workflow_json_heredoc(stage_stop, "stage_config.json"))
+        # The CLI takes flags and prints its result to stdout; the workflows
+        # write no config files and redirect stdout to the step artifact.
+        for workflow in (stage, stage_start, stage_stop):
+            self.assertNotIn("--config", workflow)
+            self.assertNotIn("config.json", workflow)
+        self.assertIn("--agent-name trustyclaw-stage", stage_start)
+        self.assertIn("--agent-name trustyclaw-stage", stage_stop)
+        self.assertIn("--operator-ssh-public-key", stage)
+        self.assertIn("> trustyclaw-stage.json", stage)
         removed_action = "start-stage" + "-instance"
         self.assertNotIn(removed_action, stage)
         self.assertNotIn(removed_action, stage_start)
@@ -434,13 +429,3 @@ class WorkflowSmokeTests(unittest.TestCase):
         self.assertIn("Fresh AWS smoke is already running; wait for the previous smoke to complete.", smoke)
         self.assertIn("for status in queued in_progress", smoke)
         self.assertIn("group: trustyclaw-smoke", smoke)
-
-def _workflow_json_heredoc(workflow: str, path: str) -> str:
-    match = re.search(rf"cat > {re.escape(path)} <<JSON\n(?P<body>.*?)\n\s*JSON", workflow, re.DOTALL)
-    if match is None:
-        raise AssertionError(f"workflow did not write {path}")
-    return match.group("body")
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -23,8 +23,10 @@ from unittest.mock import patch
 import pg_harness
 from test_tools_host import FakeTool
 
-from host.runtime import state, tools_api, tools_host, tools_mcp_shim
-from host.runtime.tools_mcp_shim import UnixHTTPConnection
+from host.runtime.core import state
+from host.runtime.tools import api as tools_api, tools_host
+from host.runtime.agent_shim import mcp_shim as tools_mcp_shim
+from host.runtime.agent_shim.mcp_shim import UnixHTTPConnection
 from host.tools import OpenedStreamingAsset, StreamingAsset
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -269,7 +271,7 @@ class ToolsSocketTests(ToolsApiTestCase):
             self.addCleanup(server.server_close)
             server._next_asset_cleanup = 999.0
             with (
-                patch("host.runtime.tools_api.time.monotonic", return_value=1_000.0),
+                patch("host.runtime.tools.api.time.monotonic", return_value=1_000.0),
                 patch.object(server.asset_store, "cleanup_expired") as cleanup,
             ):
                 server.service_actions()
@@ -491,7 +493,7 @@ class McpShimTests(ToolsApiTestCase):
         env["PYTHONPATH"] = str(REPO_ROOT)
         env["HOME"] = str(Path(socket_path).parent)
         shim = subprocess.Popen(
-            [sys.executable, "-m", "host.runtime.tools_mcp_shim"],
+            [sys.executable, "-m", "host.runtime.agent_shim.mcp_shim"],
             cwd=REPO_ROOT,
             env=env,
             stdin=subprocess.PIPE,

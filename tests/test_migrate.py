@@ -1,4 +1,4 @@
-"""Tests for the SQL migration runner (host.runtime.migrate).
+"""Tests for the SQL migration runner (host.runtime.deploy.migrate).
 
 These run against a dedicated database on the scratch cluster so migrating
 down never disturbs the schema the other tests share.
@@ -13,7 +13,8 @@ from unittest.mock import patch
 
 import pg_harness
 
-from host.runtime import app_migrate, app_platform, db, migrate
+from host.runtime.deploy import app_migrate, migrate
+from host.runtime.core import app_platform, db
 
 
 def _write(directory: Path, name: str, up: str, down: str = "") -> None:
@@ -183,7 +184,7 @@ class RepoMigrationDataTests(unittest.TestCase):
         # The migrated policy parses — an upgraded host keeps its egress
         # instead of failing closed on reserved domains.
         from host.config import parse_network_controls
-        from host.runtime.network_policy import load_policy
+        from host.runtime.core.network_policy import load_policy
 
         parsed = parse_network_controls(load_policy())
         self.assertTrue(parsed.integrations["openai"].enabled)
@@ -459,7 +460,7 @@ class AppMigrationTests(unittest.TestCase):
                 allocation=app_platform.AppAllocation(uid=48000, gid=48000, port_offset=0),
                 agent_instructions="Test app instructions.",
             )
-            with patch("host.runtime.app_platform.app_by_id", return_value=app):
+            with patch("host.runtime.core.app_platform.app_by_id", return_value=app):
                 with self.assertRaises(Exception):
                     _app_up("agent_chat")
 

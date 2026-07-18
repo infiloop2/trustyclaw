@@ -103,29 +103,8 @@ jobs:
           printf '%s\n' "${TRUSTYCLAW_STAGE_SSH_PRIVATE_KEY}" > "${key_path}"
           chmod 0600 "${key_path}"
           public_key="$(ssh-keygen -y -f "${key_path}")"
-          cat > stage_upgrade_config.json <<JSON
-          {
-            "agent_name": "trustyclaw-stage",
-            "aws_region": "us-east-1",
-            "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
-            "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY"
-          }
-          JSON
-          cat > stage_deploy_config.json <<JSON
-          {
-            "agent_name": "trustyclaw-stage",
-            "aws_region": "us-east-1",
-            "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
-            "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
-            "operator_connections": [
-              {
-                "mode": "ssh",
-                "ssh_public_key": "${public_key}"
-              }
-            ]
-          }
-          JSON
           echo "TRUSTYCLAW_STAGE_SSH_KEY=${key_path}" >> "${GITHUB_ENV}"
+          echo "TRUSTYCLAW_STAGE_SSH_PUBLIC_KEY=${public_key}" >> "${GITHUB_ENV}"
 
       - name: Upgrade stage
         id: upgrade_stage
@@ -140,9 +119,9 @@ jobs:
           version="$(cat VERSION)"
           same_version_failure=false
           if ! python3 -m host.cli.upgrade \
-            --config stage_upgrade_config.json \
-            --result-file trustyclaw-stage.json 2>&1 | tee stage-upgrade.log; then
-            if grep -F "tagged with version ${version}; upgrade requires preserved state older than local VERSION ${version}" stage-upgrade.log >/dev/null \
+            --agent-name trustyclaw-stage \
+            > trustyclaw-stage.json 2> >(tee stage-upgrade.log >&2); then
+            if grep -F "tagged with version ${version}; upgrade requires preserved state older than target VERSION ${version}" stage-upgrade.log >/dev/null \
               || grep -F "upgrade requires admin state version lower than local VERSION; state=${version}, local=${version}" stage-upgrade.log >/dev/null; then
               same_version_failure=true
             fi
@@ -163,8 +142,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m host.cli.start \
-            --config stage_upgrade_config.json \
-            --result-file trustyclaw-stage.json
+            --agent-name trustyclaw-stage \
+            > trustyclaw-stage.json
 
       - name: Recover or first-deploy stage
         id: deploy
@@ -181,13 +160,15 @@ jobs:
           # recover recreates one from preserved volumes. Deploy is only for
           # the first stage run.
           if ! python3 -m host.cli.recover \
-            --config stage_upgrade_config.json \
+            --agent-name trustyclaw-stage \
             --allow-upgrade \
-            --result-file trustyclaw-stage.json; then
+            > trustyclaw-stage.json; then
+            admin_password_sha256="$(printf %s "$TRUSTYCLAW_STAGE_ADMIN_PASSWORD" | sha256sum | cut -d' ' -f1)"
             python3 -m host.cli.deploy \
-              --config stage_deploy_config.json \
-              --admin-password-env TRUSTYCLAW_STAGE_ADMIN_PASSWORD \
-              --result-file trustyclaw-stage.json
+              --agent-name trustyclaw-stage \
+              --operator-ssh-public-key "$TRUSTYCLAW_STAGE_SSH_PUBLIC_KEY" \
+              --admin-password-sha256 "$admin_password_sha256" \
+              > trustyclaw-stage.json
           fi
 
       - name: Run stage tests
@@ -240,8 +221,8 @@ jobs:
             exit 0
           fi
           python3 -m host.cli.stop \
-            --config stage_upgrade_config.json \
-            --result-file trustyclaw-stage-stop.json
+            --agent-name trustyclaw-stage \
+            > trustyclaw-stage-stop.json
 
       - name: Write stage summary
         if: ${{ always() }}

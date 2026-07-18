@@ -9,15 +9,16 @@ from unittest.mock import patch
 
 import pg_harness
 
-from host.runtime import orchestrator, state
+from host.runtime.admin_api import orchestrator
+from host.runtime.core import state
 from host.network_integrations.claude import guard as claude_guard
 from host.network_integrations.claude.manifest import ClaudeIntegration
 
 
 def anthropic_request_denied(config, method, host, path, headers):
     return claude_guard.request_denied(config, method, host, path, "", headers, b"")
-from host.runtime.state import save_network_policy as save_policy
-from host.runtime.state import (
+from host.runtime.core.state import save_network_policy as save_policy
+from host.runtime.core.state import (
     read_claude_account,
     read_openai_account,
     read_proxy_claude_account,
@@ -1673,11 +1674,11 @@ class StartWorkersOrderTests(unittest.TestCase):
         order: list[str] = []
         with (
             patch(
-                "host.runtime.orchestrator.github_credential.reconcile",
+                "host.runtime.admin_api.orchestrator.github_credential.reconcile",
                 side_effect=lambda: order.append("refresh"),
             ),
             patch(
-                "host.runtime.orchestrator.threading.Thread",
+                "host.runtime.admin_api.orchestrator.threading.Thread",
                 side_effect=lambda *a, **k: order.append("thread") or _NoopThread(),
             ),
         ):

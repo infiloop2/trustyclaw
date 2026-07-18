@@ -22,7 +22,8 @@ import pg_harness
 
 from host.apps.workspace_kit import engine, server
 from host.apps.workspace_kit.config import DomainAction
-from host.runtime import app_migrate, app_platform, db, migrate
+from host.runtime.deploy import app_migrate, migrate
+from host.runtime.core import app_platform, db
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

@@ -25,8 +25,8 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from host.runtime import state
-from host.runtime.github_credential import HelperError, _run_helper_json
+from host.runtime.core import state
+from host.runtime.admin_api.github_credential import HelperError, _run_helper_json
 
 APPROVE_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/approve-github-push"]
 APPROVE_HELPER_TIMEOUT_SECONDS = 150

@@ -25,8 +25,8 @@ exfiltrate data?
 - **Trust boundaries:** the proxy process (`trustyclaw-proxy`) between the
   agent and the internet; nftables as the independent backstop; the
   read-only database role the proxy uses for policy and pins.
-- **In scope:** the whole request lifecycle in `host/runtime/network_proxy.py`
-  and `host/runtime/network_policy.py` — CONNECT and TLS interposition,
+- **In scope:** the whole request lifecycle in `host/runtime/network_proxy/service.py`
+  and `host/runtime/core/network_policy.py` — CONNECT and TLS interposition,
   request parsing (chunked encoding, header folding, smuggling), domain and
   wildcard matching, method/port/scheme checks, `path_guards` regex
   semantics, body buffering limits, WebSocket handshake and tunneling,
@@ -71,7 +71,7 @@ below names it.
 ## Key code and docs
 
 - `docs/architecture/network-controls.md`, `docs/api/NetworkControls.md`
-- `host/runtime/network_proxy.py`, `host/runtime/network_policy.py`,
+- `host/runtime/network_proxy/service.py`, `host/runtime/core/network_policy.py`,
   `host/runtime/proxy_state_client.py`
 - nftables rules and proxy CA setup in `host/bootstrap/`
 - `tests/` for existing proxy coverage (gaps in it are reportable as Info)
@@ -89,14 +89,14 @@ No live proxy run or PoC traffic.
 
 ### What was reviewed
 
-- `host/runtime/network_proxy.py`: `do_CONNECT` + `_serve_tls_request` (TLS
+- `host/runtime/network_proxy/service.py`: `do_CONNECT` + `_serve_tls_request` (TLS
   interposition), `_proxy_http` (plain HTTP/WS, removed since — the proxy is
   now HTTPS-only), `connect_public` (SSRF vet),
   `host_header_denial`/target-vs-Host consistency, `read_request_head`,
   `read_body`/`read_chunked_body` (smuggling, size caps), `send_http_request`
   (single-request pinning, header stripping), the WebSocket frame guard, and
   the `BoundedThreadingHTTPServer` connection cap.
-- `host/runtime/network_policy.py`: `domain_matches`/`find_domain_rule`
+- `host/runtime/core/network_policy.py`: `domain_matches`/`find_domain_rule`
   (wildcard precedence, apex exclusion), `decide_http_request` +
   `_normalized_path` (method/path-guard semantics), `openai_request_denied`,
   `anthropic_request_denied`, `_live_web_search_denial`, `_iter_tool_objects`,
@@ -109,7 +109,7 @@ No live proxy run or PoC traffic.
 
 | ID | Status | Severity | Location | Summary |
 | --- | --- | --- | --- | --- |
-| NET-1 | Fixed | High | `host/runtime/orchestrator.py:217`, `host/runtime/network_policy.py:140` | The managed-provider account pin is sourced from **agent-writable** state, so a malicious agent can redirect it to an attacker-controlled provider account and exfiltrate through the allowed provider domain. For OpenAI, `_seed_runtime_proxy_pin_for_status_check`/`account_status()` derive the account id by running `read-codex-account-id.sh` as `trustyclaw-agent` against `agent-home/.codex/auth.json` and write it into `proxy_provider_pins`; `openai_request_denied` then only checks the request's `ChatGPT-Account-Id` header against that DB pin (and never pins the OpenAI bearer token). There is no operator-controlled anchor for the expected account. A malicious agent overwrites its `auth.json` with valid credentials for an attacker-owned ChatGPT account B, waits for the background poller (`runtime_status_loop`, ≤300s) to re-derive the pin to B, then POSTs arbitrary data to the allowed `api.openai.com`/`chatgpt.com` with `ChatGPT-Account-Id: B` + B's token — the guard passes and the data lands in account B, retrievable by the attacker. The Anthropic guard shares the structure (`read-claude-account.sh` → `access_token_sha256` pin from agent-home credentials), so the same account-redirection exfil applies to Claude. Anchor the pin to operator-approved account state captured at login rather than re-deriving it from agent-home on every refresh, or treat provider domains as untrusted egress under the malicious-agent model. |
+| NET-1 | Fixed | High | `host/runtime/admin_api/orchestrator.py:217`, `host/runtime/core/network_policy.py:140` | The managed-provider account pin is sourced from **agent-writable** state, so a malicious agent can redirect it to an attacker-controlled provider account and exfiltrate through the allowed provider domain. For OpenAI, `_seed_runtime_proxy_pin_for_status_check`/`account_status()` derive the account id by running `read-codex-account-id.sh` as `trustyclaw-agent` against `agent-home/.codex/auth.json` and write it into `proxy_provider_pins`; `openai_request_denied` then only checks the request's `ChatGPT-Account-Id` header against that DB pin (and never pins the OpenAI bearer token). There is no operator-controlled anchor for the expected account. A malicious agent overwrites its `auth.json` with valid credentials for an attacker-owned ChatGPT account B, waits for the background poller (`runtime_status_loop`, ≤300s) to re-derive the pin to B, then POSTs arbitrary data to the allowed `api.openai.com`/`chatgpt.com` with `ChatGPT-Account-Id: B` + B's token — the guard passes and the data lands in account B, retrievable by the attacker. The Anthropic guard shares the structure (`read-claude-account.sh` → `access_token_sha256` pin from agent-home credentials), so the same account-redirection exfil applies to Claude. Anchor the pin to operator-approved account state captured at login rather than re-deriving it from agent-home on every refresh, or treat provider domains as untrusted egress under the malicious-agent model. |
 
 I did not find any other policy-bypass path: domain/method/port/scheme/path-guard
 matching and the SSRF vet all hold, and no request reaches an upstream the active
@@ -193,16 +193,16 @@ the scope checklist. I did not run live proxy fuzzing or packet-level PoCs.
 
 ### What was reviewed
 
-- `host/runtime/network_proxy.py`: request parsing, CONNECT prechecks, TLS
+- `host/runtime/network_proxy/service.py`: request parsing, CONNECT prechecks, TLS
   interposition, Host/target validation, body buffering, WebSocket frame
   inspection, upstream DNS/connect, certificate generation, connection caps,
   and event logging.
-- `host/runtime/network_policy.py`: domain matching, path normalization,
+- `host/runtime/core/network_policy.py`: domain matching, path normalization,
   HTTP method checks, OpenAI account/web-search guard, Anthropic bearer-hash
   guard, body decoding, and managed-provider expansion call sites.
 - `host/config.py`: domain/method/path guard validation and managed provider
   rule expansion.
-- `host/runtime/proxy_state_client.py`, `host/runtime/state.py`, and
+- `host/runtime/proxy_state_client.py`, `host/runtime/core/state.py`, and
   `host/migrations/0001_admin_state_schema.sql`: policy storage, proxy grants,
   provider pins, and network event logging.
 - `host/bootstrap/bootstrap.sh`: nftables uid rules, proxy service identity,

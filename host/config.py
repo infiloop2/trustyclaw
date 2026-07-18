@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import re
-from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from host.network_integrations.base import (
     IntegrationConfig,
@@ -16,7 +14,6 @@ from host.network_integrations.registry import NETWORK_INTEGRATIONS, managed_dom
 
 AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,50}$")
 EXACT_DOMAIN_RE = re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
-ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 AGENT_RUNTIMES = {"codex", "claude_code"}
 
 
@@ -40,13 +37,6 @@ class NetworkControls:
             },
         }
 
-
-@dataclass(frozen=True)
-class OperatorConnection:
-    mode: str
-    ssh_public_key: str | None = None
-    hostname: str | None = None
-    tunnel_token_env: str | None = None
 
 @dataclass(frozen=True)
 class RuntimeOperatorConnection:
@@ -74,129 +64,61 @@ class RuntimeOperatorConnection:
 class InputConfig:
     agent_name: str
     aws_region: str
-    aws_access_key_id_env: str
-    aws_secret_access_key_env: str
-    aws_session_token_env: str | None
-    operator_connections: tuple[OperatorConnection, ...] | None
 
 
-def load_input_config(
-    path: str | Path,
-    *,
-    require_operator_connections: bool = True,
-) -> InputConfig:
-    try:
-        raw = json.loads(Path(path).read_text())
-    except json.JSONDecodeError as exc:
-        raise ConfigError(f"{path}: invalid JSON: {exc}") from exc
-    if not isinstance(raw, dict):
-        raise ConfigError("config must be a JSON object")
-    return parse_input_config(raw, require_operator_connections=require_operator_connections)
-
-
-def parse_input_config(
-    raw: dict[str, Any],
-    *,
-    require_operator_connections: bool = True,
-) -> InputConfig:
-    allowed_keys = {
-        "agent_name",
-        "aws_region",
-        "aws_access_key_id_env",
-        "aws_secret_access_key_env",
-        "aws_session_token_env",
-    }
-    if require_operator_connections:
-        allowed_keys.add("operator_connections")
-    _reject_extra(raw, allowed_keys, "config")
-    agent_name = _string(raw, "agent_name")
+def build_input_config(agent_name: str, aws_region: str) -> InputConfig:
+    """Validate the CLI-supplied identity: the agent name and its region."""
+    agent_name = agent_name.strip()
     if not AGENT_NAME_RE.fullmatch(agent_name):
-        raise ConfigError("agent_name must be 1-50 characters of letters, numbers, '-' or '_'")
-    aws_region = _string(raw, "aws_region")
+        raise ConfigError("agent name must be 1-50 characters of letters, numbers, '-' or '_'")
+    aws_region = aws_region.strip()
     if not re.fullmatch(r"[a-z]{2}-[a-z]+-\d", aws_region):
-        raise ConfigError("aws_region must look like an AWS region, e.g. us-east-1")
-    operator_connections: tuple[OperatorConnection, ...] | None = None
-    if require_operator_connections:
-        operator_connections = parse_operator_connections(_list(raw, "operator_connections"))
-    aws_session_token_env: str | None = None
-    if "aws_session_token_env" in raw:
-        aws_session_token_env = _string(raw, "aws_session_token_env")
-        if not ENV_NAME_RE.fullmatch(aws_session_token_env):
-            raise ConfigError("aws_session_token_env must be a valid environment variable name")
-    return InputConfig(
-        agent_name=agent_name,
-        aws_region=aws_region,
-        aws_access_key_id_env=_string(raw, "aws_access_key_id_env"),
-        aws_secret_access_key_env=_string(raw, "aws_secret_access_key_env"),
-        aws_session_token_env=aws_session_token_env,
-        operator_connections=operator_connections,
-    )
+        raise ConfigError("AWS region must look like an AWS region, e.g. us-east-1")
+    return InputConfig(agent_name=agent_name, aws_region=aws_region)
 
 
-def parse_operator_connections(raw: list[Any]) -> tuple[OperatorConnection, ...]:
-    if not raw:
-        raise ConfigError("operator_connections must contain at least one connection")
-    connections = tuple(parse_operator_connection(_list_object(raw, index)) for index in range(len(raw)))
-    modes = [connection.mode for connection in connections]
-    duplicates = sorted({mode for mode in modes if modes.count(mode) > 1})
-    if duplicates:
-        raise ConfigError(f"operator_connections must not contain duplicate modes: {', '.join(duplicates)}")
-    return connections
-
-
-def parse_operator_connection(raw: dict[str, Any]) -> OperatorConnection:
-    mode = _string(raw, "mode")
-    if mode == "ssh":
-        _reject_extra(raw, {"mode", "ssh_public_key"}, "operator_connections[]")
-        ssh_public_key = _string(raw, "ssh_public_key")
-        if not (ssh_public_key.startswith("ssh-ed25519 ") or ssh_public_key.startswith("ssh-rsa ")):
-            raise ConfigError("operator_connections[].ssh_public_key must be an OpenSSH public key")
-        return OperatorConnection(mode=mode, ssh_public_key=ssh_public_key)
-    if mode == "cloudflare_access":
-        _reject_extra(raw, {"mode", "hostname", "tunnel_token_env"}, "operator_connections[]")
-        hostname = _string(raw, "hostname").lower()
-        if not EXACT_DOMAIN_RE.fullmatch(hostname):
-            raise ConfigError("operator_connections[].hostname must be an exact domain like 'trustyclaw.example.com'")
-        tunnel_token_env = _string(raw, "tunnel_token_env")
-        if not ENV_NAME_RE.fullmatch(tunnel_token_env):
-            raise ConfigError("operator_connections[].tunnel_token_env must be a valid environment variable name")
-        return OperatorConnection(mode=mode, hostname=hostname, tunnel_token_env=tunnel_token_env)
-    raise ConfigError("operator_connections[].mode must be 'ssh' or 'cloudflare_access'")
-
-
-def runtime_operator_connections_from_input(
-    connections: tuple[OperatorConnection, ...],
-    env: Mapping[str, str],
+def build_operator_connections(
+    ssh_public_key: str | None,
+    cloudflare_hostname: str | None,
+    tunnel_token: str | None,
 ) -> tuple[RuntimeOperatorConnection, ...]:
-    runtime_connections: list[RuntimeOperatorConnection] = []
-    for connection in connections:
-        if connection.mode == "ssh":
-            runtime_connections.append(
-                RuntimeOperatorConnection(mode="ssh", ssh_public_key=connection.ssh_public_key)
+    """Validate the CLI-supplied operator endpoints: at most one per mode,
+    at least one overall. The tunnel token comes from the caller's fixed
+    environment variable, never from an argument."""
+    connections: list[RuntimeOperatorConnection] = []
+    if ssh_public_key is not None:
+        ssh_public_key = ssh_public_key.strip()
+        if not (ssh_public_key.startswith("ssh-ed25519 ") or ssh_public_key.startswith("ssh-rsa ")):
+            raise ConfigError("the operator SSH public key must be an OpenSSH public key")
+        connections.append(RuntimeOperatorConnection(mode="ssh", ssh_public_key=ssh_public_key))
+    if cloudflare_hostname is not None:
+        hostname = cloudflare_hostname.strip().lower()
+        if not EXACT_DOMAIN_RE.fullmatch(hostname):
+            raise ConfigError(
+                "the operator Cloudflare hostname must be an exact domain like 'trustyclaw.example.com'"
             )
-            continue
-        if connection.mode == "cloudflare_access":
-            if connection.tunnel_token_env is None:
-                raise ConfigError("cloudflare_access connection is missing tunnel_token_env")
-            token = env.get(connection.tunnel_token_env)
-            if not token:
-                raise ConfigError(
-                    f"environment variable {connection.tunnel_token_env} is not set or is empty"
-                )
-            if any(character.isspace() for character in token):
-                raise ConfigError(
-                    f"environment variable {connection.tunnel_token_env} must contain a single Cloudflare tunnel token"
-                )
-            runtime_connections.append(
-                RuntimeOperatorConnection(
-                    mode="cloudflare_access",
-                    hostname=connection.hostname,
-                    tunnel_token=token,
-                )
+        if not tunnel_token:
+            raise ConfigError(
+                "a Cloudflare operator endpoint needs the tunnel token; set the "
+                "TRUSTYCLAW_CLOUDFLARE_TUNNEL_TOKEN environment variable"
             )
-            continue
-        raise ConfigError(f"unsupported operator connection mode: {connection.mode}")
-    return tuple(runtime_connections)
+        if any(character.isspace() for character in tunnel_token):
+            raise ConfigError(
+                "TRUSTYCLAW_CLOUDFLARE_TUNNEL_TOKEN must contain a single Cloudflare tunnel token"
+            )
+        connections.append(
+            RuntimeOperatorConnection(
+                mode="cloudflare_access",
+                hostname=hostname,
+                tunnel_token=tunnel_token,
+            )
+        )
+    if not connections:
+        raise ConfigError(
+            "at least one operator endpoint is required: pass --operator-ssh-public-key "
+            "and/or --operator-cloudflare-hostname"
+        )
+    return tuple(connections)
 
 
 def public_operator_connections(connections: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
@@ -248,23 +170,3 @@ def _object(raw: dict[str, Any], key: str, *, required: bool = True) -> dict[str
         raise ConfigError(f"{key} must be an object")
     return value
 
-
-def _list(raw: dict[str, Any], key: str) -> list[Any]:
-    value = raw.get(key)
-    if not isinstance(value, list):
-        raise ConfigError(f"{key} must be an array")
-    return value
-
-
-def _list_object(raw: list[Any], index: int) -> dict[str, Any]:
-    value = raw[index]
-    if not isinstance(value, dict):
-        raise ConfigError(f"operator_connections[{index}] must be an object")
-    return value
-
-
-def _string(raw: dict[str, Any], key: str) -> str:
-    value = raw.get(key)
-    if not isinstance(value, str) or not value.strip():
-        raise ConfigError(f"{key} must be a non-empty string")
-    return value.strip()

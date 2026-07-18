@@ -79,9 +79,11 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import hashlib
 import json
 import os
 from pathlib import Path
+import secrets as py_secrets
 import shlex
 import shutil
 import subprocess
@@ -95,10 +97,9 @@ import urllib.request
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from host.config import load_input_config
 from host.constants import ADMIN_API_PORT as ADMIN_PORT, PROXY_PORT
-from host.runtime.state import PRUNE_EVERY
-from host.runtime.tools_host import BUNDLED_TOOLS
+from host.runtime.core.state import PRUNE_EVERY
+from host.runtime.tools.tools_host import BUNDLED_TOOLS
 from tests.smoke.cdp_browser import ChromeBrowser
 
 # Region the smoke deploys into. Keep in sync with the region scoped in
@@ -280,8 +281,7 @@ class AwsSmoke:
         self.workdir = Path(tempfile.mkdtemp(prefix="smoke-aws-"))
         self.control_socket = self.workdir / "ssh-control"
         self.ssh_key: str | None = None
-        self.effective_config = self.workdir / "effective_config.json"
-        self.config = None
+        self.public_key: str | None = None
         self.region = SMOKE_REGION
         self.result: dict | None = None
         self.tunnel_open = False
@@ -349,51 +349,46 @@ class AwsSmoke:
     # --- lifecycle ---------------------------------------------------------
 
     def prepare(self) -> None:
-        """Build the smoke's own deploy config: generate an ephemeral operator
-        SSH key and pin the region to the IAM policy's, so the caller provides
-        neither a config file nor a key."""
+        """Generate an ephemeral operator SSH key and pin the region to the
+        IAM policy's, so the caller provides neither arguments nor a key."""
         self.ssh_key = str(self.workdir / "operator_key")
         subprocess.run(
             ["ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-C", "trustyclaw-smoke", "-f", self.ssh_key],
             check=True,
         )
-        public_key = Path(f"{self.ssh_key}.pub").read_text().strip()
-        raw = {
-            "agent_name": SMOKE_AGENT_NAME,
-            "aws_region": SMOKE_REGION,
-            "aws_access_key_id_env": ACCESS_KEY_ENV,
-            "aws_secret_access_key_env": SECRET_KEY_ENV,
-            "operator_connections": [
-                {
-                    "mode": "ssh",
-                    "ssh_public_key": public_key,
-                }
-            ],
-        }
-        self.effective_config.write_text(json.dumps(raw))
-        self.config = load_input_config(self.effective_config)
-        self.region = self.config.aws_region
+        self.public_key = Path(f"{self.ssh_key}.pub").read_text().strip()
+        self.region = SMOKE_REGION
 
     def deploy(self) -> None:
         self._step("deploy host")
         self._destroy_tagged_smoke_resources()
         env = os.environ.copy()
         env["PYTHONPATH"] = str(REPO_ROOT)
-        subprocess.run(
+        env["AWS_REGION"] = self.region
+        # The CLI takes only the password hash; the harness generates the
+        # password and keeps the cleartext for its own admin API checks. The
+        # result JSON is the deploy's stdout.
+        admin_password = py_secrets.token_urlsafe(32)
+        proc = subprocess.run(
             [
                 sys.executable,
                 "-m",
                 "host.cli.deploy",
-                "--config",
-                str(self.effective_config),
-                "--result-file",
-                f"{self.config.agent_name}.json",
+                "--agent-name",
+                SMOKE_AGENT_NAME,
+                "--operator-ssh-public-key",
+                self.public_key or "",
+                "--admin-password-sha256",
+                hashlib.sha256(admin_password.encode()).hexdigest(),
             ],
             cwd=self.workdir,
             env=env,
             check=True,
+            stdout=subprocess.PIPE,
+            text=True,
         )
-        self.result = json.loads((self.workdir / f"{self.config.agent_name}.json").read_text())
+        self.result = json.loads(proc.stdout)
+        self.result["admin_password"] = admin_password
         self._ok(f"instance {self.result['instance_id']} at {self.result['public_dns']}")
 
     def open_tunnel(self) -> None:
@@ -2163,7 +2158,7 @@ class AwsSmoke:
         # trustyclaw-agent and reaches the tools socket by peer credentials.
         shim_command = (
             "sudo -u trustyclaw-agent env PYTHONPATH=/opt/trustyclaw-host "
-            "python3 -m host.runtime.tools_mcp_shim"
+            "python3 -m host.runtime.agent_shim.mcp_shim"
         )
         next_request_id = 10
 
@@ -2284,7 +2279,7 @@ class AwsSmoke:
         # outright, and even the admin uid is rejected on the agent MCP routes
         # (it holds only the /operator/... delegation routes).
         probe_script = (
-            "from host.runtime.tools_mcp_shim import UnixHTTPConnection; "
+            "from host.runtime.agent_shim.mcp_shim import UnixHTTPConnection; "
             "c = UnixHTTPConnection('/run/trustyclaw-tools/tools.sock'); "
             "c.request('GET', '/tools'); print(c.getresponse().status)"
         )
@@ -2299,7 +2294,7 @@ class AwsSmoke:
                 )
 
         network_probe_script = (
-            "from host.runtime.tools_mcp_shim import UnixHTTPConnection; "
+            "from host.runtime.agent_shim.mcp_shim import UnixHTTPConnection; "
             "c = UnixHTTPConnection('/run/trustyclaw-agent-network/agent-network.sock'); "
             "c.request('GET', '/tools'); print(c.getresponse().status)"
         )

@@ -1,6 +1,6 @@
 """workspace_kit: the shared engine behind resident-workspace apps.
 
-This is an importable package (like ``host.runtime.db``), not an installed app:
+This is an importable package (like ``host.runtime.core.db``), not an installed app:
 it has no ``manifest.json``, so the app-platform validator skips it. An app's
 ``backend.py`` builds one ``WorkspaceAppConfig`` and calls ``serve(config)``.
 

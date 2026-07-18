@@ -1,6 +1,6 @@
 """Test helpers that read/write whole admin-state snapshots.
 
-The runtime uses per-operation storage accessors (host.runtime.state); tests
+The runtime uses per-operation storage accessors (host.runtime.core.state); tests
 often want to stage or inspect a complete picture instead. load_state() and
 save_state() expose a compact test-facing dict: tasks, counters, runtime
 statuses, the codex_threads/claude_sessions maps with their provider-specific
@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 from host.session_options import SESSION_OPTIONS
-from host.runtime import state
+from host.runtime.core import state
 
 _SESSION_MAPS = {"codex_threads": ("codex", "codex_thread_id"), "claude_sessions": ("claude_code", "session_id")}
 
@@ -24,9 +24,9 @@ def _default_session_options(runtime: str) -> tuple[str, str]:
 
 
 def load_state() -> dict[str, Any]:
-    from host.runtime import db
+    from host.runtime.core import db
 
-    from host.runtime import orchestrator
+    from host.runtime.admin_api import orchestrator
 
     snapshot: dict[str, Any] = {
         "agent_runtime_statuses": orchestrator.all_runtime_status_records(),
@@ -65,7 +65,7 @@ def load_state() -> dict[str, Any]:
 
 
 def save_state(snapshot: dict[str, Any]) -> None:
-    from host.runtime import orchestrator
+    from host.runtime.admin_api import orchestrator
 
     with orchestrator._RUNTIME_STATUS_LOCK:
         orchestrator._RUNTIME_STATUSES.clear()
@@ -142,7 +142,7 @@ def save_state(snapshot: dict[str, Any]) -> None:
 def read_agent_events() -> list[dict[str, Any]]:
     """Every agent event, oldest first (tests inspect whole logs; the runtime
     only ever pages)."""
-    from host.runtime import db
+    from host.runtime.core import db
 
     with db.transaction() as cur:
         cur.execute(f"SELECT {state._EVENT_FIELDS} FROM agent_events ORDER BY seq")
@@ -152,7 +152,7 @@ def read_agent_events() -> list[dict[str, Any]]:
 def read_network_events() -> list[dict[str, Any]]:
     """Every network event, oldest first (tests inspect whole logs; the
     runtime only ever pages)."""
-    from host.runtime import db
+    from host.runtime.core import db
 
     with db.transaction() as cur:
         cur.execute(f"SELECT {state._NETWORK_EVENT_FIELDS} FROM network_events ORDER BY seq")

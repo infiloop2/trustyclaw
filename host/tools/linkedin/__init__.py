@@ -513,5 +513,5 @@ class LinkedInTool:
             return ActionFailed(str(exc) or "LinkedIn write failed after approval.")
 
 
-# The instance the host discovers (see host.runtime.tools_host).
+# The instance the host discovers (see host.runtime.tools.tools_host).
 BUNDLED_TOOL = LinkedInTool()

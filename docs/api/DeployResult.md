@@ -1,9 +1,8 @@
 # Lifecycle Result
 
-Each lifecycle command prints the result path it wrote. The default is
-`<agent_name>-<mode>.json`, where mode is `deploy`, `upgrade`, `recover`,
-`reconfigure`, `start`, or `stop`. `--result-file <path>` overrides the path
-and may overwrite an existing file.
+Each lifecycle command prints exactly one result JSON on stdout; all progress
+streams on stderr, so `> result.json` captures the result cleanly. The result
+contains no secrets.
 
 ## Provisioning result
 
@@ -24,8 +23,7 @@ return this shape:
   "operator_connections": [
     {"mode": "ssh"},
     {"mode": "cloudflare_access", "hostname": "trustyclaw.example.com"}
-  ],
-  "admin_password": "generated-password"
+  ]
 }
 ```
 
@@ -36,7 +34,7 @@ return this shape:
 | `ssh_user` | Always | `trustyclaw-operator`. |
 | `admin_ui_local_url` | Always | Local URL after forwarding the admin port: `http://127.0.0.1:7443`. |
 | `admin_volume_id`, `agent_volume_id` | Always | Durable EBS volume ids attached to the host. |
-| `version` | Always | Repository `VERSION` installed by this provisioning command. |
+| `version` | Always | Target `VERSION` installed by this provisioning command. |
 | `operator_connections` | `deploy`, `reconfigure` | Public summary of the replacement endpoint list. Tunnel tokens and SSH key material are omitted. Upgrade/recover preserve the stored list and omit this field. |
 | `admin_password` | `deploy`, `reconfigure` | Cleartext admin password, read from `--admin-password-env` when supplied or generated otherwise. Upgrade/recover preserve the password and omit this field. |
 

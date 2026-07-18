@@ -9,7 +9,6 @@ import subprocess
 from typing import Any
 
 from host.config import ConfigError, InputConfig
-from host.cli.lifecycle_bootstrap import _render_user_data
 from host.cli.lifecycle_constants import (
     ADMIN_VOLUME_DEVICE,
     ADMIN_VOLUME_SIZE_GB,
@@ -32,32 +31,20 @@ CLOUDFLARE_TUNNEL_EGRESS = (
 
 
 def _aws_env(config: InputConfig) -> dict[str, str]:
-    access_key = os.environ.get(config.aws_access_key_id_env)
-    secret_key = os.environ.get(config.aws_secret_access_key_env)
-    if not access_key:
-        raise ConfigError(f"environment variable {config.aws_access_key_id_env} is not set")
-    if not secret_key:
-        raise ConfigError(f"environment variable {config.aws_secret_access_key_env} is not set")
-    session_token: str | None = None
-    if config.aws_session_token_env is not None:
-        session_token = os.environ.get(config.aws_session_token_env)
-        if not session_token:
-            raise ConfigError(f"environment variable {config.aws_session_token_env} is not set")
+    """Environment for aws CLI subprocesses: standard AWS credential
+    variables, with the region pinned to the agent's region.
+
+    AWS_SESSION_TOKEN is used exactly when set. A stale token left over next
+    to fresh static keys fails closed at AWS with an authentication error;
+    unset it for static-key runs.
+    """
+    if not os.environ.get("AWS_ACCESS_KEY_ID"):
+        raise ConfigError("environment variable AWS_ACCESS_KEY_ID is not set")
+    if not os.environ.get("AWS_SECRET_ACCESS_KEY"):
+        raise ConfigError("environment variable AWS_SECRET_ACCESS_KEY is not set")
     env = os.environ.copy()
-    env.update(
-        {
-            "AWS_ACCESS_KEY_ID": access_key,
-            "AWS_SECRET_ACCESS_KEY": secret_key,
-            "AWS_DEFAULT_REGION": config.aws_region,
-        }
-    )
-    # Session-token credentials (STS roles) are first-class; anything already
-    # in the caller's environment is still dropped so stale ambient tokens
-    # cannot leak into a static-key deployment.
-    if session_token is not None:
-        env["AWS_SESSION_TOKEN"] = session_token
-    else:
-        env.pop("AWS_SESSION_TOKEN", None)
+    env["AWS_REGION"] = config.aws_region
+    env["AWS_DEFAULT_REGION"] = config.aws_region
     return env
 
 
@@ -106,26 +93,33 @@ def _terminate_instances(instance_ids: list[str], env: dict[str, str]) -> None:
 
 def _launch_instance(
     config: InputConfig,
-    deploy_key: Path,
+    user_data: str,
+    workdir: Path,
     env: dict[str, str],
     *,
     target_version: str,
-    preferred_availability_zone: str | None = None,
-    network: tuple[str, str] | None = None,
+    network: tuple[str, str, str],
+    ssh_ingress: bool,
+    cloudflare_egress: bool,
 ) -> tuple[str, str]:
-    if network is None:
-        network = _default_network(config, env, preferred_availability_zone=preferred_availability_zone)
-    vpc_id, subnet_id = network
+    vpc_id, subnet_id, _availability_zone = network
     _log(f"using vpc {vpc_id}, public subnet {subnet_id}")
-    security_group_id = _ensure_security_group(config, env, vpc_id)
+    security_group_id = _ensure_security_group(
+        config,
+        env,
+        vpc_id,
+        ssh_ingress=ssh_ingress,
+        cloudflare_egress=cloudflare_egress,
+    )
     ami_id = _ubuntu_ami(env)
     _log(f"using Ubuntu AMI {ami_id}, instance type {INSTANCE_TYPE}")
-    user_data = _render_user_data(deploy_key.with_suffix(".pub").read_text().strip())
     # Pass user data via fileb:// rather than a raw string. The AWS CLI v2 default
     # cli_binary_format is "base64", so a raw --user-data string would be decoded
     # as base64 (corrupting the script and breaking cloud-init). fileb:// reads the
     # bytes as-is and base64-encodes them for EC2 regardless of that setting.
-    user_data_path = deploy_key.parent / "user_data.sh"
+    user_data_path = workdir / "user_data.sh"
+    user_data_path.touch(mode=0o600)
+    user_data_path.chmod(0o600)  # the GitHub delivery embeds the provisioning payload
     user_data_path.write_text(user_data)
     response = _aws(env,
         "ec2",
@@ -139,6 +133,14 @@ def _launch_instance(
         "--security-group-ids",
         security_group_id,
         "--associate-public-ip-address",
+        # Instances are cattle: the root volume is disposable by contract and
+        # the durable data volumes survive termination, so an OS-initiated
+        # shutdown terminates the instance. This lets a detached (GitHub
+        # delivery) provisioning failure clean up its own instance, and the
+        # stop command still parks compute through the EC2 API, which this
+        # attribute does not affect.
+        "--instance-initiated-shutdown-behavior",
+        "terminate",
         "--metadata-options",
         "HttpTokens=required,HttpEndpoint=enabled",
         "--block-device-mappings",
@@ -167,16 +169,20 @@ def _ensure_storage_volumes(
     config: InputConfig,
     env: dict[str, str],
     *,
-    instance_id: str,
     availability_zone: str,
     wait_for_detach: bool = False,
     created_storage_volumes: list[str] | None = None,
-) -> tuple[dict[str, str], list[str]]:
+) -> dict[str, str]:
+    """Find or create the admin and agent volumes in the availability zone.
+
+    Volumes exist before the instance launches so the GitHub delivery can
+    embed their ids in the provisioning payload; attachment happens after the
+    instance reaches ``running``.
+    """
     volumes: dict[str, str] = {}
-    created: list[str] = []
-    for role, size_gb, device in (
-        ("admin", ADMIN_VOLUME_SIZE_GB, ADMIN_VOLUME_DEVICE),
-        ("agent", AGENT_VOLUME_SIZE_GB, AGENT_VOLUME_DEVICE),
+    for role, size_gb in (
+        ("admin", ADMIN_VOLUME_SIZE_GB),
+        ("agent", AGENT_VOLUME_SIZE_GB),
     ):
         existing = _find_available_storage_volume(
             config,
@@ -187,15 +193,18 @@ def _ensure_storage_volumes(
         )
         if existing is None:
             volume_id = _create_storage_volume(config, env, role, size_gb, availability_zone)
-            created.append(volume_id)
             if created_storage_volumes is not None:
                 created_storage_volumes.append(volume_id)
         else:
             volume_id = existing
             _log(f"reusing {role} storage volume {volume_id}")
-        _attach_volume(env, instance_id=instance_id, volume_id=volume_id, device=device)
         volumes[role] = volume_id
-    return volumes, created
+    return volumes
+
+
+def _attach_storage_volumes(env: dict[str, str], *, instance_id: str, volumes: dict[str, str]) -> None:
+    for role, device in (("admin", ADMIN_VOLUME_DEVICE), ("agent", AGENT_VOLUME_DEVICE)):
+        _attach_volume(env, instance_id=instance_id, volume_id=volumes[role], device=device)
 
 
 def _existing_storage_volume_availability_zone(config: InputConfig, env: dict[str, str]) -> str | None:
@@ -363,7 +372,7 @@ def _default_network(
     env: dict[str, str],
     *,
     preferred_availability_zone: str | None = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     vpcs = _aws(env, "ec2", "describe-vpcs", "--filters", "Name=is-default,Values=true")
     if not vpcs.get("Vpcs"):
         raise ConfigError("AWS account has no default VPC in the configured region")
@@ -398,8 +407,11 @@ def _default_network(
         raise ConfigError(
             "AWS default VPC has no default subnet with an active 0.0.0.0/0 route to an internet gateway"
         )
-    subnet_id = public_subnets[0]["SubnetId"]
-    return vpc_id, subnet_id
+    subnet = public_subnets[0]
+    availability_zone = subnet.get("AvailabilityZone")
+    if not isinstance(availability_zone, str) or not availability_zone:
+        raise ConfigError(f"AWS default subnet {subnet['SubnetId']} reports no availability zone")
+    return vpc_id, subnet["SubnetId"], availability_zone
 
 
 def _subnet_has_public_ipv4_route(env: dict[str, str], vpc_id: str, subnet_id: str) -> bool:
@@ -429,7 +441,20 @@ def _subnet_has_public_ipv4_route(env: dict[str, str], vpc_id: str, subnet_id: s
     return False
 
 
-def _ensure_security_group(config: InputConfig, env: dict[str, str], vpc_id: str) -> str:
+def _ensure_security_group(
+    config: InputConfig,
+    env: dict[str, str],
+    vpc_id: str,
+    *,
+    ssh_ingress: bool,
+    cloudflare_egress: bool,
+) -> str:
+    """Converge the agent security group to the requested launch access state.
+
+    Both deliveries pass the derived final state; the SSH delivery
+    additionally keeps SSH ingress open at launch for the single-use deploy
+    key and closes it after bootstrap when the derived state says so.
+    """
     name = f"trustyclaw-host-{config.agent_name}"
     groups = _aws(env,
         "ec2",
@@ -463,24 +488,51 @@ def _ensure_security_group(config: InputConfig, env: dict[str, str], vpc_id: str
         )
         group_id = created["GroupId"]
     _reset_security_group_rules(env, group_id)
-    # SSH is opened for the single-use provisioning key. After bootstrap, the
-    # lifecycle CLI keeps or revokes this ingress based on the stored operator
-    # connections.
-    _authorize_if_missing(env, "authorize-security-group-ingress", group_id, SSH_INGRESS)
-    # Egress is pinned to HTTP, HTTPS, NTP, and a temporary Cloudflare Tunnel
-    # connector allowance: bootstrap downloads and all proxied agent traffic use
-    # 80/443, timesync uses UDP 123, cloudflared may use 7844, and DNS to the
-    # VPC resolver bypasses security groups. After bootstrap, the lifecycle CLI
-    # keeps or revokes the connector allowance based on the stored operator
-    # connections.
+    if ssh_ingress:
+        _authorize_if_missing(env, "authorize-security-group-ingress", group_id, SSH_INGRESS)
+    # Egress is pinned to HTTP, HTTPS, and NTP: bootstrap downloads and all
+    # proxied agent traffic use 80/443, timesync uses UDP 123, and DNS to the
+    # VPC resolver bypasses security groups. The Cloudflare Tunnel connector
+    # allowance (7844) is added only when requested.
     for egress in (
         {"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
         {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
         {"IpProtocol": "udp", "FromPort": 123, "ToPort": 123, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
-        *CLOUDFLARE_TUNNEL_EGRESS,
+        *(CLOUDFLARE_TUNNEL_EGRESS if cloudflare_egress else ()),
     ):
         _authorize_if_missing(env, "authorize-security-group-egress", group_id, egress)
     return group_id
+
+
+def _security_group_access_state(
+    config: InputConfig, env: dict[str, str], vpc_id: str
+) -> tuple[bool, bool] | None:
+    """Read (ssh_ingress, cloudflare_egress) from the agent's existing
+    security group, or None when the group does not exist. The previous
+    deploy or reconfigure converged these rules to the stored operator
+    connections, so on the GitHub delivery upgrade and recover reapply them
+    at launch."""
+    name = f"trustyclaw-host-{config.agent_name}"
+    groups = _aws(env,
+        "ec2",
+        "describe-security-groups",
+        "--filters",
+        f"Name=group-name,Values={name}",
+        f"Name=vpc-id,Values={vpc_id}",
+    ).get("SecurityGroups", [])
+    if not groups:
+        return None
+    group = groups[0]
+    ssh_ingress = any(
+        _same_permission_shape(permission, SSH_INGRESS)
+        for permission in group.get("IpPermissions", [])
+    )
+    cloudflare_egress = any(
+        _same_permission_shape(permission, egress)
+        for permission in group.get("IpPermissionsEgress", [])
+        for egress in CLOUDFLARE_TUNNEL_EGRESS
+    )
+    return ssh_ingress, cloudflare_egress
 
 
 def _set_security_group_ssh_ingress(env: dict[str, str], group_id: str, *, enabled: bool) -> None:
@@ -500,29 +552,6 @@ def _set_security_group_ssh_ingress(env: dict[str, str], group_id: str, *, enabl
             env,
             "ec2",
             "revoke-security-group-ingress",
-            "--group-id",
-            group_id,
-            "--ip-permissions",
-            json.dumps(matching),
-        )
-
-
-def _set_security_group_cloudflare_egress(env: dict[str, str], group_id: str, *, enabled: bool) -> None:
-    if enabled:
-        for egress in CLOUDFLARE_TUNNEL_EGRESS:
-            _authorize_if_missing(env, "authorize-security-group-egress", group_id, egress)
-        return
-    group = _aws(env, "ec2", "describe-security-groups", "--group-ids", group_id)["SecurityGroups"][0]
-    matching = [
-        permission
-        for permission in group.get("IpPermissionsEgress", [])
-        if any(_same_permission_shape(permission, egress) for egress in CLOUDFLARE_TUNNEL_EGRESS)
-    ]
-    if matching:
-        _aws(
-            env,
-            "ec2",
-            "revoke-security-group-egress",
             "--group-id",
             group_id,
             "--ip-permissions",

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from host.network_integrations.custom.manifest import CustomIntegration, rule_for_host
-from host.runtime.network_policy import route_allowed
+from host.runtime.core.network_policy import route_allowed
 
 
 def host_allowed(config: CustomIntegration, host: str) -> bool:

@@ -8,6 +8,6 @@ and runtime network policy.
 | Doc | Contents |
 | --- | --- |
 | [Admin API](AdminAPI.md) | Localhost admin routes, auth, task/runtime lifecycle, apps, tools, network policy, and host controls. |
-| [Input config](InputConfig.md) | Deploy input config schema. |
-| [Deploy result](DeployResult.md) | Sensitive lifecycle result schema written after deploy, upgrade, recover, reconfigure, start, or stop. |
+| [Lifecycle CLI](CLI.md) | Lifecycle command arguments and environment variables. |
+| [Deploy result](DeployResult.md) | Lifecycle result JSON printed on stdout by deploy, upgrade, recover, reconfigure, start, and stop. |
 | [Network controls](NetworkControls.md) | Runtime network policy schema accepted by the admin API and proxy. |

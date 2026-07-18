@@ -18,7 +18,7 @@ Brokers, and Runway) and
 parse their responses, so unlike other host code they need direct egress and are
 the host code most exposed to attacker-influenced data. They run in a **dedicated
 `trustyclaw-tools` service** — its own Linux user, running
-`host.runtime.tools_service` — kept out of the admin service. nftables grants the
+`host.runtime.tools.service` — kept out of the admin service. nftables grants the
 `trustyclaw-tools` uid DNS and outbound HTTPS (port 443) and **nothing to the
 `trustyclaw-admin` uid**, so the admin service holds no internet egress at all: a
 compromised tool package cannot exfiltrate admin state or reach an arbitrary host.
@@ -56,7 +56,7 @@ for the service/user map.
 
 Agents speak MCP, so the host bridges MCP to the tool runtime with a shim:
 
-- Both harnesses spawn `python3 -m host.runtime.tools_mcp_shim` as
+- Both harnesses spawn `python3 -m host.runtime.agent_shim.mcp_shim` as
   `trustyclaw-agent` — Claude Code through `--mcp-config` (with
   `--strict-mcp-config` making it the only server), Codex through `mcp_servers`
   in the root-owned managed config `/etc/codex/managed_config.toml`.
@@ -198,7 +198,7 @@ The listed actions are the enabled tools' manifest actions, named
 
 **Concurrency cap.** Each agent tool call blocks one handler thread on a
 third-party request, so the agent's in-flight tool calls are capped at
-`MAX_CONCURRENT_CALLS = 8` (`host/runtime/tools_api.py`). The cap is global across
+`MAX_CONCURRENT_CALLS = 8` (`host/runtime/tools/api.py`). The cap is global across
 **all** of the agent's tool calls, not per `tool_id`. Agent calls beyond the cap are rejected immediately
 with HTTP 429 — before the request body is read — rather than queueing. The
 operator delegation routes are not subject to this cap, so a busy agent can never
@@ -222,7 +222,7 @@ pull request check before it can reach a host.
 
 ## Host API implementation
 
-`host.runtime.tools_host` implements the contract against admin state:
+`host.runtime.tools.tools_host` implements the contract against admin state:
 
 - **Credentials** — the `tool_credentials` table, one row per tool holding that
   tool's `StoredCredential` in its contract fields: the non-secret connected-

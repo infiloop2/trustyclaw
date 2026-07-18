@@ -18,8 +18,8 @@ import json
 from typing import Any
 
 from host.network_integrations.base import ManagedIntegration
-from host.runtime.network_policy import decode_body, normalized_path, route_allowed
-from host.runtime.state import read_proxy_openai_account_id
+from host.runtime.core.network_policy import decode_body, normalized_path, route_allowed
+from host.runtime.core.state import read_proxy_openai_account_id
 
 # Codex standalone web search endpoints (code-mode models search here instead
 # of declaring a Responses web_search tool). The request must opt into cached

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 from collections.abc import Iterator
 import errno
@@ -16,11 +17,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from host.config import ConfigError, parse_input_config
+from host.bootstrap import render
+from host.config import ConfigError, build_input_config, build_operator_connections
 from host.cli import lifecycle as deploy
 from host.cli import lifecycle_aws
 from host.cli import power
-from host.runtime import app_platform, db
+from host.runtime.core import app_platform, db
 
 
 
@@ -38,88 +40,91 @@ class FakeScandir:
         return iter(self._entries)
 
 
-def sample_config() -> dict[str, object]:
-    return {
-        "agent_name": "trustyclaw-test",
-        "aws_region": "us-east-1",
-        "aws_access_key_id_env": "TEST_AWS_ACCESS_KEY_ID",
-        "aws_secret_access_key_env": "TEST_AWS_SECRET_ACCESS_KEY",
-        "operator_connections": [
-            {
-                "mode": "ssh",
-                "ssh_public_key": "ssh-ed25519 AAAATEST operator@example",
-            }
-        ],
-    }
+SAMPLE_SSH_PUBLIC_KEY = "ssh-ed25519 AAAATEST operator@example"
+SAMPLE_AWS_ENV = {
+    "AWS_ACCESS_KEY_ID": "AKIATEST",
+    "AWS_SECRET_ACCESS_KEY": "secret",
+    "AWS_REGION": "us-east-1",
+}
 
 
-def sample_upgrade_config() -> dict[str, object]:
-    config = sample_config()
-    config.pop("operator_connections")
-    return config
+def sample_input_config():  # type: ignore[no-untyped-def]
+    return build_input_config("trustyclaw-test", "us-east-1")
+
+
+SAMPLE_ADMIN_PASSWORD_SHA256 = "f" * 64
+
+
+def _fake_deploy_key(workdir: object) -> Path:
+    key_path = Path(str(workdir)) / "deploy_key"
+    key_path.write_text("fake-private-key")
+    key_path.with_suffix(".pub").write_text("ssh-ed25519 AAAADEPLOY trustyclaw-deploy")
+    return key_path
 
 
 class DeployUnitTests(unittest.TestCase):
-    def test_aws_env_drops_ambient_session_token_for_static_keys(self) -> None:
-        config = parse_input_config(sample_config())
+    def test_aws_env_uses_standard_credentials_and_pins_region(self) -> None:
+        config = sample_input_config()
         env_values = {
-            "TEST_AWS_ACCESS_KEY_ID": "access",
-            "TEST_AWS_SECRET_ACCESS_KEY": "secret",
-            "AWS_SESSION_TOKEN": "stale-ambient-token",
+            "AWS_ACCESS_KEY_ID": "access",
+            "AWS_SECRET_ACCESS_KEY": "secret",
+            "AWS_SESSION_TOKEN": "sts-token",
         }
         with patch.dict(os.environ, env_values, clear=False):
             env = lifecycle_aws._aws_env(config)
         self.assertEqual(env["AWS_ACCESS_KEY_ID"], "access")
         self.assertEqual(env["AWS_SECRET_ACCESS_KEY"], "secret")
-        self.assertEqual(env["AWS_DEFAULT_REGION"], "us-east-1")
-        self.assertNotIn("AWS_SESSION_TOKEN", env)
-
-    def test_aws_env_passes_configured_session_token(self) -> None:
-        raw = sample_config()
-        raw["aws_session_token_env"] = "TEST_AWS_SESSION_TOKEN"
-        config = parse_input_config(raw)
-        env_values = {
-            "TEST_AWS_ACCESS_KEY_ID": "access",
-            "TEST_AWS_SECRET_ACCESS_KEY": "secret",
-            "TEST_AWS_SESSION_TOKEN": "sts-token",
-        }
-        with patch.dict(os.environ, env_values, clear=False):
-            env = lifecycle_aws._aws_env(config)
+        # A session token is used exactly when set; a stale one next to fresh
+        # static keys fails closed at AWS instead of being silently dropped.
         self.assertEqual(env["AWS_SESSION_TOKEN"], "sts-token")
+        self.assertEqual(env["AWS_REGION"], "us-east-1")
+        self.assertEqual(env["AWS_DEFAULT_REGION"], "us-east-1")
 
-    def test_aws_env_requires_configured_session_token_to_be_set(self) -> None:
-        raw = sample_config()
-        raw["aws_session_token_env"] = "TEST_AWS_SESSION_TOKEN"
-        config = parse_input_config(raw)
-        env_values = {
-            "TEST_AWS_ACCESS_KEY_ID": "access",
-            "TEST_AWS_SECRET_ACCESS_KEY": "secret",
-        }
-        with patch.dict(os.environ, env_values, clear=False):
-            os.environ.pop("TEST_AWS_SESSION_TOKEN", None)
-            with self.assertRaisesRegex(ConfigError, "TEST_AWS_SESSION_TOKEN is not set"):
+    def test_aws_env_requires_standard_credentials(self) -> None:
+        config = sample_input_config()
+        with patch.dict(os.environ, {"AWS_SECRET_ACCESS_KEY": "secret"}, clear=False):
+            os.environ.pop("AWS_ACCESS_KEY_ID", None)
+            with self.assertRaisesRegex(ConfigError, "AWS_ACCESS_KEY_ID is not set"):
                 lifecycle_aws._aws_env(config)
 
-    def test_input_config_rejects_invalid_session_token_env_name(self) -> None:
-        raw = sample_config()
-        raw["aws_session_token_env"] = "not a valid env name"
-        with self.assertRaisesRegex(ConfigError, "aws_session_token_env must be a valid environment variable name"):
-            parse_input_config(raw)
+    def test_build_input_config_validates_name_and_region(self) -> None:
+        config = build_input_config(" trustyclaw-test ", "us-east-1")
+        self.assertEqual(config.agent_name, "trustyclaw-test")
+        self.assertEqual(config.aws_region, "us-east-1")
+        with self.assertRaisesRegex(ConfigError, "agent name must be"):
+            build_input_config("bad name!", "us-east-1")
+        with self.assertRaisesRegex(ConfigError, "AWS region must look like"):
+            build_input_config("trustyclaw-test", "everywhere")
 
-    def test_upgrade_config_accepts_session_token_env(self) -> None:
-        raw = sample_upgrade_config()
-        raw["aws_session_token_env"] = "TEST_AWS_SESSION_TOKEN"
-        config = parse_input_config(raw, require_operator_connections=False)
-        self.assertEqual(config.aws_session_token_env, "TEST_AWS_SESSION_TOKEN")
+    def test_build_operator_connections_validates_and_requires_one(self) -> None:
+        connections = build_operator_connections(SAMPLE_SSH_PUBLIC_KEY, None, None)
+        self.assertEqual(connections[0].mode, "ssh")
+        self.assertEqual(connections[0].ssh_public_key, SAMPLE_SSH_PUBLIC_KEY)
+        connections = build_operator_connections(None, "Agent.Example.com", "token-value")
+        self.assertEqual(connections[0].mode, "cloudflare_access")
+        self.assertEqual(connections[0].hostname, "agent.example.com")
+        self.assertEqual(connections[0].tunnel_token, "token-value")
+        both = build_operator_connections(SAMPLE_SSH_PUBLIC_KEY, "agent.example.com", "token-value")
+        self.assertEqual([connection.mode for connection in both], ["ssh", "cloudflare_access"])
+        with self.assertRaisesRegex(ConfigError, "at least one operator endpoint"):
+            build_operator_connections(None, None, None)
+        with self.assertRaisesRegex(ConfigError, "OpenSSH public key"):
+            build_operator_connections("not-a-key", None, None)
+        with self.assertRaisesRegex(ConfigError, "exact domain"):
+            build_operator_connections(None, "*.example.com", "token-value")
+        with self.assertRaisesRegex(ConfigError, "TRUSTYCLAW_CLOUDFLARE_TUNNEL_TOKEN"):
+            build_operator_connections(None, "agent.example.com", None)
+        with self.assertRaisesRegex(ConfigError, "single Cloudflare tunnel token"):
+            build_operator_connections(None, "agent.example.com", "two tokens")
 
     def test_default_network_selects_public_default_subnet(self) -> None:
-        config = parse_input_config(sample_config())
+        config = sample_input_config()
         responses = [
             {"Vpcs": [{"VpcId": "vpc-1"}]},
             {
                 "Subnets": [
-                    {"SubnetId": "subnet-private"},
-                    {"SubnetId": "subnet-public"},
+                    {"SubnetId": "subnet-private", "AvailabilityZone": "us-east-1a"},
+                    {"SubnetId": "subnet-public", "AvailabilityZone": "us-east-1b"},
                 ]
             },
             {"RouteTables": [{"Routes": [{"DestinationCidrBlock": "0.0.0.0/0", "NatGatewayId": "nat-1", "State": "active"}]}]},
@@ -127,10 +132,10 @@ class DeployUnitTests(unittest.TestCase):
         ]
 
         with patch("host.cli.lifecycle_aws._aws", side_effect=responses):
-            self.assertEqual(deploy._default_network(config, {}), ("vpc-1", "subnet-public"))
+            self.assertEqual(deploy._default_network(config, {}), ("vpc-1", "subnet-public", "us-east-1b"))
 
     def test_default_network_rejects_default_vpc_without_public_subnet(self) -> None:
-        config = parse_input_config(sample_config())
+        config = sample_input_config()
         responses = [
             {"Vpcs": [{"VpcId": "vpc-1"}]},
             {"Subnets": [{"SubnetId": "subnet-private"}]},
@@ -142,7 +147,7 @@ class DeployUnitTests(unittest.TestCase):
                 deploy._default_network(config, {})
 
     def test_default_network_can_prefer_existing_volume_availability_zone(self) -> None:
-        config = parse_input_config(sample_config())
+        config = sample_input_config()
         responses = [
             {"Vpcs": [{"VpcId": "vpc-1"}]},
             {
@@ -157,11 +162,11 @@ class DeployUnitTests(unittest.TestCase):
         with patch("host.cli.lifecycle_aws._aws", side_effect=responses):
             self.assertEqual(
                 deploy._default_network(config, {}, preferred_availability_zone="us-east-1b"),
-                ("vpc-1", "subnet-b"),
+                ("vpc-1", "subnet-b", "us-east-1b"),
             )
 
     def test_security_group_opens_ssh_for_provisioning(self) -> None:
-        config = parse_input_config(sample_config())
+        config = sample_input_config()
         calls: list[tuple[str, ...]] = []
 
         def fake_aws(_env, *args):  # type: ignore[no-untyped-def]
@@ -175,7 +180,10 @@ class DeployUnitTests(unittest.TestCase):
             return {}
 
         with patch("host.cli.lifecycle_aws._aws", side_effect=fake_aws):
-            self.assertEqual(deploy._ensure_security_group(config, {}, "vpc-1"), "sg-1")
+            self.assertEqual(
+                deploy._ensure_security_group(config, {}, "vpc-1", ssh_ingress=True, cloudflare_egress=True),
+                "sg-1",
+            )
 
         # SSH ingress is opened for provisioning and may be revoked after
         # bootstrap if no persistent SSH endpoint is configured.
@@ -237,89 +245,71 @@ class DeployUnitTests(unittest.TestCase):
         self.assertEqual(len(revoked_permissions), 1)
         self.assertEqual(revoked_permissions[0]["FromPort"], 22)
 
-    def test_security_group_can_close_cloudflare_egress(self) -> None:
-        calls: list[tuple[str, ...]] = []
-
-        def fake_aws(_env, *args):  # type: ignore[no-untyped-def]
-            calls.append(args)
-            if args[:2] == ("ec2", "describe-security-groups"):
-                return {
-                    "SecurityGroups": [
-                        {
-                            "IpPermissionsEgress": [
-                                {
-                                    "IpProtocol": "tcp",
-                                    "FromPort": 443,
-                                    "ToPort": 443,
-                                    "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-                                },
-                                {
-                                    "IpProtocol": "tcp",
-                                    "FromPort": 7844,
-                                    "ToPort": 7844,
-                                    "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-                                },
-                                {
-                                    "IpProtocol": "udp",
-                                    "FromPort": 7844,
-                                    "ToPort": 7844,
-                                    "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-                                },
-                            ],
-                        }
-                    ]
-                }
-            return {}
-
-        with patch("host.cli.lifecycle_aws._aws", side_effect=fake_aws):
-            deploy._set_security_group_cloudflare_egress({}, "sg-1", enabled=False)
-
-        revoke = next(call for call in calls if call[:2] == ("ec2", "revoke-security-group-egress"))
-        revoked_permissions = json.loads(revoke[revoke.index("--ip-permissions") + 1])
-        self.assertEqual(
-            sorted((permission["IpProtocol"], permission["FromPort"]) for permission in revoked_permissions),
-            [("tcp", 7844), ("udp", 7844)],
-        )
-
-    def test_main_finalizes_security_group_from_bootstrap_access_summary(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.json"
-            config_path.write_text(json.dumps(sample_config()))
-            cwd = os.getcwd()
-            os.chdir(tmp)
-            try:
-                with patch.dict(os.environ, {"TEST_AWS_ACCESS_KEY_ID": "AKIATEST", "TEST_AWS_SECRET_ACCESS_KEY": "secret"}), \
-                        patch("host.cli.lifecycle._existing_storage_volume_availability_zone", return_value=None), \
-                        patch("host.cli.lifecycle._find_existing_instances", return_value=[]), \
-                        patch("host.cli.lifecycle._existing_storage_roles", return_value=set()), \
-                        patch("host.cli.lifecycle._generate_deploy_key", side_effect=lambda workdir: Path(workdir) / "deploy_key"), \
-                        patch("host.cli.lifecycle._launch_instance", return_value=("i-123", "sg-1")), \
-                        patch(
-                            "host.cli.lifecycle._wait_for_instance",
-                            return_value={"PublicDnsName": "ec2.example", "Placement": {"AvailabilityZone": "us-east-1a"}},
+    def test_ssh_delivery_closes_provisioning_ssh_only_when_endpoints_omit_ssh(self) -> None:
+        cloudflare_only = [
+            "--operator-cloudflare-hostname",
+            "agent.example.com",
+            "--admin-password-sha256",
+            SAMPLE_ADMIN_PASSWORD_SHA256,
+        ]
+        ssh_configured = [
+            "--operator-ssh-public-key",
+            SAMPLE_SSH_PUBLIC_KEY,
+            "--admin-password-sha256",
+            SAMPLE_ADMIN_PASSWORD_SHA256,
+        ]
+        for operator_args, expect_revoke in ((cloudflare_only, True), (ssh_configured, False)):
+            with self.subTest(expect_revoke=expect_revoke):
+                with tempfile.TemporaryDirectory() as tmp:
+                    cwd = os.getcwd()
+                    os.chdir(tmp)
+                    try:
+                        with patch.dict(
+                            os.environ,
+                            {**SAMPLE_AWS_ENV, "TRUSTYCLAW_CLOUDFLARE_TUNNEL_TOKEN": "token-value"},
                         ), \
-                        patch("host.cli.lifecycle._ensure_storage_volumes", return_value=({"admin": "vol-admin", "agent": "vol-agent"}, [])), \
-                        patch(
-                            "host.cli.lifecycle._provision_over_ssh",
-                            return_value={"ssh_enabled": False, "cloudflare_enabled": False},
-                        ), \
-                        patch("host.cli.lifecycle._set_security_group_ssh_ingress") as ssh_ingress, \
-                        patch("host.cli.lifecycle._set_security_group_cloudflare_egress") as cloudflare_egress, \
-                        patch("host.cli.lifecycle_aws._aws", return_value={}), \
-                        patch("sys.stdout", _StringOutput()):
-                    self.assertEqual(deploy.main_for_mode("deploy", ["--config", str(config_path)]), 0)
-            finally:
-                os.chdir(cwd)
+                                patch("host.cli.lifecycle._existing_storage_volume_availability_zone", return_value=None), \
+                                patch("host.cli.lifecycle._find_existing_instances", return_value=[]), \
+                                patch("host.cli.lifecycle._existing_storage_roles", return_value=set()), \
+                                patch("host.cli.lifecycle._default_network", return_value=("vpc-1", "subnet-1", "us-east-1a")), \
+                                patch("host.cli.lifecycle._generate_deploy_key", side_effect=_fake_deploy_key), \
+                                patch("host.cli.lifecycle._launch_instance", return_value=("i-123", "sg-1")) as launch_instance, \
+                                patch(
+                                    "host.cli.lifecycle._wait_for_instance",
+                                    return_value={"PublicDnsName": "ec2.example", "Placement": {"AvailabilityZone": "us-east-1a"}},
+                                ), \
+                                patch("host.cli.lifecycle._ensure_storage_volumes", return_value={"admin": "vol-admin", "agent": "vol-agent"}), \
+                                patch("host.cli.lifecycle._attach_storage_volumes"), \
+                                patch("host.cli.lifecycle._provision_over_ssh"), \
+                                patch("host.cli.lifecycle._set_security_group_ssh_ingress") as ssh_ingress, \
+                                patch("host.cli.lifecycle_aws._aws", return_value={}), \
+                                patch("sys.stderr", _StringOutput()), \
+                                patch("sys.stdout", _StringOutput()):
+                            self.assertEqual(
+                                deploy.main_for_mode(
+                                    "deploy",
+                                    ["--agent-name", "trustyclaw-test", *operator_args],
+                                ),
+                                0,
+                            )
+                    finally:
+                        os.chdir(cwd)
 
-        ssh_ingress.assert_called_once()
-        cloudflare_egress.assert_called_once()
-        self.assertEqual(ssh_ingress.call_args.args[1], "sg-1")
-        self.assertEqual(cloudflare_egress.call_args.args[1], "sg-1")
-        self.assertFalse(ssh_ingress.call_args.kwargs["enabled"])
-        self.assertFalse(cloudflare_egress.call_args.kwargs["enabled"])
+                # The launch carries the derived final state, with SSH forced
+                # open for the deploy key; the only post-bootstrap step is the
+                # optional SSH revoke.
+                launch_kwargs = launch_instance.call_args.kwargs
+                self.assertTrue(launch_kwargs["ssh_ingress"])
+                self.assertEqual(launch_kwargs["cloudflare_egress"], expect_revoke)
+                if expect_revoke:
+                    ssh_ingress.assert_called_once()
+                    self.assertEqual(ssh_ingress.call_args.args[1], "sg-1")
+                    self.assertFalse(ssh_ingress.call_args.kwargs["enabled"])
+                else:
+                    ssh_ingress.assert_not_called()
 
     def test_existing_instance_lookup_requires_trustyclaw_owner_tag(self) -> None:
-        config = parse_input_config(sample_config())
+        config = sample_input_config()
         calls: list[tuple[str, ...]] = []
 
         def fake_aws(_env, *args):  # type: ignore[no-untyped-def]
@@ -334,7 +324,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("Name=tag:trustyclaw-host,Values=true", filters)
 
     def test_existing_security_group_without_owner_tag_is_rejected(self) -> None:
-        config = parse_input_config(sample_config())
+        config = sample_input_config()
 
         def fake_aws(_env, *args):  # type: ignore[no-untyped-def]
             if args[:2] == ("ec2", "describe-security-groups") and "--group-ids" not in args:
@@ -345,7 +335,7 @@ class DeployUnitTests(unittest.TestCase):
 
         with patch("host.cli.lifecycle_aws._aws", side_effect=fake_aws):
             with self.assertRaisesRegex(ConfigError, "not tagged as a TrustyClaw resource"):
-                deploy._ensure_security_group(config, {}, "vpc-1")
+                deploy._ensure_security_group(config, {}, "vpc-1", ssh_ingress=True, cloudflare_egress=True)
 
     def test_iam_policies_restrict_trustyclaw_resource_access(self) -> None:
         policy = json.loads(Path("iam_policy.json").read_text())
@@ -473,7 +463,7 @@ class DeployUnitTests(unittest.TestCase):
         )
 
     def test_storage_volumes_are_created_tagged_and_attached(self) -> None:
-        config = parse_input_config(sample_config())
+        config = sample_input_config()
         calls: list[tuple[str, ...]] = []
 
         def fake_aws(_env, *args):  # type: ignore[no-untyped-def]
@@ -491,16 +481,15 @@ class DeployUnitTests(unittest.TestCase):
 
         with patch("host.cli.lifecycle_aws._aws", side_effect=fake_aws):
             created_out: list[str] = []
-            volumes, created = deploy._ensure_storage_volumes(
+            volumes = deploy._ensure_storage_volumes(
                 config,
                 {},
-                instance_id="i-123",
                 availability_zone="us-east-1a",
                 created_storage_volumes=created_out,
             )
+            deploy._attach_storage_volumes({}, instance_id="i-123", volumes=volumes)
 
         self.assertEqual(volumes, {"admin": "vol-admin", "agent": "vol-agent"})
-        self.assertEqual(created, ["vol-admin", "vol-agent"])
         self.assertEqual(created_out, ["vol-admin", "vol-agent"])
         create_calls = [call for call in calls if call[:2] == ("ec2", "create-volume")]
         self.assertEqual(len(create_calls), 2)
@@ -522,8 +511,45 @@ class DeployUnitTests(unittest.TestCase):
         self.assertEqual(admin_mapping, [{"DeviceName": "/dev/sdf", "Ebs": {"DeleteOnTermination": False}}])
         self.assertEqual(agent_mapping, [{"DeviceName": "/dev/sdg", "Ebs": {"DeleteOnTermination": False}}])
 
+    def test_launch_instance_sets_terminate_on_shutdown(self) -> None:
+        config = sample_input_config()
+        calls: list[tuple[str, ...]] = []
+
+        def fake_aws(_env, *args):  # type: ignore[no-untyped-def]
+            calls.append(args)
+            if args[:2] == ("ec2", "describe-security-groups") and "--group-ids" not in args:
+                return {"SecurityGroups": []}
+            if args[:2] == ("ec2", "create-security-group"):
+                return {"GroupId": "sg-1"}
+            if args[:2] == ("ec2", "describe-security-groups"):
+                return {"SecurityGroups": [{"IpPermissions": [], "IpPermissionsEgress": []}]}
+            if args[:2] == ("ssm", "get-parameter"):
+                return {"Parameter": {"Value": "ami-123"}}
+            if args[:2] == ("ec2", "run-instances"):
+                return {"Instances": [{"InstanceId": "i-123"}]}
+            return {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("host.cli.lifecycle_aws._aws", side_effect=fake_aws):
+                instance_id, _group = deploy._launch_instance(
+                    config,
+                    "#!/usr/bin/env bash\n",
+                    Path(tmp),
+                    {},
+                    target_version="0.35.0",
+                    network=("vpc-1", "subnet-1", "us-east-1a"),
+                    ssh_ingress=True,
+                    cloudflare_egress=True,
+                )
+        self.assertEqual(instance_id, "i-123")
+        run = next(call for call in calls if call[:2] == ("ec2", "run-instances"))
+        # An OS-initiated shutdown terminates the instance, so a detached
+        # provisioning failure can clean up its own instance.
+        self.assertIn("--instance-initiated-shutdown-behavior", run)
+        self.assertEqual(run[run.index("--instance-initiated-shutdown-behavior") + 1], "terminate")
+
     def test_storage_volume_lookup_rejects_attached_or_duplicate_state(self) -> None:
-        config = parse_input_config(sample_config())
+        config = sample_input_config()
 
         with patch(
             "host.cli.lifecycle_aws._aws",
@@ -545,7 +571,7 @@ class DeployUnitTests(unittest.TestCase):
                 deploy._find_available_storage_volume(config, {}, "admin", "us-east-1a")
 
     def test_existing_storage_volumes_are_preserved_before_instance_termination(self) -> None:
-        config = parse_input_config(sample_config())
+        config = sample_input_config()
         calls: list[tuple[str, ...]] = []
 
         def fake_aws(_env, *args):  # type: ignore[no-untyped-def]
@@ -588,7 +614,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertNotIn("/dev/sda1", json.dumps(mappings))
 
     def test_storage_volume_lookup_can_wait_for_detach_after_replacing_instance(self) -> None:
-        config = parse_input_config(sample_config())
+        config = sample_input_config()
         calls: list[tuple[str, ...]] = []
         describe_count = 0
 
@@ -617,7 +643,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertEqual(describe_count, 2)
 
     def test_existing_storage_volume_az_steers_redeploy_and_detects_split_volumes(self) -> None:
-        config = parse_input_config(sample_config())
+        config = sample_input_config()
         responses = [
             {"Volumes": [{"VolumeId": "vol-admin", "State": "available", "AvailabilityZone": "us-east-1a"}]},
             {"Volumes": [{"VolumeId": "vol-agent", "State": "available", "AvailabilityZone": "us-east-1a"}]},
@@ -637,52 +663,44 @@ class DeployUnitTests(unittest.TestCase):
         calls: list[str] = []
 
         with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.json"
-            config_path.write_text(json.dumps(sample_upgrade_config()))
             cwd = os.getcwd()
             os.chdir(tmp)
             try:
-                with patch.dict(os.environ, {"TEST_AWS_ACCESS_KEY_ID": "AKIATEST", "TEST_AWS_SECRET_ACCESS_KEY": "secret"}), \
+                with patch.dict(os.environ, dict(SAMPLE_AWS_ENV)), \
                         patch("host.cli.lifecycle._find_existing_instances", side_effect=lambda *_args: calls.append("find_instances") or ["i-old"]), \
                         patch("host.cli.lifecycle._existing_storage_volume_availability_zone", side_effect=lambda *_args: calls.append("validate_storage") or "us-east-1a"), \
                         patch("host.cli.lifecycle._existing_storage_roles", return_value={"admin", "agent"}), \
-                        patch("host.cli.lifecycle._default_network", side_effect=lambda *_args, **_kwargs: calls.append("preflight_network") or ("vpc-1", "subnet-1")), \
+                        patch("host.cli.lifecycle._default_network", side_effect=lambda *_args, **_kwargs: calls.append("preflight_network") or ("vpc-1", "subnet-1", "us-east-1a")), \
                         patch("host.cli.lifecycle._terminate_instances", side_effect=lambda *_args: calls.append("terminate")), \
-                        patch("host.cli.lifecycle._generate_deploy_key", side_effect=lambda workdir: Path(workdir) / "deploy_key"), \
+                        patch("host.cli.lifecycle._generate_deploy_key", side_effect=_fake_deploy_key), \
                         patch("host.cli.lifecycle._launch_instance", return_value=("i-123", "sg-1")) as launch_instance, \
                         patch(
                             "host.cli.lifecycle._wait_for_instance",
                             return_value={"PublicDnsName": "ec2.example", "Placement": {"AvailabilityZone": "us-east-1a"}},
                         ), \
-                        patch("host.cli.lifecycle._ensure_storage_volumes", return_value=({"admin": "vol-admin", "agent": "vol-agent"}, [])), \
-                        patch(
-                            "host.cli.lifecycle._provision_over_ssh",
-                            return_value={"ssh_enabled": True, "cloudflare_enabled": False},
-                        ), \
+                        patch("host.cli.lifecycle._ensure_storage_volumes", return_value={"admin": "vol-admin", "agent": "vol-agent"}), \
+                        patch("host.cli.lifecycle._attach_storage_volumes"), \
+                        patch("host.cli.lifecycle._provision_over_ssh"), \
                         patch("host.cli.lifecycle._set_security_group_ssh_ingress"), \
-                        patch("host.cli.lifecycle._set_security_group_cloudflare_egress"), \
                         patch("host.cli.lifecycle_aws._aws", return_value={}), \
                         patch("sys.stdout", _StringOutput()):
-                    self.assertEqual(deploy.main_for_mode("upgrade", ["--config", str(config_path)]), 0)
+                    self.assertEqual(deploy.main_for_mode("upgrade", ["--agent-name", "trustyclaw-test"]), 0)
             finally:
                 os.chdir(cwd)
 
         self.assertLess(calls.index("validate_storage"), calls.index("terminate"))
         self.assertLess(calls.index("preflight_network"), calls.index("terminate"))
         launch_instance.assert_called_once()
-        self.assertEqual(launch_instance.call_args.kwargs["preferred_availability_zone"], "us-east-1a")
-        self.assertEqual(launch_instance.call_args.kwargs["network"], ("vpc-1", "subnet-1"))
+        self.assertEqual(launch_instance.call_args.kwargs["network"], ("vpc-1", "subnet-1", "us-east-1a"))
 
     def test_main_does_not_terminate_existing_host_when_replacement_network_fails(self) -> None:
         calls: list[str] = []
 
         with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.json"
-            config_path.write_text(json.dumps(sample_upgrade_config()))
             cwd = os.getcwd()
             os.chdir(tmp)
             try:
-                with patch.dict(os.environ, {"TEST_AWS_ACCESS_KEY_ID": "AKIATEST", "TEST_AWS_SECRET_ACCESS_KEY": "secret"}), \
+                with patch.dict(os.environ, dict(SAMPLE_AWS_ENV)), \
                         patch("host.cli.lifecycle._find_existing_instances", side_effect=lambda *_args: calls.append("find_instances") or ["i-old"]), \
                         patch("host.cli.lifecycle._existing_storage_volume_availability_zone", side_effect=lambda *_args: calls.append("validate_storage") or "us-east-1a"), \
                         patch("host.cli.lifecycle._existing_storage_roles", return_value={"admin", "agent"}), \
@@ -696,7 +714,7 @@ class DeployUnitTests(unittest.TestCase):
                         patch("host.cli.lifecycle._launch_instance", side_effect=AssertionError("_launch_instance should not run")), \
                         patch("sys.stdout", _StringOutput()), \
                         patch("sys.stderr", _StringOutput()):
-                    self.assertEqual(deploy.main_for_mode("upgrade", ["--config", str(config_path)]), 2)
+                    self.assertEqual(deploy.main_for_mode("upgrade", ["--agent-name", "trustyclaw-test"]), 2)
             finally:
                 os.chdir(cwd)
 
@@ -707,19 +725,27 @@ class DeployUnitTests(unittest.TestCase):
         cases = [
             ("upgrade", current_version, [], "upgrade requires preserved state older"),
             ("upgrade", "99.0.0", [], "upgrade requires preserved state older"),
-            ("reconfigure", "99.0.0", [], "reconfigure requires preserved state to match"),
+            (
+                "reconfigure",
+                "99.0.0",
+                [
+                    "--operator-ssh-public-key",
+                    SAMPLE_SSH_PUBLIC_KEY,
+                    "--admin-password-sha256",
+                    SAMPLE_ADMIN_PASSWORD_SHA256,
+                ],
+                "reconfigure requires preserved state to match",
+            ),
         ]
         for mode, tagged_version, extra_args, message in cases:
             with self.subTest(mode=mode, tagged_version=tagged_version, extra_args=extra_args):
                 calls: list[str] = []
 
                 with tempfile.TemporaryDirectory() as tmp:
-                    config_path = Path(tmp) / "config.json"
-                    config_path.write_text(json.dumps(sample_config() if mode == "reconfigure" else sample_upgrade_config()))
                     cwd = os.getcwd()
                     os.chdir(tmp)
                     try:
-                        with patch.dict(os.environ, {"TEST_AWS_ACCESS_KEY_ID": "AKIATEST", "TEST_AWS_SECRET_ACCESS_KEY": "secret"}), \
+                        with patch.dict(os.environ, dict(SAMPLE_AWS_ENV)), \
                                 patch("host.cli.lifecycle._find_existing_instances", side_effect=lambda *_args: calls.append("find_instances") or ["i-old"]), \
                                 patch("host.cli.lifecycle._existing_storage_volume_availability_zone", side_effect=lambda *_args: calls.append("validate_storage") or "us-east-1a"), \
                                 patch("host.cli.lifecycle._existing_storage_roles", return_value={"admin", "agent"}), \
@@ -741,11 +767,13 @@ class DeployUnitTests(unittest.TestCase):
                                     },
                                 ), \
                                 patch("host.cli.lifecycle._terminate_instances", side_effect=lambda *_args: calls.append("terminate")), \
-                                patch("host.cli.lifecycle._default_network", side_effect=lambda *_args, **_kwargs: calls.append("preflight_network") or ("vpc-1", "subnet-1")), \
+                                patch("host.cli.lifecycle._default_network", side_effect=lambda *_args, **_kwargs: calls.append("preflight_network") or ("vpc-1", "subnet-1", "us-east-1a")), \
                                 patch("host.cli.lifecycle._launch_instance", side_effect=AssertionError("_launch_instance should not run")), \
                                 patch("sys.stdout", _StringOutput()), \
                                 patch("sys.stderr", _StringOutput()) as stderr:
-                            self.assertEqual(deploy.main_for_mode(mode, ["--config", str(config_path), *extra_args]), 2)
+                            self.assertEqual(
+                                deploy.main_for_mode(mode, ["--agent-name", "trustyclaw-test", *extra_args]), 2
+                            )
                     finally:
                         os.chdir(cwd)
 
@@ -753,8 +781,8 @@ class DeployUnitTests(unittest.TestCase):
                 self.assertIn(message, stderr.value)
 
     def test_version_tag_guard_allows_compatible_tags(self) -> None:
-        config = parse_input_config(sample_config())
-        command = deploy.LifecycleCommand(mode="recover", config_path="config.json", allow_upgrade=True)
+        config = sample_input_config()
+        command = deploy.LifecycleCommand(mode="recover", agent_name="trustyclaw-test", allow_upgrade=True)
         response = {
             "Reservations": [
                 {
@@ -771,22 +799,22 @@ class DeployUnitTests(unittest.TestCase):
                 }
             ]
         }
-        with patch("host.cli.lifecycle_aws._aws", return_value=response), patch("sys.stdout", _StringOutput()) as stdout:
+        with patch("host.cli.lifecycle_aws._aws", return_value=response), patch("sys.stderr", _StringOutput()) as stderr:
             deploy._check_existing_version_hints(command, config, {}, ["i-same", "i-older"], "0.6.0")
-        self.assertIn("i-older=0.5.0", stdout.value)
+        self.assertIn("i-older=0.5.0", stderr.value)
 
     def test_version_tag_guard_rejects_mode_specific_bootstrap_failures_before_replacement(self) -> None:
-        config = parse_input_config(sample_config())
+        config = sample_input_config()
         cases = [
-            (deploy.LifecycleCommand(mode="upgrade", config_path="config.json"), "0.6.0", "older than local VERSION"),
-            (deploy.LifecycleCommand(mode="recover", config_path="config.json"), "0.5.0", "match local VERSION"),
+            (deploy.LifecycleCommand(mode="upgrade", agent_name="trustyclaw-test"), "0.6.0", "older than target VERSION"),
+            (deploy.LifecycleCommand(mode="recover", agent_name="trustyclaw-test"), "0.5.0", "match target VERSION"),
             (
-                deploy.LifecycleCommand(mode="reconfigure", config_path="config.json"),
+                deploy.LifecycleCommand(mode="reconfigure", agent_name="trustyclaw-test"),
                 "0.5.0",
                 "reconfigure requires preserved state to match",
             ),
             (
-                deploy.LifecycleCommand(mode="recover", config_path="config.json", allow_upgrade=True),
+                deploy.LifecycleCommand(mode="recover", agent_name="trustyclaw-test", allow_upgrade=True),
                 "0.7.0",
                 "cannot move preserved state backward",
             ),
@@ -810,8 +838,8 @@ class DeployUnitTests(unittest.TestCase):
                         deploy._check_existing_version_hints(command, config, {}, ["i-tagged"], "0.6.0")
 
     def test_version_tag_guard_rejects_invalid_tags_before_replacement(self) -> None:
-        config = parse_input_config(sample_config())
-        command = deploy.LifecycleCommand(mode="recover", config_path="config.json", allow_upgrade=True)
+        config = sample_input_config()
+        command = deploy.LifecycleCommand(mode="recover", agent_name="trustyclaw-test", allow_upgrade=True)
         response = {
             "Reservations": [
                 {
@@ -828,50 +856,41 @@ class DeployUnitTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "invalid trustyclaw-host-version tag"):
                 deploy._check_existing_version_hints(command, config, {}, ["i-invalid"], "0.1.0")
 
-    def test_reconfigure_can_use_stable_admin_password_and_operator_connections(self) -> None:
+    def test_reconfigure_passes_admin_password_hash_and_operator_connections(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.json"
-            config_path.write_text(json.dumps(sample_config()))
             cwd = os.getcwd()
             os.chdir(tmp)
             try:
-                with patch.dict(
-                    os.environ,
-                    {
-                        "TEST_AWS_ACCESS_KEY_ID": "AKIATEST",
-                        "TEST_AWS_SECRET_ACCESS_KEY": "secret",
-                        "STAGE_ADMIN_PASSWORD": "stable-admin",
-                    },
-                ), \
+                with patch.dict(os.environ, dict(SAMPLE_AWS_ENV)), \
                         patch("host.cli.lifecycle._find_existing_instances", return_value=["i-old"]), \
                         patch("host.cli.lifecycle._existing_storage_volume_availability_zone", return_value="us-east-1a"), \
                         patch("host.cli.lifecycle._existing_storage_roles", return_value={"admin", "agent"}), \
-                        patch("host.cli.lifecycle._default_network", return_value=("vpc-1", "subnet-1")), \
+                        patch("host.cli.lifecycle._default_network", return_value=("vpc-1", "subnet-1", "us-east-1a")), \
                         patch("host.cli.lifecycle._terminate_instances"), \
-                        patch("host.cli.lifecycle._generate_deploy_key", side_effect=lambda workdir: Path(workdir) / "deploy_key"), \
-                        patch("host.cli.lifecycle._launch_instance", return_value=("i-123", "sg-1")), \
+                        patch("host.cli.lifecycle._generate_deploy_key", side_effect=_fake_deploy_key), \
+                        patch("host.cli.lifecycle._launch_instance", return_value=("i-123", "sg-1")) as launch_instance, \
                         patch(
                             "host.cli.lifecycle._wait_for_instance",
                             return_value={"PublicDnsName": "ec2.example", "Placement": {"AvailabilityZone": "us-east-1a"}},
                         ), \
-                        patch("host.cli.lifecycle._ensure_storage_volumes", return_value=({"admin": "vol-admin", "agent": "vol-agent"}, [])), \
-                        patch(
-                            "host.cli.lifecycle._provision_over_ssh",
-                            return_value={"ssh_enabled": True, "cloudflare_enabled": False},
-                        ) as provision, \
+                        patch("host.cli.lifecycle._ensure_storage_volumes", return_value={"admin": "vol-admin", "agent": "vol-agent"}), \
+                        patch("host.cli.lifecycle._attach_storage_volumes"), \
+                        patch("host.cli.lifecycle._provision_over_ssh") as provision, \
                         patch("host.cli.lifecycle._set_security_group_ssh_ingress"), \
-                        patch("host.cli.lifecycle._set_security_group_cloudflare_egress"), \
                         patch("host.cli.lifecycle_aws._aws", return_value={}), \
                         patch("builtins.input", side_effect=AssertionError("input should not be called")), \
-                        patch("sys.stdout", _StringOutput()):
+                        patch("sys.stderr", _StringOutput()), \
+                        patch("sys.stdout", _StringOutput()) as stdout:
                     self.assertEqual(
                         deploy.main_for_mode(
                             "reconfigure",
                             [
-                                "--config",
-                                str(config_path),
-                                "--admin-password-env",
-                                "STAGE_ADMIN_PASSWORD",
+                                "--agent-name",
+                                "trustyclaw-test",
+                                "--operator-ssh-public-key",
+                                SAMPLE_SSH_PUBLIC_KEY,
+                                "--admin-password-sha256",
+                                SAMPLE_ADMIN_PASSWORD_SHA256,
                             ],
                         ),
                         0,
@@ -879,78 +898,79 @@ class DeployUnitTests(unittest.TestCase):
             finally:
                 os.chdir(cwd)
 
-            self.assertEqual(provision.call_args.args[1], "stable-admin")
+            # The caller's hash and the replacement connections ride in the
+            # payload staged through user data; SSH only delivers code.
+            provision.assert_called_once()
+            user_data = launch_instance.call_args.args[1]
+            embedded = next(line for line in user_data.splitlines() if line.startswith("{"))
+            payload = json.loads(embedded)
+            self.assertEqual(payload["operation"]["mode"], "reconfigure")
+            self.assertEqual(payload["runtime_config"]["admin_password_sha256"], SAMPLE_ADMIN_PASSWORD_SHA256)
             self.assertEqual(
-                provision.call_args.args[2],
-                deploy.runtime_operator_connections_from_input(parse_input_config(sample_config()).operator_connections, os.environ),
+                payload["runtime_config"]["operator_connections"],
+                [{"mode": "ssh", "ssh_public_key": "ssh-ed25519 AAAATEST operator@example"}],
             )
-            result = json.loads((Path(tmp) / "trustyclaw-test-reconfigure.json").read_text())
-            self.assertEqual(result["admin_password"], "stable-admin")
+            result = json.loads(stdout.value)
+            self.assertNotIn("admin_password", result)
+            self.assertNotIn(SAMPLE_ADMIN_PASSWORD_SHA256, json.dumps(result))
+            self.assertEqual(result["operator_connections"], [{"mode": "ssh"}])
 
-    def test_reconfigure_generates_admin_password_when_env_is_omitted(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.json"
-            config_path.write_text(json.dumps(sample_config()))
-            cwd = os.getcwd()
-            os.chdir(tmp)
-            try:
-                with patch.dict(
-                    os.environ,
-                    {
-                        "TEST_AWS_ACCESS_KEY_ID": "AKIATEST",
-                        "TEST_AWS_SECRET_ACCESS_KEY": "secret",
-                    },
-                ), \
-                        patch("host.cli.lifecycle._find_existing_instances", return_value=["i-old"]), \
-                        patch("host.cli.lifecycle._existing_storage_volume_availability_zone", return_value="us-east-1a"), \
-                        patch("host.cli.lifecycle._existing_storage_roles", return_value={"admin", "agent"}), \
-                        patch("host.cli.lifecycle._default_network", return_value=("vpc-1", "subnet-1")), \
-                        patch("host.cli.lifecycle._terminate_instances"), \
-                        patch("host.cli.lifecycle._generate_deploy_key", side_effect=lambda workdir: Path(workdir) / "deploy_key"), \
-                        patch("host.cli.lifecycle._launch_instance", return_value=("i-123", "sg-1")), \
-                        patch(
-                            "host.cli.lifecycle._wait_for_instance",
-                            return_value={"PublicDnsName": "ec2.example", "Placement": {"AvailabilityZone": "us-east-1a"}},
-                        ), \
-                        patch("host.cli.lifecycle._ensure_storage_volumes", return_value=({"admin": "vol-admin", "agent": "vol-agent"}, [])), \
-                        patch(
-                            "host.cli.lifecycle._provision_over_ssh",
-                            return_value={"ssh_enabled": True, "cloudflare_enabled": False},
-                        ) as provision, \
-                        patch("host.cli.lifecycle._set_security_group_ssh_ingress"), \
-                        patch("host.cli.lifecycle._set_security_group_cloudflare_egress"), \
-                        patch("host.cli.lifecycle_aws._aws", return_value={}), \
-                        patch("sys.stdout", _StringOutput()):
-                    self.assertEqual(deploy.main_for_mode("reconfigure", ["--config", str(config_path)]), 0)
-            finally:
-                os.chdir(cwd)
+    def test_generate_password_prints_matching_password_and_digest(self) -> None:
+        import hashlib
 
-            generated_password = provision.call_args.args[1]
-            self.assertIsInstance(generated_password, str)
-            self.assertGreater(len(generated_password), 20)
-            result = json.loads((Path(tmp) / "trustyclaw-test-reconfigure.json").read_text())
-            self.assertEqual(result["admin_password"], generated_password)
+        from host.cli import generate_password
 
-    def test_reconfigure_requires_full_operator_connections(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.json"
-            config_path.write_text(json.dumps(sample_upgrade_config()))
-            with (
-                patch.dict(os.environ, {"TEST_AWS_ACCESS_KEY_ID": "AKIATEST", "TEST_AWS_SECRET_ACCESS_KEY": "secret"}),
-                patch("sys.stderr", _StringOutput()) as stderr,
-            ):
-                self.assertEqual(deploy.main_for_mode("reconfigure", ["--config", str(config_path)]), 2)
-        self.assertIn("operator_connections", stderr.value)
+        with patch("sys.stdout", _StringOutput()) as stdout:
+            self.assertEqual(generate_password.main(), 0)
+        lines = stdout.value.splitlines()
+        password = next(line for line in lines if line.startswith("password: ")).removeprefix("password: ")
+        digest = next(line for line in lines if line.startswith("sha256:")).split()[-1]
+        self.assertGreater(len(password), 20)
+        self.assertEqual(hashlib.sha256(password.encode()).hexdigest(), digest)
+        self.assertIn("--admin-password-sha256", stdout.value)
 
-    def test_access_summary_detects_cloudflare_operator_connection(self) -> None:
-        self.assertTrue(deploy._access_summary_includes_cloudflare({"cloudflare_enabled": True}))
-        self.assertFalse(deploy._access_summary_includes_cloudflare({"cloudflare_enabled": False}))
-        self.assertFalse(deploy._access_summary_includes_cloudflare({"operator_connections": "ssh"}))
+    def test_deploy_and_reconfigure_reject_the_empty_password_digest(self) -> None:
+        import hashlib
+
+        empty_digest = hashlib.sha256(b"").hexdigest()
+        for mode in ("deploy", "reconfigure"):
+            with self.subTest(mode=mode):
+                with patch("sys.stderr", _StringOutput()) as stderr:
+                    with self.assertRaises(SystemExit) as raised:
+                        deploy._parse_args("deploy", ["--agent-name", "trustyclaw-test", "--admin-password-sha256", empty_digest])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("SHA-256 of an empty password", stderr.value)
+
+    def test_deploy_and_reconfigure_require_the_admin_password_hash(self) -> None:
+        for mode in ("deploy", "reconfigure"):
+            with self.subTest(mode=mode):
+                with patch("sys.stderr", _StringOutput()) as stderr:
+                    with self.assertRaises(SystemExit) as raised:
+                        deploy._parse_args(mode, ["--agent-name", "trustyclaw-test"])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("--admin-password-sha256", stderr.value)
+
+    def test_reconfigure_requires_an_operator_endpoint(self) -> None:
+        with (
+            patch.dict(os.environ, dict(SAMPLE_AWS_ENV)),
+            patch("sys.stderr", _StringOutput()) as stderr,
+        ):
+            self.assertEqual(
+                deploy.main_for_mode(
+                    "reconfigure",
+                    [
+                        "--agent-name",
+                        "trustyclaw-test",
+                        "--admin-password-sha256",
+                        SAMPLE_ADMIN_PASSWORD_SHA256,
+                    ],
+                ),
+                2,
+            )
+        self.assertIn("at least one operator endpoint", stderr.value)
 
     def test_start_existing_instance_writes_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.json"
-            config_path.write_text(json.dumps(sample_upgrade_config()))
             result_path = Path(tmp) / "stage.json"
             calls: list[tuple[str, ...]] = []
             describe_instance_count = 0
@@ -983,19 +1003,19 @@ class DeployUnitTests(unittest.TestCase):
                 return {}
 
             with (
-                patch.dict(os.environ, {"TEST_AWS_ACCESS_KEY_ID": "AKIATEST", "TEST_AWS_SECRET_ACCESS_KEY": "secret"}),
+                patch.dict(os.environ, dict(SAMPLE_AWS_ENV)),
                 patch("host.cli.lifecycle_aws._aws", side_effect=fake_aws),
                 patch("host.cli.power._aws", side_effect=fake_aws),
-                patch("sys.stdout", _StringOutput()),
+                patch("sys.stdout", _StringOutput()) as stdout,
             ):
                 self.assertEqual(
-                    power.main_for_power_mode("start", ["--config", str(config_path), "--result-file", str(result_path)]),
+                    power.main_for_power_mode("start", ["--agent-name", "trustyclaw-test"]),
                     0,
                 )
 
             self.assertIn(("ec2", "start-instances", "--instance-ids", "i-stage"), calls)
             self.assertIn(("ec2", "wait", "instance-running", "--instance-ids", "i-stage"), calls)
-            result = json.loads(result_path.read_text())
+            result = json.loads(stdout.value)
             self.assertEqual(result["agent_name"], "trustyclaw-test")
             self.assertEqual(result["instance_id"], "i-stage")
             self.assertEqual(result["state"], "running")
@@ -1003,8 +1023,6 @@ class DeployUnitTests(unittest.TestCase):
 
     def test_stop_existing_instance_writes_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.json"
-            config_path.write_text(json.dumps(sample_upgrade_config()))
             result_path = Path(tmp) / "stage-stop.json"
             calls: list[tuple[str, ...]] = []
             describe_instance_count = 0
@@ -1035,135 +1053,123 @@ class DeployUnitTests(unittest.TestCase):
                 return {}
 
             with (
-                patch.dict(os.environ, {"TEST_AWS_ACCESS_KEY_ID": "AKIATEST", "TEST_AWS_SECRET_ACCESS_KEY": "secret"}),
+                patch.dict(os.environ, dict(SAMPLE_AWS_ENV)),
                 patch("host.cli.lifecycle_aws._aws", side_effect=fake_aws),
                 patch("host.cli.power._aws", side_effect=fake_aws),
-                patch("sys.stdout", _StringOutput()),
+                patch("sys.stdout", _StringOutput()) as stdout,
             ):
                 self.assertEqual(
-                    power.main_for_power_mode("stop", ["--config", str(config_path), "--result-file", str(result_path)]),
+                    power.main_for_power_mode("stop", ["--agent-name", "trustyclaw-test"]),
                     0,
                 )
 
             self.assertIn(("ec2", "stop-instances", "--instance-ids", "i-stage"), calls)
             self.assertIn(("ec2", "wait", "instance-stopped", "--instance-ids", "i-stage"), calls)
-            result = json.loads(result_path.read_text())
+            result = json.loads(stdout.value)
             self.assertEqual(result["state"], "stopped")
 
-    def test_power_commands_reject_operator_connections(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.json"
-            config_path.write_text(json.dumps(sample_config()))
-            with patch("sys.stderr", _StringOutput()) as stderr:
-                self.assertEqual(power.main_for_power_mode("start", ["--config", str(config_path)]), 2)
+    def test_power_commands_reject_operator_endpoint_flags(self) -> None:
+        with patch("sys.stderr", _StringOutput()) as stderr:
+            with self.assertRaises(SystemExit) as raised:
+                power.main_for_power_mode(
+                    "start",
+                    ["--agent-name", "trustyclaw-test", "--operator-ssh-public-key", SAMPLE_SSH_PUBLIC_KEY],
+                )
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("unrecognized arguments", stderr.value)
 
-        self.assertIn("unsupported fields: operator_connections", stderr.value)
-
-    def test_upgrade_does_not_overwrite_existing_deploy_result_password(self) -> None:
+    def test_upgrade_prints_result_json_on_stdout_without_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            config_path = tmp_path / "config.json"
-            config_path.write_text(json.dumps(sample_upgrade_config()))
-            deploy_result_path = tmp_path / "trustyclaw-test-deploy.json"
-            deploy_result = {
-                "agent_name": "trustyclaw-test",
-                "admin_password": "original-password",
-                "admin_volume_id": "vol-admin",
-                "agent_volume_id": "vol-agent",
-            }
-            deploy_result_path.write_text(json.dumps(deploy_result))
             cwd = os.getcwd()
             os.chdir(tmp)
             try:
-                with patch.dict(os.environ, {"TEST_AWS_ACCESS_KEY_ID": "AKIATEST", "TEST_AWS_SECRET_ACCESS_KEY": "secret"}), \
+                with patch.dict(os.environ, dict(SAMPLE_AWS_ENV)), \
                         patch("host.cli.lifecycle._find_existing_instances", return_value=["i-old"]), \
                         patch("host.cli.lifecycle._existing_storage_volume_availability_zone", return_value="us-east-1a"), \
                         patch("host.cli.lifecycle._existing_storage_roles", return_value={"admin", "agent"}), \
                         patch("host.cli.lifecycle._check_existing_version_hints"), \
-                        patch("host.cli.lifecycle._default_network", return_value=("vpc-1", "subnet-1")), \
+                        patch("host.cli.lifecycle._default_network", return_value=("vpc-1", "subnet-1", "us-east-1a")), \
                         patch("host.cli.lifecycle._terminate_instances"), \
-                        patch("host.cli.lifecycle._generate_deploy_key", side_effect=lambda workdir: Path(workdir) / "deploy_key"), \
+                        patch("host.cli.lifecycle._generate_deploy_key", side_effect=_fake_deploy_key), \
                         patch("host.cli.lifecycle._launch_instance", return_value=("i-123", "sg-1")), \
                         patch(
                             "host.cli.lifecycle._wait_for_instance",
                             return_value={"PublicDnsName": "ec2.example", "Placement": {"AvailabilityZone": "us-east-1a"}},
                         ), \
-                        patch("host.cli.lifecycle._ensure_storage_volumes", return_value=({"admin": "vol-admin", "agent": "vol-agent"}, [])), \
-                        patch(
-                            "host.cli.lifecycle._provision_over_ssh",
-                            return_value={"ssh_enabled": True, "cloudflare_enabled": False},
-                        ), \
+                        patch("host.cli.lifecycle._ensure_storage_volumes", return_value={"admin": "vol-admin", "agent": "vol-agent"}), \
+                        patch("host.cli.lifecycle._attach_storage_volumes"), \
+                        patch("host.cli.lifecycle._provision_over_ssh"), \
                         patch("host.cli.lifecycle._set_security_group_ssh_ingress"), \
-                        patch("host.cli.lifecycle._set_security_group_cloudflare_egress"), \
                         patch("host.cli.lifecycle_aws._aws", return_value={}), \
+                        patch("sys.stderr", _StringOutput()), \
                         patch("sys.stdout", _StringOutput()) as stdout:
-                    self.assertEqual(deploy.main_for_mode("upgrade", ["--config", str(config_path)]), 0)
+                    self.assertEqual(deploy.main_for_mode("upgrade", ["--agent-name", "trustyclaw-test"]), 0)
             finally:
                 os.chdir(cwd)
 
-            self.assertEqual(json.loads(deploy_result_path.read_text()), deploy_result)
-            upgrade_result_path = tmp_path / "trustyclaw-test-upgrade.json"
-            upgrade_result = json.loads(upgrade_result_path.read_text())
+            # stdout carries exactly the result JSON; no files are written and
+            # nothing secret appears.
+            upgrade_result = json.loads(stdout.value)
             self.assertEqual(upgrade_result["agent_name"], "trustyclaw-test")
             self.assertEqual(upgrade_result["version"], deploy.repo_version())
             self.assertNotIn("admin_password", upgrade_result)
-            self.assertIn("Wrote upgrade result to trustyclaw-test-upgrade.json", stdout.value)
-
-    def test_result_file_override_can_write_fixed_automation_path(self) -> None:
-        command = deploy.LifecycleCommand(mode="upgrade", config_path="config.json", result_file="stage.json")
-        with tempfile.TemporaryDirectory() as tmp:
-            cwd = os.getcwd()
-            os.chdir(tmp)
-            try:
-                Path("trustyclaw-test-deploy.json").write_text("{}")
-                self.assertEqual(deploy._result_path("trustyclaw-test", command), Path("stage.json"))
-            finally:
-                os.chdir(cwd)
+            self.assertNotIn("operator_connections", upgrade_result)
+            self.assertEqual(os.listdir(tmp), [])
 
     def test_failed_deploy_reports_created_data_volumes_without_deleting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.json"
-            config_path.write_text(json.dumps(sample_config()))
             cwd = os.getcwd()
             os.chdir(tmp)
             try:
-                created_storage_volumes: list[str] | None = None
-
                 def fake_ensure_storage(*_args, **kwargs):  # type: ignore[no-untyped-def]
-                    nonlocal created_storage_volumes
-                    created_storage_volumes = kwargs["created_storage_volumes"]
-                    created_storage_volumes.extend(["vol-admin", "vol-agent"])
-                    return {"admin": "vol-admin", "agent": "vol-agent"}, ["vol-admin", "vol-agent"]
+                    kwargs["created_storage_volumes"].extend(["vol-admin", "vol-agent"])
+                    return {"admin": "vol-admin", "agent": "vol-agent"}
 
-                with patch.dict(os.environ, {"TEST_AWS_ACCESS_KEY_ID": "AKIATEST", "TEST_AWS_SECRET_ACCESS_KEY": "secret"}), \
+                with patch.dict(os.environ, dict(SAMPLE_AWS_ENV)), \
                         patch("host.cli.lifecycle._find_existing_instances", return_value=[]), \
                         patch("host.cli.lifecycle._existing_storage_volume_availability_zone", return_value=None), \
                         patch("host.cli.lifecycle._existing_storage_roles", return_value=set()), \
                         patch("host.cli.lifecycle._check_existing_version_hints"), \
-                        patch("host.cli.lifecycle._generate_deploy_key", side_effect=lambda workdir: Path(workdir) / "deploy_key"), \
+                        patch("host.cli.lifecycle._default_network", return_value=("vpc-1", "subnet-1", "us-east-1a")), \
+                        patch("host.cli.lifecycle._generate_deploy_key", side_effect=_fake_deploy_key), \
                         patch("host.cli.lifecycle._launch_instance", return_value=("i-123", "sg-1")), \
                         patch(
                             "host.cli.lifecycle._wait_for_instance",
                             return_value={"PublicDnsName": "ec2.example", "Placement": {"AvailabilityZone": "us-east-1a"}},
                         ), \
                         patch("host.cli.lifecycle._ensure_storage_volumes", side_effect=fake_ensure_storage), \
+                        patch("host.cli.lifecycle._attach_storage_volumes"), \
                         patch("host.cli.lifecycle._provision_over_ssh", side_effect=ConfigError("bootstrap failed")), \
                         patch("host.cli.lifecycle._terminate_instances") as terminate, \
                         patch("host.cli.lifecycle_aws._aws", return_value={}), \
-                        patch("sys.stdout", _StringOutput()) as stdout, \
-                        patch("sys.stderr", _StringOutput()):
-                    self.assertEqual(deploy.main_for_mode("deploy", ["--config", str(config_path)]), 2)
+                        patch("sys.stdout", _StringOutput()), \
+                        patch("sys.stderr", _StringOutput()) as stderr:
+                    self.assertEqual(
+                        deploy.main_for_mode(
+                            "deploy",
+                            [
+                                "--agent-name",
+                                "trustyclaw-test",
+                                "--operator-ssh-public-key",
+                                SAMPLE_SSH_PUBLIC_KEY,
+                                "--admin-password-sha256",
+                                SAMPLE_ADMIN_PASSWORD_SHA256,
+                            ],
+                        ),
+                        2,
+                    )
             finally:
                 os.chdir(cwd)
 
+        # One volume rule, both deliveries: created volumes are never
+        # auto-deleted; the retry refuses them until the operator deletes them.
         terminate.assert_called_once()
-        self.assertEqual(created_storage_volumes, ["vol-admin", "vol-agent"])
-        self.assertIn("vol-admin, vol-agent", stdout.value)
-        self.assertIn("delete the tagged volumes before retrying deploy", stdout.value)
+        self.assertIn("vol-admin, vol-agent", stderr.value)
+        self.assertIn("delete the tagged volumes before retrying deploy", stderr.value)
 
     def test_preflight_deploy_rejects_preserved_resources(self) -> None:
-        config = parse_input_config(sample_config())
-        command = deploy.LifecycleCommand(mode="deploy", config_path="config.json")
+        config = sample_input_config()
+        command = deploy.LifecycleCommand(mode="deploy", agent_name="trustyclaw-test")
         with self.assertRaisesRegex(ConfigError, "no existing TrustyClaw instance"):
             deploy._validate_command_preflight(command, config, ["i-old"], set())
         with self.assertRaisesRegex(ConfigError, "no existing TrustyClaw data volumes"):
@@ -1172,27 +1178,377 @@ class DeployUnitTests(unittest.TestCase):
             deploy._validate_command_preflight(command, config, [], {"admin", "agent"})
 
     def test_preflight_reconfigure_requires_existing_instance(self) -> None:
-        config = parse_input_config(sample_config())
-        command = deploy.LifecycleCommand(mode="reconfigure", config_path="config.json")
+        config = sample_input_config()
+        command = deploy.LifecycleCommand(mode="reconfigure", agent_name="trustyclaw-test")
         with self.assertRaisesRegex(ConfigError, "reconfigure requires an existing TrustyClaw instance"):
             deploy._validate_command_preflight(command, config, [], {"admin", "agent"})
         deploy._validate_command_preflight(command, config, ["i-old"], {"admin", "agent"})
 
-    def test_user_data_contains_only_account_setup_and_no_secrets(self) -> None:
-        user_data = deploy._render_user_data("ssh-ed25519 AAAADEPLOY trustyclaw-deploy")
+    def test_ssh_user_data_stages_payload_and_deploy_key(self) -> None:
+        payload = render._bootstrap_payload(
+            sample_input_config(),
+            SAMPLE_ADMIN_PASSWORD_SHA256,
+            build_operator_connections(SAMPLE_SSH_PUBLIC_KEY, None, None),
+            {"admin": "vol-admin", "agent": "vol-agent"},
+            mode="deploy",
+            target_version="0.35.0",
+        )
+        user_data = render._render_ssh_user_data(payload, "ssh-ed25519 AAAADEPLOY trustyclaw-deploy")
 
-        self.assertLess(len(user_data.encode()), 4096)
+        self.assertLess(len(user_data.encode()), 16_384)
         self.assertIn("useradd --create-home --shell /bin/bash trustyclaw-operator", user_data)
-        self.assertNotIn("ssh-ed25519 AAAATEST operator@example", user_data)
-        self.assertNotIn("@OPERATOR_PUBLIC_KEY@", user_data)
         self.assertIn("ssh-ed25519 AAAADEPLOY trustyclaw-deploy", user_data)
         self.assertIn("trustyclaw-operator ALL=(ALL) NOPASSWD:ALL", user_data)
         self.assertIn("gpasswd -d ubuntu sudo", user_data)
-        self.assertNotIn("password", user_data.lower())
+        # Both deliveries stage the same payload through user data; the host
+        # receives only the password hash.
+        embedded = next(line for line in user_data.splitlines() if line.startswith("{"))
+        self.assertEqual(json.loads(embedded), payload)
+        self.assertIn(SAMPLE_ADMIN_PASSWORD_SHA256, user_data)
+        self.assertNotIn("@PAYLOAD_JSON@", user_data)
+        self.assertNotIn("@DEPLOY_PUBLIC_KEY@", user_data)
+
+    def test_bootstrap_from_github_flag_validation(self) -> None:
+        base = ["--agent-name", "trustyclaw-test", "--admin-password-sha256", SAMPLE_ADMIN_PASSWORD_SHA256]
+        parsed = deploy._parse_args("deploy", [*base, "--bootstrap-from-github", "a" * 40])
+        self.assertEqual(parsed.github_commit_sha, "a" * 40)
+        # Without a value the flag pins the latest main commit.
+        parsed = deploy._parse_args("deploy", [*base, "--bootstrap-from-github"])
+        self.assertEqual(parsed.github_commit_sha, "")
+        parsed = deploy._parse_args("deploy", base)
+        self.assertIsNone(parsed.github_commit_sha)
+        for argv, message in (
+            ([*base, "--bootstrap-from-github", "abc123"], "lowercase hex commit sha"),
+            ([*base, "--bootstrap-from-github", "A" * 40], "lowercase hex commit sha"),
+            (["--agent-name", "trustyclaw-test", "--admin-password-sha256", "zz"], "hex SHA-256 digest"),
+        ):
+            with self.subTest(argv=argv):
+                with patch("sys.stderr", _StringOutput()) as stderr:
+                    with self.assertRaises(SystemExit) as raised:
+                        deploy._parse_args("deploy", argv)
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(message, stderr.value)
+
+    def test_render_github_user_data_embeds_payload_and_pin(self) -> None:
+        config = sample_input_config()
+        payload = render._bootstrap_payload(
+            config,
+            SAMPLE_ADMIN_PASSWORD_SHA256,
+            build_operator_connections(SAMPLE_SSH_PUBLIC_KEY, None, None),
+            {"admin": "vol-admin", "agent": "vol-agent"},
+            mode="deploy",
+            target_version="0.35.0",
+        )
+        user_data = render._render_github_user_data(payload, "b" * 40)
+
+        # Payload embeds as one line so it can never collide with the heredoc
+        # delimiter, and the whole script stays far below the 16 KiB user-data cap.
+        self.assertLess(len(user_data.encode()), 16_384)
+        embedded = next(line for line in user_data.splitlines() if line.startswith("{"))
+        self.assertEqual(json.loads(embedded), payload)
+        self.assertIn("https://github.com/infiloop2/trustyclaw.git", user_data)
+        self.assertIn("git fetch -q --depth 1 origin '" + "b" * 40 + "'", user_data)
+        self.assertIn("python3 -m host.bootstrap.self_provision", user_data)
+        # The CLI preflight already proved the commit readable, so host-side
+        # fetch failures are transient; both network steps retry for an
+        # extended window instead of bricking the instance.
+        self.assertEqual(user_data.count("for attempt in $(seq 1 60); do"), 2)
+        self.assertIn("sleep 30", user_data)
+        self.assertIn("useradd --create-home --shell /bin/bash trustyclaw-operator", user_data)
+        self.assertIn("gpasswd -d ubuntu sudo", user_data)
+        # The host receives only the password hash, and no deploy key exists
+        # in this delivery.
+        self.assertIn(SAMPLE_ADMIN_PASSWORD_SHA256, user_data)
+        self.assertNotIn("authorized_keys2", user_data)
+        # A provisioning failure shuts the instance down, which terminates it
+        # because instances launch with terminate-on-shutdown behavior.
+        self.assertIn("trap on_exit EXIT", user_data)
+        self.assertIn("shutdown -h now", user_data)
+        self.assertNotIn("@PAYLOAD_JSON@", user_data)
+        self.assertNotIn("@GITHUB_REPOSITORY@", user_data)
+        self.assertNotIn("@COMMIT_SHA@", user_data)
+
+    def test_github_deploy_launches_with_payload_and_no_ssh_provisioning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                with patch.dict(os.environ, dict(SAMPLE_AWS_ENV)), \
+                        patch("host.cli.lifecycle._find_existing_instances", return_value=[]), \
+                        patch("host.cli.lifecycle._existing_storage_volume_availability_zone", return_value=None), \
+                        patch("host.cli.lifecycle._existing_storage_roles", return_value=set()), \
+                        patch("host.cli.lifecycle._resolve_github_pin", return_value=("c" * 40, "0.35.0")), \
+                        patch("host.cli.lifecycle._default_network", return_value=("vpc-1", "subnet-1", "us-east-1a")), \
+                        patch("host.cli.lifecycle._generate_deploy_key", side_effect=AssertionError("no deploy key in the GitHub delivery")), \
+                        patch("host.cli.lifecycle._launch_instance", return_value=("i-123", "sg-1")) as launch_instance, \
+                        patch(
+                            "host.cli.lifecycle._wait_for_instance",
+                            return_value={"PublicDnsName": "ec2.example", "Placement": {"AvailabilityZone": "us-east-1a"}},
+                        ), \
+                        patch("host.cli.lifecycle._ensure_storage_volumes", return_value={"admin": "vol-admin", "agent": "vol-agent"}), \
+                        patch("host.cli.lifecycle._attach_storage_volumes") as attach_volumes, \
+                        patch("host.cli.lifecycle._provision_over_ssh", side_effect=AssertionError("no SSH in the GitHub delivery")), \
+                        patch("host.cli.lifecycle._set_security_group_ssh_ingress", side_effect=AssertionError("access is final at launch")), \
+                        patch("host.cli.lifecycle_aws._aws", return_value={}), \
+                        patch("sys.stderr", _StringOutput()), \
+                        patch("sys.stdout", _StringOutput()) as stdout:
+                    self.assertEqual(
+                        deploy.main_for_mode(
+                            "deploy",
+                            [
+                                "--agent-name",
+                                "trustyclaw-test",
+                                "--operator-ssh-public-key",
+                                SAMPLE_SSH_PUBLIC_KEY,
+                                "--admin-password-sha256",
+                                SAMPLE_ADMIN_PASSWORD_SHA256,
+                                "--bootstrap-from-github",
+                                "c" * 40,
+                            ],
+                        ),
+                        0,
+                    )
+            finally:
+                os.chdir(cwd)
+
+            attach_volumes.assert_called_once()
+            launch_kwargs = launch_instance.call_args.kwargs
+            # Only an ssh operator endpoint is configured: SSH ingress is
+            # final at launch and the Cloudflare connector egress stays closed.
+            self.assertTrue(launch_kwargs["ssh_ingress"])
+            self.assertFalse(launch_kwargs["cloudflare_egress"])
+            user_data = launch_instance.call_args.args[1]
+            embedded = next(line for line in user_data.splitlines() if line.startswith("{"))
+            payload = json.loads(embedded)
+            self.assertEqual(payload["operation"]["mode"], "deploy")
+            self.assertEqual(payload["storage_volumes"], {"admin": "vol-admin", "agent": "vol-agent"})
+            self.assertEqual(payload["runtime_config"]["admin_password_sha256"], SAMPLE_ADMIN_PASSWORD_SHA256)
+            result = json.loads(stdout.value)
+            self.assertEqual(result["github_source"], "infiloop2/trustyclaw@" + "c" * 40)
+            self.assertNotIn("admin_password", result)
+
+    def test_github_upgrade_reapplies_previous_security_group_state(self) -> None:
+        for captured, expected in (
+            ((False, True), (False, True)),
+            ((True, False), (True, False)),
+            (None, (False, True)),  # missing group: SSH fails closed, connector stays open
+        ):
+            with self.subTest(captured=captured):
+                with tempfile.TemporaryDirectory() as tmp:
+                    cwd = os.getcwd()
+                    os.chdir(tmp)
+                    try:
+                        with contextlib.ExitStack() as stack:
+                            stack.enter_context(patch.dict(os.environ, dict(SAMPLE_AWS_ENV)))
+                            stack.enter_context(patch("host.cli.lifecycle._find_existing_instances", return_value=["i-old"]))
+                            stack.enter_context(patch("host.cli.lifecycle._existing_storage_volume_availability_zone", return_value="us-east-1a"))
+                            stack.enter_context(patch("host.cli.lifecycle._existing_storage_roles", return_value={"admin", "agent"}))
+                            stack.enter_context(patch("host.cli.lifecycle._check_existing_version_hints"))
+                            stack.enter_context(patch("host.cli.lifecycle._resolve_github_pin", return_value=("d" * 40, "0.35.0")))
+                            stack.enter_context(patch("host.cli.lifecycle._default_network", return_value=("vpc-1", "subnet-1", "us-east-1a")))
+                            stack.enter_context(patch("host.cli.lifecycle._security_group_access_state", return_value=captured))
+                            stack.enter_context(patch("host.cli.lifecycle._terminate_instances"))
+                            launch_instance = stack.enter_context(patch("host.cli.lifecycle._launch_instance", return_value=("i-123", "sg-1")))
+                            stack.enter_context(
+                                patch(
+                                    "host.cli.lifecycle._wait_for_instance",
+                                    return_value={"PublicDnsName": "ec2.example", "Placement": {"AvailabilityZone": "us-east-1a"}},
+                                )
+                            )
+                            stack.enter_context(patch("host.cli.lifecycle._ensure_storage_volumes", return_value={"admin": "vol-admin", "agent": "vol-agent"}))
+                            stack.enter_context(patch("host.cli.lifecycle._attach_storage_volumes"))
+                            stack.enter_context(patch("host.cli.lifecycle._provision_over_ssh", side_effect=AssertionError("no SSH in the GitHub delivery")))
+                            stack.enter_context(patch("host.cli.lifecycle._set_security_group_ssh_ingress", side_effect=AssertionError("access is final at launch")))
+                            stack.enter_context(patch("host.cli.lifecycle_aws._aws", return_value={}))
+                            stack.enter_context(patch("sys.stdout", _StringOutput()))
+                            self.assertEqual(
+                                deploy.main_for_mode(
+                                    "upgrade",
+                                    ["--agent-name", "trustyclaw-test", "--bootstrap-from-github", "d" * 40],
+                                ),
+                                0,
+                            )
+                    finally:
+                        os.chdir(cwd)
+
+                launch_kwargs = launch_instance.call_args.kwargs
+                self.assertEqual(launch_kwargs["ssh_ingress"], expected[0])
+                self.assertEqual(launch_kwargs["cloudflare_egress"], expected[1])
+
+    def test_resolve_github_pin_confirms_the_fetched_version(self) -> None:
+        class _FakeResponse:
+            def __init__(self, body: bytes) -> None:
+                self._body = body
+
+            def __enter__(self) -> "_FakeResponse":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return self._body
+
+        sha = "e" * 40
+
+        # Pinned sha: the fetched version is shown and confirmed.
+        with patch("host.cli.lifecycle.urllib.request.urlopen", return_value=_FakeResponse(b"0.36.0\n")) as urlopen, \
+                patch("builtins.input", return_value="y"), \
+                patch("sys.stderr", _StringOutput()) as stderr:
+            self.assertEqual(deploy._resolve_github_pin(sha), (sha, "0.36.0"))
+        self.assertIn("raw.githubusercontent.com/infiloop2/trustyclaw/" + sha, urlopen.call_args.args[0])
+        self.assertIn("Proceed with TrustyClaw 0.36.0?", stderr.value)
+
+        # No sha: the latest main commit is resolved first, then confirmed.
+        def fake_urlopen(request, timeout=0):  # type: ignore[no-untyped-def]
+            del timeout
+            url = request if isinstance(request, str) else request.full_url
+            if url.startswith("https://api.github.com/"):
+                self.assertIn("/repos/infiloop2/trustyclaw/commits/main", url)
+                return _FakeResponse(json.dumps({"sha": sha}).encode())
+            self.assertIn("raw.githubusercontent.com/infiloop2/trustyclaw/" + sha, url)
+            return _FakeResponse(b"0.36.0\n")
+
+        with patch("host.cli.lifecycle.urllib.request.urlopen", side_effect=fake_urlopen), \
+                patch("builtins.input", return_value="y"), \
+                patch("sys.stderr", _StringOutput()):
+            self.assertEqual(deploy._resolve_github_pin(""), (sha, "0.36.0"))
+
+        # Decline aborts before anything is touched.
+        with patch("host.cli.lifecycle.urllib.request.urlopen", return_value=_FakeResponse(b"0.36.0\n")), \
+                patch("builtins.input", return_value="n"), \
+                patch("sys.stderr", _StringOutput()):
+            with self.assertRaisesRegex(ConfigError, "aborted"):
+                deploy._resolve_github_pin(sha)
+
+        # No terminal points at piping the confirmation.
+        with patch("host.cli.lifecycle.urllib.request.urlopen", return_value=_FakeResponse(b"0.36.0\n")), \
+                patch("builtins.input", side_effect=EOFError()), \
+                patch("sys.stderr", _StringOutput()):
+            with self.assertRaisesRegex(ConfigError, "pipe 'y' into stdin"):
+                deploy._resolve_github_pin(sha)
+
+        # Pins older than the first self_provision release fail before
+        # anything is touched instead of failing bootstrap on the host.
+        with patch("host.cli.lifecycle.urllib.request.urlopen", return_value=_FakeResponse(b"0.34.0\n")):
+            with self.assertRaisesRegex(ConfigError, "requires 0.35.0 or newer"):
+                deploy._resolve_github_pin(sha)
+
+        # GitHub failures and garbage content fail closed.
+        with patch("host.cli.lifecycle.urllib.request.urlopen", side_effect=OSError("no network")):
+            with self.assertRaisesRegex(ConfigError, "could not read the pinned commit's VERSION"):
+                deploy._resolve_github_pin(sha)
+        with patch("host.cli.lifecycle.urllib.request.urlopen", side_effect=OSError("no network")):
+            with self.assertRaisesRegex(ConfigError, "could not read the latest main commit"):
+                deploy._resolve_github_pin("")
+        with patch("host.cli.lifecycle.urllib.request.urlopen", return_value=_FakeResponse(b"<html>404</html>")):
+            with self.assertRaisesRegex(ConfigError, "invalid VERSION"):
+                deploy._resolve_github_pin(sha)
+
+    def test_security_group_access_state_reads_converged_rules(self) -> None:
+        config = sample_input_config()
+
+        with patch("host.cli.lifecycle_aws._aws", return_value={"SecurityGroups": []}):
+            self.assertIsNone(deploy._security_group_access_state(config, {}, "vpc-1"))
+
+        group = {
+            "SecurityGroups": [
+                {
+                    "GroupId": "sg-1",
+                    "IpPermissions": [
+                        {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+                    ],
+                    "IpPermissionsEgress": [
+                        {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+                    ],
+                }
+            ]
+        }
+        with patch("host.cli.lifecycle_aws._aws", return_value=group):
+            self.assertEqual(deploy._security_group_access_state(config, {}, "vpc-1"), (True, False))
+
+    def test_self_provision_enforces_version_pin_and_runs_bootstrap(self) -> None:
+        from host.bootstrap import self_provision
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            checkout = tmp_path / "checkout"
+            checkout.mkdir()
+            (checkout / "VERSION").write_text("0.35.0\n")
+            payload_path = tmp_path / "payload.json"
+            payload_path.write_text(json.dumps({"operation": {"target_version": "0.35.0"}}))
+            bootstrap_path = tmp_path / "bootstrap.sh"
+            archive_path = tmp_path / "code.tar.gz"
+
+            with patch.object(self_provision, "BOOTSTRAP_PATH", bootstrap_path), \
+                    patch.object(self_provision, "CODE_ARCHIVE_PATH", archive_path), \
+                    patch("host.bootstrap.self_provision._render_bootstrap", return_value="#!/bin/bash\n") as render_bootstrap, \
+                    patch("host.bootstrap.self_provision._write_runtime_code_archive") as write_archive, \
+                    patch("host.bootstrap.self_provision.subprocess.run") as run, \
+                    patch("sys.stdout", _StringOutput()):
+                run.return_value.returncode = 0
+                self.assertEqual(
+                    self_provision.main(["--payload", str(payload_path), "--checkout", str(checkout)]),
+                    0,
+                )
+            render_bootstrap.assert_called_once()
+            write_archive.assert_called_once_with(archive_path)
+            run.assert_called_once_with(["bash", str(bootstrap_path)])
+            self.assertEqual(bootstrap_path.read_text(), "#!/bin/bash\n")
+            self.assertFalse(checkout.exists())  # removed after success
+
+            # A pre-existing archive (the operator-owned file scp'd on the SSH
+            # delivery) is removed before the fresh archive is written, so the
+            # root rebuild is not blocked by fs.protected_regular in /tmp.
+            checkout.mkdir()
+            (checkout / "VERSION").write_text("0.35.0\n")
+            archive_path.write_text("stale scp'd archive")
+            existed_at_write: list[bool] = []
+            with patch.object(self_provision, "BOOTSTRAP_PATH", bootstrap_path), \
+                    patch.object(self_provision, "CODE_ARCHIVE_PATH", archive_path), \
+                    patch("host.bootstrap.self_provision._render_bootstrap", return_value="#!/bin/bash\n"), \
+                    patch(
+                        "host.bootstrap.self_provision._write_runtime_code_archive",
+                        side_effect=lambda path: existed_at_write.append(path.exists()),
+                    ), \
+                    patch("host.bootstrap.self_provision.subprocess.run") as run, \
+                    patch("sys.stdout", _StringOutput()):
+                run.return_value.returncode = 0
+                self.assertEqual(
+                    self_provision.main(["--payload", str(payload_path), "--checkout", str(checkout)]),
+                    0,
+                )
+            self.assertEqual(existed_at_write, [False])
+
+            # A bootstrap failure propagates as exit 1 and keeps the checkout
+            # for diagnosis.
+            checkout.mkdir()
+            (checkout / "VERSION").write_text("0.35.0\n")
+            with patch.object(self_provision, "BOOTSTRAP_PATH", bootstrap_path), \
+                    patch.object(self_provision, "CODE_ARCHIVE_PATH", archive_path), \
+                    patch("host.bootstrap.self_provision._render_bootstrap", return_value="#!/bin/bash\n"), \
+                    patch("host.bootstrap.self_provision._write_runtime_code_archive"), \
+                    patch("host.bootstrap.self_provision.subprocess.run") as run, \
+                    patch("sys.stderr", _StringOutput()):
+                run.return_value.returncode = 3
+                self.assertEqual(
+                    self_provision.main(["--payload", str(payload_path), "--checkout", str(checkout)]),
+                    1,
+                )
+            self.assertTrue(checkout.exists())
+
+            # A version-pin mismatch fails closed before rendering anything.
+            (checkout / "VERSION").write_text("0.34.0\n")
+            with patch("host.bootstrap.self_provision._render_bootstrap", side_effect=AssertionError("must not render")), \
+                    patch("sys.stderr", _StringOutput()) as stderr:
+                self.assertEqual(
+                    self_provision.main(["--payload", str(payload_path), "--checkout", str(checkout)]),
+                    2,
+                )
+            self.assertIn("the commit you pin must be the code", stderr.value)
 
     def test_rendered_bootstrap_contains_privilege_boundary(self) -> None:
-        config = parse_input_config(sample_config())
-        bootstrap = deploy._render_bootstrap(config)
+        bootstrap = render._render_bootstrap()
 
         self.assertIn("ADMIN_MOUNT=/mnt/trustyclaw-admin", bootstrap)
         self.assertIn('PGDATA_DIR="/mnt/trustyclaw-admin/postgres/${PG_MAJOR}/main"', bootstrap)
@@ -1230,7 +1586,7 @@ class DeployUnitTests(unittest.TestCase):
         for app_id in ("alpha_seeker", "social_marketer", "virality_machine", "software_builder"):
             self.assertIn(f"User=trustyclaw-app-{app_id}", bootstrap)
             self.assertIn(f"trustyclaw-app-{app_id}.service", bootstrap)
-            self.assertIn(f"python3 -m host.runtime.app_migrate pending {app_id}", bootstrap)
+            self.assertIn(f"python3 -m host.runtime.deploy.app_migrate pending {app_id}", bootstrap)
         self.assertIn("ensure_user postgres \"$POSTGRES_UID\" postgres /var/lib/postgresql", bootstrap)
         self.assertLess(
             bootstrap.index('ensure_user postgres "$POSTGRES_UID"'),
@@ -1281,26 +1637,26 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("Slice=trustyclaw_app.slice", bootstrap)
         self.assertIn("trustyclaw-app-agent_chat.service", bootstrap)
         self.assertIn("trustyclaw-app-mission_pursuit.service", bootstrap)
-        self.assertIn("python3 -m host.runtime.app_migrate pending agent_chat", bootstrap)
-        self.assertIn("python3 -m host.runtime.app_migrate pending mission_pursuit", bootstrap)
+        self.assertIn("python3 -m host.runtime.deploy.app_migrate pending agent_chat", bootstrap)
+        self.assertIn("python3 -m host.runtime.deploy.app_migrate pending mission_pursuit", bootstrap)
         self.assertIn(
             "runuser -u trustyclaw-app-agent_chat -- env PYTHONPATH=/opt/trustyclaw-host "
-            'python3 -m host.runtime.app_migrate apply-sql agent_chat "$app_migration_version"',
+            'python3 -m host.runtime.deploy.app_migrate apply-sql agent_chat "$app_migration_version"',
             bootstrap,
         )
         self.assertIn(
             "runuser -u trustyclaw-app-mission_pursuit -- env PYTHONPATH=/opt/trustyclaw-host "
-            'python3 -m host.runtime.app_migrate apply-sql mission_pursuit "$app_migration_version"',
+            'python3 -m host.runtime.deploy.app_migrate apply-sql mission_pursuit "$app_migration_version"',
             bootstrap,
         )
         self.assertIn(
             "runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host "
-            'python3 -m host.runtime.app_migrate record agent_chat "$app_migration_version"',
+            'python3 -m host.runtime.deploy.app_migrate record agent_chat "$app_migration_version"',
             bootstrap,
         )
         self.assertIn(
             "runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host "
-            'python3 -m host.runtime.app_migrate record mission_pursuit "$app_migration_version"',
+            'python3 -m host.runtime.deploy.app_migrate record mission_pursuit "$app_migration_version"',
             bootstrap,
         )
         self.assertNotIn('GRANT \\"trustyclaw-app-agent_chat\\" TO \\"trustyclaw-admin\\"', bootstrap)
@@ -1309,10 +1665,10 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("CREATE SCHEMA IF NOT EXISTS app_mission_pursuit AUTHORIZATION", bootstrap)
         self.assertIn("trustyclaw-app-agent_chat", bootstrap)
         # Credential carry-over (payload for deploy/reconfigure, stored config
-        # for upgrade/recover) lives in host.runtime.write_config now; bootstrap
+        # for upgrade/recover) lives in host.runtime.deploy.write_config now; bootstrap
         # passes the operation mode through and stages the effective config for
         # the root-only steps. Behavior is covered by tests/test_write_config.py.
-        self.assertIn("python3 -m host.runtime.write_config > /tmp/trustyclaw_effective_config.json", bootstrap)
+        self.assertIn("python3 -m host.runtime.deploy.write_config > /tmp/trustyclaw_effective_config.json", bootstrap)
         self.assertIn("json.dumps({'mode': payload['operation']['mode'], 'runtime_config': payload['runtime_config']})", bootstrap)
         self.assertIn("chmod 600 /tmp/trustyclaw_effective_config.json", bootstrap)
         self.assertIn("pathlib.Path('/tmp/trustyclaw_effective_config.json').read_text()", bootstrap)
@@ -1390,9 +1746,6 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("if cloudflare_enabled else ''", bootstrap)
         self.assertIn("$(cat /tmp/trustyclaw_cloudflare_rules)", bootstrap)
         self.assertIn("rm -f /tmp/trustyclaw_ssh_rule /tmp/trustyclaw_cloudflare_rules", bootstrap)
-        self.assertIn("TRUSTYCLAW_BOOTSTRAP_ACCESS_SUMMARY", bootstrap)
-        self.assertIn("'ssh_enabled': any(connection.get('mode') == 'ssh' for connection in connections),", bootstrap)
-        self.assertIn("'cloudflare_enabled': any(connection.get('mode') == 'cloudflare_access' for connection in connections),", bootstrap)
         self.assertIn("rm -f /home/trustyclaw-operator/.ssh/authorized_keys2", bootstrap)
         self.assertIn("CLOUDFLARED_VERSION=2026.6.1", bootstrap)
         self.assertIn("trustyclaw-cloudflared.service", bootstrap)
@@ -1415,10 +1768,10 @@ class DeployUnitTests(unittest.TestCase):
         self.assertNotIn("proxy-state/openai_account.json", bootstrap)
         self.assertNotIn("proxy-state/claude_account.json", bootstrap)
         self.assertNotIn(".network_policy.lock", bootstrap)
-        self.assertIn("chown root:root /mnt/trustyclaw-admin", bootstrap)
-        self.assertIn("chown trustyclaw-proxy:trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state", bootstrap)
-        self.assertIn("chmod 700 /mnt/trustyclaw-admin/proxy-state", bootstrap)
-        self.assertIn("chown trustyclaw-proxy:trustyclaw-proxy /mnt/trustyclaw-admin/proxy-state/generated-certs", bootstrap)
+        self.assertIn("DURABLE_PATH_OWNERSHIP=", bootstrap)
+        self.assertIn("/mnt/trustyclaw-admin root:root 711", bootstrap)
+        self.assertIn("/mnt/trustyclaw-admin/proxy-state trustyclaw-proxy:trustyclaw-proxy 700", bootstrap)
+        self.assertIn("/mnt/trustyclaw-admin/proxy-state/generated-certs trustyclaw-proxy:trustyclaw-proxy 700", bootstrap)
         # Admin state lives in Postgres now; admin-state/ keeps only the
         # deploy-plane version.json, no runtime JSON state files.
         self.assertIn("chown trustyclaw-admin:trustyclaw-admin /mnt/trustyclaw-admin/admin-state/version.json", bootstrap)
@@ -1428,11 +1781,11 @@ class DeployUnitTests(unittest.TestCase):
         self.assertNotIn("admin-state/claude_account.json", bootstrap)
         self.assertNotIn("trustyclaw-proxy:trustyclaw-admin", bootstrap)
         self.assertNotIn("for path in \\", bootstrap)
-        self.assertIn("/mnt/trustyclaw-admin/proxy-state/network_proxy_ca.key", bootstrap)
-        self.assertIn("chown trustyclaw-agent:trustyclaw-agent /mnt/trustyclaw-agent/agent-home", bootstrap)
+        self.assertIn("/mnt/trustyclaw-admin/proxy-state/network_proxy_ca.key trustyclaw-proxy:trustyclaw-proxy 600", bootstrap)
+        self.assertIn("/mnt/trustyclaw-agent/agent-home trustyclaw-agent:trustyclaw-agent 700", bootstrap)
         self.assertNotIn("chown -R trustyclaw-admin:trustyclaw-admin /mnt/trustyclaw-admin/admin-state", bootstrap)
         self.assertNotIn("chown -R trustyclaw-agent:trustyclaw-agent /mnt/trustyclaw-agent/agent-home", bootstrap)
-        self.assertIn("chmod 711 /mnt/trustyclaw-agent", bootstrap)
+        self.assertIn("/mnt/trustyclaw-agent root:root 711", bootstrap)
         self.assertIn('agent_home / "AGENTS.md"', bootstrap)
         self.assertIn('agent_home / "CLAUDE.md"', bootstrap)
         self.assertIn('agent_home / ".codex" / "config.toml"', bootstrap)
@@ -1486,27 +1839,26 @@ class DeployUnitTests(unittest.TestCase):
         # runtime directory that holds the agent-facing tools socket.
         self.assertIn("/etc/codex/managed_config.toml", bootstrap)
         self.assertIn("[mcp_servers.trustyclaw]", bootstrap)
-        self.assertIn('args = ["-m", "host.runtime.tools_mcp_shim"]', bootstrap)
+        self.assertIn('args = ["-m", "host.runtime.agent_shim.mcp_shim"]', bootstrap)
         self.assertIn('env = { PYTHONPATH = "/opt/trustyclaw-host" }', bootstrap)
         # The admin-api unit's RuntimeDirectory holds the app-backend admin
         # socket dir; the agent-facing tools socket dir is owned by the dedicated
         # trustyclaw-tools.service.
         self.assertIn("RuntimeDirectory=trustyclaw-admin-api\n", bootstrap)
-        self.assertIn("ExecStart=/usr/bin/python3 -m host.runtime.tools_service", bootstrap)
+        self.assertIn("ExecStart=/usr/bin/python3 -m host.runtime.tools.service", bootstrap)
         self.assertIn("RuntimeDirectory=trustyclaw-tools\n", bootstrap)
         self.assertIn("RuntimeDirectoryMode=0755", bootstrap)
         self.assertIn('tools_state = admin_mount / "tools-state"', bootstrap)
         self.assertIn('recreate_directory(tools_state / "assets")', bootstrap)
         self.assertIn(
-            "chown trustyclaw-tools:trustyclaw-tools /mnt/trustyclaw-admin/tools-state/assets",
+            "/mnt/trustyclaw-admin/tools-state/assets trustyclaw-tools:trustyclaw-tools 700",
             bootstrap,
         )
-        self.assertIn("chmod 700 /mnt/trustyclaw-admin/tools-state/assets", bootstrap)
         # The dedicated agent-app service has its own user and runtime
         # directory for the agent-facing socket, with no database access.
         self.assertIn('ensure_user trustyclaw-agent-app "$TRUSTYCLAW_AGENT_APP_UID" trustyclaw-agent-app /nonexistent', bootstrap)
         self.assertIn("TRUSTYCLAW_AGENT_APP_UID=47747", bootstrap)
-        self.assertIn("ExecStart=/usr/bin/python3 -m host.runtime.agent_app_service", bootstrap)
+        self.assertIn("ExecStart=/usr/bin/python3 -m host.runtime.agent_app.service", bootstrap)
         self.assertIn("User=trustyclaw-agent-app", bootstrap)
         self.assertIn("RuntimeDirectory=trustyclaw-agent-app\n", bootstrap)
         self.assertIn("systemctl enable --now trustyclaw-agent-app.service", bootstrap)
@@ -1519,7 +1871,7 @@ class DeployUnitTests(unittest.TestCase):
             bootstrap,
         )
         self.assertIn("TRUSTYCLAW_AGENT_NETWORK_UID=47748", bootstrap)
-        self.assertIn("ExecStart=/usr/bin/python3 -m host.runtime.network_introspection_service", bootstrap)
+        self.assertIn("ExecStart=/usr/bin/python3 -m host.runtime.agent_network.service", bootstrap)
         self.assertIn("User=trustyclaw-agent-network", bootstrap)
         self.assertIn("RuntimeDirectory=trustyclaw-agent-network\n", bootstrap)
         self.assertIn("systemctl enable --now trustyclaw-agent-network.service", bootstrap)
@@ -1626,7 +1978,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertNotIn("LEGACY_UNVERSIONED_STATE_VERSION", bootstrap)
 
     def test_rendered_bootstrap_provisions_every_installed_app(self) -> None:
-        bootstrap = deploy._render_bootstrap(parse_input_config(sample_config()))
+        bootstrap = render._render_bootstrap()
 
         apps = app_platform.installed_apps()
         self.assertGreaterEqual(len(apps), 1)
@@ -1642,15 +1994,15 @@ class DeployUnitTests(unittest.TestCase):
                 self.assertIn(f'CREATE ROLE "{app.db_role}" LOGIN;', bootstrap)
                 self.assertIn(f'CREATE SCHEMA IF NOT EXISTS {app.db_schema} AUTHORIZATION \\"{app.db_role}\\";', bootstrap)
                 self.assertIn(f'GRANT CONNECT ON DATABASE trustyclaw_admin TO \\"{app.db_role}\\";', bootstrap)
-                self.assertIn(f"python3 -m host.runtime.app_migrate pending {app.id}", bootstrap)
+                self.assertIn(f"python3 -m host.runtime.deploy.app_migrate pending {app.id}", bootstrap)
                 self.assertIn(
                     f"runuser -u {app.linux_user} -- env PYTHONPATH=/opt/trustyclaw-host "
-                    f'python3 -m host.runtime.app_migrate apply-sql {app.id} "$app_migration_version"',
+                    f'python3 -m host.runtime.deploy.app_migrate apply-sql {app.id} "$app_migration_version"',
                     bootstrap,
                 )
                 self.assertIn(
                     f"runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host "
-                    f'python3 -m host.runtime.app_migrate record {app.id} "$app_migration_version"',
+                    f'python3 -m host.runtime.deploy.app_migrate record {app.id} "$app_migration_version"',
                     bootstrap,
                 )
                 self.assertIn(f'oif lo ct state established,related meta skuid "{app.linux_user}" accept', bootstrap)
@@ -1693,8 +2045,8 @@ class DeployUnitTests(unittest.TestCase):
                 agent_instructions="Test app instructions.",
             )
 
-            with patch("host.cli.lifecycle_bootstrap.app_platform.installed_apps", return_value=[app]):
-                bootstrap = deploy._render_bootstrap(parse_input_config(sample_config()))
+            with patch("host.bootstrap.render.app_platform.installed_apps", return_value=[app]):
+                bootstrap = render._render_bootstrap()
 
         self.assertIn("cat > /etc/systemd/system/trustyclaw-app-custom_app.service <<'UNIT'", bootstrap)
         self.assertIn("Description=TrustyClaw App: Custom $(touch /tmp/unsafe)", bootstrap)
@@ -1704,7 +2056,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertNotIn("/opt/trustyclaw-host/host/apps/custom_app/backend.py", bootstrap)
 
     def test_rendered_bootstrap_pins_every_app_uid_in_reserved_range(self) -> None:
-        bootstrap = deploy._render_bootstrap(parse_input_config(sample_config()))
+        bootstrap = render._render_bootstrap()
         apps = app_platform.installed_apps()
         seen_uids: set[int] = set()
 
@@ -1724,8 +2076,32 @@ class DeployUnitTests(unittest.TestCase):
                 self.assertNotIn(uid, seen_uids)
                 seen_uids.add(uid)
 
+    def test_rendered_bootstrap_runs_phases_and_verification(self) -> None:
+        bootstrap = render._render_bootstrap()
+
+        # The pinned core service accounts render from host.constants, the
+        # same table host.bootstrap.verify_deploy checks on the host.
+        from host.constants import SERVICE_ACCOUNTS
+
+        for name, uid in SERVICE_ACCOUNTS.items():
+            prefix = name.upper().replace("-", "_")
+            self.assertIn(f"{prefix}_UID={uid}", bootstrap)
+            self.assertIn(f"{prefix}_GID={uid}", bootstrap)
+        # main() runs the phases in order and verification sits after the
+        # services start and before staged secrets are dropped.
+        self.assertIn("python3 -m host.bootstrap.verify_deploy --cloudflare", bootstrap)
+        self.assertLess(
+            bootstrap.index("\n  start_services\n"), bootstrap.index("\n  verify_deployment\n")
+        )
+        self.assertLess(
+            bootstrap.index("\n  verify_deployment\n"), bootstrap.index("\n  finalize_deploy\n")
+        )
+        # The sudoers drop-in is validated at write time, not at first use.
+        self.assertIn("visudo -c -q -f /etc/sudoers.d/trustyclaw-host", bootstrap)
+        self.assertTrue(bootstrap.rstrip().endswith("\nmain"))
+
     def test_rendered_bootstrap_provisions_admin_state_postgres(self) -> None:
-        bootstrap = deploy._render_bootstrap(parse_input_config(sample_config()))
+        bootstrap = render._render_bootstrap()
 
         # The Debian default cluster (root volume) is disabled before the
         # server package installs; the real data directory lives on the
@@ -1809,19 +2185,19 @@ class DeployUnitTests(unittest.TestCase):
         )
         # Schema migrations and config seeding run as trustyclaw-admin, after
         # the cluster is up and before the admin API starts.
-        migrate_up = "python3 -m host.runtime.migrate up"
+        migrate_up = "python3 -m host.runtime.deploy.migrate up"
         self.assertIn("runuser -u trustyclaw-admin -- env PYTHONPATH=/opt/trustyclaw-host " + migrate_up, bootstrap)
-        self.assertIn("python3 -m host.runtime.write_config", bootstrap)
+        self.assertIn("python3 -m host.runtime.deploy.write_config", bootstrap)
         self.assertLess(
             bootstrap.index("systemctl enable --now trustyclaw-postgres.service"),
             bootstrap.index(migrate_up),
         )
         self.assertLess(
             bootstrap.index(migrate_up),
-            bootstrap.index("python3 -m host.runtime.write_config"),
+            bootstrap.index("python3 -m host.runtime.deploy.write_config"),
         )
         self.assertLess(
-            bootstrap.index("python3 -m host.runtime.write_config"),
+            bootstrap.index("python3 -m host.runtime.deploy.write_config"),
             bootstrap.index("systemctl enable --now trustyclaw-admin-api.service"),
         )
         self.assertLess(
@@ -1837,7 +2213,7 @@ class DeployUnitTests(unittest.TestCase):
             bootstrap.index("TRUSTYCLAW_TARGET_VERSION"),
         )
         # No database driver anywhere: the runtime speaks the wire protocol
-        # itself (host/runtime/pgclient.py).
+        # itself (host/runtime/core/pgclient.py).
         self.assertNotIn("psycopg2", bootstrap)
         # Root rewrites the managed database config inside the postgres-owned
         # data directory; those slots (and every data-dir path component) are
@@ -1853,7 +2229,7 @@ class DeployUnitTests(unittest.TestCase):
     def test_bootstrap_renders_shared_port_constants(self) -> None:
         from host.constants import PROXY_PORT
 
-        bootstrap = deploy._render_bootstrap(parse_input_config(sample_config()))
+        bootstrap = render._render_bootstrap()
         # No placeholders left unrendered, and the rendered ports are the shared
         # constants — so a port change in one place cannot silently drift.
         self.assertNotIn("@PROXY_PORT@", bootstrap)
@@ -2085,11 +2461,11 @@ class DeployUnitTests(unittest.TestCase):
         return namespace
 
     def test_bootstrap_payload_omits_runtime_network_policy(self) -> None:
-        config = parse_input_config(sample_config())
+        config = sample_input_config()
         payload = deploy._bootstrap_payload(
             config,
-            "admin-password",
-            deploy.runtime_operator_connections_from_input(config.operator_connections or (), {}),
+            SAMPLE_ADMIN_PASSWORD_SHA256,
+            build_operator_connections(SAMPLE_SSH_PUBLIC_KEY, None, None),
             {"admin": "vol-admin", "agent": "vol-agent"},
             mode="deploy",
             target_version="0.1.0",
@@ -2097,7 +2473,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertEqual(payload["storage_volumes"], {"admin": "vol-admin", "agent": "vol-agent"})
         self.assertEqual(payload["operation"], {"mode": "deploy", "target_version": "0.1.0", "allow_upgrade": False})
         self.assertEqual(payload["runtime_config"]["agent_name"], "trustyclaw-test")
-        self.assertIn("admin_password_sha256", payload["runtime_config"])
+        self.assertEqual(payload["runtime_config"]["admin_password_sha256"], SAMPLE_ADMIN_PASSWORD_SHA256)
         self.assertEqual(
             payload["runtime_config"]["operator_connections"],
             [{"mode": "ssh", "ssh_public_key": "ssh-ed25519 AAAATEST operator@example"}],
@@ -2105,15 +2481,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertNotIn("network_controls", payload)
 
     def test_upgrade_bootstrap_payload_omits_replacement_operator_connections(self) -> None:
-        config = parse_input_config(
-            {
-                "agent_name": "trustyclaw-test",
-                "aws_region": "us-east-1",
-                "aws_access_key_id_env": "TEST_AWS_ACCESS_KEY_ID",
-                "aws_secret_access_key_env": "TEST_AWS_SECRET_ACCESS_KEY",
-            },
-            require_operator_connections=False,
-        )
+        config = sample_input_config()
         payload = deploy._bootstrap_payload(
             config,
             None,
@@ -2128,13 +2496,16 @@ class DeployUnitTests(unittest.TestCase):
     def test_runtime_code_archive_excludes_cli_package(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             archive = Path(tmp) / "trustyclaw-host-code.tar.gz"
-            deploy._write_runtime_code_archive(archive)
+            render._write_runtime_code_archive(archive)
 
             with tarfile.open(archive, "r:gz") as tar:
                 names = set(tar.getnames())
 
-        self.assertIn("host/runtime/admin_api.py", names)
+        self.assertIn("host/runtime/admin_api/service.py", names)
         self.assertIn("host/version.py", names)
+        # VERSION rides along so self_provision can enforce the version gate
+        # on the delivered tree.
+        self.assertIn("VERSION", names)
         self.assertIn("host/bootstrap/agent-home/agents_claude.md", names)
         self.assertNotIn("host/bootstrap/agent-home/AGENTS.md", names)
         self.assertNotIn("host/bootstrap/agent-home/CLAUDE.md", names)
@@ -2161,20 +2532,29 @@ class FakeCliIntegrationTests(unittest.TestCase):
                 fake = fake_bin / name
                 fake.write_text(_fake_cli_script(name, log_path))
                 fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
-            config_path = tmp_path / "config.json"
-            config_path.write_text(json.dumps(sample_config()))
             env = os.environ.copy()
             env.update(
                 {
                     "PATH": f"{fake_bin}:{env['PATH']}",
                     "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
-                    "TEST_AWS_ACCESS_KEY_ID": "access",
-                    "TEST_AWS_SECRET_ACCESS_KEY": "secret",
+                    "AWS_ACCESS_KEY_ID": "access",
+                    "AWS_SECRET_ACCESS_KEY": "secret",
+                    "AWS_REGION": "us-east-1",
                 }
             )
 
             proc = subprocess.run(
-                [sys.executable, "-m", "host.cli.deploy", "--config", str(config_path)],
+                [
+                    sys.executable,
+                    "-m",
+                    "host.cli.deploy",
+                    "--agent-name",
+                    "trustyclaw-test",
+                    "--operator-ssh-public-key",
+                    SAMPLE_SSH_PUBLIC_KEY,
+                    "--admin-password-sha256",
+                    SAMPLE_ADMIN_PASSWORD_SHA256,
+                ],
                 cwd=tmp_path,
                 env=env,
                 text=True,
@@ -2183,16 +2563,16 @@ class FakeCliIntegrationTests(unittest.TestCase):
                 check=True,
             )
 
-            self.assertIn("Wrote deploy result", proc.stdout)
-            result_path = tmp_path / "trustyclaw-test-deploy.json"
-            result = json.loads(result_path.read_text())
+            # stdout is exactly the result JSON; progress went to stderr.
+            result = json.loads(proc.stdout)
+            self.assertIn("[deploy]", proc.stderr)
             self.assertEqual(result["admin_ui_local_url"], "http://127.0.0.1:7443")
             self.assertEqual(result["public_dns"], "trustyclaw.example.com")
             self.assertEqual(result["ssh_user"], "trustyclaw-operator")
             self.assertEqual(result["admin_volume_id"], "vol-admin")
             self.assertEqual(result["agent_volume_id"], "vol-agent")
             self.assertEqual(result["version"], deploy.repo_version())
-            self.assertEqual(stat.S_IMODE(result_path.stat().st_mode), 0o600)
+            self.assertEqual(result["operator_connections"], [{"mode": "ssh"}])
 
             calls = [json.loads(line) for line in log_path.read_text().splitlines()]
             run_call = next(call for call in calls if call[1:3] == ["ec2", "run-instances"])
@@ -2219,13 +2599,19 @@ class FakeCliIntegrationTests(unittest.TestCase):
 
             scp_call = next(call for call in calls if call[0] == "scp")
             copied = " ".join(scp_call)
-            self.assertIn("trustyclaw_payload.json", copied)
-            self.assertIn("trustyclaw_bootstrap.sh", copied)
+            # The payload rides in user data and bootstrap renders on the
+            # host; SSH pushes only the runtime code archive.
+            self.assertNotIn("trustyclaw_payload.json", copied)
+            self.assertNotIn("trustyclaw_bootstrap.sh", copied)
             self.assertIn("trustyclaw-host-code.tar.gz", copied)
 
-            bootstrap_call = next(call for call in calls if call[0] == "ssh" and "sudo" in call)
-            self.assertIn("bash", bootstrap_call)
-            self.assertIn("/tmp/trustyclaw_bootstrap.sh", bootstrap_call)
+            provision_call = next(
+                call for call in calls if call[0] == "ssh" and any("self_provision" in item for item in call)
+            )
+            remote = next(item for item in provision_call if "self_provision" in item)
+            self.assertIn("tar -xzf /tmp/trustyclaw-host-code.tar.gz", remote)
+            self.assertIn("python3 -m host.bootstrap.self_provision", remote)
+            self.assertIn("--payload /tmp/trustyclaw_payload.json", remote)
 
 
 def _fake_cli_script(name: str, log_path: Path) -> str:
@@ -2245,8 +2631,6 @@ if {name!r} == "ssh-keygen":
     key = pathlib.Path(args[args.index("-f") + 1])
     key.write_text("fake private key\\n")
     key.with_suffix(".pub").write_text("ssh-ed25519 AAAADEPLOY trustyclaw-deploy\\n")
-elif {name!r} == "ssh" and "bash" in args and "/tmp/trustyclaw_bootstrap.sh" in args:
-    print('TRUSTYCLAW_BOOTSTRAP_ACCESS_SUMMARY {{"cloudflare_enabled": false, "ssh_enabled": true}}')
 elif {name!r} in ("ssh", "scp"):
     pass
 elif args[:2] == ["ec2", "describe-instances"] and "--instance-ids" not in args:

@@ -899,5 +899,5 @@ class RunwayTool:
         return ActionFailed("Runway has no approval-gated actions.")
 
 
-# The instance the host discovers (see host.runtime.tools_host).
+# The instance the host discovers (see host.runtime.tools.tools_host).
 BUNDLED_TOOL = RunwayTool()

@@ -50,8 +50,8 @@ import time
 from typing import Any
 from urllib.parse import quote, unquote
 
-from host.constants import LOOPBACK
-from host.runtime import db
+from host.constants import APP_BACKEND_ADMIN_SOCKET_PATH, LOOPBACK
+from host.runtime.core import db
 from host.session_options import public_session_options, session_config_error
 
 from host.apps.workspace_kit.config import WorkspaceAppConfig
@@ -178,7 +178,7 @@ DB_SCHEMA = ""
 HOST = LOOPBACK
 PORT = 0
 ADMIN_API_SOCKET = os.environ.get(
-    "TRUSTYCLAW_APP_ADMIN_API_SOCKET", "/run/trustyclaw-admin-api/app-backend.sock"
+    "TRUSTYCLAW_APP_ADMIN_API_SOCKET", APP_BACKEND_ADMIN_SOCKET_PATH
 )
 SETUP_BRIEF = GENERIC_SETUP_BRIEF
 _SEED: Any = None
@@ -2262,7 +2262,7 @@ def _network_integrations_snapshot() -> dict[str, bool] | None:
 def parse_network_integrations(payload: Any) -> dict[str, bool]:
     """Enabled flags from a /v1/network/policy response.
 
-    The envelope keys belong to host.runtime.network_policy; the kit cannot
+    The envelope keys belong to host.runtime.core.network_policy; the kit cannot
     import that module at runtime, so test_workspace_kit pins this parser
     against the host module's actual response shape.
     """

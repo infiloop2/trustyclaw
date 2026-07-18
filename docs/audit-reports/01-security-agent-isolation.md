@@ -61,8 +61,8 @@ below names it.
 
 - `docs/architecture/privilege-boundaries.md`, `docs/architecture/filesystem.md`
 - `host/bootstrap/bootstrap.sh`, `host/bootstrap/helpers/`
-- `host/runtime/admin_api.py` (agent file routes, process listing),
-  `host/runtime/orchestrator.py`, `host/runtime/pgclient.py`
+- `host/runtime/admin_api/service.py` (agent file routes, process listing),
+  `host/runtime/admin_api/orchestrator.py`, `host/runtime/core/pgclient.py`
 - systemd units and nftables rules as written by bootstrap
 
 ## Audit entries
@@ -87,7 +87,7 @@ source; did not run a live host or write exploit code.
   `read-claude-account.sh`, `reboot-host.sh`.
 - Agent-controlled content flowing into the admin service: the
   `read-agent-file` list/read routes and their argument handling
-  (`host/runtime/admin_api.py` `_run_agent_file_helper`, `_agent_file_path`),
+  (`host/runtime/admin_api/service.py` `_run_agent_file_helper`, `_agent_file_path`),
   and the `agent-processes` `/proc` reader.
 - The environment the run-helpers hand to agent runtimes.
 
@@ -166,13 +166,13 @@ runtime launch environments. I did not run a live host or exploit PoCs.
   ownership, sudoers, nftables, systemd units, and agent slice setup.
 - `host/bootstrap/helpers/*.sh`: runtime launch helpers, account readers,
   `read-agent-file`, and `reboot-host`.
-- `host/runtime/admin_api.py`: `/v1/agent-files*`, `/v1/agent-processes`,
+- `host/runtime/admin_api/service.py`: `/v1/agent-files*`, `/v1/agent-processes`,
   reboot helper invocation, auth, static serving, and route dispatch.
-- `host/runtime/state.py`, `host/runtime/db.py`, `host/runtime/pgclient.py`,
+- `host/runtime/core/state.py`, `host/runtime/core/db.py`, `host/runtime/core/pgclient.py`,
   and `host/migrations/0001_admin_state_schema.sql`: database roles, peer auth,
   proxy grants, event writes, provider pins, and certificate file paths.
-- `host/runtime/orchestrator.py`, `host/runtime/codex_app_server.py`, and
-  `host/runtime/claude_code.py`: launch environment, task process ownership,
+- `host/runtime/admin_api/orchestrator.py`, `host/runtime/admin_api/codex_app_server.py`, and
+  `host/runtime/admin_api/claude_code.py`: launch environment, task process ownership,
   runtime status/account metadata reads, and process shutdown paths.
 - `docs/architecture/privilege-boundaries.md`,
   `docs/architecture/filesystem.md`, and

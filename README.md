@@ -15,8 +15,8 @@ open TrustyClaw securely from any browser, including mobile.
 Alternatively, you can deploy without HTTPS UI access and connect using SSH
 port forwarding. That setup is simpler, but the UI is available only from a
 computer that holds your SSH private key, not from mobile or browsers on other
-devices. Follow [Deploy Without Cloudflare](#deploy-without-cloudflare) for
-that path. Tailscale SSH support is coming.
+devices. To take it, skip Cloudflare (step 3) and pass an SSH operator
+endpoint at [Deploy](#4-deploy). Tailscale SSH support is coming.
 
 ### Before You Start
 
@@ -69,21 +69,26 @@ The last command prints the account and identity that will create the
 TrustyClaw resources. This creates temporary administrator credentials in the
 current terminal; it does not create or store a root access key.
 
+Set the region for the host as well; it is part of the agent's identity, so
+later lifecycle commands must use the same region:
+
+```bash
+export AWS_REGION=us-east-1
+```
+
 If you use an IAM user or federated identity instead, its administrator needs
 to grant the permissions in [`iam_policy.json`](iam_policy.json). Then run the
 same commands while signed in as that identity.
 
 If `aws login` is unavailable, update AWS CLI v2. Existing access keys also
-work; export `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, then run
-`unset AWS_SESSION_TOKEN`. The configs below use the temporary token created by
-`aws login`; if you use access keys, delete the `aws_session_token_env` line.
+work: export `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
 
 ### 3. Set Up Cloudflare Access
 
 Cloudflare Access is recommended because it gives TrustyClaw a persistent HTTPS
 address and an admin UI you can open securely from anywhere. To deploy without
-Cloudflare, skip steps 3 and 4; use
-[Deploy Without Cloudflare](#deploy-without-cloudflare) instead.
+Cloudflare, skip this step and pass `--operator-ssh-public-key` at
+[Deploy](#4-deploy) instead of a Cloudflare hostname.
 
 You will create an active domain, a Zero Trust organization, an Access
 application, a tunnel, and a published hostname. Cloudflare moves dashboard
@@ -156,46 +161,34 @@ export TRUSTYCLAW_CLOUDFLARE_TUNNEL_TOKEN='eyJ...'
 If you lose the token, open the tunnel's **Overview** tab and copy it from the
 installation command again, or select **Refresh token**.
 
-### 4. Create the Deploy Config
+### 4. Deploy
 
-Create a file named `config.json` with the content below. Replace
-`trustyclaw.example.com` with the hostname from step 3. This deploys a host
-named `my-trustyclaw` in `us-east-1`; change either value if needed.
+Choose an admin password and keep it in your password manager; the deploy
+command takes only its SHA-256 hash, so no process or file ever holds the
+password itself. To generate a strong password and its hash in one step:
 
-```json
-{
-  "agent_name": "my-trustyclaw",
-  "aws_region": "us-east-1",
-  "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
-  "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
-  "aws_session_token_env": "AWS_SESSION_TOKEN",
-  "operator_connections": [
-    {
-      "mode": "cloudflare_access",
-      "hostname": "trustyclaw.example.com",
-      "tunnel_token_env": "TRUSTYCLAW_CLOUDFLARE_TUNNEL_TOKEN"
-    }
-  ]
-}
+```bash
+python3 -m host.cli.generate_password
 ```
 
-The config stores only environment variable names, not credentials or the
-tunnel token. `agent_name` is the stable identity used to find this host and
-its preserved data volumes during future lifecycle commands. Keep it unchanged
-after deploy.
-
-### 5. Deploy
+Store the printed password, then deploy with the digest (or hash your own
+password with `printf %s 'your-chosen-password' | sha256sum`):
 
 ```bash
 python3 -m host.cli.deploy \
-  --config config.json \
-  --result-file trustyclaw-deploy.json
+  --agent-name my-trustyclaw \
+  --operator-cloudflare-hostname <hostname-from-step-3> \
+  --admin-password-sha256 <sha256-from-above>
 ```
 
-Wait for `Wrote deploy result to trustyclaw-deploy.json`. The command creates
-the host, installs TrustyClaw, and writes the address and generated admin
-password to that local file. The file is created with mode `0600`; keep it
-private.
+To reach the host over SSH instead of Cloudflare Access — a simpler setup
+that skips step 3, with the admin UI available only while you run an SSH
+tunnel — pass `--operator-ssh-public-key` with your OpenSSH public key in
+place of (or alongside) `--operator-cloudflare-hostname`. See
+[SSH Operator Access](#ssh-operator-access) to create the key.
+
+The command creates the host and installs TrustyClaw, streaming progress as
+it runs, and finishes by printing a result JSON with the host's address.
 
 The AWS credentials are no longer needed after deploy. Remove them from this
 terminal and end the browser login session:
@@ -205,9 +198,9 @@ unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 aws logout
 ```
 
-### 6. Open TrustyClaw
+### 5. Open TrustyClaw
 
-Copy `admin_password` from the deploy result in `trustyclaw-deploy.json`.
+Have the admin password you chose in step 4 ready.
 
 If you used Cloudflare, the tunnel now shows **Healthy**. Open the hostname from
 step 3, complete Cloudflare Access authentication, then sign in with the admin
@@ -228,45 +221,6 @@ keeps running.
 
 Your host is ready. The admin UI guides you through connecting an AI provider,
 enabling network access, and adding optional tools.
-
-### Deploy Without Cloudflare
-
-Use this SSH-only path in place of steps 3 and 4 above. It keeps public SSH
-access open and makes the admin UI available only while you run a tunnel from
-your computer. You also need OpenSSH locally.
-
-Create a dedicated SSH key. Skip this command if the file already exists:
-
-```bash
-ssh-keygen -t ed25519 -C trustyclaw-operator -f ~/.ssh/trustyclaw_operator
-```
-
-Print the public key:
-
-```bash
-cat ~/.ssh/trustyclaw_operator.pub
-```
-
-Create a file named `config.json` with the content below. Replace the
-`ssh_public_key` value with the complete output from the command above.
-
-```json
-{
-  "agent_name": "my-trustyclaw",
-  "aws_region": "us-east-1",
-  "aws_access_key_id_env": "AWS_ACCESS_KEY_ID",
-  "aws_secret_access_key_env": "AWS_SECRET_ACCESS_KEY",
-  "aws_session_token_env": "AWS_SESSION_TOKEN",
-  "operator_connections": [
-    {
-      "mode": "ssh",
-      "ssh_public_key": "ssh-ed25519 AAAA... trustyclaw-operator"
-    }
-  ]
-}
-```
-
-Continue to [step 5](#5-deploy).
 
 ## Why Use TrustyClaw
 
@@ -302,41 +256,34 @@ See [PHILOSOPHY.md](./PHILOSOPHY.md).
 
 ## Configuration Reference
 
-The first-deploy walkthrough generates a complete `config.json`. To build or
-edit one manually, start from the included example:
+Lifecycle commands take arguments and standard environment variables; there
+are no configuration files.
 
-```bash
-cp example_config.json config.json
-```
+Arguments:
 
-In `config.json`, set:
-
-| Field | What To Put |
+| Argument | What To Put |
 | --- | --- |
-| `agent_name` | Stable host name. Lifecycle commands use it to find the same host and data volumes. |
-| `aws_region` | AWS region to deploy into. |
-| `aws_access_key_id_env` | Environment variable name containing the AWS access key id. |
-| `aws_secret_access_key_env` | Environment variable name containing the AWS secret access key. |
-| `aws_session_token_env` | Optional. Environment variable name containing an AWS session token, for temporary credentials from an assumed STS role. |
-| `operator_connections` | One or more access endpoints. Use `ssh`, `cloudflare_access`, or both. |
-| `operator_connections[].mode` | `ssh` or `cloudflare_access`. |
-| `operator_connections[].ssh_public_key` | For SSH, public key content installed for operator access, for example the output of `cat ~/.ssh/id_ed25519.pub`. |
-| `operator_connections[].hostname` | For Cloudflare Access, the fixed hostname that routes to the admin UI/API. |
-| `operator_connections[].tunnel_token_env` | For Cloudflare Access, environment variable name containing the Cloudflare Tunnel token. |
+| `--agent-name` | Stable host name. Lifecycle commands use it to find the same host and data volumes. |
+| `--operator-ssh-public-key` | For SSH operator access: the public key content to install, for example the output of `cat ~/.ssh/id_ed25519.pub`. |
+| `--operator-cloudflare-hostname` | For Cloudflare Access: the fixed hostname that routes to the admin UI/API. |
+| `--admin-password-sha256` | SHA-256 hex digest of the chosen admin password. |
 
-Deploy reads AWS credentials from the environment variables named in the
-config. For long-lived credentials:
+Deploy and reconfigure require at least one operator endpoint; use one or
+both endpoint arguments.
 
-```bash
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-unset AWS_SESSION_TOKEN
-```
+Environment variables:
 
-For temporary credentials, also export `AWS_SESSION_TOKEN` and set
-`aws_session_token_env` to `AWS_SESSION_TOKEN`. Repeat the AWS sign-in and
-export step before a lifecycle command whenever the temporary credentials have
-expired.
+| Variable | What To Put |
+| --- | --- |
+| `AWS_REGION` | AWS region of the host. Required by every command; `AWS_DEFAULT_REGION` also works. |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | AWS credentials. |
+| `AWS_SESSION_TOKEN` | Set only for temporary credentials (an assumed STS role); unset it when using long-lived access keys, or every AWS call fails with an authentication error. |
+| `TRUSTYCLAW_CLOUDFLARE_TUNNEL_TOKEN` | The Cloudflare Tunnel token. Required when `--operator-cloudflare-hostname` is passed. |
+
+For long-lived credentials, export `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`. For temporary credentials, also export
+`AWS_SESSION_TOKEN`, and repeat the AWS sign-in and export step before a
+lifecycle command whenever they expire.
 
 ### AWS Account Setup
 
@@ -347,7 +294,7 @@ subnet with public IPv4 routing.
 For regular use or automation, attach `iam_policy.json` to a federated IAM role.
 The policy requires TrustyClaw tags on created resources, allows EC2 updates
 and cleanup only on TrustyClaw-tagged resources, and leaves region selection to
-your deploy config.
+`AWS_REGION`.
 See [`docs/architecture/iam-policy.md`](docs/architecture/iam-policy.md) for
 why each policy statement is needed and how its resource scope is constrained.
 
@@ -381,13 +328,10 @@ Create an SSH keypair if you do not already have one:
 ssh-keygen -t ed25519 -C trustyclaw-operator -f ~/.ssh/trustyclaw_operator
 ```
 
-Then add this endpoint to `operator_connections`:
+Then pass the public key to deploy or reconfigure:
 
-```json
-{
-  "mode": "ssh",
-  "ssh_public_key": "ssh-ed25519 AAAA... trustyclaw-operator"
-}
+```bash
+--operator-ssh-public-key "ssh-ed25519 AAAA... trustyclaw-operator"
 ```
 
 When an SSH endpoint is configured, TrustyClaw keeps EC2 security-group ingress
@@ -397,14 +341,12 @@ the final host closes EC2 SSH ingress after bootstrap.
 ### Cloudflare Access Operator Access
 
 The recommended walkthrough above covers Cloudflare setup from a new account.
-Its `operator_connections` entry has this shape:
+Pass the protected hostname to deploy or reconfigure and export the tunnel
+token:
 
-```json
-{
-  "mode": "cloudflare_access",
-  "hostname": "trustyclaw.example.com",
-  "tunnel_token_env": "TRUSTYCLAW_CLOUDFLARE_TUNNEL_TOKEN"
-}
+```bash
+export TRUSTYCLAW_CLOUDFLARE_TUNNEL_TOKEN='eyJ...'
+--operator-cloudflare-hostname trustyclaw.example.com
 ```
 
 TrustyClaw installs `cloudflared` as a systemd service, enables it across
@@ -412,35 +354,37 @@ reboots, and verifies during bootstrap that the configured hostname returns a
 Cloudflare Access login or deny response. The admin password is still required
 after Cloudflare Access succeeds.
 
-See [`docs/api/InputConfig.md`](docs/api/InputConfig.md) for the full input
-schema for customization.
+See [`docs/api/CLI.md`](docs/api/CLI.md) for the full argument and
+environment reference.
 
 ## Manage Your Host
 
-Run lifecycle commands from the repository root. Each command writes a local
-result file and prints its path. By default, the filename is
-`<agent_name>-<mode>.json`. Deploy and reconfigure result files include the
-admin password and are created with mode `0600`; keep them private.
+Run lifecycle commands from the repository root. Each command streams
+progress on stderr and prints one result JSON on stdout, so `> result.json`
+captures the result cleanly.
 
 Host lifecycle commands:
 
 | Command | Behavior | Credential behavior |
 | --- | --- | --- |
-| `python3 -m host.cli.deploy --config <path>` | Creates a new host. Fails if a TrustyClaw instance or data volume already exists for `agent_name`. | Generates a new admin password, or uses `--admin-password-env <name>`. Installs the configured operator endpoints. |
-| `python3 -m host.cli.upgrade --config <path>` | Replaces the EC2 instance/root volume and reuses the preserved admin and agent data volumes. Requires an existing instance and existing data volumes. Bootstrap requires the admin state version to be lower than the repo `VERSION`. | Preserves the existing admin password and operator endpoints from admin state. |
-| `python3 -m host.cli.recover --config <path>` | Creates a replacement host from preserved admin and agent data volumes when no TrustyClaw instance exists. Bootstrap requires the admin state version to equal the repo `VERSION`, unless `--allow-upgrade` is supplied. | Preserves the existing admin password and operator endpoints from admin state. |
-| `python3 -m host.cli.reconfigure --config <path>` | Replaces an existing EC2 instance/root volume, reuses preserved admin and agent data volumes, and replaces the full operator endpoint list. Requires an existing instance and existing data volumes. Bootstrap requires the admin state version to equal the repo `VERSION`. | Installs a new generated admin password, or uses `--admin-password-env <name>`. |
-| `python3 -m host.cli.start --config <path>` | Starts the existing EC2 instance for `agent_name`, waits until it is running, and writes a result JSON. Config must use the upgrade/recover shape and omit `operator_connections`. | Does not change credentials, root disk, data volumes, version, or operator endpoints. |
-| `python3 -m host.cli.stop --config <path>` | Stops the existing EC2 instance for `agent_name`, waits until it is stopped, and writes a result JSON. Config must use the upgrade/recover shape and omit `operator_connections`. | Does not change credentials, root disk, data volumes, version, or operator endpoints. |
+| `python3 -m host.cli.deploy --agent-name <name>` | Creates a new host. Fails if a TrustyClaw instance or data volume already exists for `agent_name`. | Installs the `--admin-password-sha256` digest as the admin password hash. Installs the configured operator endpoints. |
+| `python3 -m host.cli.upgrade --agent-name <name>` | Replaces the EC2 instance/root volume and reuses the preserved admin and agent data volumes. Requires an existing instance and existing data volumes. Bootstrap requires the admin state version to be lower than the repo `VERSION`. | Preserves the existing admin password and operator endpoints from admin state. |
+| `python3 -m host.cli.recover --agent-name <name>` | Creates a replacement host from preserved admin and agent data volumes when no TrustyClaw instance exists. Bootstrap requires the admin state version to equal the repo `VERSION`, unless `--allow-upgrade` is supplied. | Preserves the existing admin password and operator endpoints from admin state. |
+| `python3 -m host.cli.reconfigure --agent-name <name>` | Replaces an existing EC2 instance/root volume, reuses preserved admin and agent data volumes, and replaces the full operator endpoint list. Requires an existing instance and existing data volumes. Bootstrap requires the admin state version to equal the repo `VERSION`. | Installs the `--admin-password-sha256` digest as the new admin password hash. |
+| `python3 -m host.cli.start --agent-name <name>` | Starts the existing EC2 instance for the agent and waits until it is running. | Does not change credentials, root disk, data volumes, version, or operator endpoints. |
+| `python3 -m host.cli.stop --agent-name <name>` | Stops the existing EC2 instance for the agent and waits until it is stopped. | Does not change credentials, root disk, data volumes, version, or operator endpoints. |
+| `python3 -m host.cli.generate_password` | Prints a generated admin password and its SHA-256 digest, then exits. Touches no config, AWS resources, or files. | Store the password in your password manager; pass the digest to `--admin-password-sha256`. |
 
 Shared flags:
 
 | Flag | Commands | Behavior |
 | --- | --- | --- |
-| `--config <path>` | all | Required. Reads the deploy input config from `<path>`. |
-| `--result-file <path>` | all | Writes the local result JSON to `<path>` instead of the default path. This may overwrite an existing file at that path. |
-| `--admin-password-env <name>` | `deploy`, `reconfigure` | Reads the admin password from environment variable `<name>` instead of generating one. The host still receives only the password hash. |
-| `--allow-upgrade` | `recover` | Allows no-instance recovery to advance preserved admin state from an older version to the repo `VERSION`. |
+| `--agent-name <name>` | all | Required. Stable host name: 1-50 characters of letters, numbers, hyphen, underscore. |
+| `--operator-ssh-public-key <key>` | `deploy`, `reconfigure` | Installs this OpenSSH public key as the SSH operator endpoint. At least one operator endpoint is required. |
+| `--operator-cloudflare-hostname <host>` | `deploy`, `reconfigure` | Configures a Cloudflare Access operator endpoint at this exact hostname; the tunnel token is read from `TRUSTYCLAW_CLOUDFLARE_TUNNEL_TOKEN`. At least one operator endpoint is required. |
+| `--admin-password-sha256 <hex>` | `deploy`, `reconfigure` | Required. SHA-256 hex digest of the chosen admin password, for example `printf %s 'your-password' | sha256sum`. The CLI and the host only ever see this hash. |
+| `--bootstrap-from-github [commit-sha]` | `deploy`, `upgrade`, `recover`, `reconfigure` | Provisions the instance from a pinned `infiloop2/trustyclaw` commit via EC2 user data instead of pushing the local checkout over SSH; without a value, the latest `main` commit is pinned. The CLI first reads the commit's `VERSION` from GitHub — that version is the operation's target — and asks for confirmation. The command returns once the instance is launched with its volumes attached; bootstrap completes on the host, and a bootstrap failure terminates the instance. |
+| `--allow-upgrade` | `recover` | Allows no-instance recovery to advance preserved admin state from an older version to the target `VERSION`. |
 
 Lifecycle commands fail before replacing an existing instance when the AWS
 resource shape or version tag is incompatible with the command. Bootstrap then
@@ -475,7 +419,7 @@ result file schema.
 
 ## Admin API and File Uploads
 
-With the SSH tunnel from [step 6](#6-open-trustyclaw) active, call the admin API
+With the SSH tunnel from [step 5](#5-open-trustyclaw) active, call the admin API
 directly:
 
 ```bash

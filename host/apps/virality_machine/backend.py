@@ -30,8 +30,8 @@ import os
 import time
 from typing import Any
 
-from host.constants import LOOPBACK
-from host.runtime import db
+from host.constants import APP_BACKEND_ADMIN_SOCKET_PATH, LOOPBACK
+from host.runtime.core import db
 from host.apps import workspace_kit
 from host.apps.workspace_kit import engine
 from host.apps.workspace_kit.config import DomainAction, WorkspaceAppConfig
@@ -341,7 +341,7 @@ CONFIG = WorkspaceAppConfig(
     title="Virality Machine",
     host=os.environ.get("TRUSTYCLAW_APP_HOST", LOOPBACK),
     admin_api_socket=os.environ.get(
-        "TRUSTYCLAW_APP_ADMIN_API_SOCKET", "/run/trustyclaw-admin-api/app-backend.sock"
+        "TRUSTYCLAW_APP_ADMIN_API_SOCKET", APP_BACKEND_ADMIN_SOCKET_PATH
     ),
     setup_brief=REEL_SETUP_BRIEF,
     seed=seed,

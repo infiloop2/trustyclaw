@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from host.runtime import claude_code
+from host.runtime.admin_api import claude_code
 
 
 class ClaudeCodeTests(unittest.TestCase):
@@ -531,7 +531,7 @@ print(json.dumps({
             claude_code.DEFAULT_COMMAND = [sys.executable, "-u", "-c", script]
             claude_code.AGENT_CWD = "/definitely/not-readable-by-admin"
             server = claude_code.ClaudeCodeSession()
-            with patch("host.runtime.state.read_claude_web_search", return_value=False):
+            with patch("host.runtime.core.state.read_claude_web_search", return_value=False):
                 session_id, output = claude_code.run_turn(
                     server,
                     "initial",
@@ -571,7 +571,7 @@ print(json.dumps({
                     thread_id="mission_pursuit__ws-3",
                 )
                 server.app_instructions = "Use only the documented app routes."
-                with patch("host.runtime.state.read_claude_web_search", return_value=False):
+                with patch("host.runtime.core.state.read_claude_web_search", return_value=False):
                     claude_code.run_turn(
                         server,
                         "initial",
@@ -629,7 +629,7 @@ print(json.dumps({
                 # the decision exactly as the real launcher would.
                 command = [sys.executable, "-u", "-c", script, str(argv_path)]
                 for web_search, expected_token in ((False, "web-search=off"), (True, "web-search=on")):
-                    with patch("host.runtime.state.read_claude_web_search", return_value=web_search):
+                    with patch("host.runtime.core.state.read_claude_web_search", return_value=web_search):
                         claude_code.run_turn(
                             claude_code.ClaudeCodeSession(command), "initial", None, "opus", "high",
                             lambda: [], lambda _message: None, lambda _message: None,
@@ -650,7 +650,7 @@ class ToolsMcpConfigTests(unittest.TestCase):
         config = json.loads(claude_code.TOOLS_MCP_CONFIG)
         shim = config["mcpServers"]["trustyclaw"]
         self.assertEqual(shim["command"], "/usr/bin/python3")
-        self.assertEqual(shim["args"], ["-m", "host.runtime.tools_mcp_shim"])
+        self.assertEqual(shim["args"], ["-m", "host.runtime.agent_shim.mcp_shim"])
         self.assertEqual(shim["env"], {"PYTHONPATH": "/opt/trustyclaw-host"})
 
         # Echo the CLI argv back through the turn result to pin the flags the
