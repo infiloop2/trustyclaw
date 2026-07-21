@@ -16,7 +16,7 @@ from test_tools import FakeHostAPI
 
 def configured_api() -> FakeHostAPI:
     api = FakeHostAPI()
-    api.config["SERPAPI_API_KEY"] = "serp-key"
+    api.config["SERPERAPI_API_KEY"] = "serper-key"
     return api
 
 
@@ -34,12 +34,12 @@ class LinkedInDiscoveryToolTests(unittest.TestCase):
             [
                 "What leaves this host",
                 "Where it can go",
-                "What SerpApi can do with it",
-                "How long SerpApi retains it",
+                "What Serper can do with it",
+                "How long Serper retains it",
             ],
         )
         policy_urls = {link.url for card in manifest.data_summary.cards for link in card.links}
-        self.assertIn("https://serpapi.com/legal", policy_urls)
+        self.assertIn("https://serper.dev/privacy", policy_urls)
         self.assertIn("https://policies.google.com/privacy", policy_urls)
 
     def test_search_scopes_query_and_normalizes_only_linkedin_posts(self) -> None:
@@ -48,8 +48,10 @@ class LinkedInDiscoveryToolTests(unittest.TestCase):
         def fake_json_request(method: str, url: str, **kwargs: Any):
             seen["method"] = method
             seen["url"] = url
+            seen["headers"] = kwargs.get("headers")
+            seen["body"] = kwargs.get("body")
             return {
-                "organic_results": [
+                "organic": [
                     {"position": 1, "title": "Agent post", "link": "https://www.linkedin.com/posts/alice_agents-123?utm_source=google#comments", "snippet": "Useful text", "date": "2 days ago", "source": "Alice"},
                     {"position": 2, "title": "Profile", "link": "https://www.linkedin.com/in/alice", "snippet": "drop"},
                     {"position": 3, "title": "Duplicate", "link": "https://linkedin.com/posts/alice_agents-123#comments", "snippet": "drop"},
@@ -60,10 +62,20 @@ class LinkedInDiscoveryToolTests(unittest.TestCase):
         with patch.object(linkedin_discovery, "json_request", fake_json_request):
             result = LinkedInDiscoveryTool().execute("search_posts", {"query": "AI agents", "limit": "5", "page": "2"}, configured_api())
         assert isinstance(result, ActionExecuted)
-        self.assertEqual(seen["method"], "GET")
-        self.assertIn("site%3Alinkedin.com%2Fposts+AI+agents", seen["url"])
-        self.assertIn("start=10", seen["url"])
-        self.assertIn("api_key=serp-key", seen["url"])
+        self.assertEqual(seen["method"], "POST")
+        self.assertEqual(seen["url"], "https://google.serper.dev/search")
+        self.assertEqual(seen["headers"], {"X-API-KEY": "serper-key"})
+        self.assertEqual(
+            seen["body"],
+            {
+                "q": "site:linkedin.com/posts AI agents",
+                "hl": "en",
+                "gl": "us",
+                "num": 10,
+                "page": 2,
+                "autocorrect": False,
+            },
+        )
         self.assertEqual(len(result.result["results"]), 1)
         self.assertEqual(result.result["results"][0]["source"], "Alice")
         self.assertEqual(result.result["results"][0]["url"], "https://www.linkedin.com/posts/alice_agents-123")
@@ -84,11 +96,9 @@ class LinkedInDiscoveryToolTests(unittest.TestCase):
             with self.subTest(tool_input=tool_input):
                 self.assertIsInstance(tool.execute("search_posts", tool_input, configured_api()), ActionFailed)
 
-    def test_no_results_error_is_a_valid_empty_result_not_a_failure(self) -> None:
-        # SerpApi returns HTTP 200 with this error text when nothing matched; it
-        # must not surface as a failure (which would make the agent retry).
+    def test_no_organic_results_is_a_valid_empty_result_not_a_failure(self) -> None:
         def fake_json_request(method: str, url: str, **kwargs: Any):
-            return {"error": "Google hasn't returned any results for this query."}
+            return {"organic": []}
 
         with patch.object(linkedin_discovery, "json_request", fake_json_request):
             result = LinkedInDiscoveryTool().execute("search_posts", {"query": "obscure topic"}, configured_api())
@@ -97,7 +107,7 @@ class LinkedInDiscoveryToolTests(unittest.TestCase):
 
     def test_accepts_regional_linkedin_hosts(self) -> None:
         def fake_json_request(method: str, url: str, **kwargs: Any):
-            return {"organic_results": [{"position": 1, "title": "UK post", "link": "https://uk.linkedin.com/posts/bob_ai-9", "snippet": "text"}]}
+            return {"organic": [{"position": 1, "title": "UK post", "link": "https://uk.linkedin.com/posts/bob_ai-9", "snippet": "text"}]}
 
         with patch.object(linkedin_discovery, "json_request", fake_json_request):
             result = LinkedInDiscoveryTool().execute("search_posts", {"query": "ai"}, configured_api())
@@ -116,7 +126,7 @@ class LinkedInDiscoveryToolTests(unittest.TestCase):
         with patch.object(
             linkedin_discovery,
             "json_request",
-            return_value={"organic_results": [{"link": link} for link in links]},
+            return_value={"organic": [{"link": link} for link in links]},
         ):
             result = LinkedInDiscoveryTool().execute(
                 "search_posts", {"query": "ai"}, configured_api()
@@ -129,7 +139,7 @@ class LinkedInDiscoveryToolTests(unittest.TestCase):
             linkedin_discovery,
             "json_request",
             return_value={
-                "organic_results": [
+                "organic": [
                     {"link": "https://evil.example\t.linkedin.com/posts/alice_ai-1"}
                 ]
             },
@@ -151,7 +161,14 @@ class LinkedInDiscoveryToolTests(unittest.TestCase):
     def test_missing_config_is_operator_actionable(self) -> None:
         result = LinkedInDiscoveryTool().execute("search_posts", {"query": "agents"}, FakeHostAPI())
         assert isinstance(result, ActionFailed)
-        self.assertIn("SERPAPI_API_KEY", result.error)
+        self.assertIn("SERPERAPI_API_KEY", result.error)
+
+    def test_old_serpapi_key_is_not_a_compatibility_alias(self) -> None:
+        api = FakeHostAPI()
+        api.config["SERPAPI_API_KEY"] = "old-key"
+        result = LinkedInDiscoveryTool().execute("search_posts", {"query": "agents"}, api)
+        assert isinstance(result, ActionFailed)
+        self.assertIn("SERPERAPI_API_KEY", result.error)
 
 
 if __name__ == "__main__":

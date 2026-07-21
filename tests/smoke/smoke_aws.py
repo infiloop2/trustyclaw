@@ -31,13 +31,16 @@ login-dependent runtime checks live in ``tests/stage/stage_aws.py``.
   - deploy-time config schema on the real host: agent_runtime, agent_type,
     operator connection details and network_controls are absent from persisted runtime
     config; first boot creates an empty runtime network policy, with no
-    network_status.json, and both runtimes stay deactivated until the runtime
+    network_status.json, and all four runtimes stay deactivated until the runtime
     policy enables their managed providers
   - proxy protocol edge cases: CONNECT port pinning, unknown hosts, Host
     header mismatch, percent-encoded paths against path guards, wildcard
     domain rules, malformed request lengths, and plain-HTTP proxying
   - provider guard pre-login behavior: managed OpenAI/Claude access wakes
     runtimes but does not require completing OAuth
+  - real Pi and Hermes launcher startup through the admin sudo path, systemd
+    scope, installed package, stdin protocol, dummy AWS identity, and proxy,
+    which denies locally before an upstream call because no credential exists
   - the cross-process event log: the network event table is pushed past its
     amortized prune threshold by the proxy process (writing under its narrow
     database role) while the admin API concurrently pages it — reads stay
@@ -65,8 +68,10 @@ Environment assumptions (each is checked, with a clear failure if missing):
      are exported as ``AWS_ACCESS_KEY_ID`` / ``AWS_SECRET_ACCESS_KEY``. See
      docs/development/fresh-aws-smoke.md for how to create a scoped IAM user.
 
-Cost: one t3.small plus a 16 GiB root gp3 volume and two 8 GiB encrypted data
-gp3 volumes for the few minutes the test runs (about one US cent). Teardown
+Cost: one t3.small plus a 16 GiB root gp3 volume, a 16 GiB encrypted admin
+volume, and an 8 GiB encrypted agent volume for the few minutes the test runs
+(about one US cent). The launcher probes cannot incur model inference cost
+because no Bedrock credential exists. Teardown
 removes the instance root volume and all tagged smoke data volumes.
 
 Usage:
@@ -98,9 +103,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from host.constants import ADMIN_API_PORT as ADMIN_PORT, PROXY_PORT
+from host.network_integrations.bedrock.manifest import ROUTING_ACCESS_KEY_IDS
 from host.runtime.core.state import PRUNE_EVERY
 from host.runtime.tools.tools_host import BUNDLED_TOOLS
-from tests.smoke.cdp_browser import ChromeBrowser
 
 # Region the smoke deploys into. Keep in sync with the region scoped in
 # tests/smoke/iam_policy_smoke.json — change both together.
@@ -111,8 +116,21 @@ SECRET_KEY_ENV = "AWS_SECRET_ACCESS_KEY"
 
 HEALTH_TIMEOUT = 600  # bootstrap installs packages; allow time before the API answers
 MESSAGE_LIMIT = 50_000  # mirrors the admin API's input_message cap
-SMOKE_RUNTIMES = ("codex", "claude_code")
-SMOKE_MANAGED_PROVIDERS = {"openai": True, "claude": True}
+SMOKE_RUNTIMES = ("codex", "claude_code", "pi", "hermes")
+SMOKE_OAUTH_RUNTIMES = ("codex", "claude_code")
+SMOKE_MANAGED_PROVIDERS = {"openai": True, "claude": True, "bedrock": True}
+SMOKE_BEDROCK_REGION = "us-east-1"
+SMOKE_RUNTIME_MODELS = {
+    "codex": "gpt-5.6-terra",
+    "claude_code": "opus",
+    "pi": "deepseek.v3.2",
+    "hermes": "qwen.qwen3-coder-next",
+}
+SMOKE_BEDROCK_MODELS = (
+    "deepseek.v3.2",
+    "qwen.qwen3-coder-next",
+    "moonshotai.kimi-k2.5",
+)
 SMOKE_GITHUB_INTEGRATION = {"enabled": True, "write_repositories": [{"owner": "infiloop2", "repo": "trustyclaw"}]}
 SMOKE_MANAGED_DOMAINS = (
     "api.openai.com",
@@ -128,6 +146,9 @@ SMOKE_MANAGED_DOMAINS = (
     "objects.githubusercontent.com",
     "github-cloud.githubusercontent.com",
     "release-assets.githubusercontent.com",
+    "bedrock-runtime.us-east-1.amazonaws.com",
+    "bedrock-runtime.us-east-2.amazonaws.com",
+    "bedrock-runtime.us-west-2.amazonaws.com",
 )
 SMOKE_TOOL_CALLS: dict[str, tuple[tuple[str, dict], ...]] = {
     "brave_search": (("search_web", {"query": "TrustyClaw"}),),
@@ -170,6 +191,7 @@ SMOKE_TOOL_CALLS: dict[str, tuple[tuple[str, dict], ...]] = {
         ),
     ),
     "ibkr": (
+        ("get_accounts", {}),
         ("get_positions", {}),
         ("get_account_summary", {}),
         ("get_trades", {"days": "1"}),
@@ -263,6 +285,7 @@ def main(argv: list[str] | None = None) -> int:
         smoke.check_proxy_edge_cases()
         smoke.check_proxy_concurrency()
         smoke.check_pre_login_provider_guards()
+        smoke.check_precredential_bedrock_harness_launchers()
         smoke.check_tools_surface()
         smoke.check_network_event_prune_race()
         print(f"\n{smoke.passed}/{smoke.total} checks passed")
@@ -304,9 +327,7 @@ class AwsSmoke:
         effort: str | None = None,
     ) -> dict:
         selected_runtime = runtime or self.agent_runtime
-        selected_model = model or (
-            "opus" if selected_runtime == "claude_code" else "gpt-5.6-terra"
-        )
+        selected_model = model or SMOKE_RUNTIME_MODELS[selected_runtime]
         return {
             "input_message": input_message,
             "thread_id": thread_id,
@@ -332,8 +353,9 @@ class AwsSmoke:
         """Self-contained policy pushed at runtime, independent of deploy config.
 
         The /zen guard backs the percent-encoded-path check; the wildcard rule
-        backs the wildcard domain check. Both managed provider bundles stay on
-        so Codex and Claude Code can be logged in and interwoven in one run.
+        backs the wildcard domain check. All three provider integrations stay
+        on so every runtime can be active. One Bedrock connection makes both
+        Pi and Hermes available.
         The GitHub integration backs the repo-scope enforcement checks.
         """
         policy = network_policy(
@@ -564,11 +586,14 @@ class AwsSmoke:
             mount = mounts.get(mount_name)
             if not isinstance(mount, dict) or mount.get("total_bytes", 0) <= 0:
                 raise AssertionError(f"health missing filesystem mount {mount_name}: {last['host_runtime']['filesystem']}")
-        codex = self.runtime_status_record(last["agent_runtime"], "codex")
-        claude = self.runtime_status_record(last["agent_runtime"], "claude_code")
+        runtime_states = {
+            runtime: self.runtime_status_record(last["agent_runtime"], runtime)["status"]
+            for runtime in SMOKE_RUNTIMES
+        }
         self._ok(
-            f"healthy; codex runtime {codex['status']}, claude_code runtime {claude['status']}, "
-            "swap and all storage mounts reported"
+            "healthy; "
+            + ", ".join(f"{runtime} runtime {status}" for runtime, status in runtime_states.items())
+            + ", swap and all storage mounts reported"
         )
 
     def check_host_config_schema(self) -> None:
@@ -612,7 +637,7 @@ class AwsSmoke:
         # provider_accounts table (empty or explicit-null records until login).
         admin_accounts = self._ssh_code(
             "sudo -u postgres psql -tA -d trustyclaw_admin "
-            "-c \"SELECT provider FROM provider_accounts WHERE provider NOT IN ('openai', 'claude')\""
+            "-c \"SELECT provider FROM provider_accounts WHERE provider NOT IN ('openai', 'claude', 'bedrock')\""
         ).strip()
         if admin_accounts:
             raise AssertionError(f"unexpected provider_accounts rows: {admin_accounts}")
@@ -667,17 +692,19 @@ class AwsSmoke:
         ).strip()
         if partition_access != "ok":
             raise AssertionError("proxy-state and the Postgres data directory must be unreadable across service users")
-        # The admin role has full access; the proxy role may connect (its
-        # narrow per-table grants are pinned by the network event storm check)
-        # but must not be able to create objects; the agent has no role at all.
+        # The admin role has full access. The proxy role can read the shared
+        # Bedrock row but cannot mutate it or create objects; the agent has no
+        # database role at all.
         database_access = self._ssh_code(
             "sudo -u trustyclaw-admin psql -tA -d trustyclaw_admin -c 'SELECT 1' && "
             "sudo -u trustyclaw-proxy psql -tA -d trustyclaw_admin -c 'SELECT 2' && "
+            "sudo -u trustyclaw-proxy psql -tA -d trustyclaw_admin -c 'SELECT count(*) FROM bedrock_credentials' && "
+            "sudo -u trustyclaw-proxy bash -c '! psql -tA -d trustyclaw_admin -c \"UPDATE bedrock_credentials SET access_key_id = access_key_id\" 2>/dev/null' && "
             "sudo -u trustyclaw-proxy bash -c '! psql -tA -d trustyclaw_admin -c \"CREATE TABLE smoke_illegal (n INT)\" 2>/dev/null' && "
             "sudo -u trustyclaw-agent bash -c '! psql -tA -d trustyclaw_admin -c \"SELECT 1\" 2>/dev/null' && "
             "echo ok"
         ).strip().splitlines()
-        if database_access != ["1", "2", "ok"]:
+        if database_access != ["1", "2", "0", "ok"]:
             raise AssertionError(
                 f"database access must be admin-full, proxy-narrow, agent-none: {database_access}"
             )
@@ -820,6 +847,14 @@ class AwsSmoke:
             raise AssertionError(f"empty valid policy should report derived active network status: {health}")
         if policy.get("network_integrations", {}) != {}:
             raise AssertionError(f"initial policy should be empty: {policy}")
+        bedrock_rows = self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c "
+            "'SELECT count(*) FROM bedrock_credentials'"
+        ).strip()
+        if bedrock_rows != "0":
+            raise AssertionError(
+                f"fresh host seeded a Bedrock credential: {bedrock_rows}"
+            )
         for runtime in SMOKE_RUNTIMES:
             status = self._wait_for_runtime_status({"deactivated"}, runtime=runtime, timeout=90)
             if status != "deactivated":
@@ -838,9 +873,11 @@ class AwsSmoke:
                 raise AssertionError(f"{login_path} while initially deactivated returned {status}, expected 409: {body}")
         self._api("PUT", "/v1/network/policy", self.enforcement_policy())
         for runtime in SMOKE_RUNTIMES:
-            status = self._wait_for_runtime_status({"loading", "awaiting_login", "active"}, runtime=runtime, timeout=120)
-            if status not in {"loading", "awaiting_login", "active"}:
-                raise AssertionError(f"{runtime} did not wake after enabling provider access, got {status}")
+            status = self._wait_for_runtime_status({"awaiting_login"}, runtime=runtime, timeout=120)
+            if status != "awaiting_login":
+                raise AssertionError(
+                    f"{runtime} should await its connection after enabling provider access, got {status}"
+                )
         self._ok("first boot creates an empty derived-active policy; providers omitted keep runtimes deactivated")
 
     def check_ui_page(self) -> None:
@@ -1042,11 +1079,15 @@ class AwsSmoke:
         the complete operator path through task creation and its clear
         fail-fast result, without granting the smoke a provider account.
         """
+        from tests.smoke.playwright_browser import ChromeBrowser
+
         self._step("Mission Pursuit browser flow before provider login")
         for runtime in SMOKE_RUNTIMES:
             status = self._wait_for_runtime_status({"awaiting_login"}, runtime=runtime, timeout=180)
             if status != "awaiting_login":
-                raise AssertionError(f"fresh {runtime} runtime settled at {status}, expected awaiting_login")
+                raise AssertionError(
+                    f"fresh {runtime} runtime settled at {status}, expected awaiting_login"
+                )
 
         password = json.dumps(self.result["admin_password"])
         message = "Build a practical launch plan for a neighborhood repair cafe."
@@ -1108,6 +1149,27 @@ class AwsSmoke:
             after = app.evaluate(bounds)
             if before != after:
                 raise AssertionError(f"opening agent settings shifted the workspace: {before} -> {after}")
+            runtime_options = app.evaluate(
+                "[...document.getElementById('agent-runtime').options]"
+                ".map(option => [option.value, option.textContent.trim()])"
+            )
+            expected_runtime_options = [
+                ["codex", "Codex"],
+                ["claude_code", "Claude Code"],
+                ["pi", "Pi"],
+                ["hermes", "Hermes"],
+            ]
+            if sorted(runtime_options) != sorted(expected_runtime_options):
+                raise AssertionError(f"Mission Pursuit runtime choices are incomplete: {runtime_options}")
+            for runtime in ("pi", "hermes"):
+                app.evaluate(
+                    f"document.getElementById('agent-runtime').value={json.dumps(runtime)};"
+                    "document.getElementById('agent-runtime')"
+                    ".dispatchEvent(new Event('change',{bubbles:true})); true"
+                )
+                model_count = app.evaluate("document.getElementById('agent-model').options.length")
+                if not isinstance(model_count, int) or model_count < 1:
+                    raise AssertionError(f"Mission Pursuit exposed no model choices for {runtime}")
             app.evaluate(
                 "document.getElementById('agent-runtime').value='claude_code';"
                 "document.getElementById('agent-runtime')"
@@ -1295,6 +1357,22 @@ class AwsSmoke:
             status, _ = self._api_status("POST", login_path)
             if status != 409:
                 raise AssertionError(f"{login_path} while provider is deactivated returned {status}, expected 409")
+        status, body = self._api_status(
+            "POST",
+            "/v1/agent-runtime/bedrock-credentials",
+            {
+                "access_key_id": "AKIA0000000000000000",
+                "secret_access_key": "not-a-real-secret",
+                "region": SMOKE_BEDROCK_REGION,
+            },
+        )
+        if status != 400:
+            raise AssertionError(
+                f"invalid Bedrock credentials while disabled returned {status}, expected 400: {body}"
+            )
+        metadata = self._api("GET", "/v1/agent-runtime/bedrock-credentials")
+        if metadata != {"connected": False}:
+            raise AssertionError(f"rejected Bedrock credential remained stored: {metadata}")
 
         for label, providers, enabled_runtime, disabled_runtime, disabled_login_path in (
             (
@@ -1332,6 +1410,24 @@ class AwsSmoke:
                 flush=True,
             )
 
+        status, body = self._api_status(
+            "PUT", "/v1/network/policy", network_policy({"bedrock": True})
+        )
+        if status != 200:
+            raise AssertionError(f"Bedrock-only policy returned {status}, expected 200: {body}")
+        for runtime in ("pi", "hermes"):
+            enabled_status = self._wait_for_runtime_status(
+                {"awaiting_login"}, runtime=runtime, timeout=120
+            )
+            if enabled_status != "awaiting_login":
+                raise AssertionError(f"Bedrock should await one connection for {runtime}: {enabled_status}")
+        for runtime in ("codex", "claude_code"):
+            disabled_status = self._wait_for_runtime_status(
+                {"deactivated"}, runtime=runtime, timeout=60
+            )
+            if disabled_status != "deactivated":
+                raise AssertionError(f"Bedrock-only policy should deactivate {runtime}")
+
         for label, bad_policy, expected_error in (
             (
                 "self-managed-openai-domain",
@@ -1342,6 +1438,11 @@ class AwsSmoke:
                 "self-managed-claude-domain",
                 network_policy({"openai": True, "claude": True}, {"api.anthropic.com": {"allow_http_methods": ["POST"]}}),
                 "network_integrations.claude",
+            ),
+            (
+                "unsupported-bedrock-region",
+                {"network_integrations": {"bedrock": {"enabled": True, "region": "eu-west-1"}}},
+                "unsupported fields",
             ),
             (
                 "user-openai-managed-flag",
@@ -1421,6 +1522,40 @@ class AwsSmoke:
             raise AssertionError(f"pre-login task ended {failed['status']}, expected fail-fast failure: {failed}")
         if "tasks run only while it is active" not in failed.get("error_message", ""):
             raise AssertionError(f"fail-fast error should name the runtime status: {failed}")
+
+        # Exercise every runtime through the real API, PostgreSQL session
+        # constraint, worker claim, and fail-fast path. Pi and Hermes cannot
+        # run a paid turn in credential-free smoke, but their task rows and
+        # runtime dispatch must still work on a freshly migrated host.
+        for runtime in (item for item in SMOKE_RUNTIMES if item != self.agent_runtime):
+            models = (
+                SMOKE_BEDROCK_MODELS
+                if runtime in ("pi", "hermes")
+                else (SMOKE_RUNTIME_MODELS[runtime],)
+            )
+            for model in models:
+                runtime_task = self._api(
+                    "POST",
+                    "/v1/tasks",
+                    self.task_body(
+                        f"{runtime} {model} lifecycle check (smoke)",
+                        f"smoke-lifecycle-{runtime}-{model.replace('.', '-').replace(':', '-')}",
+                        runtime=runtime,
+                        model=model,
+                    ),
+                )
+                if runtime_task.get("model") != model:
+                    raise AssertionError(f"{runtime} task did not retain {model}: {runtime_task}")
+                runtime_failed = self._wait_for_task_status(
+                    runtime_task["task_id"], "failed", timeout=60
+                )
+                if "tasks run only while it is active" not in runtime_failed.get(
+                    "error_message", ""
+                ):
+                    raise AssertionError(
+                        f"{runtime} {model} did not fail cleanly before login: "
+                        f"{runtime_failed}"
+                    )
 
         status, _ = self._api_status("GET", "/v1/tasks/task_999999")
         if status != 404:
@@ -1506,7 +1641,10 @@ class AwsSmoke:
         if status != 404:
             raise AssertionError(f"removed finished-task endpoint returned {status}, expected 404")
         self._ok(
-            "pre-login task failed fast with the runtime status; validation 400s and terminal 409s honored; "
+            "all four pre-login runtimes passed real task insertion, both "
+            "Bedrock harnesses accepted all three models, and every task "
+            "failed fast; "
+            "validation 400s and terminal 409s honored; "
             "events scoped; thread list/task history covered"
         )
 
@@ -2064,7 +2202,7 @@ class AwsSmoke:
         self._ok("12 parallel requests all decided and logged with unique, ordered seqs")
 
     def check_pre_login_provider_guards(self) -> None:
-        self._step("managed provider data-plane fails closed before login")
+        self._step("all managed provider data planes fail closed before login")
         baseline = max((event["seq"] for event in self._network_events()), default=0)
         self._api(
             "PUT",
@@ -2105,6 +2243,87 @@ class AwsSmoke:
         if "anthropic_token_unavailable" not in claude_response:
             raise AssertionError(f"Anthropic API request did not fail closed before login; proxy returned {claude_response!r}")
 
+        def post_bedrock(
+            *,
+            region: str,
+            access_key_id: str,
+            query: str = "",
+            session_token: bool = False,
+        ) -> str:
+            url = (
+                f"https://bedrock-runtime.{region}.amazonaws.com/model/"
+                f"deepseek.v3.2/converse{query}"
+            )
+            authorization = (
+                "AWS4-HMAC-SHA256 "
+                f"Credential={access_key_id}/20260718/{region}/bedrock/aws4_request, "
+                "SignedHeaders=content-type;host;x-amz-date, "
+                f"Signature={'0' * 64}"
+            )
+            token_header = " -H 'X-Amz-Security-Token: smuggled-session-token'" if session_token else ""
+            return self._ssh_code(
+                f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} "
+                "curl -s --max-time 20 -X POST -H 'Content-Type: application/json' "
+                "-H 'X-Amz-Date: 20260718T000000Z' "
+                f"-H {shlex.quote(f'Authorization: {authorization}')}"
+                f"{token_header} --data '{{\"messages\":[]}}' {shlex.quote(url)}"
+            )
+
+        bedrock_cases = (
+            (
+                "pi-no-credential",
+                post_bedrock(
+                    region=SMOKE_BEDROCK_REGION,
+                    access_key_id=ROUTING_ACCESS_KEY_IDS["pi"],
+                ),
+                "bedrock_credentials_unavailable",
+            ),
+            (
+                "hermes-no-credential",
+                post_bedrock(
+                    region=SMOKE_BEDROCK_REGION,
+                    access_key_id=ROUTING_ACCESS_KEY_IDS["hermes"],
+                ),
+                "bedrock_credentials_unavailable",
+            ),
+            (
+                "foreign-aws-key",
+                post_bedrock(
+                    region=SMOKE_BEDROCK_REGION,
+                    access_key_id="AKIA0000000000000000",
+                ),
+                "bedrock_access_key_mismatch",
+            ),
+            (
+                "presigned-query",
+                post_bedrock(
+                    region=SMOKE_BEDROCK_REGION,
+                    access_key_id=ROUTING_ACCESS_KEY_IDS["pi"],
+                    query="?X-Amz-Credential=smuggled",
+                ),
+                "bedrock_query_auth_denied",
+            ),
+            (
+                "session-credential",
+                post_bedrock(
+                    region=SMOKE_BEDROCK_REGION,
+                    access_key_id=ROUTING_ACCESS_KEY_IDS["hermes"],
+                    session_token=True,
+                ),
+                "bedrock_session_credentials_denied",
+            ),
+        )
+        for label, response, expected_reason in bedrock_cases:
+            if expected_reason not in response:
+                raise AssertionError(
+                    f"{label} should fail with {expected_reason}; proxy returned {response!r}"
+                )
+
+        # Without a stored credential there is no selected region to enforce
+        # at CONNECT time. The supported Bedrock host reaches the request
+        # guard, which fails closed before any upstream AWS connection.
+        post_bedrock(region="us-west-2", access_key_id=ROUTING_ACCESS_KEY_IDS["pi"])
+
         events = self._network_events(since=baseline)
         if not any(
             event["host"] == "chatgpt.com"
@@ -2127,8 +2346,128 @@ class AwsSmoke:
             for event in events
         ):
             raise AssertionError("Claude unauthenticated readiness request was not logged as allowed")
+        for expected_reason in {
+            "bedrock_credentials_unavailable",
+            "bedrock_access_key_mismatch",
+            "bedrock_query_auth_denied",
+            "bedrock_session_credentials_denied",
+        }:
+            if not any(event.get("reason_code") == expected_reason for event in events):
+                raise AssertionError(f"no live Bedrock denial was logged for {expected_reason}")
+        if not any(
+            event["host"] == "bedrock-runtime.us-west-2.amazonaws.com"
+            and event["method"] == "POST"
+            and event["decision"] == "denied"
+            and event.get("reason_code") == "bedrock_credentials_unavailable"
+            for event in events
+        ):
+            raise AssertionError("no cross-region Bedrock request reached the local missing-credential denial")
         self._ok(
-            "OpenAI and Claude data-plane requests denied before login while Claude readiness stayed allowed"
+            "OpenAI and Claude failed closed before login; Pi/Hermes routing identities, regions, "
+            "query auth, session credentials, and missing proxy credentials all denied live"
+        )
+
+    def check_precredential_bedrock_harness_launchers(self) -> None:
+        """Start both installed harnesses without a working AWS credential.
+
+        This is the deepest fail-closed fresh-host probe available without a
+        paid provider call: the real admin sudo path, systemd scope, package,
+        harness config, stdin protocol, dummy SDK identity, CA, and proxy all
+        run. The proxy must stop the request locally before an AWS connection
+        because no re-signing credential exists.
+        """
+        self._step("installed Pi and Hermes launchers reach the local Bedrock credential boundary")
+        self._api(
+            "PUT",
+            "/v1/network/policy",
+            network_policy(SMOKE_MANAGED_PROVIDERS),
+        )
+        credential_rows = self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c "
+            + shlex.quote("SELECT count(*) FROM bedrock_credentials")
+        ).strip()
+        if credential_rows != "0":
+            raise AssertionError(
+                "credential-free launcher probes require no stored Bedrock credential; "
+                f"found {credential_rows}"
+            )
+
+        pi_prompt = json.dumps(
+            {"id": "smoke", "type": "prompt", "message": "Reply with exactly OK."},
+            separators=(",", ":"),
+        )
+        probes = (
+            (
+                "pi",
+                "smoke-pi-launch",
+                "qwen.qwen3-coder-next",
+                # Pi RPC stays alive while its stdin remains open. Keep the
+                # pipe open long enough for the real child turn to reach the
+                # proxy; closing it immediately after the prompt makes Pi
+                # acknowledge the command and exit before model inference.
+                f"{{ printf '%s\\n' {shlex.quote(pi_prompt)}; sleep 5; }} | "
+                "sudo -u trustyclaw-admin -- timeout 90 sudo -n "
+                "/usr/local/lib/trustyclaw-host/run-pi "
+                f"region={SMOKE_BEDROCK_REGION} --thread-scope smoke-pi-launch "
+                "--mode rpc --model qwen.qwen3-coder-next --thinking high "
+                "--session-id 00000000-0000-4000-8000-000000000001 2>&1 | tail -c 4000",
+            ),
+            (
+                "hermes",
+                "smoke-hermes-launch",
+                "qwen.qwen3-coder-next",
+                f"printf %s {shlex.quote('Reply with exactly OK.')} | "
+                "sudo -u trustyclaw-admin -- timeout 90 sudo -n "
+                "/usr/local/lib/trustyclaw-host/run-hermes "
+                f"region={SMOKE_BEDROCK_REGION} --thread-scope smoke-hermes-launch "
+                "--model qwen.qwen3-coder-next 2>&1 | tail -c 4000",
+            ),
+        )
+        for runtime, thread_scope, model, command in probes:
+            baseline = max((event["seq"] for event in self._network_events()), default=0)
+            output = self._ssh_code(command)
+            expected_path = f"/model/{model}/"
+            expected_host = f"bedrock-runtime.{SMOKE_BEDROCK_REGION}.amazonaws.com"
+
+            def reached_missing_credential_boundary(events: list[dict]) -> bool:
+                return any(
+                    event["host"] == expected_host
+                    and expected_path in event.get("path", "")
+                    and event["decision"] == "denied"
+                    and event.get("reason_code") == "bedrock_credentials_unavailable"
+                    for event in events
+                )
+
+            # Pi can return its RPC startup response before the child process
+            # has emitted its first proxy event. Allow the real event log to
+            # catch up before stopping the scope and judging the probe.
+            events: list[dict] = []
+            for _ in range(15):
+                events = self._network_events(since=baseline)
+                if reached_missing_credential_boundary(events):
+                    break
+                time.sleep(1)
+            # A timeout or client retry must not leave a named harness scope
+            # behind. Stopping an already collected scope is a harmless no-op.
+            self._ssh_code(
+                f"sudo systemctl stop trustyclaw-agent-thread-{thread_scope}.scope "
+                ">/dev/null 2>&1 || true"
+            )
+            if not reached_missing_credential_boundary(events):
+                raise AssertionError(
+                    f"installed {runtime} launcher did not reach the local missing-credential "
+                    f"Bedrock boundary for {model}; output={output!r}, events={events}"
+                )
+
+        final_rows = self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c "
+            + shlex.quote("SELECT count(*) FROM bedrock_credentials")
+        ).strip()
+        if final_rows != "0":
+            raise AssertionError(f"launcher probes changed Bedrock credential state: {final_rows}")
+        self._ok(
+            "both real harness launch paths reached the proxy's local missing-credential denial; "
+            "no AWS credential was stored and no upstream model call was possible"
         )
 
     def check_tools_surface(self) -> None:
@@ -2200,6 +2539,25 @@ class AwsSmoke:
             raise AssertionError(f"MCP shim listing missing network introspection: {shim_listing!r}")
         if "gmail_search_messages" in shim_listing:
             raise AssertionError("MCP shim listed a disabled tool")
+
+        network_result, network_listing = shim_tool_call("list_network_integrations", {})
+        if network_result.get("isError") or not isinstance(network_listing, dict):
+            raise AssertionError(
+                f"list_network_integrations failed through the agent-network service: {network_result}"
+            )
+        listed_integrations = {
+            entry.get("integration_id"): entry
+            for entry in network_listing.get("network_integrations", [])
+            if isinstance(entry, dict)
+        }
+        entry = listed_integrations.get("bedrock")
+        if not isinstance(entry, dict) or entry.get("enabled") is not True:
+            raise AssertionError(f"agent-network introspection omitted active Bedrock: {entry}")
+        # Region is part of the encrypted credential connection, not the
+        # enablement-only network policy. A fresh smoke host has no credential,
+        # so the agent-facing policy introspection must not expose a region.
+        if "region" in (entry.get("options") or {}):
+            raise AssertionError(f"agent-network introspection exposed unconnected Bedrock region: {entry}")
 
         # The catalog built-in shows disabled tools too, so the agent can ask
         # the operator to enable an existing tool instead of rebuilding it.
@@ -2532,25 +2890,35 @@ class AwsSmoke:
         )
 
     def check_both_runtimes_active(self) -> None:
-        self._step("both agent runtimes logged in together")
+        self._step("all four agent runtimes active together")
         statuses = {}
         for runtime in SMOKE_RUNTIMES:
             statuses[runtime] = self._wait_for_runtime_status({"active"}, runtime=runtime, timeout=120)
-        if statuses != {"codex": "active", "claude_code": "active"}:
-            raise AssertionError(f"both runtimes should be active before mixed tasks: {statuses}")
+        if statuses != {runtime: "active" for runtime in SMOKE_RUNTIMES}:
+            raise AssertionError(f"all four runtimes should be active before mixed tasks: {statuses}")
         accounts = {runtime: self._agent_account(runtime) for runtime in SMOKE_RUNTIMES}
         for runtime, account in accounts.items():
             if account.get("status") != "active" or not account.get("account_id"):
                 raise AssertionError(f"{runtime} account should be active before mixed tasks: {account}")
             self._assert_provider_metadata(runtime, account)
+        bedrock_keys = self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c "
+            "\"SELECT count(*) || ':' || count(DISTINCT access_key_id) FROM bedrock_credentials\""
+        ).strip()
+        if bedrock_keys != "1:1":
+            raise AssertionError(
+                f"Pi and Hermes must share one durable IAM access key in stage: {bedrock_keys}"
+            )
         self._assert_provider_account_anchors(live_pins=True)
-        self._ok("Codex and Claude Code are active at the same time with account pins available")
+        self._ok("Codex, Claude Code, Pi, and Hermes are active together with account metadata available")
 
     def check_runtime_deactivation_stops_running_tasks(self) -> None:
-        self._step("runtime deactivation closes active Codex and Claude tasks")
+        self._step("runtime deactivation closes active tasks for all four harnesses")
         specs = [
             ("codex", "smoke-deactivate-codex", "CODEX_SHOULD_NOT_FINISH"),
             ("claude_code", "smoke-deactivate-claude", "CLAUDE_SHOULD_NOT_FINISH"),
+            ("pi", "smoke-deactivate-pi", "PI_SHOULD_NOT_FINISH"),
+            ("hermes", "smoke-deactivate-hermes", "HERMES_SHOULD_NOT_FINISH"),
         ]
         tasks = {}
         for runtime, thread_id, token in specs:
@@ -2559,8 +2927,8 @@ class AwsSmoke:
                 "/v1/tasks",
                 self.task_body(
                     (
-                        "Do not finish yet. Wait for a follow-up instruction. "
-                        f"When you receive it, reply with exactly the word {token} and nothing else."
+                        "Use the terminal tool to run `sleep 300` now. Only after that command exits, "
+                        f"reply with exactly the word {token} and nothing else."
                     ),
                     thread_id,
                     runtime=runtime,
@@ -2578,6 +2946,15 @@ class AwsSmoke:
             if status != "deactivated":
                 raise AssertionError(f"{runtime} did not deactivate after provider disable: {status}")
         self._assert_provider_account_anchors(live_pins=False)
+        bedrock_rows = self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c "
+            "'SELECT count(*) FROM bedrock_credentials'"
+        ).strip()
+        if bedrock_rows != "1":
+            raise AssertionError(
+                "Bedrock deactivation must preserve the one validated credential row: "
+                f"{bedrock_rows}"
+            )
         for task_id, runtime in tasks.items():
             done = self._wait_for_task(task_id, timeout=90)
             if done["status"] != "failed":
@@ -2591,13 +2968,21 @@ class AwsSmoke:
             if status != "active":
                 raise AssertionError(f"{runtime} did not recover to active after provider re-enable: {status}")
         self._assert_provider_account_anchors(live_pins=True)
-        self._ok("disabling providers failed running tasks, closed runtimes, and both runtimes recovered after re-enable")
+        bedrock_rows = self._ssh_code(
+            "sudo -u postgres psql -tA -d trustyclaw_admin -c "
+            "'SELECT count(*) FROM bedrock_credentials'"
+        ).strip()
+        if bedrock_rows != "1":
+            raise AssertionError(
+                f"Bedrock reactivation did not retain the validated credential: {bedrock_rows}"
+            )
+        self._ok("disabling providers failed running tasks, closed all four runtimes, and each recovered after re-enable")
 
     def check_agent_parallelism(self) -> None:
         """Mixed-runtime parallelism on the live host: three Codex tasks and
         three Claude Code tasks run at the same time through independent
         per-runtime pools, then all are steered to completion."""
-        self._step("mixed agent parallelism: 3 Codex + 3 Claude tasks, max concurrency 6")
+        self._step("mixed OAuth harness parallelism: 3 Codex + 3 Claude tasks")
         specs = [
             ("codex", "smoke-codex-par-a", "CODEX_ALPHA"),
             ("claude_code", "smoke-claude-par-a", "CLAUDE_ALPHA"),
@@ -2624,7 +3009,7 @@ class AwsSmoke:
         print(f"  created {', '.join(sorted(created))}", flush=True)
 
         max_running_total = 0
-        max_running_by_runtime = {runtime: 0 for runtime in SMOKE_RUNTIMES}
+        max_running_by_runtime = {runtime: 0 for runtime in SMOKE_OAUTH_RUNTIMES}
         all_running_seen = False
         deadline = time.time() + 300
         while time.time() < deadline:
@@ -2633,7 +3018,7 @@ class AwsSmoke:
             max_running_total = max(max_running_total, len(running))
             runtime_status = self._api("GET", "/v1/agent-runtime/status")
             active_by_runtime = {}
-            for runtime in SMOKE_RUNTIMES:
+            for runtime in SMOKE_OAUTH_RUNTIMES:
                 active_task_ids = [
                     task_id
                     for task_id in self.runtime_status_record(runtime_status, runtime).get("active_task_ids", [])
@@ -2645,7 +3030,7 @@ class AwsSmoke:
                     raise AssertionError(f"more than 3 {runtime} tasks reported running: {runtime_status}")
             if sum(len(ids) for ids in active_by_runtime.values()) > 6:
                 raise AssertionError(f"more than 6 mixed tasks reported running: {runtime_status}")
-            if all(len(active_by_runtime[runtime]) == 3 for runtime in SMOKE_RUNTIMES):
+            if all(len(active_by_runtime[runtime]) == 3 for runtime in SMOKE_OAUTH_RUNTIMES):
                 all_running_seen = True
                 break
             time.sleep(2)
@@ -2672,7 +3057,9 @@ class AwsSmoke:
                 raise AssertionError(f"mixed {runtime} task {task_id} answered {done.get('output_message')!r}, expected {token}")
 
         intervals: dict[str, tuple[float, float]] = {}
-        by_runtime_intervals: dict[str, list[tuple[float, float]]] = {runtime: [] for runtime in SMOKE_RUNTIMES}
+        by_runtime_intervals: dict[str, list[tuple[float, float]]] = {
+            runtime: [] for runtime in SMOKE_OAUTH_RUNTIMES
+        }
         for task_id, (runtime, _, _) in created.items():
             events = self._task_events(task_id)
             started = next((e["timestamp"] for e in events if e["event_type"] == "task.started"), None)
@@ -2725,7 +3112,7 @@ class AwsSmoke:
             if token not in (done.get("output_message") or "").upper():
                 raise AssertionError(f"{runtime} thread context lost across tasks: {done.get('output_message')!r}")
 
-        self._ok("6 mixed tasks ran together at total cap 6/per-runtime cap 3; both runtimes kept thread context")
+        self._ok("6 mixed OAuth tasks ran together at 3 per runtime; both kept thread context")
 
     def check_agent_steering(self) -> None:
         """Mid-turn steering through the admin API: a steer sent while the task
@@ -2736,7 +3123,7 @@ class AwsSmoke:
             "POST",
             "/v1/tasks",
             self.task_body(
-                "Slowly write a 300-word essay about the history of bananas, one sentence at a time.",
+                "Use the terminal tool to run `sleep 20`, then write a 300-word essay about bananas.",
                 f"smoke-steer-{self.agent_runtime}",
             ),
         )
@@ -2756,16 +3143,17 @@ class AwsSmoke:
             raise AssertionError(f"steer did not take effect, output: {done.get('output_message')!r}")
         self._ok(f"{self.agent_runtime} steer redirected the running turn")
 
-    def check_agent_kill_and_thread_survival(self) -> None:
+    def check_agent_kill_and_thread_survival(self, *, expect_steering_denied: bool = False) -> None:
         """Kill a running task (its runtime process is terminated mid-turn), then
         run another task on the same thread: the kill must not corrupt the
-        persisted runtime thread/session."""
+        persisted runtime thread/session. A runtime without mid-turn steering
+        can prove that API boundary against the same running task."""
         self._step(f"{self.agent_runtime} kill: cancel a running task, then reuse its thread")
         slow = self._api(
             "POST",
             "/v1/tasks",
             self.task_body(
-                "Slowly write a 500-word essay about the history of bananas, one sentence at a time.",
+                "Use the terminal tool to run `sleep 300`, then write a 500-word essay about bananas.",
                 f"smoke-kill-{self.agent_runtime}",
             ),
         )
@@ -2773,6 +3161,19 @@ class AwsSmoke:
         current = self._wait_for_task_status(slow_id, "running", timeout=120)
         if current["status"] != "running":
             raise AssertionError(f"slow task never started (status {current['status']}); cannot test kill")
+        if expect_steering_denied:
+            status, body = self._api_status(
+                "POST",
+                f"/v1/tasks/{slow_id}/steer",
+                {"steer_message": "change direction"},
+            )
+            expected_error = (
+                "Hermes tasks do not support steering; create a new task on the same thread_id"
+            )
+            error = body.get("error")
+            message = error.get("message", "") if isinstance(error, dict) else str(error or "")
+            if status != 409 or message != expected_error:
+                raise AssertionError(f"unsupported steering returned {status}: {body}")
         start = time.time()
         status, body = self._api_status("POST", f"/v1/tasks/{slow_id}/kill")
         if status != 200 or body.get("status") != "accepted":
@@ -2797,7 +3198,11 @@ class AwsSmoke:
             )
         if "SURVIVED" not in (done.get("output_message") or "").upper():
             raise AssertionError(f"follow-up on killed thread answered {done.get('output_message')!r}")
-        self._ok(f"{self.agent_runtime} kill cancelled the running task; a later task resumed the same thread")
+        steering = " and rejected unsupported steering" if expect_steering_denied else ""
+        self._ok(
+            f"{self.agent_runtime} kill cancelled the running task{steering}; "
+            "a later task resumed the same thread"
+        )
 
     def check_agent_thread_recall(self) -> None:
         """Thread context must survive runtime process recycling. By now the
@@ -2861,12 +3266,19 @@ class AwsSmoke:
         if survivor["status"] != "completed":
             raise AssertionError(f"completed task changed across reboot: {survivor}")
 
-        # The provider logins persisted: both runtimes re-derive active without
-        # a new login flow.
+        # All provider credentials persisted: every runtime re-derives active
+        # without a new login or credential connection.
         for runtime in SMOKE_RUNTIMES:
-            status = self._wait_for_runtime_status({"active", "awaiting_login", "error"}, runtime=runtime, timeout=180)
+            wanted = (
+                {"active", "error"}
+                if runtime in {"pi", "hermes"}
+                else {"active", "awaiting_login", "error"}
+            )
+            status = self._wait_for_runtime_status(wanted, runtime=runtime, timeout=180)
             if status != "active":
-                raise AssertionError(f"{runtime} is {status} after reboot; expected the login to survive")
+                raise AssertionError(
+                    f"{runtime} is {status} after reboot; expected its provider connection to survive"
+                )
 
         # And pre-reboot threads resume with their context for both runtimes.
         for runtime, (thread_id, token) in self.parallel_threads.items():
@@ -2888,7 +3300,7 @@ class AwsSmoke:
                 )
             if token not in (done.get("output_message") or "").upper():
                 raise AssertionError(f"{runtime} thread context lost across reboot: {done.get('output_message')!r}")
-        self._ok("host rebooted clean; history, both logins, and both runtime thread contexts survived")
+        self._ok("host rebooted clean; history, all four credentials, and retained runtime thread contexts survived")
 
     # --- helpers -----------------------------------------------------------
 
@@ -2972,15 +3384,18 @@ class AwsSmoke:
             raise AssertionError(f"storm generated {needed} denials but only {verdict['rows']} events landed")
         if not verdict["unique"]:
             raise AssertionError(f"duplicate event seqs after the storm: {verdict}")
-        # Role isolation: the proxy role can touch exactly network_events.
+        # Role isolation: the proxy can append audit events and read the one
+        # Bedrock credential, but cannot mutate credentials or read admin state.
         isolation = self._ssh_code(
             "sudo -u trustyclaw-proxy psql -tA -d trustyclaw_admin -c 'SELECT count(*) >= 0 FROM network_events' && "
+            "sudo -u trustyclaw-proxy psql -tA -d trustyclaw_admin -c 'SELECT count(*) >= 0 FROM bedrock_credentials' && "
+            "sudo -u trustyclaw-proxy bash -c '! psql -tA -d trustyclaw_admin -c \"UPDATE bedrock_credentials SET access_key_id = access_key_id\" 2>/dev/null' && "
             "sudo -u trustyclaw-proxy bash -c '! psql -tA -d trustyclaw_admin -c \"SELECT count(*) FROM tasks\" 2>/dev/null' && "
             "sudo -u trustyclaw-proxy bash -c '! psql -tA -d trustyclaw_admin -c \"SELECT agent_name FROM config\" 2>/dev/null' && "
             "echo ok"
         ).strip().splitlines()
-        if isolation != ["t", "ok"]:
-            raise AssertionError(f"proxy database role is not confined to network_events: {isolation}")
+        if isolation != ["t", "t", "ok"]:
+            raise AssertionError(f"proxy database role exceeded its narrow table grants: {isolation}")
         final = self._api("GET", "/v1/network/events")
         if not final["events"]:
             raise AssertionError("admin API cannot read the network events after the storm")
@@ -3143,6 +3558,8 @@ class AwsSmoke:
         for account in accounts:
             if account.get("agent_runtime") == runtime_type:
                 return account
+            if runtime_type in ("pi", "hermes") and account.get("provider") == "bedrock":
+                return account
         raise AssertionError(f"account summary did not include {runtime_type}: {accounts}")
 
     def _assert_provider_metadata(self, runtime_type: str, account: dict) -> None:
@@ -3152,15 +3569,23 @@ class AwsSmoke:
             allowed_keys.add("codex_usage")
         elif runtime_type == "claude_code":
             allowed_keys.add("claude_usage")
+        elif runtime_type in ("pi", "hermes"):
+            allowed_keys = {
+                "provider", "agent_runtimes", "status", "account_id", "arn", "bedrock_usage"
+            }
         unexpected_keys = sorted(set(account) - allowed_keys)
         if unexpected_keys:
             raise AssertionError(f"{runtime_type} account metadata exposed unexpected key(s) {unexpected_keys}: {account}")
+
+        # The live Bedrock usage counters legitimately count tokens; every
+        # other secret-shaped key name stays forbidden.
+        usage_counter_keys = {"input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"}
 
         def check_no_secretish_keys(value: object) -> None:
             if isinstance(value, dict):
                 for key, item in value.items():
                     lowered = str(key).lower()
-                    if any(fragment in lowered for fragment in forbidden_fragments):
+                    if any(fragment in lowered for fragment in forbidden_fragments) and key not in usage_counter_keys:
                         raise AssertionError(f"{runtime_type} account metadata leaked secret-like key {key!r}: {account}")
                     check_no_secretish_keys(item)
             elif isinstance(value, list):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from host.network_integrations.base import request_param_denial
 from host.network_integrations.custom.manifest import CustomIntegration, rule_for_host
 from host.runtime.core.network_policy import route_allowed
 
@@ -26,4 +27,7 @@ def request_denied(
         method, path, query, rule.allow_http_methods, rule.path_guards
     ):
         return "network_policy_denied"
-    return None
+    # The operator allows the domain, methods, and paths; the parameter guard
+    # adds content protection over the agent-authored request URL so a secret
+    # or identifier cannot ride out through a custom destination.
+    return request_param_denial(path, query)

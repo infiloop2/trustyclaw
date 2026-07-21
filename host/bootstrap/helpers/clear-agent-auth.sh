@@ -25,10 +25,13 @@ runtime = sys.argv[1]
 home = Path.home()
 claude_config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(home / ".claude")))
 
-paths = [home / ".codex" / "auth.json"] if runtime == "codex" else [
-    claude_config_dir / ".credentials.json",
-    home / ".claude" / ".credentials.json",
-]
+if runtime == "codex":
+    paths = [home / ".codex" / "auth.json"]
+else:
+    paths = [
+        claude_config_dir / ".credentials.json",
+        home / ".claude" / ".credentials.json",
+    ]
 
 removed = []
 for path in paths:

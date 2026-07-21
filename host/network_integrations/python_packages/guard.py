@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from host.network_integrations.base import ManagedIntegration
+from host.network_integrations.base import ManagedIntegration, request_param_denial
 from host.runtime.core.network_policy import route_allowed
 
 ROUTES = {
@@ -27,4 +27,14 @@ def request_denied(
 ) -> str | None:
     del config, headers, body
     route = ROUTES.get(host.lower())
-    return None if route and route_allowed(method, path, query, *route) else "network_policy_denied"
+    if not route or not route_allowed(method, path, query, *route):
+        return "network_policy_denied"
+    if host.lower() == "files.pythonhosted.org":
+        # Download URLs come from the simple-index response: their hash
+        # segments and filenames are provider-echoed values, exempt like
+        # GitHub's signed URLs. The agent-authored surface is the package
+        # name on pypi.org, guarded below.
+        return None
+    # A package name is a classic small-payload exfiltration channel; run
+    # the outbound parameter guard over the decoded name and query values.
+    return request_param_denial(path, query)

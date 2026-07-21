@@ -1,4 +1,4 @@
-"""Public LinkedIn-post discovery through SerpApi's Google Search API."""
+"""Public LinkedIn-post discovery through Serper's Google Search API."""
 
 from __future__ import annotations
 
@@ -6,13 +6,14 @@ import re
 import urllib.parse
 from typing import cast
 
+from host.param_guard import PARAM_GUARD_PROTECTION, PARAM_GUARD_TECHNICAL_DETAIL
 from host.tools.host_api import ApprovalRecord, HostAPI
 from host.tools.json_types import JSONObject, JSONValue
 from host.tools.manifest import ActionSpec, ConfigRequirement, DataSummary, DataSummaryCard, DataSummaryLink, DataSummaryPoint, SetupStep, ToolManifest
 from host.tools.results import ActionExecuted, ActionFailed, ActionResult, ApprovalResult
 from host.tools.shared.web import WebRequestError, json_request
 
-SERPAPI_SEARCH_URL = "https://serpapi.com/search.json"
+SERPER_SEARCH_URL = "https://google.serper.dev/search"
 MAX_QUERY_CHARS = 300
 MAX_RESULTS = 10
 MAX_PAGE = 10
@@ -59,11 +60,11 @@ MANIFEST = ToolManifest(
                 "LinkedIn URLs, dates, sources, and search snippets. This is discovery and snippet reading, "
                 "not a LinkedIn feed or full-post reader: unindexed, private, deleted, login-gated, or text "
                 "omitted from Google's snippet is unavailable. The tool adds site:linkedin.com/posts itself, "
-                "runs immediately, and spends one SerpApi search credit unless SerpApi serves a free cached result."
+                "runs immediately, and spends one Serper search credit when the request succeeds."
             ),
             data_policy=(
-                "Sends the topic inside a site:linkedin.com/posts Google query, page offset, language, country, "
-                "safe-search setting, and the deployment API key to SerpApi. Returns only bounded organic-result "
+                "Sends the topic inside a site:linkedin.com/posts Google query, page number, language, country, "
+                "and the deployment API key to Serper. Returns only bounded organic-result "
                 "metadata for LinkedIn post URLs; the result enters active model context. LinkedIn is not contacted "
                 "by this host. This read-only action runs directly with no approval."
             ),
@@ -77,11 +78,11 @@ MANIFEST = ToolManifest(
                     },
                     "limit": {
                         "type": "string",
-                        "description": "Maximum matching LinkedIn results returned, 1-10 (default 10). One API request is charged regardless of this value.",
+                        "description": "Maximum matching LinkedIn results returned, 1-10 (default 10). One successful API request is charged regardless of this value.",
                     },
                     "page": {
                         "type": "string",
-                        "description": "Google results page, 1-10 (default 1). Use a later page only after the prior page; each page is a separate SerpApi request.",
+                        "description": "Google results page, 1-10 (default 1). Use a later page only after the prior page; each page is a separate Serper request.",
                     },
                 },
                 "additionalProperties": False,
@@ -91,31 +92,33 @@ MANIFEST = ToolManifest(
     ),
     config=(
         ConfigRequirement(
-            key="SERPAPI_API_KEY",
-            description="SerpApi account API key used only for this LinkedIn public-post search tool.",
+            key="SERPERAPI_API_KEY",
+            description="Serper account API key used only for this LinkedIn public-post search tool.",
         ),
     ),
     protections=(
-        "The host never logs in to or sends a request to LinkedIn. The only provider request is a bounded site-restricted Google search through SerpApi.",
+        "The host never logs in to or sends a request to LinkedIn. The only provider request is a bounded site-restricted Google search through Serper.",
         "Only public LinkedIn post URLs are returned. The API key stays in write-only tool config, queries are capped at 300 characters, and results are capped at 10.",
+        PARAM_GUARD_PROTECTION,
     ),
+    technical_details=(PARAM_GUARD_TECHNICAL_DETAIL,),
     setup_steps=(
         SetupStep(
-            title="Create a SerpApi account",
-            description="Create a SerpApi account and choose a plan with enough Google Search credits. The current free plan is suitable for a setup test; the Starter plan currently includes 1,000 searches per month. One uncached search_posts page consumes one search even when Google returns no matching LinkedIn post.",
-            link_url="https://serpapi.com/pricing",
-            link_label="View SerpApi plans",
+            title="Create a Serper account",
+            description="Create a Serper account and obtain enough Google Search credits for the expected use. One successful search_posts page consumes one credit even when Google returns no matching LinkedIn post.",
+            link_url="https://serper.dev",
+            link_label="Open Serper",
         ),
         SetupStep(
             title="Copy the API key",
-            description="Open the SerpApi dashboard and copy the private API key. TrustyClaw uses the synchronous Google Search JSON endpoint and allows SerpApi's one-hour cache.",
-            link_url="https://serpapi.com/manage-api-key",
-            link_label="Open the SerpApi API key page",
+            description="Open the Serper dashboard and copy the private API key. TrustyClaw sends synchronous Google Search requests; Serper states that it queries Google in real time and does not cache results.",
+            link_url="https://serper.dev/dashboard",
+            link_label="Open the Serper dashboard",
         ),
         SetupStep(
             title="Configure and enable LinkedIn Discovery",
             show_config=True,
-            description="Expand LinkedIn Discovery in Internet Access and Tools, save the key as SERPAPI_API_KEY, then enable the tool. There is no LinkedIn app, login, OAuth consent, cookie, or session to configure; never paste LinkedIn credentials into this field. SerpApi offers Zero Data Retention through ZeroTrace on Enterprise plans, but TrustyClaw does not currently enable it.",
+            description="Expand LinkedIn Discovery in Internet Access and Tools, save the key as SERPERAPI_API_KEY, then enable the tool. There is no LinkedIn app, login, OAuth consent, cookie, or session to configure; never paste LinkedIn credentials into this field.",
         ),
     ),
     data_summary=DataSummary(
@@ -123,39 +126,39 @@ MANIFEST = ToolManifest(
             DataSummaryCard(
                 title="What leaves this host",
                 description=(
-                    "Only the topic text, sent as a site:linkedin.com/posts Google query with fixed English, United States, "
-                    "safe-search, and paging options. This tool holds no LinkedIn credential; besides the SerpApi key that "
-                    "authenticates each request, nothing else on this host is sent. The topic text is received and logged like "
-                    "any other search, so what the agent searches for is itself data sent to SerpApi and Google."
+                    "Only the topic text, sent as a site:linkedin.com/posts Google query with fixed English and United States "
+                    "locale settings plus paging options. This tool holds no LinkedIn credential; besides the Serper key that "
+                    "authenticates each request, nothing else on this host is sent. What the agent searches for is data sent "
+                    "to Serper and Google. The topic text "
+                    "first passes the host parameter guard (see Technical notes), which denies secret- or credential-shaped values before it is sent."
                 ),
             ),
             DataSummaryCard(
                 title="Where it can go",
                 points=(
-                    DataSummaryPoint(label="SerpApi", text="The query goes to SerpApi, which runs the search from its own infrastructure and may serve identical queries from its one-hour cache."),
-                    DataSummaryPoint(label="Google", text="SerpApi submits the query to Google Search, so Google also sees the topic text along with SerpApi's request metadata rather than this host's."),
+                    DataSummaryPoint(label="Serper", text="The query goes to Serper, which states that it runs the Google search in real time without caching results."),
+                    DataSummaryPoint(label="Google", text="Serper submits the query to Google Search, so Google also sees the topic text along with Serper's request metadata rather than this host's."),
                 ),
             ),
             DataSummaryCard(
-                title="What SerpApi can do with it",
+                title="What Serper can do with it",
                 description=(
-                    "SerpApi keeps search and account data to operate, secure, debug, and support the service under its legal "
-                    "policy. Zero Data Retention is available through ZeroTrace on Enterprise plans, but TrustyClaw does not "
-                    "currently enable it, so standard-search handling applies. Google processes the search under its own "
-                    "Privacy Policy."
+                    "Serper's policy permits processing personal data to operate, secure, monitor, and improve the service and "
+                    "for analytics, including AI or machine learning. It does not say whether query text is included in activity "
+                    "logs or analytics. Serper may use contracted service providers and says it acts as processor when providing "
+                    "the service involves personal data. Google processes the search under its own Privacy Policy."
                 ),
                 links=(
-                    DataSummaryLink(label="SerpApi ZeroTrace", url="https://serpapi.com/zero-trace-mode"),
-                    DataSummaryLink(label="SerpApi legal and privacy policy", url="https://serpapi.com/legal"),
+                    DataSummaryLink(label="Serper Privacy Policy", url="https://serper.dev/privacy"),
+                    DataSummaryLink(label="Serper Terms", url="https://serper.dev/terms"),
                     DataSummaryLink(label="Google Privacy Policy", url="https://policies.google.com/privacy"),
                 ),
             ),
             DataSummaryCard(
-                title="How long SerpApi retains it",
-                description="SerpApi states no fixed retention period for standard searches. Its Enterprise ZeroTrace mode offers Zero Data Retention, but that mode is not available in TrustyClaw. Google's retention follows its own policy.",
+                title="How long Serper retains it",
+                description="Serper says search results are not cached, but its public policy gives no separate retention period for search queries or activity logs. It generally retains personal data while the account exists and longer when required for legal, tax, contractual, or litigation purposes. Google's retention follows its own policy.",
                 links=(
-                    DataSummaryLink(label="SerpApi ZeroTrace", url="https://serpapi.com/zero-trace-mode"),
-                    DataSummaryLink(label="SerpApi legal and privacy policy", url="https://serpapi.com/legal"),
+                    DataSummaryLink(label="Serper Privacy Policy", url="https://serper.dev/privacy"),
                 ),
             ),
         ),
@@ -230,7 +233,7 @@ def _linkedin_post_url(value: object) -> str:
 
 
 def _organic_results(response: JSONObject, *, limit: int) -> list[JSONObject]:
-    raw_results = response.get("organic_results")
+    raw_results = response.get("organic")
     if not isinstance(raw_results, list):
         return []
     results: list[JSONObject] = []
@@ -258,21 +261,21 @@ def _organic_results(response: JSONObject, *, limit: int) -> list[JSONObject]:
 
 
 def _search(api_key: str, query: str, page: int) -> JSONObject:
-    params = {
-        "engine": "google",
+    body: JSONObject = {
         "q": f"site:linkedin.com/posts {query}",
         "hl": "en",
         "gl": "us",
-        "safe": "active",
-        "num": str(MAX_RESULTS),
-        "start": str((page - 1) * MAX_RESULTS),
-        "api_key": api_key,
+        "num": MAX_RESULTS,
+        "page": page,
+        "autocorrect": False,
     }
     return json_request(
-        "GET",
-        f"{SERPAPI_SEARCH_URL}?{urllib.parse.urlencode(params)}",
-        failure_message="SerpApi LinkedIn search failed.",
-        invalid_response_message="SerpApi returned an invalid LinkedIn search response.",
+        "POST",
+        SERPER_SEARCH_URL,
+        headers={"X-API-KEY": api_key},
+        body=body,
+        failure_message="Serper LinkedIn search failed.",
+        invalid_response_message="Serper returned an invalid LinkedIn search response.",
     )
 
 
@@ -289,22 +292,11 @@ class LinkedInDiscoveryTool:
         if action != "search_posts":
             return ActionFailed("Unsupported LinkedIn Discovery action.")
         try:
-            query = _query(tool_input)
+            query = api.outbound.guard_request_parameter_string(_query(tool_input))
             limit = _bounded_int(tool_input.get("limit"), name="limit", default=MAX_RESULTS, minimum=1, maximum=MAX_RESULTS)
             page = _bounded_int(tool_input.get("page"), name="page", default=1, minimum=1, maximum=MAX_PAGE)
-            response = _search(api.config["SERPAPI_API_KEY"], query, page)
-            error = response.get("error")
-            if isinstance(error, str) and error:
-                # SerpApi returns HTTP 200 with this error text when a search
-                # simply matched nothing; a site:linkedin.com/posts scope hits
-                # it often. Report a valid empty result rather than a failure
-                # (which would make the agent retry and burn search credits).
-                if "hasn't returned any results" in error.lower() or "no results" in error.lower():
-                    results: list[JSONObject] = []
-                else:
-                    raise RuntimeError("SerpApi rejected the LinkedIn search request.")
-            else:
-                results = _organic_results(response, limit=limit)
+            response = _search(api.config["SERPERAPI_API_KEY"], query, page)
+            results = _organic_results(response, limit=limit)
             return ActionExecuted(
                 {
                     "status": "success_executed",
@@ -316,9 +308,9 @@ class LinkedInDiscoveryTool:
             )
         except WebRequestError as exc:
             if exc.status in {401, 403}:
-                return ActionFailed("SerpApi rejected the configured API key.")
+                return ActionFailed("Serper rejected the configured API key.")
             if exc.status == 429:
-                return ActionFailed("SerpApi search capacity or account credits were exhausted.")
+                return ActionFailed("Serper search capacity or account credits were exhausted.")
             return ActionFailed(str(exc))
         except (ValueError, RuntimeError) as exc:
             # Input validation and config-unset carry curated messages.

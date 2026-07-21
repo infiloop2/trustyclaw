@@ -134,6 +134,25 @@ class InstagramDiscoveryToolTests(unittest.TestCase):
         self.assertNotIn("utm_source", seen["url"])
         self.assertEqual(result.result["reel"]["shortcode"], "ABC123")
 
+    def test_details_reads_trimmed_top_level_media(self) -> None:
+        with patch.object(
+            instagram_discovery,
+            "json_request",
+            return_value={
+                "success": True,
+                "credits_used": 1,
+                "xdt_shortcode_media": reel("Trimmed123"),
+            },
+        ):
+            result = InstagramDiscoveryTool().execute(
+                "get_reel_details",
+                {"url": "https://instagram.com/reel/Trimmed123/"},
+                configured_api(),
+            )
+
+        assert isinstance(result, ActionExecuted)
+        self.assertEqual(result.result["reel"]["shortcode"], "Trimmed123")
+
     def test_provider_supplied_urls_on_foreign_hosts_are_dropped(self) -> None:
         # The scraper is untrusted; a planted attacker URL must not appear as a
         # Reel's url/video_url/image_url. The permalink is derived from the

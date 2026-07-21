@@ -112,6 +112,7 @@ MANIFEST = ToolManifest(
         ConfigRequirement(key="LINKEDIN_OAUTH_CLIENT_SECRET", description="LinkedIn developer app client secret."),
     ),
     protections=(
+        "Your LinkedIn OAuth client secret and connected-account tokens stay in the host credential store and are never returned to or read by the agent.",
         "OAuth connects one personal LinkedIn profile. Only someone with access to this host's protected Connect flow can choose or replace that profile.",
         "LinkedIn's self-serve API cannot read the connected profile's feed or public posts; indexed discovery is a separate no-login tool.",
         "Publishing happens only after your approval.",

@@ -18,7 +18,7 @@ flowchart LR
 
     subgraph outside["outside internet"]
         direction TB
-        outside_services["Internet services<br/>GitHub, OpenAI, Anthropic,<br/>package registries, tool APIs"]
+        outside_services["Internet services<br/>GitHub, OpenAI, Anthropic, AWS,<br/>package registries, tool APIs"]
     end
 
     subgraph ec2["AWS EC2 host"]
@@ -26,14 +26,14 @@ flowchart LR
 
         subgraph services["users"]
             direction TB
-            root["root<br/>owns root filesystem + host code<br/>executes eleven fixed helpers only"]
+            root["root<br/>owns root filesystem + host code<br/>executes fourteen fixed helpers only"]
             admin["trustyclaw-admin<br/>Admin API/UI + orchestrator<br/>127.0.0.1:7443<br/>no internet egress"]
             proxy["trustyclaw-proxy<br/>Network proxy<br/>127.0.0.1:7445<br/>DNS + TCP 80/443 only"]
             tools["trustyclaw-tools<br/>Tool packages + tools.sock<br/>DNS + TCP 443 only"]
             agentnetwork["trustyclaw-agent-network<br/>Network introspection socket<br/>no egress"]
             agentapp["trustyclaw-agent-app<br/>app_api proxy + agent-app.sock<br/>loopback to app ports only"]
             apps["trustyclaw-app-*<br/>App backends<br/>host-slot uid, port, schema<br/>no egress"]
-            agent["trustyclaw-agent<br/>Codex + Claude Code<br/>no sudo, DB role, or direct egress"]
+            agent["trustyclaw-agent<br/>Codex + Claude Code + Pi + Hermes<br/>no sudo, DB role, or direct egress"]
             db["postgres<br/>trustyclaw_admin<br/>Unix socket only, peer auth"]
             tunnel["cloudflared<br/>Tunnel connector<br/>DNS, TCP 443/7844, UDP 7844"]
         end
@@ -54,7 +54,7 @@ flowchart LR
     cfedge -->|"operator request + admin bearer"| tunnel
     tunnel -->|"forwards to 127.0.0.1:7443"| admin
 
-    admin -->|"eleven exact sudo helpers"| root
+    admin -->|"fourteen exact sudo helpers"| root
     root -->|"demote into transient runtime scopes"| agent
     root -->|"bootstrap, updates, provider/GitHub helpers"| outside_services
     root -->|"OS, host code, systemd, nftables, helpers"| rootvol

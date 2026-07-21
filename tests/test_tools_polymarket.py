@@ -159,20 +159,24 @@ class PolymarketToolTests(unittest.TestCase):
         assert isinstance(market, dict)
         self.assertEqual(market["description"], "Resolves YES if measurable rain falls.")
 
-    def test_get_market_by_id_quotes_path_segment(self) -> None:
+    def test_get_market_by_id_enforces_numeric_grammar(self) -> None:
         captured: dict[str, str] = {}
 
         def fake_json_request(method: str, url: str, **kwargs: Any) -> JSONObject:
             captured["url"] = url
             return dict(MARKET_RECORD)
 
-        # An id carrying path/query characters must be percent-encoded into one
-        # path segment so it cannot reach a different Gamma path.
+        # Gamma ids are integers: an id carrying path/query characters is
+        # rejected before any request (stricter than the old behavior of
+        # percent-encoding it into one segment), and a numeric id still
+        # lands as a single quoted path segment.
+        result = PolymarketTool().execute("get_market", {"market_id": "512329/../events?x=1"}, FakeHostAPI())
+        self.assertIsInstance(result, ActionFailed)
+        self.assertIn("numeric", result.error)
         with patch.object(polymarket, "json_request", fake_json_request):
-            result = PolymarketTool().execute("get_market", {"market_id": "512329/../events?x=1"}, FakeHostAPI())
+            result = PolymarketTool().execute("get_market", {"market_id": "512329"}, FakeHostAPI())
         assert isinstance(result, ActionExecuted)
-        self.assertIn("/markets/512329%2F..%2Fevents%3Fx%3D1", captured["url"])
-        self.assertNotIn("/events?", captured["url"])
+        self.assertIn("/markets/512329", captured["url"])
 
     def test_get_order_book_validates_token_and_maps_levels(self) -> None:
         result = PolymarketTool().execute("get_order_book", {"token_id": "not-digits"}, FakeHostAPI())

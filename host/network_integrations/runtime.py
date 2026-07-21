@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from host.config import NetworkControls
+from host.network_integrations.bedrock import guard as bedrock_guard
 from host.network_integrations.claude import guard as claude_guard
 from host.network_integrations.custom import guard as custom_guard
 from host.network_integrations.github import guard as github_guard
@@ -23,6 +24,9 @@ from host.network_integrations.registry import managed_domain_owner
 HostAllowed = Callable[[Any, str], bool]
 RequestDenied = Callable[
     [Any, str, str, str, str, list[tuple[str, str]], bytes], str | None
+]
+RewriteRequestHeaders = Callable[
+    [Any, str, str, str, str, list[tuple[str, str]], bytes], list[tuple[str, str]]
 ]
 
 
@@ -36,10 +40,11 @@ class IntegrationGuard:
 
     host_allowed: HostAllowed
     request_denied: RequestDenied
-    rewrite_request_headers: Callable[[str, list[tuple[str, str]]], list[tuple[str, str]]] | None = None
+    rewrite_request_headers: RewriteRequestHeaders | None = None
     gate_response: Callable[[Any, str, str, str, bytes], tuple[bytes | None, str | None]] | None = None
     ws_inspection_required: Callable[[Any, str], bool] | None = None
     ws_message_denied: Callable[[bytes], str | None] | None = None
+    response_meter: Callable[[Any, str, str, str, str, list[tuple[str, str]], bytes], Any] | None = None
 
 
 GUARDS: dict[str, IntegrationGuard] = {
@@ -52,6 +57,12 @@ GUARDS: dict[str, IntegrationGuard] = {
     "claude": IntegrationGuard(
         host_allowed=claude_guard.host_allowed,
         request_denied=claude_guard.request_denied,
+    ),
+    "bedrock": IntegrationGuard(
+        host_allowed=bedrock_guard.host_allowed,
+        request_denied=bedrock_guard.request_denied,
+        rewrite_request_headers=bedrock_guard.rewrite_request_headers,
+        response_meter=bedrock_guard.response_meter,
     ),
     "github": IntegrationGuard(
         host_allowed=github_guard.host_allowed,
@@ -109,12 +120,37 @@ def gate_response(
 
 
 def rewrite_request_headers(
-    controls: NetworkControls, host: str, headers: list[tuple[str, str]]
+    controls: NetworkControls,
+    method: str,
+    host: str,
+    path: str,
+    query: str,
+    headers: list[tuple[str, str]],
+    body: bytes,
 ) -> list[tuple[str, str]]:
-    guard, _config = _selection(controls, host)
+    guard, config = _selection(controls, host)
     if guard.rewrite_request_headers is None:
         return headers
-    return guard.rewrite_request_headers(host, headers)
+    return guard.rewrite_request_headers(config, method, host, path, query, headers, body)
+
+
+def response_meter(
+    controls: NetworkControls,
+    method: str,
+    host: str,
+    path: str,
+    query: str,
+    headers: list[tuple[str, str]],
+    body: bytes,
+) -> Any:
+    """The owning integration's passive response observer for this allowed
+    request (an object with ``feed(bytes)`` and ``finish()``), or None. Only
+    Bedrock defines one: it turns the token usage AWS reports in each
+    response into the live per-runtime usage counters."""
+    guard, config = _selection(controls, host)
+    if not config.enabled or guard.response_meter is None:
+        return None
+    return guard.response_meter(config, method, host, path, query, headers, body)
 
 
 def ws_message_guard(

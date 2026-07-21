@@ -101,6 +101,26 @@ class StateStorageTests(unittest.TestCase):
         self.assertIsNone(loaded["output_message"])
         self.assertEqual([t["task_id"] for t in state.active_tasks()], ["task_1"])
 
+    def test_every_session_option_satisfies_the_thread_constraint(self) -> None:
+        # The thread_sessions_options_check constraint must track the
+        # operator-facing option matrix exactly: a combination the API offers
+        # that the constraint rejects fails the first task on that thread.
+        from host.session_options import SESSION_OPTIONS
+
+        with state.mutation() as cur:
+            for runtime, models in SESSION_OPTIONS.items():
+                for model, efforts in models.items():
+                    for effort in efforts:
+                        state.save_thread_session(
+                            cur,
+                            runtime,
+                            f"opt-{runtime}-{model}-{effort}",
+                            None,
+                            "2026-06-08T00:00:00Z",
+                            model,
+                            effort,
+                        )
+
     def test_thread_session_configuration_is_immutable(self) -> None:
         with state.mutation() as cur:
             state.save_thread_session(
@@ -400,6 +420,14 @@ class StateStorageTests(unittest.TestCase):
         assert record is not None
         self.assertNotIn("web_search", record["controls"]["network_integrations"]["claude"])
 
+    def test_agent_network_role_cannot_read_bedrock_connection(self) -> None:
+        with db.transaction() as cur:
+            cur.execute(
+                "SELECT has_table_privilege('trustyclaw-agent-network', "
+                "'bedrock_credentials', 'SELECT')"
+            )
+            self.assertEqual(cur.fetchone(), (False,))
+
     def test_network_policy_round_trips_integrations_and_github_repos(self) -> None:
         controls = {
             "network_integrations": {
@@ -539,7 +567,12 @@ class StateStorageTests(unittest.TestCase):
         self.assertEqual(state.read_github_credential_metadata(), {"configured": False})
 
     def test_proxy_github_token_round_trips_and_drives_injection_headers(self) -> None:
-        from host.network_integrations.github.guard import rewrite_request_headers as github_credential_headers
+        from host.network_integrations.github.guard import rewrite_request_headers
+
+        def github_credential_headers(host: str, headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
+            # Only host and headers matter to the GitHub rewrite; the fuller
+            # hook signature exists for integrations that re-sign bodies.
+            return rewrite_request_headers(None, "GET", host, "/", "", headers, b"")
 
         self.assertIsNone(state.read_proxy_github_token())
         # Without a working token: agent-supplied Authorization is stripped
@@ -588,6 +621,34 @@ class StateStorageTests(unittest.TestCase):
         self.assertIsNone(state.read_proxy_github_token())
         with self.assertRaises(ValueError):
             state.save_proxy_github_token("")
+
+    def test_bedrock_proxy_reads_the_one_validated_row(self) -> None:
+        self.assertIsNone(state.read_bedrock_proxy_credential())
+        state.save_bedrock_credential("AKIASHAREDOPERATOR01", "shared-secret-material", "us-east-1")
+        self.assertEqual(
+            state.read_bedrock_proxy_credential(),
+            ("AKIASHAREDOPERATOR01", "shared-secret-material", "us-east-1"),
+        )
+        # The one row holds ciphertext at rest. Policy enablement is a soft
+        # state the proxy guard checks before it uses this accessor.
+        with db.transaction() as cur:
+            cur.execute("SELECT secret_access_key_encrypted FROM bedrock_credentials WHERE singleton = TRUE")
+            (stored,) = cur.fetchone()
+        self.assertTrue(stored.startswith(secretbox.PREFIX))
+        self.assertNotIn("shared-secret-material", stored)
+
+        # Replacing the validated row invalidates the decryption cache.
+        # Disabling does not mutate the durable credential; the proxy's parsed
+        # policy rejects the request earlier.
+        state.save_bedrock_credential("AKIASHAREDOPERATOR01", "shared-new-secret", "us-west-2")
+        self.assertEqual(
+            state.read_bedrock_proxy_credential(),
+            ("AKIASHAREDOPERATOR01", "shared-new-secret", "us-west-2"),
+        )
+        state.save_network_policy({"network_integrations": {}}, "2026-06-08T00:00:01Z")
+        self.assertIsNotNone(state.read_bedrock_proxy_credential())
+        self.assertEqual(state.read_bedrock_access_key_id(), "AKIASHAREDOPERATOR01")
+        self.assertEqual(state.read_bedrock_region(), "us-west-2")
 
     def test_github_repo_audits_upsert_and_prune(self) -> None:
         self.assertEqual(state.read_github_repo_audits(), {})
@@ -679,6 +740,71 @@ class StateStorageTests(unittest.TestCase):
                     if root not in allowed_roots:
                         offenders.append(f"{path.relative_to(repo_root)}: {root}")
         self.assertEqual(offenders, [])
+
+
+class BedrockUsageCounterTests(unittest.TestCase):
+    """The proxy-written live usage counters: one row per (runtime, model,
+    UTC day), incremented per allowed invocation, aggregated per month for
+    the admin API's cost estimate."""
+
+    def setUp(self) -> None:
+        pg_harness.reset_database()
+
+    USAGE = {
+        "input_tokens": 100,
+        "output_tokens": 40,
+        "cache_read_tokens": 8,
+        "cache_write_tokens": 2,
+    }
+    # The proxy prices each response before recording; record_bedrock_usage
+    # only stores and sums the cost it is handed, so the test pins an exact,
+    # NUMERIC(_,6)-representable value rather than re-deriving a rate.
+    COST = 0.0625
+
+    def test_usage_increments_one_row_per_runtime_model_and_day(self) -> None:
+        state.record_bedrock_usage("pi", "deepseek.v3.2", dict(self.USAGE), self.COST)
+        state.record_bedrock_usage("pi", "deepseek.v3.2", dict(self.USAGE), self.COST)
+        state.record_bedrock_usage("pi", "moonshotai.kimi-k2.5", dict(self.USAGE), self.COST)
+        state.record_bedrock_usage("hermes", "deepseek.v3.2", dict(self.USAGE), self.COST)
+        rows = state.read_bedrock_usage("1970-01-01")
+        self.assertEqual(
+            [(row["runtime"], row["model_id"], row["requests"]) for row in rows],
+            [
+                ("hermes", "deepseek.v3.2", 1),
+                ("pi", "deepseek.v3.2", 2),
+                ("pi", "moonshotai.kimi-k2.5", 1),
+            ],
+        )
+        doubled = rows[1]
+        self.assertEqual(doubled["metered_requests"], 2)
+        self.assertEqual(doubled["input_tokens"], 200)
+        self.assertEqual(doubled["output_tokens"], 80)
+        self.assertEqual(doubled["cache_read_tokens"], 16)
+        self.assertEqual(doubled["cache_write_tokens"], 4)
+        self.assertAlmostEqual(doubled["cost_usd"], 2 * self.COST)
+
+    def test_unmetered_request_counts_without_tokens_or_cost(self) -> None:
+        # A cost is passed, but an unmetered response records none of it.
+        state.record_bedrock_usage("pi", "deepseek.v3.2", None, self.COST)
+        (row,) = state.read_bedrock_usage("1970-01-01")
+        self.assertEqual(row["requests"], 1)
+        self.assertEqual(row["metered_requests"], 0)
+        self.assertEqual(row["input_tokens"], 0)
+        self.assertEqual(row["cost_usd"], 0.0)
+
+    def test_read_since_day_excludes_prior_months(self) -> None:
+        state.record_bedrock_usage("pi", "deepseek.v3.2", dict(self.USAGE), self.COST)
+        with db.transaction() as cur:
+            cur.execute(
+                "INSERT INTO bedrock_usage (runtime, model_id, day, requests, metered_requests,"
+                " input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)"
+                " VALUES ('pi', 'deepseek.v3.2', '2001-01-31', 7, 7, 999, 999, 0, 0)",
+            )
+        (row,) = state.read_bedrock_usage("2001-02-01")
+        self.assertEqual(row["requests"], 1)
+        self.assertEqual(row["input_tokens"], 100)
+        self.assertEqual(len(state.read_bedrock_usage("1970-01-01")), 1)
+        self.assertEqual(state.read_bedrock_usage("1970-01-01")[0]["requests"], 8)
 
 
 if __name__ == "__main__":

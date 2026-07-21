@@ -9,6 +9,7 @@ import urllib.parse
 from contextlib import contextmanager
 from typing import BinaryIO, Iterator, cast
 
+from host.param_guard import PARAM_GUARD_PROTECTION, PARAM_GUARD_TECHNICAL_DETAIL
 from host.tools.json_types import JSONObject
 from host.tools.manifest import ActionSpec, ConfigRequirement, DataSummary, DataSummaryCard, DataSummaryLink, DataSummaryPoint, SetupStep, ToolManifest
 from host.tools.results import (
@@ -282,7 +283,9 @@ MANIFEST = ToolManifest(
     protections=(
         "Your Runway key stays in write-only tool config. Inputs are bounded, and local images and videos are uploaded to Runway only when used as inputs.",
         "Generation is billed to your Runway organization. TrustyClaw does not publish the media. A completed video can be saved from Runway's authoritative temporary URL into the agent workspace for durable operator review and later approval-gated publishing.",
+        PARAM_GUARD_PROTECTION,
     ),
+    technical_details=(PARAM_GUARD_TECHNICAL_DETAIL,),
     setup_steps=(
         SetupStep(
             title="Create a Runway developer account",
@@ -307,7 +310,7 @@ MANIFEST = ToolManifest(
             DataSummaryCard(
                 title="What leaves this host",
                 points=(
-                    DataSummaryPoint(label="Generation requests", text="The prompt or speech text, generation options (model, ratio, duration, quality, voice, seed), and any public image or video URL given as input go to Runway."),
+                    DataSummaryPoint(label="Generation requests", text="The prompt or speech text, generation options (model, ratio, duration, quality, voice, seed), and any public image or video URL given as input go to Runway. These free-text values (prompt, speech text, external media URL) first pass the host parameter guard (see Technical notes), which denies secret- or credential-shaped values before anything is sent."),
                     DataSummaryPoint(label="Workspace media", text="When an image or video from the agent workspace is used as an input, its bytes and original filename upload to Runway. Its local workspace path is not sent."),
                 ),
             ),
@@ -404,7 +407,7 @@ def _string_choice(tool_input: JSONObject, key: str, allowed: tuple[str, ...], d
     return value
 
 
-def _prompt_text(tool_input: JSONObject) -> str:
+def _prompt_text(tool_input: JSONObject, api: HostAPI) -> str:
     prompt = tool_input.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ToolInputValidationError("Runway tool_input.prompt is required.")
@@ -413,10 +416,10 @@ def _prompt_text(tool_input: JSONObject) -> str:
     # render of an input the agent did not ask for.
     if len(prompt) > MAX_PROMPT_CHARS:
         raise ToolInputValidationError(f"Runway prompt must be at most {MAX_PROMPT_CHARS} characters.")
-    return prompt
+    return api.outbound.guard_request_parameter_string(prompt)
 
 
-def _https_url(tool_input: JSONObject, key: str) -> str:
+def _https_url(tool_input: JSONObject, key: str, api: HostAPI) -> str:
     value = tool_input.get(key)
     if not isinstance(value, str):
         raise ToolInputValidationError(f"Runway tool_input.{key} must be an https URL.")
@@ -436,11 +439,15 @@ def _https_url(tool_input: JSONObject, key: str) -> str:
         or port not in {None, 443}
     ):
         raise ToolInputValidationError(f"Runway tool_input.{key} must be an https URL.")
-    return value
+    # Runway fetches this URL, so scan the whole value for secrets or personal
+    # data an agent might encode into the path or query and exfiltrate. (Raw-IP
+    # hosts are allowed - Runway does the fetch from its own network, so any
+    # SSRF exposure is Runway's, not this host's.)
+    return api.outbound.guard_request_parameter_string(value)
 
 
 def _generation_request(
-    tool_input: JSONObject, staged_image_uri: str | None = None
+    api: HostAPI, tool_input: JSONObject, staged_image_uri: str | None = None
 ) -> tuple[str, JSONObject]:
     """Build the (endpoint, body) for generate_video, routing to image- or
     text-to-video by whether a first-frame image was supplied."""
@@ -451,7 +458,7 @@ def _generation_request(
         raise ToolInputValidationError(
             "Runway generate_video only supports prompt, model, image_url, image_asset_id, ratio, duration_seconds, and seed."
         )
-    prompt = _prompt_text(tool_input)
+    prompt = _prompt_text(tool_input, api)
     has_url = tool_input.get("image_url") is not None
     has_asset = tool_input.get("image_asset_id") is not None
     if has_url and has_asset:
@@ -460,7 +467,7 @@ def _generation_request(
         )
     prompt_image: str | None = None
     if has_url:
-        prompt_image = _https_url(tool_input, "image_url")
+        prompt_image = _https_url(tool_input, "image_url", api)
     elif has_asset:
         asset_id = tool_input.get("image_asset_id")
         if not isinstance(asset_id, str) or not asset_id:
@@ -488,7 +495,7 @@ def _generation_request(
     return endpoint, body
 
 
-def _edit_request(tool_input: JSONObject, video_uri: str | None = None) -> JSONObject:
+def _edit_request(api: HostAPI, tool_input: JSONObject, video_uri: str | None = None) -> JSONObject:
     extra = set(tool_input) - {"video_url", "video_asset_id", "prompt", "seed"}
     if extra:
         raise ToolInputValidationError(
@@ -501,8 +508,8 @@ def _edit_request(tool_input: JSONObject, video_uri: str | None = None) -> JSONO
             "Runway edit_video requires exactly one of video_url or video_asset_id."
         )
     if video_uri is None:
-        video_uri = _https_url(tool_input, "video_url")
-    prompt = _prompt_text(tool_input)
+        video_uri = _https_url(tool_input, "video_url", api)
+    prompt = _prompt_text(tool_input, api)
     seed = _optional_seed(tool_input)
     body: JSONObject = {"model": EDIT_MODEL, "videoUri": video_uri, "promptText": prompt}
     if seed is not None:
@@ -603,20 +610,20 @@ def _upload_staged_asset(
     return runway_uri
 
 
-def _image_request(tool_input: JSONObject) -> JSONObject:
+def _image_request(api: HostAPI, tool_input: JSONObject) -> JSONObject:
     extra = set(tool_input) - {"prompt", "ratio", "quality"}
     if extra:
         raise ToolInputValidationError("Runway generate_image only supports prompt, ratio, and quality.")
     return {
         "model": IMAGE_MODEL,
-        "promptText": _prompt_text(tool_input),
+        "promptText": _prompt_text(tool_input, api),
         "ratio": _string_choice(tool_input, "ratio", IMAGE_RATIOS, DEFAULT_IMAGE_RATIO),
         "quality": _string_choice(tool_input, "quality", IMAGE_QUALITIES, DEFAULT_IMAGE_QUALITY),
         "outputCount": 1,
     }
 
 
-def _speech_request(tool_input: JSONObject) -> JSONObject:
+def _speech_request(api: HostAPI, tool_input: JSONObject) -> JSONObject:
     extra = set(tool_input) - {"text", "voice"}
     if extra:
         raise ToolInputValidationError("Runway generate_speech only supports text and voice.")
@@ -629,7 +636,7 @@ def _speech_request(tool_input: JSONObject) -> JSONObject:
     voice = _string_choice(tool_input, "voice", SPEECH_VOICES, DEFAULT_SPEECH_VOICE)
     return {
         "model": SPEECH_MODEL,
-        "promptText": text,
+        "promptText": api.outbound.guard_request_parameter_string(text),
         "voice": {"type": "runway-preset", "presetId": voice},
     }
 
@@ -820,11 +827,11 @@ class RunwayTool:
             }
             if action == "generate_video":
                 asset_id = tool_input.get("image_asset_id")
-                endpoint, body = _generation_request(tool_input)
+                endpoint, body = _generation_request(api, tool_input)
                 if asset_id is None:
                     return self._create_task(endpoint, body, headers, cast(str, body["model"]), "video")
                 runway_uri = _upload_staged_asset(cast(str, asset_id), headers, api, kind="image")
-                endpoint, body = _generation_request(tool_input, runway_uri)
+                endpoint, body = _generation_request(api, tool_input, runway_uri)
                 result = self._create_task(endpoint, body, headers, cast(str, body["model"]), "video")
                 if isinstance(result, ActionExecuted):
                     api.assets.delete(cast(str, asset_id))
@@ -832,7 +839,7 @@ class RunwayTool:
             if action == "edit_video":
                 asset_id = tool_input.get("video_asset_id")
                 if asset_id is None:
-                    body = _edit_request(tool_input)
+                    body = _edit_request(api, tool_input)
                     return self._create_task(
                         VIDEO_TO_VIDEO_ENDPOINT, body, headers, EDIT_MODEL, "video"
                     )
@@ -842,9 +849,9 @@ class RunwayTool:
                     )
                 # Validate the full request shape before uploading, so a bad
                 # input never streams the staged video to Runway first.
-                _edit_request(tool_input, "runway://pending")
+                _edit_request(api, tool_input, "runway://pending")
                 runway_uri = _upload_staged_asset(asset_id, headers, api, kind="video")
-                body = _edit_request(tool_input, runway_uri)
+                body = _edit_request(api, tool_input, runway_uri)
                 result = self._create_task(
                     VIDEO_TO_VIDEO_ENDPOINT, body, headers, EDIT_MODEL, "video"
                 )
@@ -860,10 +867,10 @@ class RunwayTool:
                     )
                 return _save_video(cast(str, tool_input["task_id"]), headers)
             if action == "generate_image":
-                body = _image_request(tool_input)
+                body = _image_request(api, tool_input)
                 return self._create_task(TEXT_TO_IMAGE_ENDPOINT, body, headers, IMAGE_MODEL, "image")
             if action == "generate_speech":
-                body = _speech_request(tool_input)
+                body = _speech_request(api, tool_input)
                 return self._create_task(TEXT_TO_SPEECH_ENDPOINT, body, headers, SPEECH_MODEL, "audio")
             if action == "get_task":
                 extra = set(tool_input) - {"task_id", "output_kind"}

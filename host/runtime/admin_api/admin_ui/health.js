@@ -2,9 +2,10 @@
 
 import { api } from "./api.js";
 import {
-  $, badge, clampPercent, esc, gib, inlineMessage, notice, setHtml, RUNTIME_PROVIDERS,
+  $, badge, bedrockRuntimeUsage, clampPercent, esc, formatTokenCount, gib, inlineMessage,
+  notice, setHtml, RUNTIME_PROVIDERS,
 } from "./helpers.js";
-import { renderIntegrationAccounts } from "./network.js";
+import { renderIntegrationAccounts, setBedrockCredentialMetadata } from "./network.js";
 
 let latestRuntimes = [];
 let latestAccounts = [];
@@ -128,7 +129,11 @@ function renderVersion(version) {
 }
 
 export async function refreshProviderAccounts() {
-  const response = await api("GET", "/v1/agent-runtime/account");
+  const [response, bedrockCredentials] = await Promise.all([
+    api("GET", "/v1/agent-runtime/account"),
+    api("GET", "/v1/agent-runtime/bedrock-credentials"),
+  ]);
+  setBedrockCredentialMetadata(bedrockCredentials);
   renderProviderAccounts(response);
 }
 
@@ -147,21 +152,41 @@ export async function refreshProviderUsage() {
 function renderRuntimeOverview() {
   const container = $("runtime-overview");
   if (!container) return;
-  const runtimes = ["codex", "claude_code"].map(runtime => {
-    const meta = RUNTIME_PROVIDERS[runtime];
-    const record = latestRuntimes.find(entry => entry.type === runtime) || { status: "loading" };
-    const account = latestAccounts.find(entry => entry.agent_runtime === runtime) || {};
-    const windows = usageWindows(account);
-    const running = Array.isArray(record.active_task_ids) ? record.active_task_ids.length : 0;
-    const statusText = String(record.status || "loading").replaceAll("_", " ");
-    const modelSummary = windows.fableWeekly
-      ? `; ${usageSummary(`${windows.fableWeekly.label} weekly`, windows.fableWeekly)}` : "";
-    const runningLabel = running ? `; ${running} running` : "";
-    // The running count is a corner badge rather than inline text so a long
-    // status ("awaiting login") never truncates it away.
-    const runningBadge = running
-      ? `<span class="runtime-running-badge" aria-hidden="true">${running} running</span>` : "";
-    const inner = `
+  const bedrockAccount = latestAccounts.find(entry => entry.provider === "bedrock") || {};
+  // The top toolbar is per agent runtime: one box each for Codex, Claude Code,
+  // Pi, and Hermes. Every box shows that runtime's own process status and its
+  // own usage. Pi and Hermes are separate boxes even though they share one
+  // Bedrock credential — credential state is managed per provider in the
+  // Internet Access and Tools tab, not here, so the toolbar stays purely
+  // per-runtime.
+  const boxes = [
+    subscriptionSummary("codex"),
+    subscriptionSummary("claude_code"),
+    bedrockSummary("pi", bedrockAccount),
+    bedrockSummary("hermes", bedrockAccount),
+  ].join("");
+  setHtml(container, `${boxes}
+    <button class="ghost sm icon-button runtime-refresh" data-action="refresh-provider-usage" title="Refresh provider status and usage" aria-label="Refresh provider status and usage">
+      <svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><path d="M16.2 6.5A6.8 6.8 0 1 0 17 10M16.2 3.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>`);
+}
+
+// The shared top-bar box for one runtime: a status dot, the runtime label and
+// its live process status, a usage readout on the right, and a running-task
+// corner badge. `usageHtml` and `usageSummaryText` are the only things that
+// differ between a subscription runtime (quota rings) and a Bedrock runtime (a
+// month-to-date cost estimate).
+function runtimeSummaryCard(runtime, usageHtml, usageSummaryText, extraClass) {
+  const meta = RUNTIME_PROVIDERS[runtime];
+  const record = latestRuntimes.find(entry => entry.type === runtime) || { status: "loading" };
+  const running = Array.isArray(record.active_task_ids) ? record.active_task_ids.length : 0;
+  const statusText = String(record.status || "loading").replaceAll("_", " ");
+  const runningLabel = running ? `; ${running} running` : "";
+  // The running count is a corner badge rather than inline text so a long
+  // status ("awaiting login") never truncates it away.
+  const runningBadge = running
+    ? `<span class="runtime-running-badge" aria-hidden="true">${running} running</span>` : "";
+  const inner = `
         <span class="runtime-summary-name">
           <span class="runtime-status-dot ${esc(record.status)}" aria-hidden="true"></span>
           <span class="runtime-summary-copy">
@@ -169,29 +194,67 @@ function renderRuntimeOverview() {
             <span class="runtime-state">${esc(statusText)}</span>
           </span>
         </span>
-        <span class="runtime-usage">
-          ${usageRing("5h", windows.fiveHour)}
-          ${usageRing("wk", windows.weekly)}
-          ${windows.fableWeekly ? usageRing(windows.fableWeekly.label, windows.fableWeekly) : ""}
+        <span class="runtime-usage">${usageHtml}
         </span>
         ${runningBadge}`;
-    // Only a deactivated runtime has somewhere worth navigating to: the
-    // Internet Access and Tools tab, to re-enable its managed integration. An
-    // active, logging-in, or errored runtime needs no navigation, so it is a
-    // static chip, not a button.
-    if (record.status === "deactivated") {
-      const summaryLabel = `${meta.label}: ${statusText}${runningLabel}; ${usageSummary("5 hour", windows.fiveHour)}; ${usageSummary("weekly", windows.weekly)}${modelSummary}. Open account settings`;
-      return `
-      <button class="runtime-summary" data-action="open-provider" data-provider="${esc(meta.provider)}" aria-label="${esc(summaryLabel)}">${inner}</button>`;
-    }
-    const summaryLabel = `${meta.label}: ${statusText}${runningLabel}; ${usageSummary("5 hour", windows.fiveHour)}; ${usageSummary("weekly", windows.weekly)}${modelSummary}`;
-    return `
-      <div class="runtime-summary is-static" role="group" aria-label="${esc(summaryLabel)}">${inner}</div>`;
-  }).join("");
-  setHtml(container, `${runtimes}
-    <button class="ghost sm icon-button runtime-refresh" data-action="refresh-provider-usage" title="Refresh provider status and usage" aria-label="Refresh provider status and usage">
-      <svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><path d="M16.2 6.5A6.8 6.8 0 1 0 17 10M16.2 3.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    </button>`);
+  const cls = `runtime-summary${extraClass ? ` ${extraClass}` : ""}`;
+  // Every box links to the Internet Access and Tools tab for its provider, in
+  // any state — to connect or re-enable a deactivated runtime, or to manage
+  // credentials and integration settings for an active one.
+  const summaryLabel = `${meta.label}: ${statusText}${runningLabel}; ${usageSummaryText}. Open provider settings`;
+  return `
+      <button class="${cls}" data-action="open-provider" data-provider="${esc(meta.provider)}" aria-label="${esc(summaryLabel)}">${inner}</button>`;
+}
+
+// A subscription runtime (Codex, Claude Code): usage is quota windows, drawn as
+// percentage rings.
+function subscriptionSummary(runtime) {
+  const account = latestAccounts.find(entry => entry.agent_runtime === runtime) || {};
+  const windows = usageWindows(account);
+  const modelSummary = windows.fableWeekly
+    ? `; ${usageSummary(`${windows.fableWeekly.label} weekly`, windows.fableWeekly)}` : "";
+  const usageHtml = `
+        ${usageRing("5h", windows.fiveHour)}
+        ${usageRing("wk", windows.weekly)}
+        ${windows.fableWeekly ? usageRing(windows.fableWeekly.label, windows.fableWeekly) : ""}`;
+  const usageSummaryText = `${usageSummary("5 hour", windows.fiveHour)}; ${usageSummary("weekly", windows.weekly)}${modelSummary}`;
+  return runtimeSummaryCard(runtime, usageHtml, usageSummaryText);
+}
+
+// A Bedrock runtime (Pi, Hermes): usage is pay-per-token, so the readout is a
+// month-to-date cost estimate with token totals, not a quota ring. The numbers
+// come from the shared provider account's per-runtime usage map, but the box is
+// otherwise driven by the runtime's own status.
+function bedrockSummary(runtime, account) {
+  const usage = bedrockRuntimeUsage(account, runtime);
+  const usageHtml = bedrockUsageReadout(usage);
+  let usageSummaryText = "no metered usage yet";
+  if (usage) {
+    const tokens = `${formatTokenCount(usage.inputTokens)} input / ${formatTokenCount(usage.outputTokens)} output tokens`;
+    // Surface the metered gap, so a screen reader hears why the estimate may
+    // lag actual spend.
+    const metered = usage.requests > usage.meteredRequests
+      ? `; ${usage.meteredRequests} of ${usage.requests} requests metered` : "";
+    usageSummaryText = `estimated month-to-date ${usage.cost} (${tokens})${metered}`;
+  }
+  return runtimeSummaryCard(runtime, usageHtml, usageSummaryText, "runtime-summary-bedrock");
+}
+
+// The right-hand readout for a Bedrock box: three stacked figures — input
+// tokens, output tokens, and the cost — mirroring the subscription boxes' row
+// of usage rings so all four boxes read at the same visual weight. The cost is
+// labelled "MTD est." to flag that it is a metered estimate, not the AWS bill.
+// Placeholder dashes keep the box populated before any usage has been metered.
+function bedrockUsageReadout(usage) {
+  const stat = (value, label, extraClass = "") =>
+    `<span class="runtime-stat${extraClass ? ` ${extraClass}` : ""}">
+          <span class="runtime-stat-value">${esc(value)}</span>
+          <span class="runtime-stat-label">${esc(label)}</span>
+        </span>`;
+  if (!usage) {
+    return `${stat("--", "in")}${stat("--", "out")}${stat("--", "MTD est.", "runtime-stat-cost")}`;
+  }
+  return `${stat(formatTokenCount(usage.inputTokens), "in")}${stat(formatTokenCount(usage.outputTokens), "out")}${stat(usage.cost, "MTD est.", "runtime-stat-cost")}`;
 }
 
 function usageWindows(account) {
@@ -275,6 +338,7 @@ function usageRing(label, window) {
 }
 
 async function showOauth(start, runtime) {
+  if (runtime === "pi" || runtime === "hermes") return; // no OAuth flow; credentials connect in the integration card
   const provider = runtime === "claude_code" ? "claude" : "openai";
   // The card target is re-queried after each await: the 5-second poll can
   // re-render the provider card while the request is in flight, and writing

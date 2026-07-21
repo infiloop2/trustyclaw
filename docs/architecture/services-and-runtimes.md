@@ -48,8 +48,8 @@
 | Tools socket handler threads | tools service | One per agent tool call (and per delegated operator operation), bounded by a concurrency cap; tool packages run their third-party requests on these threads. |
 | Network-introspection socket handler threads | agent-network service | One per local request, bounded by a concurrency cap; calls perform read-only policy or denial queries. |
 | Maintenance thread | admin API | Periodically prunes bounded state and event history. |
-| Runtime status poller | admin API/orchestrator | Rechecks provider login state and updates each runtime status. |
-| Task worker threads | admin API/orchestrator | Six total workers claim queued tasks; at most three tasks run per runtime. Each turn spawns and closes its own runtime process. |
+| Runtime status poller | admin API/orchestrator | Rechecks provider health; the one Bedrock result is projected into both Pi and Hermes runtime rows. |
+| Task worker threads | admin API/orchestrator | Twelve total workers claim queued tasks; at most three tasks run per runtime. Each turn spawns and closes its own runtime process. |
 | Proxy handler threads | network proxy | One per proxied connection, capped so buffered request bodies cannot exhaust memory. |
 | Proxy certificate lock users | network proxy | Serialize per-host certificate generation so concurrent TLS CONNECTs do not race on cert files. |
 

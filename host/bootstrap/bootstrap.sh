@@ -8,6 +8,12 @@ cd /
 NODE_VERSION=22.12.0
 CODEX_CLI_VERSION=0.144.0
 CLAUDE_CODE_VERSION=2.1.206
+PI_CODING_AGENT_VERSION=0.80.10
+HERMES_AGENT_VERSION=0.18.2
+# hermes-agent requires Python 3.11-3.13; the base image ships 3.10, so uv
+# provisions a standalone interpreter for its dedicated venv.
+UV_VERSION=0.9.26
+HERMES_PYTHON_VERSION=3.12
 CLOUDFLARED_VERSION=2026.6.1
 # Ubuntu 22.04 ships PostgreSQL 14. The data directory below is versioned by
 # major so a future base-image bump gets an explicit pg_upgrade step instead
@@ -248,6 +254,7 @@ for directory in (
     agent_home,
     agent_home / ".codex",
     agent_home / ".claude",
+    agent_home / ".hermes",
 ):
     ensure_directory(directory)
 recreate_directory(proxy_state / "generated-certs")
@@ -265,6 +272,8 @@ for path in (
     agent_home / "CLAUDE.md",
     agent_home / ".codex" / "config.toml",
     agent_home / ".claude" / "settings.json",
+    agent_home / ".hermes" / "config.yaml",
+    agent_home / ".hermes" / ".env",
 ):
     ensure_regular_file_slot(path)
 PY
@@ -595,6 +604,31 @@ echo "== installing Codex CLI =="
 npm install -g --no-fund --no-audit --loglevel=error "@openai/codex@${CODEX_CLI_VERSION}"
 echo "== installing Claude Code CLI =="
 npm install -g --no-fund --no-audit --loglevel=error "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+echo "== installing Pi coding agent =="
+# --ignore-scripts is the package's own recommended install: no lifecycle
+# scripts run, and the optional native clipboard helper (unused headless) is
+# simply absent.
+npm install -g --no-fund --no-audit --loglevel=error --ignore-scripts "@earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION}"
+
+echo "== installing Hermes agent =="
+case "$arch" in
+  amd64) uv_arch=x86_64-unknown-linux-gnu ;;
+  arm64) uv_arch=aarch64-unknown-linux-gnu ;;
+  *) echo "unsupported uv architecture: ${arch}" >&2; exit 1 ;;
+esac
+curl -fsSLo /tmp/uv.tar.gz "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${uv_arch}.tar.gz"
+tar -xzf /tmp/uv.tar.gz -C /tmp
+install -m 0755 "/tmp/uv-${uv_arch}/uv" /usr/local/bin/uv
+rm -rf /tmp/uv.tar.gz "/tmp/uv-${uv_arch}"
+export UV_PYTHON_INSTALL_DIR=/usr/local/lib/hermes-python
+uv python install "${HERMES_PYTHON_VERSION}"
+uv venv --python "${HERMES_PYTHON_VERSION}" /usr/local/lib/hermes-venv
+# The bedrock extra brings the boto3 Converse transport; the mcp extra brings
+# the MCP client SDK, which the managed ~/.hermes/config.yaml needs to spawn
+# the bundled-tools MCP shim (mcp_servers.trustyclaw).
+uv pip install --python /usr/local/lib/hermes-venv/bin/python \
+  "hermes-agent[bedrock,mcp]==${HERMES_AGENT_VERSION}"
+chmod -R a+rX /usr/local/lib/hermes-python /usr/local/lib/hermes-venv
 # npm inherits the script's umask 077, which would leave the CLI root-only;
 # the agent user must be able to run it.
 chmod -R a+rX /usr/local/lib/node_modules
@@ -728,6 +762,9 @@ HELPER_NAMES=(
   read-codex-account-id
   run-claude-code
   read-claude-account
+  run-pi
+  run-hermes
+  read-aws-account
   clear-agent-auth
   read-agent-file
   reboot-host
@@ -741,6 +778,7 @@ for helper_name in "${HELPER_NAMES[@]}"; do
     "$HELPER_SOURCE_DIR/${helper_name}.sh" \
     > "/usr/local/lib/trustyclaw-host/${helper_name}"
 done
+install -m 0755 "$HELPER_SOURCE_DIR/hermes-stdin.py" /usr/local/lib/trustyclaw-host/hermes-stdin.py
 chown root:root /usr/local/lib/trustyclaw-host/*
 chmod 755 /usr/local/lib/trustyclaw-host/*
 
@@ -781,7 +819,10 @@ apply_durable_ownership() {
     chown "$row_owner" "$row_path"
     chmod "$row_mode" "$row_path"
   done <<< "$DURABLE_PATH_OWNERSHIP"
-  install -d -m 700 -o trustyclaw-agent -g trustyclaw-agent "$AGENT_HOME_PATH/.codex" "$AGENT_HOME_PATH/.claude"
+  install -d -m 700 -o trustyclaw-agent -g trustyclaw-agent \
+    "$AGENT_HOME_PATH/.codex" \
+    "$AGENT_HOME_PATH/.claude" \
+    "$AGENT_HOME_PATH/.hermes"
   # No initial network policy is seeded: a missing policy row is the
   # fail-closed empty default (deny everything).
 }
@@ -794,7 +835,9 @@ for managed_agent_file in \
   "$AGENT_HOME_PATH/AGENTS.md" \
   "$AGENT_HOME_PATH/CLAUDE.md" \
   "$AGENT_HOME_PATH/.codex/config.toml" \
-  "$AGENT_HOME_PATH/.claude/settings.json"; do
+  "$AGENT_HOME_PATH/.claude/settings.json" \
+  "$AGENT_HOME_PATH/.hermes/config.yaml" \
+  "$AGENT_HOME_PATH/.hermes/.env"; do
   if [ -e "$managed_agent_file" ]; then
     chattr -f -i "$managed_agent_file" 2>/dev/null || true
   fi
@@ -803,16 +846,27 @@ install -m 0644 -o root -g root "$AGENT_HOME_SOURCE_DIR/agents_claude.md" "$AGEN
 install -m 0644 -o root -g root "$AGENT_HOME_SOURCE_DIR/agents_claude.md" "$AGENT_HOME_PATH/CLAUDE.md"
 install -m 0644 -o root -g root "$AGENT_HOME_SOURCE_DIR/.codex/config.toml" "$AGENT_HOME_PATH/.codex/config.toml"
 install -m 0644 -o root -g root "$AGENT_HOME_SOURCE_DIR/.claude/settings.json" "$AGENT_HOME_PATH/.claude/settings.json"
+install -m 0644 -o root -g root "$AGENT_HOME_SOURCE_DIR/.hermes/config.yaml" "$AGENT_HOME_PATH/.hermes/config.yaml"
+install -m 0644 -o root -g root "$AGENT_HOME_SOURCE_DIR/.hermes/.env" "$AGENT_HOME_PATH/.hermes/.env"
 chattr +i \
   "$AGENT_HOME_PATH/AGENTS.md" \
   "$AGENT_HOME_PATH/CLAUDE.md" \
   "$AGENT_HOME_PATH/.codex/config.toml" \
-  "$AGENT_HOME_PATH/.claude/settings.json"
+  "$AGENT_HOME_PATH/.claude/settings.json" \
+  "$AGENT_HOME_PATH/.hermes/config.yaml" \
+  "$AGENT_HOME_PATH/.hermes/.env"
 }
 
 write_sudoers_policy() {
 cat > /etc/sudoers.d/trustyclaw-host <<'SUDOERS'
-trustyclaw-admin ALL=(root) NOPASSWD: /usr/local/lib/trustyclaw-host/reboot-host, /usr/local/lib/trustyclaw-host/run-codex-app-server, /usr/local/lib/trustyclaw-host/read-codex-account-id, /usr/local/lib/trustyclaw-host/run-claude-code, /usr/local/lib/trustyclaw-host/read-claude-account, /usr/local/lib/trustyclaw-host/clear-agent-auth, /usr/local/lib/trustyclaw-host/read-agent-file, /usr/local/lib/trustyclaw-host/check-for-upgrade, /usr/local/lib/trustyclaw-host/mint-github-app-token, /usr/local/lib/trustyclaw-host/audit-github-repo, /usr/local/lib/trustyclaw-host/approve-github-push
+# The admin service decrypts the connected AWS key pair and passes it to the
+# read-aws-account helper (STS attestation) through these environment
+# variables; the per-command env_keep preserves them across sudo's env reset
+# for exactly that helper and no other rule, so the Bedrock launchers
+# structurally never receive them. Each harness signs with its own fixed
+# routing identity and the proxy re-signs.
+Defaults!/usr/local/lib/trustyclaw-host/read-aws-account env_keep += "TRUSTYCLAW_BEDROCK_AWS_ACCESS_KEY_ID TRUSTYCLAW_BEDROCK_AWS_SECRET_ACCESS_KEY"
+trustyclaw-admin ALL=(root) NOPASSWD: /usr/local/lib/trustyclaw-host/reboot-host, /usr/local/lib/trustyclaw-host/run-codex-app-server, /usr/local/lib/trustyclaw-host/read-codex-account-id, /usr/local/lib/trustyclaw-host/run-claude-code, /usr/local/lib/trustyclaw-host/read-claude-account, /usr/local/lib/trustyclaw-host/run-pi, /usr/local/lib/trustyclaw-host/run-hermes, /usr/local/lib/trustyclaw-host/read-aws-account, /usr/local/lib/trustyclaw-host/clear-agent-auth, /usr/local/lib/trustyclaw-host/read-agent-file, /usr/local/lib/trustyclaw-host/check-for-upgrade, /usr/local/lib/trustyclaw-host/mint-github-app-token, /usr/local/lib/trustyclaw-host/audit-github-repo, /usr/local/lib/trustyclaw-host/approve-github-push
 SUDOERS
 chmod 440 /etc/sudoers.d/trustyclaw-host
   # A malformed sudoers drop-in would otherwise surface only when the admin
@@ -833,6 +887,20 @@ claude_code_version="$(runuser -u trustyclaw-agent -- env HOME=/mnt/trustyclaw-a
   /usr/local/bin/claude --version)"
 if [ "$claude_code_version" != "${CLAUDE_CODE_VERSION} (Claude Code)" ]; then
   echo "unexpected Claude Code version: ${claude_code_version}" >&2
+  exit 1
+fi
+pi_version="$(runuser -u trustyclaw-agent -- env HOME=/mnt/trustyclaw-agent/agent-home PI_OFFLINE=1 \
+  /usr/local/bin/pi --version)"
+if [ "$pi_version" != "${PI_CODING_AGENT_VERSION}" ]; then
+  echo "unexpected Pi coding agent version: ${pi_version}" >&2
+  exit 1
+fi
+# importlib.metadata is deterministic and network-free, unlike `hermes
+# --version` (which phones home for an update check).
+hermes_version="$(runuser -u trustyclaw-agent -- /usr/local/lib/hermes-venv/bin/python \
+  -c 'import importlib.metadata; print(importlib.metadata.version("hermes-agent"))')"
+if [ "$hermes_version" != "${HERMES_AGENT_VERSION}" ]; then
+  echo "unexpected Hermes agent version: ${hermes_version}" >&2
   exit 1
 fi
 }

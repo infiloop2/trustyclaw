@@ -72,7 +72,8 @@ def save_state(snapshot: dict[str, Any]) -> None:
         for runtime, record in snapshot.get("agent_runtime_statuses", {}).items():
             record = dict(record) if isinstance(record, dict) else {}
             record.setdefault("status", "loading")
-            orchestrator._RUNTIME_STATUSES[runtime] = record
+            key = "bedrock" if runtime in orchestrator.BEDROCK_RUNTIMES else runtime
+            orchestrator._RUNTIME_STATUSES.setdefault(key, record)
 
     with state.mutation() as cur:
         cur.execute("DELETE FROM tasks")

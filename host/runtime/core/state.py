@@ -566,6 +566,67 @@ def read_claude_account(cur: Any = None) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def save_bedrock_account(account: dict[str, Any] | None, cur: Any = None) -> None:
+    """Cache the shared AWS-attested identity for both harnesses."""
+    _save_provider_account("bedrock", account or {}, cur)
+
+
+def read_bedrock_account(cur: Any = None) -> dict[str, Any]:
+    value = _read_provider_account("bedrock", cur)
+    return value if isinstance(value, dict) else {}
+
+
+# -- Bedrock connected credential (one admin-written, proxy-readable row) ------------
+
+
+def save_bedrock_credential(access_key_id: str, secret_access_key: str, region: str, cur: Any = None) -> None:
+    """Store a synchronously validated AWS key pair."""
+    if cur is None:
+        with mutation() as fresh:
+            save_bedrock_credential(access_key_id, secret_access_key, region, fresh)
+        return
+    cur.execute(
+        "INSERT INTO bedrock_credentials (singleton, access_key_id, secret_access_key_encrypted, region)"
+        " VALUES (TRUE, %s, %s, %s)"
+        " ON CONFLICT (singleton) DO UPDATE SET access_key_id = EXCLUDED.access_key_id,"
+        " secret_access_key_encrypted = EXCLUDED.secret_access_key_encrypted, region = EXCLUDED.region",
+        (access_key_id, secretbox.encrypt(secret_access_key), region),
+    )
+
+
+def delete_bedrock_credential(cur: Any = None) -> None:
+    if cur is None:
+        with mutation() as fresh:
+            delete_bedrock_credential(fresh)
+        return
+    cur.execute("DELETE FROM bedrock_credentials")
+
+
+def read_bedrock_access_key_id(cur: Any = None) -> str | None:
+    """The connected access key id (not secret), or None. Used to report
+    whether a credential is connected without decrypting the secret."""
+    with _read(cur) as cur:
+        cur.execute("SELECT access_key_id FROM bedrock_credentials WHERE singleton = TRUE")
+        row = cur.fetchone()
+    return str(row[0]) if row and row[0] else None
+
+
+def read_bedrock_credential_secret() -> tuple[str, str] | None:
+    """The connected (access_key_id, secret_access_key) with the secret
+    decrypted, or None. Called only in the admin service (which owns the
+    secretbox key) to hand the plaintext to the root helper through its
+    environment. The plaintext never touches disk."""
+    with db.transaction() as cur:
+        cur.execute(
+            "SELECT access_key_id, secret_access_key_encrypted FROM bedrock_credentials"
+            " WHERE singleton = TRUE"
+        )
+        row = cur.fetchone()
+    if row is None or not row[0] or not row[1]:
+        return None
+    return str(row[0]), secretbox.decrypt(str(row[1]))
+
+
 def _save_provider_account(provider: str, data: dict[str, Any], cur: Any = None) -> None:
     # account_id is a typed column; the rest is the provider CLI's own shape,
     # cached verbatim as metadata.
@@ -788,6 +849,104 @@ def read_claude_web_search() -> bool:
         return False
 
 
+# -- Bedrock live usage (proxy-written token counters) ------------------------
+
+_BEDROCK_USAGE_COUNTERS = (
+    "metered_requests",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+)
+
+
+def record_bedrock_usage(
+    runtime: str, model_id: str, usage: dict[str, int] | None, cost_usd: float
+) -> None:
+    """Add one allowed Bedrock invocation to its (runtime, model, UTC day)
+    counter row. Runs in the proxy process under its own database role.
+    ``usage`` is the token usage AWS reported in the response, or None when
+    the response carried none (an AWS error, or a shape the meter could not
+    parse) — the request still counts, so undercounting stays visible as
+    ``requests`` without ``metered_requests``. ``cost_usd`` is the USD the
+    proxy priced this response at; it is stored, not recomputed at read time,
+    so a later rate edit never rewrites history. ``model_id`` is already
+    normalized to the catalog (unknown models collapse into one bucket), which
+    bounds the row count.
+
+    The single-statement ``INSERT ... ON CONFLICT DO UPDATE`` is atomic: on a
+    conflict Postgres takes a row lock and applies the ``col = col + EXCLUDED``
+    increments under it, so concurrent proxy writes to the same row serialize
+    and simply sum — no read-modify-write race in application code."""
+    counters = {column: 0 for column in _BEDROCK_USAGE_COUNTERS}
+    if usage is not None:
+        counters["metered_requests"] = 1
+        for column in _BEDROCK_USAGE_COUNTERS[1:]:
+            counters[column] = int(usage.get(column, 0))
+    # An unmetered response carries no priced cost regardless of the argument.
+    cost = cost_usd if usage is not None else 0.0
+    columns = (*_BEDROCK_USAGE_COUNTERS, "cost_usd")
+    assignments = ", ".join(
+        f"{column} = bedrock_usage.{column} + EXCLUDED.{column}"
+        for column in ("requests", *columns)
+    )
+    with db.transaction() as cur:
+        cur.execute(
+            "INSERT INTO bedrock_usage (runtime, model_id, day, requests, "
+            + ", ".join(columns)
+            + ") VALUES (%s, %s, %s, 1, %s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (runtime, model_id, day) DO UPDATE SET " + assignments,
+            (
+                runtime,
+                model_id,
+                time.strftime("%Y-%m-%d", time.gmtime()),
+                *(counters[column] for column in _BEDROCK_USAGE_COUNTERS),
+                cost,
+            ),
+        )
+
+
+def read_bedrock_usage(since_day: str) -> list[dict[str, Any]]:
+    """Per-(runtime, model) counter totals for UTC days >= ``since_day``
+    (an ISO date, typically the first of the current month). ``cost_usd`` is
+    the summed recorded cost — the final figure, not a re-priced estimate."""
+    with db.transaction() as cur:
+        cur.execute(
+            "SELECT runtime, model_id, SUM(requests), "
+            + ", ".join(f"SUM({column})" for column in _BEDROCK_USAGE_COUNTERS)
+            + ", SUM(cost_usd)"
+            + " FROM bedrock_usage WHERE day >= %s GROUP BY runtime, model_id"
+            " ORDER BY runtime, model_id",
+            (since_day,),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "runtime": str(row[0]),
+            "model_id": str(row[1]),
+            "requests": int(row[2]),
+            **{column: int(row[3 + index]) for index, column in enumerate(_BEDROCK_USAGE_COUNTERS)},
+            "cost_usd": float(row[3 + len(_BEDROCK_USAGE_COUNTERS)]),
+        }
+        for row in rows
+    ]
+
+
+def read_bedrock_region() -> str | None:
+    """The shared operator-configured Bedrock region, or None without a
+    connected credential. Read by the orchestrator to tell each Bedrock
+    launcher which regional endpoint to use; the proxy enforces the
+    same region independently. Any read failure returns None (fail closed —
+    no region means the turn fails before any Bedrock traffic)."""
+    try:
+        with db.transaction() as cur:
+            cur.execute("SELECT region FROM bedrock_credentials WHERE singleton = TRUE")
+            row = cur.fetchone()
+            return str(row[0]) if row and row[0] else None
+    except Exception:
+        return None
+
+
 def save_network_policy(controls: dict[str, Any], updated_at: str) -> None:
     """Replace the active policy in one transaction (admin service only; the
     proxy role can only read these tables). ``controls`` is the already
@@ -856,6 +1015,35 @@ def save_proxy_claude_account(account: dict[str, Any] | None, cur: Any = None) -
 
 def read_proxy_claude_account() -> dict[str, Any]:
     return _read_proxy_pin("claude")
+
+
+_bedrock_proxy_credential_cache: tuple[str, str, str, str] | None = None
+
+
+def read_bedrock_proxy_credential() -> tuple[str, str, str] | None:
+    """Read the one shared row for the trusted network proxy.
+
+    Enablement is already present in the parsed proxy policy. Decryption is
+    cached per ciphertext so an enabled steady-state request costs one SELECT,
+    like the proxy GitHub token.
+    """
+    with db.transaction() as cur:
+        cur.execute(
+            "SELECT access_key_id, secret_access_key_encrypted, region FROM bedrock_credentials"
+            " WHERE singleton = TRUE"
+        )
+        row = cur.fetchone()
+    if row is None:
+        global _bedrock_proxy_credential_cache
+        _bedrock_proxy_credential_cache = None
+        return None
+    access_key_id, ciphertext, region = str(row[0]), str(row[1]), str(row[2])
+    cached = _bedrock_proxy_credential_cache
+    if cached is not None and cached[0] == ciphertext:
+        return cached[1], cached[2], cached[3]
+    secret = secretbox.decrypt(ciphertext)
+    _bedrock_proxy_credential_cache = (ciphertext, access_key_id, secret, region)
+    return access_key_id, secret, region
 
 
 def _save_proxy_pin(provider: str, data: dict[str, Any], cur: Any = None) -> None:

@@ -261,12 +261,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     + message
                 )
                 return
+            # The owning integration may passively observe the upstream
+            # response of an allowed request (Bedrock token-usage metering);
+            # the relayed bytes are never modified. Selected from the
+            # as-received headers, before the rewrite below replaces the
+            # routing identity that attributes the request to its runtime.
+            assert policy is not None
+            meter = integrations.response_meter(policy, method, host, path, query, headers, body)
             # After the allow decision, the owning integration may rewrite
             # headers: on GitHub domains the proxy authenticates the request
             # itself (agent Authorization stripped, the working token
-            # injected) — the agent never holds the token.
-            assert policy is not None
-            headers = integrations.rewrite_request_headers(policy, host, headers)
+            # injected), and on Bedrock domains it re-signs the request with
+            # the operator's credential — the agent never holds either.
+            headers = integrations.rewrite_request_headers(policy, method, host, path, query, headers, body)
             upstream_raw = connect_public(host, port, timeout=15)
             upstream_tls = ssl.create_default_context().wrap_socket(upstream_raw, server_hostname=host)
             upstream_tls.settimeout(IDLE_TIMEOUT)
@@ -278,7 +285,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     initial_client_bytes=reader.drain(),
                 )
             else:
-                forward_until_close(upstream_tls, client_tls)
+                forward_until_close(upstream_tls, client_tls, meter)
         except OSError:
             pass
         finally:
@@ -461,15 +468,22 @@ def send_http_request(
         upstream.sendall(body)
 
 
-def forward_until_close(source: socket.socket, target: socket.socket) -> None:
+def forward_until_close(source: socket.socket, target: socket.socket, meter: Any = None) -> None:
+    """Relay upstream bytes to the client until close. ``meter`` (feed/finish)
+    observes the raw bytes without touching the relay; finish() runs even on
+    an aborted relay so the request is still counted."""
     try:
         while True:
             data = source.recv(BUFFER_SIZE)
             if not data:
                 return
+            if meter is not None:
+                meter.feed(data)
             target.sendall(data)
     finally:
         source.close()
+        if meter is not None:
+            meter.finish()
 
 
 class WebSocketDenied(Exception):

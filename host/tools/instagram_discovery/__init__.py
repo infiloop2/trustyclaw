@@ -9,6 +9,7 @@ import urllib.parse
 from collections.abc import Mapping
 from typing import Any, cast
 
+from host.param_guard import PARAM_GUARD_PROTECTION, PARAM_GUARD_TECHNICAL_DETAIL
 from host.tools.host_api import ApprovalRecord, HostAPI
 from host.tools.json_types import JSONObject, JSONValue
 from host.tools.manifest import ActionSpec, ConfigRequirement, DataSummary, DataSummaryCard, DataSummaryLink, DataSummaryPoint, SetupStep, ToolManifest
@@ -210,11 +211,14 @@ MANIFEST = ToolManifest(
         ),
     ),
     protections=(
+        "The ScrapeCreators API key stays in write-only tool config and is never returned to or read by the agent.",
         "The tool has no Instagram login, cookie, or session and exposes only five fixed read-only endpoints for public content. It cannot follow, like, comment, message, or publish.",
         "Results include only the public Reel details your agent needs, with at most 25 unique items per request.",
+        PARAM_GUARD_PROTECTION,
     ),
     technical_details=(
         "TrustyClaw accepts only valid hashtags, numeric audio ids, and instagram.com Reel URLs. It asks ScrapeCreators not to download media, removes duplicate Reels, and maps vendor responses to fixed fields before returning them.",
+        PARAM_GUARD_TECHNICAL_DETAIL,
     ),
     setup_steps=(
         SetupStep(
@@ -244,7 +248,8 @@ MANIFEST = ToolManifest(
                     "a hashtag, date, page, or cursor values, an audio id, or a validated public Instagram Reel URL, plus the "
                     "ScrapeCreators API key. Requests rejected by TrustyClaw do not leave the host. Requests rejected by "
                     "ScrapeCreators have already left the host and may be represented in its retained request metadata and error "
-                    "logs. No Instagram account or credential is sent."
+                    "logs. No Instagram account or credential is sent. The free-text request values (keyword, hashtag, Reel URL) "
+                    "first pass the host parameter guard (see Technical notes), which denies secret- or credential-shaped values before anything is sent."
                 ),
             ),
             DataSummaryCard(
@@ -575,6 +580,7 @@ def _normalized_reels(response: JSONObject, *, limit: int) -> list[JSONObject]:
 
 def _details_media(response: JSONObject) -> object:
     candidates = (
+        response.get("xdt_shortcode_media"),
         _nested(response, "data", "xdt_shortcode_media"),
         response.get("reel"),
         response.get("post"),
@@ -629,7 +635,7 @@ class InstagramDiscoveryTool:
             api_key = api.config["SCRAPECREATORS_API_KEY"]
             limit = _bounded_int(tool_input.get("limit"), name="limit", default=10, maximum=MAX_RESULTS)
             if action == "search_reels":
-                params = {"query": _query(tool_input.get("query")), "page": str(_bounded_int(tool_input.get("page"), name="page", default=1, maximum=100))}
+                params = {"query": api.outbound.guard_request_parameter_string(_query(tool_input.get("query"))), "page": str(_bounded_int(tool_input.get("page"), name="page", default=1, maximum=100))}
                 date_posted = _date_window(tool_input.get("date_posted"))
                 if date_posted:
                     params["date_posted"] = date_posted
@@ -640,7 +646,7 @@ class InstagramDiscoveryTool:
                 reels_only = tool_input.get("reels_only", True)
                 if not isinstance(reels_only, bool):
                     raise ValueError("reels_only must be true or false.")
-                params = {"hashtag": _hashtag(tool_input.get("hashtag")), "media_type": "reels" if reels_only else "all"}
+                params = {"hashtag": api.outbound.guard_request_parameter_string(_hashtag(tool_input.get("hashtag"))), "media_type": "reels" if reels_only else "all"}
                 date_posted = _date_window(tool_input.get("date_posted"))
                 cursor = _cursor(tool_input.get("cursor"))
                 if date_posted:

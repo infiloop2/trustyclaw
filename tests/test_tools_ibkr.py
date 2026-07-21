@@ -116,16 +116,25 @@ class IBKRToolTests(unittest.TestCase):
         self.assertIsNone(tool.credentials)
         self.assertEqual(
             [spec.id for spec in tool.manifest.actions],
-            ["get_positions", "get_account_summary", "get_trades"],
+            ["get_accounts", "get_positions", "get_account_summary", "get_trades"],
         )
         self.assertEqual(len(tool.manifest.config), 6)
         self.assertIn(
             "cannot send arbitrary request text, orders, or trading instructions",
             tool.manifest.data_summary.cards[0].points[0].text,
         )
-        self.assertIn("IBKR does not make the OAuth credential read-only", tool.manifest.protections[1])
+        self.assertIn(
+            "IBKR does not make the OAuth credential read-only",
+            " ".join(tool.manifest.protections),
+        )
+        # The reduced-permission-username recommendation precedes registration,
+        # because the OAuth consumer binds to whichever username registers it.
         self.assertEqual(
-            tool.manifest.setup_steps[2].link_url,
+            tool.manifest.setup_steps[2].title,
+            "Recommended: prepare a reduced-permission username",
+        )
+        self.assertEqual(
+            tool.manifest.setup_steps[3].link_url,
             "https://ndcdyn.interactivebrokers.com/sso/Login?RL=1&action=OAUTH",
         )
 
@@ -152,7 +161,7 @@ class IBKRToolTests(unittest.TestCase):
             }
         )
         with patch.object(ibkr, "json_request", server.json_request):
-            result = IBKRTool().execute("get_positions", {}, configured_api())
+            result = IBKRTool().execute("get_positions", {"account_id": "U1234567"}, configured_api())
         assert isinstance(result, ActionExecuted)
         self.assertEqual(result.result["account_id"], "U1234567")
         positions = result.result["positions"]
@@ -186,6 +195,40 @@ class IBKRToolTests(unittest.TestCase):
         self.assertIn("U9999999", result.error)
         self.assertIn("U1234567", result.error)
 
+    def test_missing_account_id_fails_with_the_available_ids(self) -> None:
+        server = FakeIBKRServer({"/portfolio/accounts": ACCOUNTS_RESPONSE})
+        with patch.object(ibkr, "json_request", server.json_request):
+            result = IBKRTool().execute("get_positions", {}, configured_api())
+        assert isinstance(result, ActionFailed)
+        self.assertIn("account_id is required", result.error)
+        self.assertIn("U1234567", result.error)
+        self.assertIn("U7654321", result.error)
+
+    def test_get_accounts_lists_the_login_accounts(self) -> None:
+        server = FakeIBKRServer(
+            {
+                "/portfolio/accounts": {
+                    "items": [
+                        {"accountId": "U1234567", "accountTitle": "Alice", "currency": "USD", "type": "INDIVIDUAL"},
+                        {"accountId": "U7654321"},
+                    ]
+                },
+            }
+        )
+        with patch.object(ibkr, "json_request", server.json_request):
+            result = IBKRTool().execute("get_accounts", {}, configured_api())
+        assert isinstance(result, ActionExecuted)
+        accounts = result.result["accounts"]
+        assert isinstance(accounts, list)
+        self.assertEqual([account["account_id"] for account in accounts], ["U1234567", "U7654321"])
+        self.assertEqual(accounts[0]["title"], "Alice")
+        self.assertEqual(accounts[0]["currency"], "USD")
+
+    def test_get_accounts_rejects_unsupported_input(self) -> None:
+        result = IBKRTool().execute("get_accounts", {"account_id": "U1234567"}, configured_api())
+        assert isinstance(result, ActionFailed)
+        self.assertIn("no fields", result.error)
+
     def test_provider_account_ids_are_validated_before_use_in_a_path(self) -> None:
         server = FakeIBKRServer(
             {
@@ -200,7 +243,14 @@ class IBKRToolTests(unittest.TestCase):
             }
         )
         with patch.object(ibkr, "json_request", server.json_request):
-            result = IBKRTool().execute("get_positions", {}, configured_api())
+            listed = IBKRTool().execute("get_accounts", {}, configured_api())
+            result = IBKRTool().execute("get_positions", {"account_id": "U1234567"}, configured_api())
+        # The hostile provider id is dropped from the listing (charset-validated,
+        # deduplicated) and never lands in a request path.
+        assert isinstance(listed, ActionExecuted)
+        self.assertEqual(
+            [account["account_id"] for account in listed.result["accounts"]], ["U1234567"]
+        )
         assert isinstance(result, ActionExecuted)
         self.assertEqual(result.result["account_id"], "U1234567")
         self.assertFalse(any("/orders" in request["url"] for request in server.requests))
@@ -217,7 +267,7 @@ class IBKRToolTests(unittest.TestCase):
             }
         )
         with patch.object(ibkr, "json_request", server.json_request):
-            result = IBKRTool().execute("get_account_summary", {}, configured_api())
+            result = IBKRTool().execute("get_account_summary", {"account_id": "U1234567"}, configured_api())
         assert isinstance(result, ActionExecuted)
         summary = result.result["summary"]
         assert isinstance(summary, dict)
@@ -256,7 +306,7 @@ class IBKRToolTests(unittest.TestCase):
             }
         )
         with patch.object(ibkr, "json_request", server.json_request):
-            result = IBKRTool().execute("get_trades", {"days": "3"}, configured_api())
+            result = IBKRTool().execute("get_trades", {"account_id": "U1234567", "days": "3"}, configured_api())
         assert isinstance(result, ActionExecuted)
         init_request = next(r for r in server.requests if "/ssodh/init" in r["url"])
         # compete=False so this read never force-closes the operator's own live
@@ -315,7 +365,7 @@ class IBKRToolTests(unittest.TestCase):
             }
         )
         with patch.object(ibkr, "json_request", server.json_request):
-            result = IBKRTool().execute("get_trades", {}, configured_api())
+            result = IBKRTool().execute("get_trades", {"account_id": "U1234567"}, configured_api())
         assert isinstance(result, ActionExecuted)
         trades = result.result["trades"]
         assert isinstance(trades, list)
@@ -345,7 +395,7 @@ class IBKRToolTests(unittest.TestCase):
             }
         )
         with patch.object(ibkr, "json_request", server.json_request):
-            result = IBKRTool().execute("get_trades", {}, configured_api())
+            result = IBKRTool().execute("get_trades", {"account_id": "U1234567"}, configured_api())
         assert isinstance(result, ActionFailed)
         self.assertIn("brokerage session", result.error)
 
@@ -359,7 +409,7 @@ class IBKRToolTests(unittest.TestCase):
             }
         )
         with patch.object(ibkr, "json_request", server.json_request):
-            result = IBKRTool().execute("get_trades", {}, configured_api())
+            result = IBKRTool().execute("get_trades", {"account_id": "U1234567"}, configured_api())
         assert isinstance(result, ActionFailed)
         self.assertIn("another live brokerage session", result.error)
         self.assertFalse(any("/account/trades" in r["url"] for r in server.requests))

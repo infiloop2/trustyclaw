@@ -20,6 +20,7 @@ from pathlib import Path
 import time
 from typing import Any, Mapping, cast
 
+from host.param_guard import OutboundGuardService
 from host.runtime.core import state
 from host.runtime.tools import assets as tool_assets
 import host.tools
@@ -251,6 +252,7 @@ class HostToolAPI:
     config: Mapping[str, str]
     approvals: HostApprovals
     assets: HostAssets
+    outbound: OutboundGuardService
 
 
 class _ToolConfigView(dict[str, str]):
@@ -265,6 +267,9 @@ class _ToolConfigView(dict[str, str]):
         )
 
 
+_OUTBOUND_GUARD = OutboundGuardService()
+
+
 def host_api_for(tool: Tool, asset_store: tool_assets.ToolAssetStore | None = None) -> HostToolAPI:
     manifest = tool.manifest
     config = state.tool_config_values(manifest.tool_id, [entry.key for entry in manifest.config])
@@ -276,6 +281,7 @@ def host_api_for(tool: Tool, asset_store: tool_assets.ToolAssetStore | None = No
             manifest.tool_id,
             asset_store or _DEFAULT_ASSET_STORE,
         ),
+        outbound=_OUTBOUND_GUARD,
     )
 
 

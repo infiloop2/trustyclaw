@@ -256,10 +256,37 @@ class HostAPI(Protocol):
     def approvals(self) -> Approvals: ...               # host-owned approval workflow
     @property
     def assets(self) -> Assets: ...                     # opaque, tool-scoped staged bytes
+    @property
+    def outbound(self) -> Outbound: ...                 # request-parameter guard
 ```
 
 Host implementations validate every argument: invalid types, formats, or
 size-limit violations raise `ValueError`; a missing config key raises `KeyError`.
+
+### Outbound parameter guard
+
+`Outbound` is the host-owned check tools apply to agent-controlled free-text
+request values before building a request. It is deterministic and offline, and
+denies by raising `ValueError` with a descriptive, value-free message the tool
+surfaces verbatim so the agent can rephrase and retry.
+
+```python
+class Outbound(Protocol):
+    def guard_request_parameter_string(self, value: str, *, allow_identifiers: bool = False) -> str: ...
+```
+
+It denies secret/credential shapes, one-time codes, personal and financial
+identifiers, and encoded payloads, and returns the value unchanged on
+success. `allow_identifiers=True` skips only the personal-identifier rules
+(email, phone, card, SSN, digit runs, DOB, government id) for a query against
+an account the operator already connected (a mailbox search), where a
+personal identifier is legitimate search syntax (`from:alice@example.com`)
+and the destination already holds that data; secret/credential shapes and
+encoded payloads are still denied. A tool applies the guard to each
+decoded semantic value it controls; the host runs the same rules over managed
+network-integration request URLs. The rules, the data classes each covers, and
+the trade-offs are specified in
+[`outbound-request-filtering.md`](outbound-request-filtering.md).
 
 ### Staged assets
 

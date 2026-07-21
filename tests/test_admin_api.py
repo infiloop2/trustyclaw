@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 import subprocess
 from typing import Any
 import urllib.error
@@ -48,6 +48,23 @@ def save_approved_openai_account(account_id: str, **extra: Any) -> None:
     )
 
 
+# The zeroed live-usage payload every accounts read carries for a Bedrock
+# runtime that has no metered requests this month.
+EMPTY_BEDROCK_USAGE = {
+    runtime: {
+        "month_to_date": 0.0,
+        "currency": "USD",
+        "requests": 0,
+        "metered_requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
+    for runtime in ("pi", "hermes")
+}
+
+
 def save_attested_claude_account(account_id: str, **extra: Any) -> None:
     save_claude_account(
         {"account_id": account_id, "identity_attestation": orchestrator.CLAUDE_IDENTITY_ATTESTATION, **extra}
@@ -61,6 +78,15 @@ class AdminUiStaticTests(unittest.TestCase):
         # assertions here so exact UI-copy and domain-list contracts are always
         # exercised before CI.
         AdminApiIntegrationTests.test_admin_ui_has_thread_task_event_smoke_path(self)
+
+    def test_agent_chat_hides_unsupported_hermes_steering(self) -> None:
+        script = (
+            Path(__file__).parents[1] / "host/apps/agent_chat/ui/agent_chat.js"
+        ).read_text()
+        self.assertIn(
+            'task.status === "running" && task.agent_runtime !== "hermes"',
+            script,
+        )
 
     def test_connection_guide_preserves_network_and_data_disclosure_contracts(self) -> None:
         runtime = Path(__file__).parents[1] / "host/runtime/admin_api"
@@ -97,6 +123,42 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertIn("Integration Guides", html)
         self.assertNotIn("What each integration enables", html)
 
+    def test_bedrock_ui_copy_and_toolbar_contract(self) -> None:
+        runtime = Path(__file__).parents[1] / "host/runtime/admin_api"
+        catalog = (runtime / "admin_ui" / "integration_catalog.js").read_text()
+        guide = (runtime / "admin_ui" / "connection_guide.js").read_text()
+        health = (runtime / "admin_ui" / "health.js").read_text()
+        network = (runtime / "admin_ui" / "network.js").read_text()
+        css = (runtime / "admin_ui.css").read_text()
+        combined = "\n".join((catalog, guide, health, network, css))
+
+        self.assertIn('label: "AWS Bedrock"', catalog)
+        self.assertNotIn("AWS Bedrock AI inference", combined)
+        # Two separate live usage boxes, one per Bedrock runtime, in both the
+        # per-runtime toolbar boxes and the provider panel; the Cost Explorer
+        # display is gone with the polling it required.
+        self.assertIn("bedrockRuntimeUsage(account, runtime)", health)
+        self.assertIn("runtime-summary-bedrock", combined)
+        self.assertIn("bedrock-usage-box", network)
+        self.assertIn("MTD est.", health)
+        self.assertNotIn("Cost Explorer", combined)
+        self.assertNotIn("bedrock_spend", combined)
+        self.assertNotIn("ce:GetCostAndUsage", combined)
+        self.assertNotIn("bedrock-toolbar-lag", combined)
+        self.assertIn("runtime-running-badge", combined)
+        self.assertIn('id="bedrock-region-', network)
+        self.assertIn('"region": region', network)
+        self.assertNotIn("setBedrockRegion", combined)
+        self.assertNotIn("The toolbar keeps separate Pi and Hermes running-task counters.", combined)
+        self.assertIn("credentials required", network)
+        self.assertIn("bedrock:InvokeModel", catalog)
+        self.assertIn("bedrock:InvokeModelWithResponseStream", catalog)
+        self.assertIn("guide-step-code", combined)
+        self.assertNotIn("TrustyClaw rechecks the connected key", catalog)
+        self.assertNotIn("The first task is the live check", catalog)
+        self.assertNotIn("TrustyClaw immediately verifies", catalog)
+        self.assertNotIn("TrustyClaw verifies the credential", catalog)
+
     def test_connection_guide_screenshots_are_local_png_assets(self) -> None:
         repo = Path(__file__).parents[1]
         asset_dir = repo / "host/tools/shared/guide_assets/google"
@@ -119,7 +181,14 @@ class AdminUiStaticTests(unittest.TestCase):
         css = (runtime / "admin_ui.css").read_text()
 
         self.assertIn('if (!enabled) {\n      setHtml(node, "");', network_js)
-        self.assertIn('const summary = !enabled && !identity', network_js)
+        self.assertIn('const summary = !enabled && !linked', network_js)
+        self.assertEqual(
+            network_js.count(
+                'const record = runtimeRecords().find(entry => entry.type === runtime) || '
+                '{ status: account.status || "loading" };'
+            ),
+            2,
+        )
         self.assertIn('tool.connection === "oauth" && (tool.enabled || connected)', tools_js)
         self.assertIn(".connection-summary {", css)
         self.assertIn("color: var(--text-dim);", css)
@@ -2451,6 +2520,39 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(body["status"], "accepted")
         self.assertEqual(load_state()["tasks"][0]["steer_messages"], ["s2", "s3"])
 
+    def test_running_hermes_task_rejects_steering_without_recording_it(self) -> None:
+        _, task = self.request(
+            "POST",
+            "/v1/tasks",
+            {
+                "input_message": "initial",
+                "thread_id": "hermes-thread",
+                "agent_runtime": "hermes",
+                "model": "deepseek.v3.2",
+                "effort": "high",
+            },
+        )
+        with state.mutation() as cur:
+            stored = state.get_task(task["task_id"], cur)
+            assert stored is not None
+            stored["status"] = "running"
+            state.save_task(cur, stored)
+
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request(
+                "POST",
+                f"/v1/tasks/{task['task_id']}/steer",
+                {"steer_message": "change direction"},
+            )
+
+        self.assertEqual(error.exception.code, HTTPStatus.CONFLICT)
+        self.assertIn(
+            "Hermes tasks do not support steering; create a new task on the same thread_id",
+            error.exception.read().decode(),
+        )
+        self.assertEqual(state.task_steers(task["task_id"]), [])
+        self.assertEqual(state.page_task_events(task["task_id"], None), [])
+
     def test_login_completion_clears_device_login_record(self) -> None:
         # Once the account goes active the device code is spent; keeping the
         # record would replay a dead code if the session later expires back to
@@ -2616,6 +2718,12 @@ class AdminApiIntegrationTests(unittest.TestCase):
                         "account_id": "acct_claude",
                         "email": "claude@example.com",
                     },
+                    {
+                        "provider": "bedrock",
+                        "agent_runtimes": ["pi", "hermes"],
+                        "status": "loading",
+                        "bedrock_usage": EMPTY_BEDROCK_USAGE,
+                    },
                 ]
             },
         )
@@ -2644,7 +2752,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
             body["accounts"][1], {"agent_runtime": "claude_code", "provider": "claude", "status": "awaiting_login"}
         )
 
-    def test_agent_accounts_return_both_runtime_statuses(self) -> None:
+    def test_agent_accounts_return_provider_records(self) -> None:
         state = load_state()
         state["agent_runtime_statuses"]["codex"]["status"] = "active"
         state["agent_runtime_statuses"]["claude_code"]["status"] = "awaiting_login"
@@ -2695,6 +2803,12 @@ class AdminApiIntegrationTests(unittest.TestCase):
                         },
                     },
                     {"agent_runtime": "claude_code", "provider": "claude", "status": "awaiting_login"},
+                    {
+                        "provider": "bedrock",
+                        "agent_runtimes": ["pi", "hermes"],
+                        "status": "loading",
+                        "bedrock_usage": EMPTY_BEDROCK_USAGE,
+                    },
                 ]
             },
         )
@@ -2797,6 +2911,12 @@ class AdminApiIntegrationTests(unittest.TestCase):
                             "last_checked_at": "2026-06-29T23:10:00Z",
                         },
                     },
+                    {
+                        "provider": "bedrock",
+                        "agent_runtimes": ["pi", "hermes"],
+                        "status": "loading",
+                        "bedrock_usage": EMPTY_BEDROCK_USAGE,
+                    },
                 ]
             },
         )
@@ -2835,9 +2955,38 @@ class AdminApiIntegrationTests(unittest.TestCase):
             )
 
         refresh.assert_called_once_with("claude_code", force_provider_probe=True)
-        self.assertEqual([account["agent_runtime"] for account in body["accounts"]], ["codex", "claude_code"])
+        self.assertEqual([account["provider"] for account in body["accounts"]], ["openai", "claude", "bedrock"])
+
+    def test_agent_runtime_refresh_endpoint_forces_requested_bedrock_runtime(self) -> None:
+        for runtime_type in ("pi", "hermes"):
+            save_policy(
+                {
+                    "network_integrations": {
+                        "bedrock": {"enabled": True}
+                    }
+                },
+                "2026-06-08T00:00:00Z",
+            )
+            with (
+                self.subTest(runtime_type=runtime_type),
+                patch("host.runtime.admin_api.service.orchestrator.refresh_runtime_status") as refresh,
+            ):
+                self.request(
+                    "POST",
+                    "/v1/agent-runtime/refresh",
+                    {"agent_runtime": runtime_type},
+                )
+                refresh.assert_called_once_with(runtime_type, force_provider_probe=True)
 
     def test_agent_runtime_refresh_endpoint_refreshes_all_runtimes_by_default(self) -> None:
+        save_policy(
+            {
+                "network_integrations": {
+                    "bedrock": {"enabled": True},
+                }
+            },
+            "2026-06-08T00:00:00Z",
+        )
         with patch("host.runtime.admin_api.service.orchestrator.refresh_runtime_status") as refresh:
             self.request("POST", "/v1/agent-runtime/refresh", {})
 
@@ -2846,6 +2995,24 @@ class AdminApiIntegrationTests(unittest.TestCase):
             [
                 ("codex", {"force_provider_probe": True}),
                 ("claude_code", {"force_provider_probe": True}),
+                ("pi", {"force_provider_probe": True}),
+            ],
+        )
+
+    def test_agent_runtime_refresh_endpoint_does_not_force_disabled_bedrock(self) -> None:
+        save_policy(
+            {"network_integrations": {}},
+            "2026-06-08T00:00:00Z",
+        )
+        with patch("host.runtime.admin_api.service.orchestrator.refresh_runtime_status") as refresh:
+            self.request("POST", "/v1/agent-runtime/refresh", {})
+
+        self.assertEqual(
+            [(entry.args[0], entry.kwargs) for entry in refresh.call_args_list],
+            [
+                ("codex", {"force_provider_probe": True}),
+                ("claude_code", {"force_provider_probe": True}),
+                ("pi", {"force_provider_probe": False}),
             ],
         )
 
@@ -3032,6 +3199,208 @@ class AdminApiIntegrationTests(unittest.TestCase):
         refresh_status.assert_called_once_with("claude_code")
         self.assertIsNone(load_state()["claude_oauth"])
 
+    def test_connect_bedrock_credentials_validates_and_refreshes(self) -> None:
+        save_policy(
+            {"network_integrations": {"bedrock": {"enabled": True}}},
+            "2026-06-08T00:00:00Z",
+        )
+        with (
+            patch(
+                "host.runtime.admin_api.orchestrator.replace_and_validate_bedrock_credentials",
+                return_value=("active", None),
+            ) as replace,
+            patch(
+                "host.runtime.admin_api.orchestrator.refresh_runtime_status",
+                return_value="active",
+            ) as refresh_status,
+        ):
+            response = admin_api.connect_bedrock_credentials(
+                {"access_key_id": "AKIAOPERATORKEY00001", "secret_access_key": "S" * 40, "region": "us-west-2"}
+            )
+
+        self.assertEqual(response, {"status": "accepted"})
+        self.assertEqual(
+            refresh_status.call_args_list,
+            [call("pi")],
+        )
+        replace.assert_called_once_with("AKIAOPERATORKEY00001", "S" * 40, "us-west-2")
+
+    def test_bedrock_account_metadata_has_one_provider_row(self) -> None:
+        account = {
+            "account_id": "123456789012",
+            "arn": "arn:aws:iam::123456789012:user/trustyclaw-bedrock",
+            "access_key_id": "AKIAOPERATORKEY00001",
+        }
+        state.save_bedrock_credential("AKIAOPERATORKEY00001", "S" * 40, "us-east-1")
+        state.save_bedrock_account(account)
+        statuses = {"pi": {"status": "active"}, "hermes": {"status": "active"}}
+        bedrock = admin_api._current_bedrock_account(statuses)
+        self.assertEqual(bedrock["provider"], "bedrock")
+        self.assertEqual(bedrock["agent_runtimes"], ["pi", "hermes"])
+        for key in ("account_id", "arn"):
+            self.assertEqual(bedrock[key], account[key])
+        self.assertEqual(
+            admin_api.current_bedrock_credentials(),
+            {
+                "connected": True,
+                "access_key_id": "AKIAOPERATORKEY00001",
+                "region": "us-east-1",
+            },
+        )
+
+    def test_bedrock_account_reports_live_per_runtime_usage(self) -> None:
+        # The proxy prices each response and stores the cost; the admin API
+        # sums the stored counters for the current month into one entry per
+        # runtime. 1M input at $0.62/M plus 100k output at $1.85/M is $0.805.
+        state.record_bedrock_usage(
+            "pi",
+            "deepseek.v3.2",
+            {
+                "input_tokens": 1_000_000,
+                "output_tokens": 100_000,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+            },
+            0.805,
+        )
+        state.record_bedrock_usage("pi", "deepseek.v3.2", None, 0.0)
+        # An unknown model was normalized to the shared 'other' bucket, priced
+        # at 0 because it is outside the catalog.
+        state.record_bedrock_usage(
+            "hermes",
+            "other",
+            {"input_tokens": 10, "output_tokens": 5, "cache_read_tokens": 0, "cache_write_tokens": 0},
+            0.0,
+        )
+        statuses = {"pi": {"status": "awaiting_login"}, "hermes": {"status": "awaiting_login"}}
+        usage = admin_api._current_bedrock_account(statuses)["bedrock_usage"]
+        self.assertEqual(sorted(usage), ["hermes", "pi"])
+        pi = usage["pi"]
+        self.assertEqual(pi["requests"], 2)
+        self.assertEqual(pi["metered_requests"], 1)
+        self.assertNotIn("unpriced_requests", pi)
+        self.assertEqual(pi["input_tokens"], 1_000_000)
+        self.assertEqual(pi["output_tokens"], 100_000)
+        self.assertAlmostEqual(pi["month_to_date"], 0.805)
+        self.assertEqual(pi["currency"], "USD")
+        hermes = usage["hermes"]
+        # An unknown model keeps its tokens and requests visible but, being
+        # unpriced, adds nothing to the cost.
+        self.assertEqual(hermes["requests"], 1)
+        self.assertEqual(hermes["input_tokens"], 10)
+        self.assertEqual(hermes["month_to_date"], 0.0)
+
+    def test_connect_bedrock_credentials_validates_while_disabled(self) -> None:
+        save_policy(
+            {"network_integrations": {"openai": {"enabled": True}}},
+            "2026-06-08T00:00:00Z",
+        )
+        with patch(
+            "host.runtime.admin_api.orchestrator.replace_and_validate_bedrock_credentials",
+            return_value=("active", None),
+        ) as replace:
+            response = admin_api.connect_bedrock_credentials(
+                {"access_key_id": "AKIAOPERATORKEY00001", "secret_access_key": "S" * 40, "region": "us-east-2"}
+            )
+        self.assertEqual(response, {"status": "accepted"})
+        replace.assert_called_once_with("AKIAOPERATORKEY00001", "S" * 40, "us-east-2")
+
+    def test_connect_bedrock_credentials_surfaces_rejected_candidate(self) -> None:
+        save_policy(
+            {"network_integrations": {"openai": {"enabled": True}}},
+            "2026-06-08T00:00:00Z",
+        )
+        with patch(
+            "host.runtime.admin_api.orchestrator.replace_and_validate_bedrock_credentials",
+            return_value=("error", "AWS rejected the connected credential"),
+        ):
+            with self.assertRaises(admin_api.ApiError) as caught:
+                admin_api.connect_bedrock_credentials(
+                    {"access_key_id": "AKIAOPERATORKEY00001", "secret_access_key": "T" * 40, "region": "us-east-1"}
+                )
+
+        self.assertEqual(caught.exception.status, HTTPStatus.BAD_REQUEST)
+        self.assertIn("AWS rejected", caught.exception.message)
+        self.assertEqual(admin_api.current_bedrock_credentials(), {"connected": False})
+
+    def test_connect_bedrock_credentials_rejects_missing_fields(self) -> None:
+        for body in (
+            None,
+            [],
+            {},
+            {"access_key_id": "AKIAOPERATORKEY00001"},
+            {"secret_access_key": "x"},
+            {"access_key_id": "AKIAOPERATORKEY00001", "secret_access_key": "S" * 40},
+        ):
+            with self.subTest(body=body), self.assertRaises(admin_api.ApiError) as caught:
+                admin_api.connect_bedrock_credentials(body)
+            self.assertEqual(caught.exception.status, HTTPStatus.BAD_REQUEST)
+
+    def test_connect_bedrock_credentials_rejects_runtime_and_unknown_fields(self) -> None:
+        for field in ("agent_runtime", "runtime", "extra"):
+            body = {
+                "access_key_id": "AKIAOPERATORKEY00001",
+                "secret_access_key": "S" * 40,
+                "region": "us-east-1",
+                field: "pi",
+            }
+            with self.subTest(field=field), self.assertRaises(admin_api.ApiError) as caught:
+                admin_api.connect_bedrock_credentials(body)
+            self.assertEqual(caught.exception.status, HTTPStatus.BAD_REQUEST)
+            self.assertIn("unexpected request fields", caught.exception.message)
+
+    def test_connect_bedrock_credentials_rejects_non_long_term_key_ids(self) -> None:
+        save_policy(
+            {"network_integrations": {"bedrock": {"enabled": True}}},
+            "2026-06-08T00:00:00Z",
+        )
+        for access_key_id in (
+            "ASIASESSIONKEY000001",  # temporary session credential
+            "bad",
+            "AKIAOPERATORKEY0001",  # 19 characters
+            "AKIAOPERATORKEY000001",  # 21 characters
+            "AKIAoperatorkey00001",  # lowercase
+        ):
+            with self.subTest(access_key_id=access_key_id):
+                with self.assertRaises(admin_api.ApiError) as caught:
+                    admin_api.connect_bedrock_credentials(
+                        {
+                            "access_key_id": access_key_id,
+                            "secret_access_key": "S" * 40,
+                            "region": "us-east-1",
+                        }
+                    )
+                self.assertEqual(caught.exception.status, HTTPStatus.BAD_REQUEST)
+                self.assertIn("long-term IAM access key id", caught.exception.message)
+        self.assertIsNone(state.read_bedrock_access_key_id())
+
+    def test_disconnect_bedrock_credentials_clears_shared_credential(self) -> None:
+        save_policy(
+            {"network_integrations": {
+                "bedrock": {"enabled": True},
+            }},
+            "2026-06-08T00:00:00Z",
+        )
+        state.save_bedrock_credential("AKIAOPERATORKEY00001", "S" * 40, "us-east-1")
+        state.save_bedrock_account({"account_id": "123456789012", "access_key_id": "AKIAOPERATORKEY00001"})
+
+        with patch(
+            "host.runtime.admin_api.orchestrator._stop_runtime_processes"
+        ) as stop_runtime_processes:
+            status, response = self.request("DELETE", "/v1/agent-runtime/bedrock-credentials")
+
+        self.assertEqual(status, HTTPStatus.OK)
+        self.assertEqual(response, {"status": "accepted"})
+        self.assertEqual(
+            [entry.args[0] for entry in stop_runtime_processes.call_args_list],
+            ["pi", "hermes"],
+        )
+
+        self.assertEqual(state.read_bedrock_account(), {})
+        self.assertIsNone(state.read_bedrock_proxy_credential())
+        self.assertIsNone(state.read_bedrock_credential_secret())
+        self.assertIsNone(state.read_bedrock_region())
+
     def test_reset_linked_account_clears_anchor_pin_and_pending_oauth(self) -> None:
         save_policy(
             {"network_integrations": {"openai": {"enabled": True}}},
@@ -3118,7 +3487,13 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(read_proxy_claude_account(), {})
 
     def test_reset_linked_account_rejects_unknown_runtime(self) -> None:
-        for body in (None, {}, {"agent_runtime": "cursor"}):
+        for body in (
+            None,
+            {},
+            {"agent_runtime": "cursor"},
+            {"agent_runtime": "pi"},
+            {"agent_runtime": "hermes"},
+        ):
             with self.assertRaises(admin_api.ApiError) as error:
                 admin_api.reset_linked_account(body)
             self.assertEqual(error.exception.status, HTTPStatus.BAD_REQUEST)
@@ -3658,7 +4033,13 @@ class ToolRoutesTests(unittest.TestCase):
         discovery = self.tool_entry(body, "instagram_discovery")
         self.assertIn("at most 25 unique items", " ".join(discovery["protections"]))
         self.assertIn("maps vendor responses to fixed fields", " ".join(discovery["technical_details"]))
-        for tool_id in ("ibkr", "instagram", "linkedin", "runway", "twitter"):
+        # Tools whose parameters are guarded carry the shared parameter-guard
+        # description; tools without guarded request fields have none.
+        for tool_id in ("runway", "twitter"):
+            self.assertIn(
+                "parameter guard", " ".join(self.tool_entry(body, tool_id)["technical_details"]).lower()
+            )
+        for tool_id in ("ibkr", "instagram", "linkedin"):
             self.assertEqual(self.tool_entry(body, tool_id)["technical_details"], [])
 
     def test_config_and_enable_flow(self) -> None:

@@ -20,15 +20,30 @@ class SessionOptionsTests(unittest.TestCase):
                     "fable": ("high", "max", "ultracode"),
                     "sonnet": ("high", "max", "ultracode"),
                 },
+                "pi": {
+                    "deepseek.v3.2": ("medium", "high", "max"),
+                    "qwen.qwen3-coder-next": ("medium", "high", "max"),
+                    "moonshotai.kimi-k2.5": ("medium", "high", "max"),
+                },
+                "hermes": {
+                    "deepseek.v3.2": ("high",),
+                    "qwen.qwen3-coder-next": ("high",),
+                    "moonshotai.kimi-k2.5": ("high",),
+                },
             },
         )
 
     def test_rejects_cross_runtime_and_luna_ultra_combinations(self) -> None:
         self.assertIsNone(session_config_error("codex", "gpt-5.6-sol", "ultra"))
         self.assertIsNone(session_config_error("claude_code", "fable", "ultracode"))
+        self.assertIsNone(session_config_error("pi", "deepseek.v3.2", "max"))
         self.assertIsNotNone(session_config_error("codex", "gpt-5.6-luna", "ultra"))
         self.assertIsNotNone(session_config_error("codex", "opus", "high"))
         self.assertIsNotNone(session_config_error("claude_code", "fable", "ultra"))
+        self.assertIsNotNone(session_config_error("pi", "opus", "high"))
+        self.assertIsNotNone(session_config_error("pi", "deepseek.v3.2", "ultracode"))
+        self.assertIsNone(session_config_error("hermes", "deepseek.v3.2", "high"))
+        self.assertIsNotNone(session_config_error("hermes", "deepseek.v3.2", "max"))
 
     def test_public_options_are_json_facing_copies(self) -> None:
         options = public_session_options()

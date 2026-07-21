@@ -23,6 +23,7 @@ import time
 import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import cast
 
 from host.tools.json_types import JSONObject, JSONValue
 from host.tools.manifest import ActionSpec, ConfigRequirement, DataSummary, DataSummaryCard, DataSummaryLink, DataSummaryPoint, SetupStep, ToolManifest
@@ -92,7 +93,7 @@ IBKR_OUTPUT_SCHEMA: JSONObject = {
 _ACCOUNT_INPUT: JSONObject = {
     "account_id": {
         "type": "string",
-        "description": "IBKR account id (e.g. U1234567). Defaults to the first account of the login.",
+        "description": "IBKR account id (e.g. U1234567); any account the connected username can access. Call get_accounts to list them.",
     }
 }
 
@@ -107,6 +108,12 @@ MANIFEST = ToolManifest(
     description="Connect your Interactive Brokers account and let your agent read live positions, balances, margin, and executed trades. Trading is not available.",
     connection="enable_only",
     actions=(
+        ActionSpec(id="get_accounts",
+            description="List the IBKR accounts available to the connected username, with each account's id, title, alias, currency, and type. Call this first; the other actions require one of these account ids.",
+            data_policy=IBKR_READ_POLICY,
+            input_schema=_schema({}),
+            output_schema=IBKR_OUTPUT_SCHEMA,
+        ),
         ActionSpec(id="get_positions",
             description="Read up to 100 current open positions for one IBKR account, including quantity, mark/value, cost, and unrealized/realized PnL. This is a live portfolio snapshot, not executions or an order book.",
             data_policy=IBKR_READ_POLICY,
@@ -140,8 +147,9 @@ MANIFEST = ToolManifest(
         ConfigRequirement(key="IBKR_DH_PRIME", description="Hex prime from your dhparam.pem (openssl dhparam -in dhparam.pem -text; strip colons/whitespace)."),
     ),
     protections=(
-        "The package exposes only three read actions. It contains no order, transfer, account-change, or trading endpoint and signs requests only to api.ibkr.com.",
-        "TrustyClaw uses the credentials only for these reads, but IBKR does not make the OAuth credential read-only. Anyone with the six values could use the permissions of the authorized IBKR username.",
+        "The six configured IBKR credential values stay in write-only host config and are never returned to or read by the agent.",
+        "The package exposes only four read actions. It contains no order, transfer, account-change, or trading endpoint and signs requests only to api.ibkr.com.",
+        "TrustyClaw uses the credentials only for these reads, but IBKR does not make the OAuth credential read-only. Anyone with the six values could use the permissions of the authorized IBKR username, so the setup guide recommends registering under a reduced-permission username with no trading access.",
     ),
     setup_steps=(
         SetupStep(
@@ -157,8 +165,14 @@ MANIFEST = ToolManifest(
             link_label="Review IBKR OAuth 1.0a key handling",
         ),
         SetupStep(
+            title="Recommended: prepare a reduced-permission username",
+            description="The OAuth credential inherits the full IBKR permissions of whichever username registers it; the self-service flow has no read-only scope, and this tool's read-only behavior is enforced only on this host. For enforcement by IBKR itself, register under a dedicated username with no trading access: in Client Portal open Settings > Users & Access Rights and add a user, or ask IBKR Account Configuration for one, then complete every following step signed in as that username. Which accounts the user can access and which functions it may perform are separate choices there: grant the new username access to every account the agent should read, with reporting access and no trading, funding, or account-settings rights. The tool sees exactly the accounts granted to the username; get_accounts lists them, and the portfolio actions read one named account per call via account_id. Trade-offs: IBKR API support may need to enable the OAuth self-service flow for the new username, the completed-trades action can stop working because IBKR serves it through a brokerage session, and market data subscriptions ride on usernames, so assign them to the new one if you want live mark prices. Skipping this step leaves a credential that could trade if it ever left this host.",
+            link_url="https://www.interactivebrokers.com/campus/ibkr-api-page/market-data-subscriptions/#market-data-users",
+            link_label="Review IBKR reduced-permission users",
+        ),
+        SetupStep(
             title="Register first-party OAuth through IBKR's dedicated login",
-            description="IBKR does not place this flow in the normal Client Portal menus. Open the dedicated OAuth self-service login and sign in with the exact live or paper username the agent will use. If it opens ordinary Client Portal instead of OAuth Configuration, stop and contact IBKR API support because that username does not currently have the self-service flow. Registration and authorization finish entirely on IBKR's side, with no TrustyClaw callback.",
+            description="IBKR does not place this flow in the normal Client Portal menus. Open the dedicated OAuth self-service login and sign in with the exact live or paper username the agent will use, ideally the reduced-permission username from the previous step. If it opens ordinary Client Portal instead of OAuth Configuration, stop and contact IBKR API support because that username does not currently have the self-service flow. Registration and authorization finish entirely on IBKR's side, with no TrustyClaw callback.",
             link_url="https://ndcdyn.interactivebrokers.com/sso/Login?RL=1&action=OAUTH",
             link_label="Open IBKR OAuth self-service",
         ),
@@ -169,12 +183,6 @@ MANIFEST = ToolManifest(
         SetupStep(
             title="Enable IBKR OAuth access",
             description="On the same OAuth Configuration page, enable API access for the registered consumer and verify the consumer key is enabled for the expected live or paper username. A newly registered key can remain inactive until IBKR's weekend server restart, so an otherwise correct first request may return 401 for up to one week.",
-        ),
-        SetupStep(
-            title="Understand the IBKR permission boundary",
-            description="The OAuth credential inherits the authorized username's IBKR permissions; the self-service flow does not give it a read-only scope. TrustyClaw exposes only fixed reads, but the same credential used by different software could trade when that username has trading permissions. For IBKR-side enforcement, ask IBKR Account Configuration for a separate reduced-permission username with no direct trading access. That stronger setup can prevent the completed-trades action from working because IBKR serves it through a brokerage session.",
-            link_url="https://www.interactivebrokers.com/campus/ibkr-api-page/market-data-subscriptions/#market-data-users",
-            link_label="Review IBKR reduced-permission users",
         ),
         SetupStep(
             title="Extract the Diffie-Hellman prime",
@@ -402,25 +410,62 @@ def _account_id_input(tool_input: JSONObject) -> str | None:
     return account_id.strip()
 
 
-def _resolve_account(material: _OAuthMaterial, live_session_token: str, requested: str | None) -> str:
+ACCOUNT_DETAIL_FIELDS = (
+    ("alias", "accountAlias"),
+    ("title", "accountTitle"),
+    ("display_name", "displayName"),
+    ("currency", "currency"),
+    ("type", "type"),
+)
+
+
+def _portfolio_accounts(material: _OAuthMaterial, live_session_token: str) -> list[JSONObject]:
+    """The accounts this login can access, with charset-validated ids (a hostile
+    provider entry must never land in a request path) and deduplicated."""
     response = _signed_request(material, live_session_token, "GET", "/portfolio/accounts", what="accounts")
     items = response.get("items")
-    account_ids: list[str] = []
+    accounts: list[JSONObject] = []
+    seen: set[str] = set()
     for entry in (items if isinstance(items, list) else [])[:MAX_ACCOUNTS]:
         if not isinstance(entry, dict):
             continue
         account_id = str(entry.get("accountId") or entry.get("id") or "")
-        if ACCOUNT_ID_RE.fullmatch(account_id) and account_id not in account_ids:
-            account_ids.append(account_id)
-    if not account_ids:
+        if not ACCOUNT_ID_RE.fullmatch(account_id) or account_id in seen:
+            continue
+        seen.add(account_id)
+        account: JSONObject = {"account_id": account_id}
+        for output_key, source_key in ACCOUNT_DETAIL_FIELDS:
+            value = entry.get(source_key)
+            account[output_key] = value if isinstance(value, (str, int, float)) and not isinstance(value, bool) else ""
+        accounts.append(account)
+    if not accounts:
         raise RuntimeError("IBKR returned no accounts for this login.")
+    return accounts
+
+
+def _resolve_account(material: _OAuthMaterial, live_session_token: str, requested: str | None) -> str:
+    # No default account: every read names its account explicitly, so a
+    # multi-account login can never silently read whichever account IBKR
+    # happens to list first. An omitted or unknown id fails with the full list.
+    account_ids = [str(account["account_id"]) for account in _portfolio_accounts(material, live_session_token)]
     if requested is None:
-        return account_ids[0]
+        raise ToolInputValidationError(
+            f"IBKR tool_input.account_id is required (accounts for this login: {', '.join(account_ids)}; see get_accounts)."
+        )
     if requested not in account_ids:
         raise ToolInputValidationError(
             f"IBKR account {requested} was not found for this login (accounts: {', '.join(account_ids)})."
         )
     return requested
+
+
+def _accounts_result(material: _OAuthMaterial, live_session_token: str) -> JSONObject:
+    accounts = _portfolio_accounts(material, live_session_token)
+    return {
+        "status": "success_executed",
+        "message": f"IBKR returned {len(accounts)} account(s) for this login.",
+        "accounts": cast(list[JSONValue], accounts),
+    }
 
 
 POSITION_FIELDS = (
@@ -601,14 +646,21 @@ class IBKRTool:
         return None
 
     def execute(self, action: str, tool_input: JSONObject, api: HostAPI) -> ActionResult:
-        if action not in {"get_positions", "get_account_summary", "get_trades"}:
+        if action not in {"get_accounts", "get_positions", "get_account_summary", "get_trades"}:
             return ActionFailed("Unsupported IBKR action.")
-        allowed = {"account_id", "days"} if action == "get_trades" else {"account_id"}
+        allowed_by_action = {
+            "get_accounts": frozenset[str](),
+            "get_trades": frozenset({"account_id", "days"}),
+        }
+        allowed = allowed_by_action.get(action, frozenset({"account_id"}))
         if set(tool_input) - allowed:
-            return ActionFailed(f"IBKR {action} tool input only supports {', '.join(sorted(allowed))}.")
+            supported = ", ".join(sorted(allowed)) if allowed else "no fields"
+            return ActionFailed(f"IBKR {action} tool input only supports {supported}.")
         try:
             material = _oauth_material(api)
             live_session_token = _live_session_token(material)
+            if action == "get_accounts":
+                return ActionExecuted(_accounts_result(material, live_session_token))
             account_id = _resolve_account(material, live_session_token, _account_id_input(tool_input))
             if action == "get_positions":
                 return ActionExecuted(_positions_result(material, live_session_token, account_id))

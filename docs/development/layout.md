@@ -61,7 +61,7 @@ Important source areas and the context that runs them:
 | `host/runtime/deploy/app_migrate.py` | App role for SQL; admin role for records | Applies replay-safe app SQL under the app schema and records versions in host-owned state. |
 | `host/runtime/admin_api/app_api_proxy.py` | `trustyclaw-admin` | Proxies authenticated browser app requests to uid-firewalled loopback app ports without forwarding the raw admin bearer. |
 | `host/runtime/admin_api/app_backend_api.py` | `trustyclaw-admin` | Serves the peer-authenticated app-backend Unix socket and scopes allowlisted task/thread routes to the calling app. |
-| `host/runtime/admin_api/orchestrator.py` | `trustyclaw-admin` | Runs the six task workers, runtime status/account pollers, credential convergence, and task lifecycle coordination. |
+| `host/runtime/admin_api/orchestrator.py` | `trustyclaw-admin` | Runs the twelve task workers, runtime status/account pollers, credential convergence, and task lifecycle coordination. |
 | `host/runtime/admin_api/codex_app_server.py` | Admin adapter controlling an agent child | Implements the Codex stdio JSON-RPC protocol and runtime lifecycle. |
 | `host/runtime/admin_api/claude_code.py` | Admin adapter controlling an agent child | Implements Claude Code stream-json turns, steering, login, and status probes. |
 | `host/runtime/network_proxy/service.py` | `trustyclaw-proxy` | Serves `127.0.0.1:7445`, terminates/inspects proxied traffic, applies policy before upstream connections, and records network events. |
@@ -77,4 +77,6 @@ Important source areas and the context that runs them:
 | `host/runtime/agent_shim/mcp_shim.py` | `trustyclaw-agent`, spawned by each harness | Aggregates the peer-authenticated tools, network-introspection, and app sockets over one stdio MCP server. |
 | `host/runtime/admin_api/github_*.py` | `trustyclaw-admin`, with fixed root helpers for egress | Converges the GitHub credential, derives repository warnings, queues `.github` pushes, and resolves operator decisions. |
 
-Develop against Python 3.11, the Ubuntu 22.04 host and CI runtime version.
+Develop and run unit CI against Python 3.11. Production uses Ubuntu 22.04's
+system Python 3.10; the runtime stays standard-library-only and fresh AWS smoke
+tests exercise that exact host environment.

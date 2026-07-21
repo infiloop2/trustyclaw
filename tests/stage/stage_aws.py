@@ -2,10 +2,11 @@
 """Persistent staging test for an already deployed TrustyClaw host.
 
 Unlike the smoke test, this does not deploy or tear down the host. It assumes a
-stage host was upgraded/recovered with stable admin and agent data volumes, and
-that Codex and Claude Code OAuth have already been completed once. If either
-runtime is not active, this test fails with a manual-login message instead of
-starting an interactive OAuth flow.
+stage host was upgraded/recovered with stable admin and agent data volumes.
+The ``all`` suite checks every integration's credentials before testing: an
+unconfigured or expired integration is reported and skipped without hiding
+results for configured integrations. Focused suites remain strict and fail
+when their selected integration is unavailable.
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import shlex
 import sys
 import tempfile
 import time
@@ -23,77 +23,25 @@ from urllib.parse import quote
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from host.constants import PROXY_PORT
-from host.runtime.tools.tools_host import BUNDLED_TOOLS
-from tests.smoke.smoke_aws import SMOKE_RUNTIMES, AwsSmoke
-
-
-STAGE_AGENT_NAME = "trustyclaw-stage"
-
-# Every bundled tool is an individually triggerable stage suite. A selected
-# tool fails preflight when its config/connection is missing; "all" requires
-# every tool so it is the comprehensive persistent-host check.
-TOOL_SUITES = tuple(sorted(BUNDLED_TOOLS))
-STAGE_SUITES = ("all", *TOOL_SUITES, "claude", "codex", "github")
-_RUNTIME_LABELS = {"codex": "Codex", "claude_code": "Claude Code"}
-
-STAGE_TOOL_CALLS: dict[str, tuple[str, dict]] = {
-    "brave_search": ("search_web", {"query": "TrustyClaw agent host"}),
-    "ibkr": ("get_positions", {}),
-    "instagram": ("get_profile", {}),
-    "instagram_discovery": ("get_trending_reels", {"limit": "1"}),
-    "linkedin": ("get_profile", {}),
-    "linkedin_discovery": ("search_posts", {"query": "TrustyClaw", "limit": "1"}),
-    "polymarket": ("list_markets", {"limit": "1"}),
-    # Use the connected user's OAuth token, not the separate app-only trends
-    # bearer, so this live probe proves the persisted connection itself works.
-    "twitter": ("search_tweets", {"query": "TrustyClaw", "max_results": "10"}),
-}
-
-
-def suite_tools(suite: str) -> tuple[str, ...]:
-    """Bundled tools required by one stage suite."""
-    if suite == "all":
-        return TOOL_SUITES
-    return (suite,) if suite in TOOL_SUITES else ()
-
-# Environment variables (fed from CI secrets) that supply a GitHub App
-# credential and sandbox write repo. When all are set the stage run installs
-# them on the host itself, so GitHub needs no manual operator setup. When none
-# are set the run falls back to operator-configured credentials.
-STAGE_GITHUB_APP_ENV = {
-    "write_repo": "STAGE_GITHUB_WRITE_REPO",
-    "app_id": "STAGE_GITHUB_APP_ID",
-    "installation_id": "STAGE_GITHUB_APP_INSTALLATION_ID",
-    "private_key": "STAGE_GITHUB_APP_PRIVATE_KEY",
-}
-def _github_app_config_from_env() -> dict[str, str] | None:
-    """Read the GitHub App credential and sandbox write repo from the stage
-    secrets in the environment. Returns None when none are set (operator-config
-    mode), the parsed config when all are set, and exits when only some are: a
-    partially configured secret set is an operator mistake worth failing on."""
-    values = {key: (os.environ.get(env) or "").strip() for key, env in STAGE_GITHUB_APP_ENV.items()}
-    if not any(values.values()):
-        return None
-    missing = [STAGE_GITHUB_APP_ENV[key] for key, value in values.items() if not value]
-    if missing:
-        raise SystemExit(
-            "incomplete GitHub App stage configuration: set all of "
-            + ", ".join(STAGE_GITHUB_APP_ENV.values())
-            + " or none; missing "
-            + ", ".join(missing)
-        )
-    repo = values["write_repo"]
-    owner, _, name = repo.partition("/")
-    if not owner or not name or "/" in name:
-        raise SystemExit(f"{STAGE_GITHUB_APP_ENV['write_repo']} must be 'owner/repo', got {repo!r}")
-    return {
-        "owner": owner,
-        "repo": name,
-        "app_id": values["app_id"],
-        "installation_id": values["installation_id"],
-        "private_key_pem": values["private_key"],
-    }
+from tests.smoke.smoke_aws import SMOKE_RUNTIMES
+from tests.stage.stage_bedrock_checks import StageBedrockChecks
+from tests.stage.stage_integration_checks import StageIntegrationChecks
+from tests.stage.stage_tool_checks import StageToolChecks
+from tests.stage.stage_support import (
+    CHEAP_EFFORT,
+    CHEAP_MODELS,
+    RUNTIME_LABELS as _RUNTIME_LABELS,
+    STAGE_AGENT_NAME,
+    STAGE_SUITES,
+    TOOL_SUITES,
+    StageReport,
+    bedrock_credential_from_env as _bedrock_credential_from_env,
+    github_app_config_from_env as _github_app_config_from_env,
+    integration_label as _integration_label,
+    record_check as _record_check,
+    suite_tools,
+    write_action_summary as _write_action_summary,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -110,73 +58,207 @@ def main(argv: list[str] | None = None) -> int:
         help="Environment variable containing the stage admin password when the result file omits it.",
     )
     parser.add_argument(
+        "--summary-file",
+        type=Path,
+        help="Write the integration result table here for the workflow's final Actions summary step.",
+    )
+    parser.add_argument(
         "--suite",
         choices=STAGE_SUITES,
         default="all",
         help=(
-            "Which test suite to run. 'claude', 'codex', or 'github' run that provider's "
+            "Which test suite to run. 'claude', 'codex', 'pi', 'hermes', or 'github' run that integration's "
             "checks only (plus the shared preamble); each bundled tool id runs that tool's "
-            "live check; 'all' (default) also requires every tool and runs the cross-runtime "
-            "checks. Every suite first verifies the operator configuration it needs is "
-            "present, failing fast if not."
+            "live check; 'all' (default) checks credentials for every integration first, "
+            "skips unavailable integrations, and runs every available integration "
+            "independently. A focused suite still fails when its required credential is absent."
         ),
     )
     args = parser.parse_args(argv)
 
     ssh_key = Path(args.ssh_key) if args.ssh_key is not None else _required_env_path(args.ssh_key_env)
-    stage = StageAwsSmoke(Path(args.result_file), ssh_key, args.admin_password_env)
     suite = args.suite
-    run_codex = suite in ("codex", "all")
-    run_claude = suite in ("claude", "all")
-    run_github = suite in ("github", "all")
+    report = StageReport(suite)
+    stage = StageAwsSmoke(Path(args.result_file), ssh_key, args.admin_password_env)
     selected_tools = suite_tools(suite)
-    run_cross = suite == "all"
+    run_network_baseline = 0
     try:
         stage.open_tunnel()
+        # One optional credential configures the shared Bedrock provider. The
+        # POST validates it synchronously before the provider is enabled.
+        stage.autoconfigure_bedrock(suite)
         # Install the GitHub App credential and sandbox write repo from CI
         # secrets when present, so the GitHub checks need no manual operator
         # setup. A no-op when the secrets are absent or GitHub is out of scope.
         stage.autoconfigure_github(suite)
         stage.autoconfigure_tools(selected_tools)
-        # Fail fast, before any long-running check, if the configuration this
-        # suite depends on is still not present on the host.
-        stage.verify_operator_configuration(suite)
-        stage.recover_baseline(suite)
-        stage.check_health()
-        stage.check_ui_page()
-        stage.check_admin_auth()
-        stage.check_agent_file_explorer()
-        if run_cross:
-            stage.check_both_runtimes_active()
-        if selected_tools:
-            stage.check_tools_live(selected_tools)
-        if run_codex:
-            stage.agent_runtime = "codex"
-            stage.check_task()
-        if run_claude:
-            stage.agent_runtime = "claude_code"
-            stage.check_claude_auth_and_task()
-        if run_cross:
-            stage.check_agent_parallelism()
-        for runtime in stage.suite_runtimes(suite):
-            stage.agent_runtime = runtime
-            stage.check_agent_steering()
-            stage.check_agent_kill_and_thread_survival()
-        if run_cross:
-            stage.check_agent_thread_recall()
-            stage.check_runtime_deactivation_stops_running_tasks()
-            stage.check_reboot_recovery()
+        availability = stage.integration_availability(suite)
+        unavailable = {name: reason for name, reason in availability.items() if reason is not None}
+        if suite != "all" and unavailable:
+            reason = next(iter(unavailable.values()))
+            assert reason is not None
+            report.add(_integration_label(suite), "unavailable", "failed", reason)
+            raise AssertionError(reason)
+        for integration, reason in unavailable.items():
+            assert reason is not None
+            report.add(_integration_label(integration), "unavailable", "skipped", reason)
+
+        ready_runtimes = tuple(
+            runtime
+            for integration, runtime in (
+                ("codex", "codex"),
+                ("claude", "claude_code"),
+                ("pi", "pi"),
+                ("hermes", "hermes"),
+            )
+            if availability.get(integration) is None and integration in availability
+        )
+        stage.recover_baseline(ready_runtimes)
+        run_network_baseline = max(
+            (event["seq"] for event in stage._network_events()),
+            default=0,
+        )
+
+        try:
+            stage.check_health()
+            stage.check_ui_page()
+            stage.check_admin_auth()
+            stage.check_agent_file_explorer()
             stage.check_network_event_prune_race()
-        if run_github:
-            stage.check_github_write_e2e()
-        print(f"\n{stage.passed}/{stage.total} checks passed (suite: {suite})")
-        return 0 if stage.passed == stage.total else 1
+        except Exception as exc:
+            report.add("Core host", "n/a", "failed", f"{type(exc).__name__}: {exc}")
+            for integration, reason in availability.items():
+                if reason is None:
+                    report.add(
+                        _integration_label(integration),
+                        "available",
+                        "skipped",
+                        "not run because the shared host checks failed",
+                    )
+            raise
+        report.add("Core host", "n/a", "passed", "health, UI, auth, files, and event pruning")
+
+        passed_runtimes: list[str] = []
+        if availability.get("codex") is None and "codex" in availability:
+            def check_codex() -> None:
+                stage.agent_runtime = "codex"
+                stage.check_task()
+                stage.check_agent_mcp_catalog("codex")
+                stage.check_agent_steering()
+                stage.check_agent_kill_and_thread_survival()
+
+            if _record_check(report, "codex", check_codex, "guards, MCP catalog, tasks, steering, and kill recovery"):
+                passed_runtimes.append("codex")
+        if availability.get("claude") is None and "claude" in availability:
+            def check_claude() -> None:
+                stage.agent_runtime = "claude_code"
+                stage.check_claude_auth_and_task()
+                stage.check_agent_mcp_catalog("claude_code")
+                stage.check_agent_steering()
+                stage.check_agent_kill_and_thread_survival()
+
+            if _record_check(report, "claude", check_claude, "guards, MCP catalog, tasks, steering, and kill recovery"):
+                passed_runtimes.append("claude_code")
+        if availability.get("pi") is None and "pi" in availability:
+            def check_pi() -> None:
+                stage.agent_runtime = "pi"
+                stage.check_bedrock_auth_and_task()
+                stage.check_agent_mcp_catalog("pi")
+                stage.check_agent_steering()
+                stage.check_agent_kill_and_thread_survival()
+
+            if _record_check(
+                report,
+                "pi",
+                check_pi,
+                "shared credential boundary, real task, MCP catalog, session resume, steering, and kill recovery",
+            ):
+                passed_runtimes.append("pi")
+        if availability.get("hermes") is None and "hermes" in availability:
+            def check_hermes() -> None:
+                stage.agent_runtime = "hermes"
+                stage.check_bedrock_auth_and_task()
+                stage.check_agent_mcp_catalog("hermes")
+                stage.check_agent_kill_and_thread_survival(expect_steering_denied=True)
+
+            if _record_check(
+                report,
+                "hermes",
+                check_hermes,
+                "shared credential boundary, real task, MCP catalog, session resume, steering denial, and kill recovery",
+            ):
+                passed_runtimes.append("hermes")
+
+        if suite == "all":
+            if {"pi", "hermes"}.issubset(passed_runtimes):
+                _record_check(
+                    report,
+                    "bedrock_shared",
+                    stage.check_bedrock_disable_stages_credential_for_reenable,
+                    "one provider toggle deactivated and restored both harnesses",
+                )
+            else:
+                report.add(
+                    "Shared AWS Bedrock",
+                    "unavailable",
+                    "skipped",
+                    "requires successful Pi and Hermes integration checks",
+                )
+
+        if suite == "all":
+            if passed_runtimes == list(SMOKE_RUNTIMES):
+                def check_cross_runtime() -> None:
+                    stage.check_both_runtimes_active()
+                    stage.check_agent_parallelism()
+                    stage.check_agent_thread_recall()
+                    stage.check_runtime_deactivation_stops_running_tasks()
+                    stage.check_reboot_recovery()
+
+                _record_check(
+                    report,
+                    "runtime_interoperability",
+                    check_cross_runtime,
+                    "mixed concurrency, recall, deactivation, and reboot recovery",
+                )
+            else:
+                report.add(
+                    "Runtime interoperability",
+                    "unavailable",
+                    "skipped",
+                    "requires successful Codex, Claude Code, Pi, and Hermes integration checks",
+                )
+
+        if availability.get("github") is None and "github" in availability:
+            _record_check(report, "github", stage.check_github_write_e2e, "authenticated read/write and fail-closed guards")
+
+        for tool_id in selected_tools:
+            if availability.get(tool_id) is not None:
+                continue
+            _record_check(
+                report,
+                tool_id,
+                lambda tool_id=tool_id: stage.check_tool_live(tool_id),
+                "deterministic live MCP coverage",
+                skip_unavailable=suite == "all",
+            )
+
+        print(f"\n{stage.passed}/{stage.total} checks passed")
+        print(f"suite: {suite}")
+        failed = report.failed() or stage.passed != stage.total
+        if failed:
+            stage.print_configuration_snapshot()
+            stage.print_network_events(
+                "Network events during failed integration run",
+                since=run_network_baseline,
+            )
+        return 1 if failed else 0
     except Exception as exc:  # noqa: BLE001 - report failure with network + config context
         stage.print_configuration_snapshot()
-        stage.print_network_events("Network events before failure", since=0)
+        stage.print_network_events("Network events before failure", since=run_network_baseline)
         print(f"\n[FAIL] {exc}", file=sys.stderr)
         return 1
     finally:
+        _write_action_summary(report, args.summary_file)
         stage.close_tunnel()
 
 
@@ -187,24 +269,27 @@ def _required_env_path(env_name: str) -> Path:
     return Path(value)
 
 
-class StageAwsSmoke(AwsSmoke):
+class StageAwsSmoke(StageToolChecks, StageBedrockChecks, StageIntegrationChecks):
     def __init__(self, result_file: Path, ssh_key: Path, admin_password_env: str | None = None) -> None:
         super().__init__()
-        self.result = json.loads(result_file.read_text())
-        if self.result.get("agent_name") != STAGE_AGENT_NAME:
-            raise AssertionError(f"stage result file is for {self.result.get('agent_name')!r}, expected {STAGE_AGENT_NAME!r}")
-        if "admin_password" not in self.result and admin_password_env is not None:
+        result = json.loads(result_file.read_text())
+        if not isinstance(result, dict):
+            raise AssertionError("stage result file must contain a JSON object")
+        if result.get("agent_name") != STAGE_AGENT_NAME:
+            raise AssertionError(f"stage result file is for {result.get('agent_name')!r}, expected {STAGE_AGENT_NAME!r}")
+        if "admin_password" not in result and admin_password_env is not None:
             admin_password = os.environ.get(admin_password_env)
             if not admin_password:
                 raise AssertionError(f"{admin_password_env} is not set or empty")
-            self.result["admin_password"] = admin_password
+            result["admin_password"] = admin_password
+        self.result = result
         self.ssh_key = str(ssh_key)
-        self.region = str(self.result["region"])
+        self.region = str(result["region"])
         self.workdir = Path(tempfile.mkdtemp(prefix="stage-aws-"))
         self.control_socket = self.workdir / "ssh-control"
         self.thread_prefix = f"stage-{int(time.time())}-"
-        # Parsed once so a malformed secret set fails before the tunnel opens.
-        self.github_app_config = _github_app_config_from_env()
+        self.github_app_config, self.github_secret_error = _github_app_config_from_env()
+        self.stage_bedrock_credential, self.bedrock_secret_error = _bedrock_credential_from_env()
 
     def enforcement_policy(self) -> dict:
         policy = super().enforcement_policy()
@@ -231,12 +316,13 @@ class StageAwsSmoke(AwsSmoke):
         model: str | None = None,
         effort: str | None = None,
     ) -> dict:
+        selected_runtime = runtime or self.agent_runtime
         return super().task_body(
             input_message,
             self.thread_prefix + thread_id,
-            runtime=runtime,
-            model=model,
-            effort=effort,
+            runtime=selected_runtime,
+            model=model or CHEAP_MODELS[selected_runtime],
+            effort=effort or CHEAP_EFFORT,
         )
 
     def follow_up_body(self, input_message: str, thread_id: str) -> dict:
@@ -264,7 +350,7 @@ class StageAwsSmoke(AwsSmoke):
     def teardown(self) -> None:
         self.close_tunnel()
 
-    def recover_baseline(self, suite: str = "all") -> None:
+    def recover_baseline(self, runtimes: tuple[str, ...] = ()) -> None:
         self._step("stage baseline recovery")
         # GitHub write repositories must survive the baseline policy reset. When
         # the run is auto-configured from CI secrets, the sandbox repo from those
@@ -303,10 +389,9 @@ class StageAwsSmoke(AwsSmoke):
             time.sleep(3)
         else:
             raise AssertionError(f"stage still has active tasks after cleanup: {self._active_tasks()}")
-        runtimes = self.suite_runtimes(suite)
         for runtime in runtimes:
             self.require_runtime_active(runtime)
-        if runtimes:
+        if any(runtime in {"codex", "claude_code"} for runtime in runtimes):
             self._assert_provider_account_anchors(live_pins=True)
         active_note = (
             ", ".join(_RUNTIME_LABELS[runtime] for runtime in runtimes) + " active"
@@ -318,390 +403,16 @@ class StageAwsSmoke(AwsSmoke):
     @staticmethod
     def suite_runtimes(suite: str) -> tuple[str, ...]:
         """Provider runtimes the selected suite exercises (and therefore needs
-        logged in). 'github' needs neither; 'all' needs both."""
+        available). 'github' and tool suites need none; 'all' needs all four."""
         if suite == "codex":
             return ("codex",)
         if suite == "claude":
             return ("claude_code",)
+        if suite in {"pi", "hermes"}:
+            return (suite,)
         if suite == "github" or suite in TOOL_SUITES:
             return ()
         return SMOKE_RUNTIMES
-
-    def autoconfigure_github(self, suite: str) -> None:
-        """When the stage secrets supply a GitHub App credential and sandbox
-        write repo, install them on the host so the GitHub checks need no manual
-        operator setup: store the App credential, and add the write repo to the
-        stored policy (exactly the state an operator would have configured). A
-        no-op when the secrets are absent or the suite excludes GitHub."""
-        if suite not in ("github", "all"):
-            return
-        config = self.github_app_config
-        if config is None:
-            return
-        repo = {"owner": config["owner"], "repo": config["repo"]}
-        self._step(f"configure GitHub App credential and write repo {config['owner']}/{config['repo']} from stage secrets")
-        self._api(
-            "PUT",
-            "/v1/network-tools/github-credential",
-            {
-                "mode": "app",
-                "app_id": config["app_id"],
-                "installation_id": config["installation_id"],
-                "private_key_pem": config["private_key_pem"],
-            },
-        )
-        # Fully manage the GitHub integration from the secret: the sandbox repo
-        # is the only configured write repo, replacing whatever was on the host,
-        # so the preflight and the write e2e can never see a stale entry. The GET
-        # response wraps the controls; the PUT takes them directly. Other
-        # integrations and domain rules are preserved.
-        controls = self._api("GET", "/v1/network/policy").get("network_controls") or {}
-        integrations = dict(controls.get("network_integrations") or {})
-        integrations["github"] = {"enabled": True, "write_repositories": [repo]}
-        controls["network_integrations"] = integrations
-        self._api("PUT", "/v1/network/policy", controls)
-        self._ok(f"GitHub App credential stored and {config['owner']}/{config['repo']} set as the sole write repo")
-
-    def verify_operator_configuration(self, suite: str) -> None:
-        """Preflight: confirm the one-time operator configuration this suite
-        needs is present before any long-running check runs. Every missing item
-        is collected and reported together, so one run surfaces the full list
-        instead of one item per rerun. Read-only: it inspects runtime status and
-        the stored policy, and changes nothing."""
-        self._step(f"operator configuration preflight (suite: {suite})")
-        failures: list[str] = []
-        for runtime in self.suite_runtimes(suite):
-            status = self._wait_for_runtime_status(
-                {"active", "awaiting_login", "deactivated", "error"}, runtime=runtime, timeout=180
-            )
-            if status == "active":
-                print(f"  [ok] {_RUNTIME_LABELS[runtime]} runtime is active", flush=True)
-            else:
-                failures.append(
-                    f"{_RUNTIME_LABELS[runtime]} runtime is {status!r}; open the stage admin UI, "
-                    "complete its OAuth login, then rerun (one-time stage-host configuration)"
-                )
-        if suite in ("github", "all"):
-            failures.extend(self._github_config_failures())
-        for tool_id in suite_tools(suite):
-            failures.extend(self._tool_credential_failures(tool_id))
-        if failures:
-            listing = "".join(f"\n  - {item}" for item in failures)
-            raise AssertionError(
-                f"stage host is missing configuration required for the {suite!r} suite:{listing}"
-            )
-        self._ok(f"required operator configuration present for the {suite!r} suite")
-
-    def _tool_credential_failures(self, suite: str) -> list[str]:
-        """Preflight one bundled tool after enable-only autoconfiguration.
-
-        OAuth tools are never configured or enabled from CI secrets. Their
-        complete ready state must already exist on the persistent stage host.
-        """
-        tool_id = suite
-        tools = {entry["tool_id"]: entry for entry in self._api("GET", "/v1/tools")["tools"]}
-        entry = tools.get(tool_id) or {}
-        manifest = BUNDLED_TOOLS[tool_id].manifest
-        missing_config = [item["key"] for item in entry.get("config", []) if not item.get("set")]
-        connected = (entry.get("connection_status") or {}).get("connected") is True
-        if entry.get("enabled") and not missing_config and (
-            manifest.connection != "oauth" or connected
-        ):
-            state = "connected" if manifest.connection == "oauth" else "configured"
-            print(f"  [ok] {tool_id} is enabled and {state}", flush=True)
-            return []
-        problems: list[str] = []
-        if missing_config:
-            if manifest.connection == "oauth":
-                problems.append(
-                    "set its OAuth app configuration once in the stage admin UI "
-                    f"(missing: {', '.join(missing_config)})"
-                )
-            else:
-                env_names = [f"TRUSTYCLAW_STAGE_{key}" for key in missing_config]
-                problems.append(f"set config via {', '.join(env_names)} or the admin UI")
-        if manifest.connection == "oauth" and not connected:
-            problems.append("connect its stage account once in the admin UI")
-        if not entry.get("enabled"):
-            problems.append("enable the tool")
-        return [f"{tool_id}: {'; '.join(problems)}"]
-
-    def _github_config_failures(self) -> list[str]:
-        """GitHub configuration checks for the preflight. Returns remediation
-        strings for whatever is missing; prints an [ok] line for each item that
-        is present. A non-empty write-repository list implies the integration is
-        enabled (policy validation rejects write repos while disabled), so the
-        two operator-provided pieces to confirm are the credential and at least
-        one sandbox write repository."""
-        failures: list[str] = []
-        stored = self._api("GET", "/v1/network/policy").get("network_controls") or {}
-        github = ((stored.get("network_integrations") or {}).get("github")) or {}
-        write_repos = [repo for repo in (github.get("write_repositories") or []) if isinstance(repo, dict)]
-        metadata = self._api("GET", "/v1/network-tools/github-credential")
-        if metadata.get("configured") is True:
-            validation = (metadata.get("validation") or {}).get("status")
-            print(
-                f"  [ok] GitHub credential configured (mode={metadata.get('mode')}, validation={validation})",
-                flush=True,
-            )
-        else:
-            failures.append(
-                "no GitHub credential is configured; set the STAGE_GITHUB_* stage secrets "
-                "to auto-configure, or store a write-capable PAT or App credential in the "
-                "admin UI (Internet Access and Tools)"
-            )
-        if write_repos:
-            listed = ", ".join(f"{repo.get('owner')}/{repo.get('repo')}" for repo in write_repos)
-            print(f"  [ok] GitHub write repositories in policy: {listed}", flush=True)
-        else:
-            failures.append(
-                "the network policy lists no GitHub write repository; set the STAGE_GITHUB_* "
-                "stage secrets to auto-configure, or add a dedicated sandbox write repo in "
-                "the admin UI (Internet Access and Tools)"
-            )
-        return failures
-
-    def print_configuration_snapshot(self) -> None:
-        """Best-effort dump of the operator-facing configuration: runtime
-        statuses, the managed-integration enable flags with the GitHub write
-        repos, and the GitHub credential state. Printed on any failure so a red
-        run shows what was (and was not) configured without another round trip."""
-        print("  configuration snapshot:", flush=True)
-        try:
-            status = self._api("GET", "/v1/agent-runtime/status")
-            for runtime in SMOKE_RUNTIMES:
-                try:
-                    record = self.runtime_status_record(status, runtime)
-                except AssertionError:
-                    print(f"    runtime {runtime}: <not present>", flush=True)
-                    continue
-                detail = record.get("error_message")
-                extra = f", error_message={detail!r}" if detail else ""
-                print(f"    runtime {runtime}: {record.get('status')}{extra}", flush=True)
-        except Exception as exc:  # noqa: BLE001 - best-effort debug output
-            print(f"    runtimes: could not read status: {type(exc).__name__}: {exc}", flush=True)
-        try:
-            policy = self._api("GET", "/v1/network/policy")
-            controls = policy.get("network_controls") or {}
-            integrations = controls.get("network_integrations") or {}
-            enabled = {
-                name: (value.get("enabled") if isinstance(value, dict) else None)
-                for name, value in integrations.items()
-            }
-            github = integrations.get("github") or {}
-            repos = [
-                f"{repo.get('owner')}/{repo.get('repo')}"
-                for repo in (github.get("write_repositories") or [])
-                if isinstance(repo, dict)
-            ]
-            print(f"    policy updated_at: {policy.get('updated_at')}", flush=True)
-            print(f"    managed integrations enabled: {enabled or '<none>'}", flush=True)
-            print(f"    github write repositories: {repos or '<none>'}", flush=True)
-        except Exception as exc:  # noqa: BLE001 - best-effort debug output
-            print(f"    network policy: could not read: {type(exc).__name__}: {exc}", flush=True)
-        try:
-            credential = self._api("GET", "/v1/network-tools/github-credential")
-            validation = (credential.get("validation") or {}).get("status")
-            print(
-                f"    github credential configured: {credential.get('configured')} "
-                f"(mode={credential.get('mode')}, validation={validation})",
-                flush=True,
-            )
-        except Exception as exc:  # noqa: BLE001 - best-effort debug output
-            print(f"    github credential: could not read: {type(exc).__name__}: {exc}", flush=True)
-
-    def require_runtime_active(self, runtime: str) -> None:
-        status = self._wait_for_runtime_status({"active", "awaiting_login", "deactivated", "error"}, runtime=runtime, timeout=180)
-        if status != "active":
-            raise AssertionError(
-                f"{runtime} runtime is {status}; manually open the stage admin UI, complete OAuth, then rerun stage"
-            )
-
-    def _shim_call(self, request: dict) -> dict:
-        """One MCP request through the tools shim, run exactly as an agent
-        harness would: as trustyclaw-agent against the tools socket."""
-        line = json.dumps(request)
-        output = self._ssh_code(
-            f"printf '%s\\n' {shlex.quote(line)} | "
-            "sudo -u trustyclaw-agent env PYTHONPATH=/opt/trustyclaw-host "
-            "python3 -m host.runtime.agent_shim.mcp_shim"
-        )
-        try:
-            return json.loads(output)
-        except json.JSONDecodeError as exc:
-            raise AssertionError(f"tools shim returned non-JSON: {output!r}") from exc
-
-    def _shim_tool_result(self, name: str, arguments: dict) -> dict:
-        response = self._shim_call(
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
-        )
-        result = response.get("result") or {}
-        text = (result.get("content") or [{}])[0].get("text", "")
-        if result.get("isError"):
-            raise AssertionError(f"{name} failed: {text}")
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise AssertionError(f"{name} returned non-JSON result text: {text!r}") from exc
-
-    def autoconfigure_tools(self, tool_ids: tuple[str, ...]) -> None:
-        """Apply enable-only provider config from Actions secrets when present.
-
-        Every config key uses the uniform ``TRUSTYCLAW_STAGE_<KEY>`` secret
-        name. OAuth tools are deliberately untouched: stage verifies the
-        enabled, configured, connected state already stored on the persistent
-        host and fails with an operator-facing setup message when it is absent.
-        """
-        for tool_id in tool_ids:
-            manifest = BUNDLED_TOOLS[tool_id].manifest
-            if manifest.connection == "oauth":
-                continue
-            for requirement in manifest.config:
-                value = os.environ.get(f"TRUSTYCLAW_STAGE_{requirement.key}", "")
-                if value:
-                    self._api(
-                        "PUT",
-                        f"/v1/tools/{tool_id}/config",
-                        {"key": requirement.key, "value": value},
-                    )
-        listing = {
-            entry["tool_id"]: entry for entry in self._api("GET", "/v1/tools")["tools"]
-        }
-        for tool_id in tool_ids:
-            if BUNDLED_TOOLS[tool_id].manifest.connection == "oauth":
-                continue
-            entry = listing[tool_id]
-            if all(item.get("set") for item in entry.get("config", [])):
-                self._api("POST", f"/v1/tools/{tool_id}/enable", {})
-
-    def check_tools_live(self, tool_ids: tuple[str, ...]) -> None:
-        """Run each selected bundled tool independently against its provider."""
-        self._step("bundled tools against live third-party APIs")
-        # A per-run nonce keeps each run's draft/event title unique.
-        unique_title = f"TrustyClaw stage check {os.urandom(4).hex()}"
-        details: list[str] = []
-        selected = set(tool_ids)
-
-        if "gmail" in selected:
-            # Reads: search, labels, drafts.
-            messages = self._shim_tool_result("gmail_search_messages", {"query": "in:anywhere"})
-            labels = self._shim_tool_result("gmail_list_labels", {})
-            self._shim_tool_result("gmail_list_drafts", {})
-            # Write-approval round trip: create a draft, approve it, then delete
-            # the draft (also approval-gated) so the check leaves nothing behind
-            # and never sends a real email.
-            pending = self._shim_tool_result(
-                "gmail_draft_action",
-                {
-                    "action": "create",
-                    "to": "stage@example.com",
-                    "subject": unique_title,
-                    "blocks": [{"type": "paragraph", "text": "Stage draft round trip; safe to ignore."}],
-                },
-            )
-            approval_id = pending.get("approval_id")
-            if not approval_id:
-                raise AssertionError(f"gmail draft create did not queue an approval: {pending}")
-            created = self._api("POST", f"/v1/tools/gmail/approvals/{approval_id}/approve", {})
-            if created["approval"]["status"] != "executed":
-                raise AssertionError(f"approved gmail draft create did not execute: {created}")
-            # The approved-create message carries the new draft id, so cleanup can
-            # target exactly the object this run created.
-            draft_id = self._created_id_from_message(created.get("result"))
-            if not draft_id:
-                raise AssertionError(f"approved gmail draft create did not report a draft id: {created}")
-            cleanup = self._shim_tool_result("gmail_draft_action", {"action": "delete", "draft_id": draft_id})
-            cleanup_decision = self._api("POST", f"/v1/tools/gmail/approvals/{cleanup['approval_id']}/approve", {})
-            if cleanup_decision["approval"]["status"] != "executed":
-                raise AssertionError(f"approved gmail draft delete did not execute: {cleanup_decision}")
-            details.append(
-                f"gmail search returned {len(messages.get('messages', []))} messages, "
-                f"{len(labels.get('labels', []))} labels, draft round trip created and deleted {draft_id}"
-            )
-        if "google_calendar" in selected:
-            events = self._shim_tool_result("google_calendar_read_events", {})
-            if events.get("status") != "success_executed":
-                raise AssertionError(f"calendar read failed: {events}")
-
-            # Full single-use approval round trip against the real API:
-            # propose an event, approve it, then propose and approve deletion.
-            start = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() + 86400))
-            end = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() + 90000))
-            pending = self._shim_tool_result(
-                "google_calendar_event_change",
-                {"operation": "create", "summary": unique_title, "start_time": start, "end_time": end},
-            )
-            approval_id = pending.get("approval_id")
-            if not approval_id:
-                raise AssertionError(f"calendar write did not queue an approval: {pending}")
-            decision = self._api("POST", f"/v1/tools/google_calendar/approvals/{approval_id}/approve", {})
-            if decision["approval"]["status"] != "executed":
-                raise AssertionError(f"approved calendar create did not execute: {decision}")
-            # The approved-create message carries the new event id.
-            event_id = self._created_id_from_message(decision.get("result"))
-            if not event_id:
-                raise AssertionError(f"approved calendar create did not report an event id: {decision}")
-            checked = self._shim_tool_result(
-                "check_tool_approval", {"approval_id": approval_id}
-            )
-            if checked["approval_status"] != "executed":
-                raise AssertionError(f"check_tool_approval disagreed: {checked}")
-
-            cleanup = self._shim_tool_result(
-                "google_calendar_event_change", {"operation": "delete", "event_id": event_id}
-            )
-            cleanup_decision = self._api("POST", f"/v1/tools/google_calendar/approvals/{cleanup['approval_id']}/approve", {})
-            if cleanup_decision["approval"]["status"] != "executed":
-                raise AssertionError(f"approved calendar delete did not execute: {cleanup_decision}")
-            details.append(f"calendar approval round trip created and deleted event {event_id}")
-        for tool_id in sorted(selected - {"gmail", "google_calendar", "runway"}):
-            action_id, arguments = STAGE_TOOL_CALLS[tool_id]
-            result = self._shim_tool_result(f"{tool_id}_{action_id}", arguments)
-            if result.get("status") != "success_executed":
-                raise AssertionError(f"{tool_id} live check returned an invalid result: {result}")
-            details.append(f"{tool_id} {action_id} completed")
-
-        if "runway" in selected:
-            response = self._shim_call(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "runway_get_task",
-                        "arguments": {"task_id": "trustyclaw-stage-missing"},
-                    },
-                }
-            )
-            result = response.get("result") or {}
-            text = (result.get("content") or [{}])[0].get("text", "")
-            if not result.get("isError") or "not found" not in text.lower():
-                raise AssertionError(f"Runway authenticated task probe was unexpected: {response}")
-            details.append("runway authenticated missing-task probe completed")
-
-        # Whenever any live tool ran, the dedicated tool audit log must have
-        # recorded it (calls and approval decisions), and it must page.
-        if details:
-            events = self._api("GET", "/v1/tools/events?limit=5")["events"]
-            if not events:
-                raise AssertionError("tool events log is empty after live tool activity")
-            seqs = [event["seq"] for event in events]
-            if seqs != sorted(seqs, reverse=True):
-                raise AssertionError(f"tool events are not newest-first: {seqs}")
-            details.append(f"tool audit log recorded {len(events)}+ events")
-
-        self._ok("; ".join(details))
-
-    @staticmethod
-    def _created_id_from_message(result: object) -> str:
-        """The created object's id from an approved-execution result. Approved
-        executions surface a user-visible message ending in the id (for example
-        "Created Gmail draft <id>." or "Created Google Calendar event <id>."), so
-        the id is the last whitespace token with the trailing period stripped."""
-        message = result.get("message") if isinstance(result, dict) else None
-        if not isinstance(message, str) or not message.strip():
-            return ""
-        return message.strip().rstrip(".").split()[-1]
 
     def check_agent_file_explorer(self) -> None:
         self._step("agent file explorer API on real agent home")
@@ -778,416 +489,6 @@ class StageAwsSmoke(AwsSmoke):
         finally:
             self._ssh_code(cleanup)
         self._ok("hidden directory listed, hostile filenames read as text, and path/symlink escapes rejected")
-
-    def check_task(self) -> None:
-        self._step("Codex account guard + real web-search task")
-        # Publish the full enforcement policy (not just the provider bundle) so a
-        # provider-only run keeps the GitHub integration and its write
-        # repositories in the stored policy instead of erasing them.
-        self._api("PUT", "/v1/network/policy", self.enforcement_policy())
-        self.require_runtime_active("codex")
-        for method in ("POST", "GET"):
-            code, _ = self._api_status(method, "/v1/agent-runtime/codex-oauth-login")
-            if code != 409:
-                raise AssertionError(f"{method} codex-oauth-login while active returned {code}, expected 409")
-        account = self._agent_account("codex")
-        if account.get("status") != "active":
-            raise AssertionError(f"GET account while active did not report active: {account}")
-        account_id = account.get("account_id")
-        if not account_id:
-            raise AssertionError(f"GET account while active did not include account_id: {account}")
-        self._assert_provider_metadata("codex", account)
-
-        proxy = f"http://127.0.0.1:{PROXY_PORT}"
-        url = "https://chatgpt.com/backend-api/codex/responses"
-        live = '{"tools":[{"type":"web_search","external_web_access":true}]}'
-        cached = '{"tools":[{"type":"web_search","external_web_access":false}]}'
-
-        def post_openai(payload: str, account_header: str | None = account_id) -> str:
-            header = "" if account_header is None else f" -H {shlex.quote(f'ChatGPT-Account-Id: {account_header}')}"
-            return self._ssh_code(
-                f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} "
-                f"curl -s --max-time 20 -X POST -H 'Content-Type: application/json' "
-                f"{header} --data {shlex.quote(payload)} {shlex.quote(url)}"
-            )
-
-        missing_account_response = post_openai(cached, account_header=None)
-        wrong_account_response = post_openai(cached, account_header=f"{account_id}-wrong")
-        live_response = post_openai(live)
-        cached_response = post_openai(cached)
-        if "openai_account_header_required" not in missing_account_response:
-            raise AssertionError(f"missing account header was not blocked; proxy returned {missing_account_response!r}")
-        if "openai_account_mismatch" not in wrong_account_response:
-            raise AssertionError(f"wrong account header was not blocked; proxy returned {wrong_account_response!r}")
-        if "openai_web_tool_denied" not in live_response:
-            raise AssertionError(f"live web search payload was not blocked; proxy returned {live_response!r}")
-        if "openai_web_tool_denied" in cached_response:
-            raise AssertionError("cached web search payload was incorrectly blocked")
-
-        baseline_seq = max((event["seq"] for event in self._network_events()), default=0)
-        prompt = "Use your web search tool to check today's date, then reply with the word DONE."
-        task = self._api(
-            "POST",
-            "/v1/tasks",
-            self.task_body(prompt, "codex-web", model="gpt-5.6-sol", effort="ultra"),
-        )
-        if (task.get("model"), task.get("effort")) != ("gpt-5.6-sol", "ultra"):
-            raise AssertionError(f"Codex task did not retain the selected session options: {task}")
-        current = self._wait_for_task(task["task_id"], timeout=240)
-        events = self._network_events(since=baseline_seq)
-        chatgpt = [event for event in events if event["host"].endswith("chatgpt.com")]
-        denied = [event for event in chatgpt if event["decision"] == "denied"]
-        fatal = [event for event in denied if event["path"].startswith("/backend-api/codex/responses")]
-        if current["status"] != "completed":
-            raise AssertionError(f"task did not complete: {current}; denied chatgpt.com events: {denied}")
-        if fatal:
-            raise AssertionError(f"the guard denied agent ChatGPT turn traffic: {fatal}")
-        if not any(event["decision"] == "allowed" for event in chatgpt):
-            raise AssertionError(f"no allowed chatgpt.com traffic was observed for the task: {events}")
-        self._ok("web search task completed; account and external URL request guards held")
-
-    def check_claude_auth_and_task(self) -> None:
-        self._step("Claude account guard + real task")
-        # Publish the full enforcement policy (not just the provider bundle) so a
-        # provider-only run keeps the GitHub integration and its write
-        # repositories in the stored policy instead of erasing them.
-        self._api("PUT", "/v1/network/policy", self.enforcement_policy())
-        self.require_runtime_active("claude_code")
-        for method in ("POST", "GET"):
-            code, _ = self._api_status(method, "/v1/agent-runtime/claude-oauth-login")
-            if code != 409:
-                raise AssertionError(f"{method} claude-oauth-login while active returned {code}, expected 409")
-        account = self._agent_account("claude_code")
-        if (
-            account.get("status") != "active"
-            or account.get("provider") != "claude"
-            or not account.get("account_id")
-            or "email" not in account
-        ):
-            raise AssertionError(f"GET account while Claude is active returned unexpected shape: {account}")
-        self._assert_provider_metadata("claude_code", account)
-
-        proxy = f"http://127.0.0.1:{PROXY_PORT}"
-        url = "https://api.anthropic.com/v1/messages"
-        payload = '{"model":"claude-sonnet-4-5","max_tokens":8,"messages":[{"role":"user","content":"hello"}]}'
-        missing = self._ssh_code(
-            f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} "
-            f"curl -s --max-time 20 -X POST -H 'Content-Type: application/json' "
-            f"--data {shlex.quote(payload)} {shlex.quote(url)}"
-        )
-        wrong = self._ssh_code(
-            f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} "
-            f"curl -s --max-time 20 -X POST -H 'Content-Type: application/json' "
-            f"-H 'Authorization: Bearer stage-wrong-token' "
-            f"--data {shlex.quote(payload)} {shlex.quote(url)}"
-        )
-        if "anthropic_token_required" not in missing:
-            raise AssertionError(f"missing Claude bearer was not blocked; proxy returned {missing!r}")
-        if "anthropic_token_mismatch" not in wrong:
-            raise AssertionError(f"wrong Claude bearer was not blocked; proxy returned {wrong!r}")
-
-        task_baseline_seq = max((event["seq"] for event in self._network_events()), default=0)
-        prompt = "Reply with exactly the word CLAUDE_STAGE_OK and nothing else."
-        task = self._api(
-            "POST",
-            "/v1/tasks",
-            self.task_body(prompt, "claude", model="fable", effort="ultracode"),
-        )
-        if (task.get("model"), task.get("effort")) != ("fable", "ultracode"):
-            raise AssertionError(f"Claude task did not retain the selected session options: {task}")
-        done = self._wait_for_task(task["task_id"], timeout=240)
-        if done["status"] != "completed":
-            raise AssertionError(f"Claude task ended {done['status']}: {self._task_failure_detail(task['task_id'])}")
-        if "CLAUDE_STAGE_OK" not in (done.get("output_message") or ""):
-            raise AssertionError(f"Claude task output did not contain expected token: {done.get('output_message')!r}")
-        events = self._network_events(since=task_baseline_seq)
-        anthropic = [event for event in events if event["host"] == "api.anthropic.com"]
-        if not any(event["decision"] == "allowed" for event in anthropic):
-            raise AssertionError(f"Claude task completed without an allowed api.anthropic.com event: {events}")
-        fatal = [
-            event for event in anthropic
-            if event["decision"] == "denied" and event["path"].startswith("/v1/messages")
-        ]
-        if fatal:
-            raise AssertionError(f"Claude task had denied message traffic: {fatal}")
-
-        follow_up_prompt = (
-            "Earlier in this Claude conversation you replied with one uppercase token. "
-            "Reply with exactly that token again and nothing else."
-        )
-        follow_up = self._api(
-            "POST",
-            "/v1/tasks",
-            self.follow_up_body(follow_up_prompt, "claude"),
-        )
-        follow_up_done = self._wait_for_task(follow_up["task_id"], timeout=240)
-        if follow_up_done["status"] != "completed":
-            raise AssertionError(
-                f"Claude follow-up ended {follow_up_done['status']}: "
-                f"{self._task_failure_detail(follow_up['task_id'])}"
-            )
-        if "CLAUDE_STAGE_OK" not in (follow_up_done.get("output_message") or ""):
-            raise AssertionError(
-                "Claude follow-up did not resume the persisted session context: "
-                f"{follow_up_done.get('output_message')!r}"
-            )
-        self._ok("Claude account guard passed; real task completed and resumed through the proxy")
-
-    def check_github_write_e2e(self) -> None:
-        """End-to-end exercise of the authenticated GitHub paths with a real,
-        operator-installed write credential: clone, a real branch push
-        (receive-pack), authenticated gh API read and write, and the write
-        denial on an unlisted repo. Like the provider OAuth logins, this
-        requires one-time stage-host configuration and fails with instructions
-        until it is done: a write-capable credential stored and at least one
-        sandbox write repository in the policy (real branches are pushed and
-        deleted there). The pushed branch is deleted through the API."""
-        write_repos = [
-            repo for repo in getattr(self, "stage_github_repositories", []) if isinstance(repo, dict)
-        ]
-        if not write_repos:
-            raise AssertionError(
-                "the stage host's network policy lists no GitHub write repository; "
-                "add a dedicated sandbox write repo in the admin UI (Internet Access "
-                "and Tools), then rerun — like the provider logins, this is one-time "
-                "stage-host configuration"
-            )
-        metadata = self._api("GET", "/v1/network-tools/github-credential")
-        if metadata.get("configured") is not True:
-            raise AssertionError(
-                "no GitHub credential is configured on the stage host; store a write-capable "
-                "PAT or App credential in the admin UI (Internet Access and Tools), then rerun "
-                "— like the provider logins, this is one-time stage-host configuration"
-            )
-        write_repo = f"{write_repos[0]['owner']}/{write_repos[0]['repo']}"
-        self._step(f"github write e2e against {write_repo} (operator-installed credential)")
-        # Self-contained regardless of suite or ordering: the provider checks
-        # reset the policy to a GitHub-less bundle, so publish the GitHub-enabled
-        # enforcement policy (with the stage write repositories) before
-        # exercising the authenticated paths.
-        self._api("PUT", "/v1/network/policy", self.enforcement_policy())
-        proxy = f"http://127.0.0.1:{PROXY_PORT}"
-        env = f"sudo -u trustyclaw-agent env HTTPS_PROXY={proxy} https_proxy={proxy}"
-        branch = f"stage-e2e-{time.time_ns()}"
-        workdir = f"/tmp/trustyclaw-stage-github-{time.time_ns()}"
-        baseline_seq = max((event["seq"] for event in self._network_events()), default=0)
-        try:
-            cloned = self._ssh_code(
-                f"{env} git clone --depth 1 https://github.com/{write_repo} {workdir} "
-                ">/dev/null 2>&1 && echo cloned"
-            ).strip()
-            if cloned != "cloned":
-                raise AssertionError(f"authenticated clone of {write_repo} through the proxy failed")
-            pushed = self._ssh_code(
-                f"{env} sh -c 'cd {workdir} && git config user.email stage@trustyclaw.invalid && "
-                f"git config user.name trustyclaw-stage && echo {branch} > STAGE_E2E.txt && "
-                f"git add STAGE_E2E.txt && git commit -q -m stage-e2e && "
-                f"git push -q origin HEAD:refs/heads/{branch} && echo pushed' 2>/dev/null"
-            ).strip()
-            if pushed != "pushed":
-                raise AssertionError(f"git push of {branch} to {write_repo} failed")
-            # Authenticated API read through the gh shim proves the pushed
-            # branch is real on GitHub, not just accepted by the proxy.
-            seen = self._ssh_code(
-                f"{env} gh api repos/{write_repo}/branches/{branch} --jq .name 2>/dev/null"
-            ).strip()
-            if seen != branch:
-                raise AssertionError(f"pushed branch not visible via gh api: {seen!r}")
-            # Authenticated API write: delete the ref (also the cleanup). Capture
-            # the outcome so a real write failure (e.g. a missing permission)
-            # reads distinctly from the branch merely lingering below.
-            delete_result = self._ssh_code(
-                f"{env} sh -c 'gh api -X DELETE repos/{write_repo}/git/refs/heads/{branch} 2>&1 "
-                "&& echo DELETE_OK || echo DELETE_FAILED'"
-            ).strip()
-            if not delete_result.endswith("DELETE_OK"):
-                raise AssertionError(f"gh api DELETE of {branch} on {write_repo} failed: {delete_result!r}")
-            # GitHub's branches REST endpoint can briefly still report a ref that
-            # was just deleted through the git data plane, so confirm the branch
-            # is gone with a few short retries instead of a single racy read.
-            deleted = "present"
-            for _ in range(6):
-                deleted = self._ssh_code(
-                    f"{env} sh -c 'gh api repos/{write_repo}/branches/{branch} >/dev/null 2>&1 "
-                    "&& echo present || echo deleted'"
-                ).strip()
-                if deleted == "deleted":
-                    break
-                time.sleep(2)
-            if deleted != "deleted":
-                raise AssertionError(f"gh api DELETE did not remove {branch} from {write_repo} after retries")
-            # The same credential must not be able to push to an unlisted repo:
-            # the proxy denies receive-pack before GitHub sees it.
-            denied = self._ssh_code(
-                f"{env} git -C {workdir} push -q https://github.com/torvalds/linux "
-                f"HEAD:refs/heads/{branch} >/dev/null 2>&1 && echo pushed || echo denied"
-            ).strip()
-            if denied != "denied":
-                raise AssertionError("push to an unlisted repo was not denied by the proxy")
-            self._check_github_dot_github_approval_e2e(write_repo, env, baseline_seq)
-        except Exception:
-            self._print_denied_github_events(baseline_seq)
-            raise
-        finally:
-            self._ssh_code(f"sudo rm -rf {workdir}")
-        self._ok(
-            f"clone + push + gh api read/write on {write_repo}, branch {branch} cleaned up, "
-            "unlisted push denied, .github approval queued and approved"
-        )
-
-    def _check_github_dot_github_approval_e2e(self, write_repo: str, env: str, baseline_seq: int) -> None:
-        """Real stage coverage for the .github approval gate: enable the toggle,
-        prove REST bypasses are denied, queue a .github-changing push, approve it,
-        confirm it lands on GitHub, then delete the branch through git."""
-        owner, repo = write_repo.split("/", 1)
-        branch = f"stage-dotgithub-{time.time_ns()}"
-        ref = f"refs/heads/{branch}"
-        workdir = f"/tmp/trustyclaw-stage-dotgithub-{time.time_ns()}"
-        self._api("PUT", "/v1/network/policy", self.enforcement_policy())
-        branch_landed = False
-        pending_id = None
-        try:
-            seed_script = f"""
-rm -rf {shlex.quote(workdir)}
-git clone --depth 1 https://github.com/{shlex.quote(write_repo)} {shlex.quote(workdir)} >/dev/null 2>&1 || {{ echo CLONE_FAILED; exit 0; }}
-cd {shlex.quote(workdir)} || {{ echo CD_FAILED; exit 0; }}
-git config user.email stage@trustyclaw.invalid
-git config user.name trustyclaw-stage
-git checkout -q -b {shlex.quote(branch)}
-echo {shlex.quote(branch)} > STAGE_DOTGITHUB_BASE.txt
-git add STAGE_DOTGITHUB_BASE.txt
-git commit -q -m stage-dotgithub-base
-git push -q origin HEAD:{shlex.quote(ref)} >/dev/null 2>&1 && echo SEED_PUSHED || echo SEED_FAILED
-"""
-            seed_output = self._ssh_code(f"{env} sh -c {shlex.quote(seed_script)}").strip()
-            if seed_output != "SEED_PUSHED":
-                raise AssertionError(f"setup branch for .github approval push failed: {seed_output!r}")
-            branch_landed = True
-
-            approval_policy = self.enforcement_policy()
-            github = dict(approval_policy["network_integrations"]["github"])
-            github["require_dot_github_approval"] = True
-            approval_policy["network_integrations"]["github"] = github
-            self._api("PUT", "/v1/network/policy", approval_policy)
-
-            rest_code = self._ssh_code(
-                f"{env} curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 "
-                f"-X PUT -d '{{\"message\":\"stage\",\"content\":\"eA==\"}}' "
-                f"https://api.github.com/repos/{write_repo}/contents/.github/CODEOWNERS || true"
-            ).strip()
-            if rest_code != "403":
-                raise AssertionError(f".github REST contents write should be denied by approval gate, got {rest_code!r}")
-
-            script = f"""
-cd {shlex.quote(workdir)} || {{ echo CD_FAILED; exit 0; }}
-mkdir -p .github
-printf 'stage * @trustyclaw-stage\\n' > .github/CODEOWNERS
-git add .github/CODEOWNERS
-git commit -q -m stage-dotgithub-approval
-git push origin HEAD:{shlex.quote(ref)} > /tmp/trustyclaw-stage-dotgithub-push.out 2>&1
-status=$?
-cat /tmp/trustyclaw-stage-dotgithub-push.out
-echo PUSH_STATUS:$status
-"""
-            push_output = self._ssh_code(f"{env} sh -c {shlex.quote(script)}")
-            if "CD_FAILED" in push_output:
-                raise AssertionError(f"setup for .github approval push failed: {push_output!r}")
-            if "PUSH_STATUS:0" in push_output:
-                raise AssertionError(".github-changing push succeeded instead of being queued for approval")
-            if "queued for approval" not in push_output:
-                raise AssertionError(f".github-changing push did not report approval queue: {push_output!r}")
-
-            pending = None
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                pushes = self._api("GET", "/v1/network-tools/github-pending-pushes").get("pending_pushes") or []
-                for candidate in pushes:
-                    updates = candidate.get("ref_updates") or []
-                    if (
-                        candidate.get("owner") == owner.lower()
-                        and candidate.get("repo") == repo.lower()
-                        and candidate.get("status") == "pending"
-                        and any(update.get("ref") == ref for update in updates if isinstance(update, dict))
-                    ):
-                        pending = candidate
-                        break
-                if pending is not None:
-                    break
-                time.sleep(2)
-            if pending is None:
-                raise AssertionError(f"no pending .github push found for {ref}")
-            pending_id = pending["id"]
-            changed_paths = pending.get("changed_paths") or []
-            if ".github/CODEOWNERS" not in changed_paths:
-                raise AssertionError(f"pending push did not record .github/CODEOWNERS: {pending}")
-
-            approved = self._api("POST", f"/v1/network-tools/github-pending-pushes/{pending_id}/approve")
-            if (approved.get("pending_push") or {}).get("status") != "approved":
-                raise AssertionError(f"approval did not mark push approved: {approved}")
-            pending_id = None
-            seen = self._ssh_code(
-                f"{env} gh api repos/{write_repo}/branches/{branch} --jq .name 2>/dev/null"
-            ).strip()
-            if seen != branch:
-                raise AssertionError(f"approved .github branch not visible via gh api: {seen!r}")
-
-            deleted = self._ssh_code(
-                f"{env} git -C {workdir} push -q origin :{shlex.quote(ref)} >/dev/null 2>&1 "
-                "&& echo deleted || echo delete_failed"
-            ).strip()
-            if deleted != "deleted":
-                raise AssertionError(f"approved branch cleanup via git delete failed: {deleted!r}")
-            branch_landed = False
-            reasons = {
-                event.get("reason_code")
-                for event in self._network_events(since=baseline_seq)
-                if event.get("host") in {"github.com", "api.github.com"}
-            }
-            for reason in ("github_dot_github_rest_write_denied", "github_push_queued_for_approval"):
-                if reason not in reasons:
-                    raise AssertionError(f"missing network event reason code {reason!r} after approval e2e: {sorted(reasons)}")
-        finally:
-            if pending_id:
-                try:
-                    self._api("POST", f"/v1/network-tools/github-pending-pushes/{pending_id}/reject")
-                except Exception:
-                    pass
-            try:
-                self._api("PUT", "/v1/network/policy", self.enforcement_policy())
-            except Exception:
-                pass
-            if branch_landed:
-                self._ssh_code(
-                    f"{env} gh api -X DELETE repos/{write_repo}/git/refs/heads/{branch} >/dev/null 2>&1 || true"
-                )
-            self._ssh_code(f"sudo rm -rf {workdir} /tmp/trustyclaw-stage-dotgithub-push.out")
-
-    def _print_denied_github_events(self, since: int) -> None:
-        """Dump denied GitHub network events since ``since`` with their reason
-        codes: what separates an unloadable policy ('network_policy_unavailable')
-        from a host that simply is not allowed ('network_policy_denied')."""
-        github_hosts = {
-            "github.com", "api.github.com", "uploads.github.com",
-            "codeload.github.com", "raw.githubusercontent.com",
-        }
-        try:
-            events = [
-                event for event in self._network_events(since=since)
-                if event.get("host") in github_hosts and event.get("decision") == "denied"
-            ]
-        except Exception as exc:  # noqa: BLE001 - best-effort debug output
-            print(f"  denied GitHub events: could not read: {type(exc).__name__}: {exc}", flush=True)
-            return
-        if not events:
-            print("  denied GitHub events during write e2e: <none>", flush=True)
-            return
-        print(f"  denied GitHub events during write e2e ({len(events)}):", flush=True)
-        for event in events:
-            print(
-                f"    seq={event.get('seq')} {event.get('method')} "
-                f"{event.get('host')}{event.get('path')} reason={event.get('reason')!r}",
-                flush=True,
-            )
 
 
 if __name__ == "__main__":

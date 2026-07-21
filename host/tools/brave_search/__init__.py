@@ -5,6 +5,7 @@ from __future__ import annotations
 import urllib.parse
 from typing import Any, cast
 
+from host.param_guard import PARAM_GUARD_PROTECTION, PARAM_GUARD_TECHNICAL_DETAIL
 from host.tools.json_types import JSONObject, JSONValue
 from host.tools.manifest import (
     ActionSpec,
@@ -38,7 +39,8 @@ MANIFEST = ToolManifest(
                 title="What leaves this host",
                 description=(
                     "Only the search query (shortened to a maximum length), fixed result-size options, and the API key that "
-                    "authenticates the request. Nothing else on this host is sent."
+                    "authenticates the request. Nothing else on this host is sent. The search query first passes the "
+                    "host parameter guard (see Technical notes), which denies secret- or credential-shaped values before it is sent."
                 ),
             ),
             DataSummaryCard(
@@ -107,7 +109,9 @@ MANIFEST = ToolManifest(
     protections=(
         "Only the search query and the API key that authenticates the request are sent to Brave. The API key stays in write-only host config and is never returned to the agent.",
         "The tool is read-only, and its requests do not require operator approval.",
+        PARAM_GUARD_PROTECTION,
     ),
+    technical_details=(PARAM_GUARD_TECHNICAL_DETAIL,),
     setup_steps=(
         SetupStep(
             title="Create a Brave Search API account",
@@ -164,9 +168,9 @@ def _extract_search_query(tool_input: JSONObject) -> str:
     return query[:MAX_SEARCH_QUERY_CHARS]
 
 
-def _request_payload(tool_input: JSONObject) -> JSONObject:
+def _request_payload(tool_input: JSONObject, api: HostAPI) -> JSONObject:
     return {
-        "q": _extract_search_query(tool_input),
+        "q": api.outbound.guard_request_parameter_string(_extract_search_query(tool_input)),
         "count": DEFAULT_COUNT,
         "maximum_number_of_urls": DEFAULT_COUNT,
         "maximum_number_of_tokens": DEFAULT_MAX_TOKENS,
@@ -236,7 +240,7 @@ class BraveSearchTool:
             return ActionFailed("Unsupported Brave Search action.")
         try:
             api_key = api.config["BRAVE_SEARCH_API_KEY"]
-            request_payload = _request_payload(tool_input)
+            request_payload = _request_payload(tool_input, api)
             raw_response = _post_brave_context(api_key, request_payload)
             results = _grounding_results(raw_response)
             result: JSONObject = {

@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pg_harness
 
@@ -54,9 +54,13 @@ class FakeServer:
 
 
 def make_task(number: int, thread_id: str, status: str = "queued", runtime: str = "codex") -> dict[str, object]:
-    model, effort = (
-        ("opus", "high") if runtime == "claude_code" else ("gpt-5.6-terra", "high")
-    )
+    model = {
+        "codex": "gpt-5.6-terra",
+        "claude_code": "opus",
+        "pi": "deepseek.v3.2",
+        "hermes": "qwen.qwen3-coder-next",
+    }[runtime]
+    effort = "high"
     return {
         "task_id": f"task_{number}",
         "status": status,
@@ -320,65 +324,40 @@ class OrchestratorTests(unittest.TestCase):
             )
         self.assertEqual(FakeServer.instances, [])
 
-    def test_codex_and_claude_have_independent_three_task_claim_caps(self) -> None:
-        save_attested_claude_account("acct", access_token_sha256="f" * 64)
+    def test_all_four_runtimes_have_independent_three_task_caps(self) -> None:
+        runtimes = ("codex", "claude_code", "pi", "hermes")
+        self.assertEqual(orchestrator.WORKER_COUNT, 12)
         tasks = []
         number = 1
-        for index in range(4):
-            tasks.append(make_task(number, f"codex-{index}", runtime="codex"))
-            number += 1
-            tasks.append(make_task(number, f"claude-{index}", runtime="claude_code"))
-            number += 1
+        for runtime in runtimes:
+            for index in range(4):
+                tasks.append(make_task(number, f"{runtime}-{index}", runtime=runtime))
+                number += 1
         self.seed_tasks(*tasks)
-        release = threading.Event()
-        started: list[tuple[str, str]] = []
-        started_lock = threading.Lock()
-
-        def record(runtime_type: str, input_message: str) -> None:
-            with started_lock:
-                started.append((runtime_type, input_message))
-
-        def fake_codex_run_turn(server, input_message, codex_thread_id, model, effort, steers, on_message, steer_delivered):
-            record("codex", input_message)
-            release.wait(timeout=10)
-            return f"codex-{input_message}", "done"
-
-        def fake_claude_run_turn(server, input_message, session_id, model, effort, steers, on_message, steer_delivered):
-            record("claude_code", input_message)
-            release.wait(timeout=10)
-            return f"claude-{input_message}", "done"
-
-        with (
-            patch.object(orchestrator.claude_code, "ClaudeCodeSession", FakeServer),
-            patch.object(orchestrator.codex_app_server, "run_turn", fake_codex_run_turn),
-            patch.object(orchestrator.claude_code, "run_turn", fake_claude_run_turn),
-            patch.object(
-                orchestrator.claude_code,
-                "account_status",
-                return_value=("active", None, {"account_id": "acct", "access_token_sha256": "f" * 64}),
-            ),
-        ):
-            threads = [threading.Thread(target=orchestrator.run_next_task) for _ in range(8)]
-            for thread in threads:
-                thread.start()
-            for _ in range(200):
-                with started_lock:
-                    if len(started) == orchestrator.WORKER_COUNT:
-                        break
-                threading.Event().wait(0.01)
-            with started_lock:
-                snapshot = list(started)
-            self.assertEqual(len(snapshot), 6)
-            self.assertEqual(sum(1 for runtime, _ in snapshot if runtime == "codex"), 3)
-            self.assertEqual(sum(1 for runtime, _ in snapshot if runtime == "claude_code"), 3)
-            release.set()
-            for thread in threads:
-                thread.join(timeout=10)
-
-        completed = {task["task_id"] for task in load_state()["tasks"] if task["status"] == "completed"}
-        queued = {task["task_id"] for task in load_state()["tasks"] if task["status"] == "queued"}
-        self.assertEqual(len(completed), 6)
-        self.assertEqual(queued, {"task_7", "task_8"})
+        claimed = [orchestrator._claim_next_task() for _ in range(orchestrator.WORKER_COUNT)]
+        self.assertNotIn(None, claimed)
+        self.assertIsNone(orchestrator._claim_next_task())
+        for runtime in runtimes:
+            self.assertEqual(
+                sum(
+                    1
+                    for task in claimed
+                    if task is not None and task[1] == runtime
+                ),
+                3,
+            )
+        running = {
+            task["task_id"]
+            for task in load_state()["tasks"]
+            if task["status"] == "running"
+        }
+        queued = {
+            task["task_id"]
+            for task in load_state()["tasks"]
+            if task["status"] == "queued"
+        }
+        self.assertEqual(len(running), 12)
+        self.assertEqual(queued, {"task_4", "task_8", "task_12", "task_16"})
 
     def test_each_task_runs_on_a_fresh_server_that_is_closed_after_the_turn(self) -> None:
         self.seed_tasks(make_task(1, "chat"))
@@ -1666,6 +1645,254 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(calls, ["codex"])
         self.assertEqual(background, [("codex",)])
         self.assertEqual(orchestrator.runtime_status("claude_code"), "deactivated")
+
+    # -- pi / hermes (AWS Bedrock) lifecycle ------------------------------------------
+    # Credential POST validates STS before atomically storing the one shared
+    # credential and its display metadata. Steady-state status is local; later
+    # provider failures surface on the task that encounters them, and cost is
+    # metered at the proxy rather than polled from a billing API.
+
+    IDENTITY = {
+        "access_key_id": "AKIAOPERATORKEY00001",
+        "account_id": "123456789012",
+        "arn": "arn:aws:iam::123456789012:user/pi-bedrock",
+        "user_id": "AIDAEXAMPLE",
+    }
+
+    def enable_bedrock(self) -> None:
+        save_policy(
+            {
+                "network_integrations": {
+                    "openai": {"enabled": True},
+                    "claude": {"enabled": True},
+                    "bedrock": {"enabled": True},
+                },
+            },
+            "2026-06-08T00:00:00Z",
+        )
+
+    def connect_bedrock(self, access_key_id: str = "AKIAOPERATORKEY00001") -> None:
+        account: dict[str, object] = dict(self.IDENTITY, access_key_id=access_key_id)
+        with state.mutation() as cur:
+            state.save_bedrock_credential(access_key_id, "S" * 40, "us-east-1", cur)
+            state.save_bedrock_account(account, cur)
+
+    def test_bedrock_credential_validation_is_independent_of_enablement(self) -> None:
+        def attest(*, credential=None):  # type: ignore[no-untyped-def]
+            self.assertEqual(credential, ("AKIAOPERATORKEY00001", "S" * 40))
+            self.assertIsNone(state.read_bedrock_access_key_id())
+            return dict(self.IDENTITY)
+
+        with patch.object(
+            orchestrator.bedrock_credentials, "read_attested_identity", side_effect=attest
+        ):
+            self.assertEqual(
+                orchestrator.replace_and_validate_bedrock_credentials(
+                    "AKIAOPERATORKEY00001", "S" * 40, "us-west-2"
+                ),
+                ("active", None),
+            )
+
+        self.assertEqual(state.read_bedrock_account()["account_id"], "123456789012")
+        self.assertEqual(state.read_bedrock_region(), "us-west-2")
+        self.assertEqual(
+            state.read_bedrock_proxy_credential(),
+            ("AKIAOPERATORKEY00001", "S" * 40, "us-west-2"),
+        )
+
+    def test_rejected_bedrock_replacement_preserves_the_old_row(self) -> None:
+        self.connect_bedrock()
+        with patch.object(
+            orchestrator.bedrock_credentials,
+            "read_attested_identity",
+            side_effect=orchestrator.bedrock_credentials.BedrockAuthenticationError(
+                "invalid candidate"
+            ),
+        ):
+            status, error = orchestrator.replace_and_validate_bedrock_credentials(
+                "AKIAREJECTEDKEY00001", "T" * 40, "us-west-2"
+            )
+        self.assertEqual(status, "error")
+        self.assertIn("invalid candidate", error or "")
+        self.assertEqual(
+            state.read_bedrock_proxy_credential(),
+            ("AKIAOPERATORKEY00001", "S" * 40, "us-east-1"),
+        )
+        self.assertEqual(state.read_bedrock_account()["account_id"], "123456789012")
+        self.assertEqual(state.read_bedrock_region(), "us-east-1")
+
+    def test_bedrock_disconnect_waits_for_an_older_connect(self) -> None:
+        validation_started = threading.Event()
+        release_validation = threading.Event()
+        disconnect_done = threading.Event()
+
+        def attest(*, credential=None):  # type: ignore[no-untyped-def]
+            validation_started.set()
+            self.assertTrue(release_validation.wait(2))
+            return dict(self.IDENTITY)
+
+        def disconnect() -> None:
+            orchestrator.disconnect_bedrock_connection()
+            disconnect_done.set()
+
+        with patch.object(
+            orchestrator.bedrock_credentials, "read_attested_identity", side_effect=attest
+        ):
+            connect_thread = threading.Thread(
+                target=orchestrator.replace_and_validate_bedrock_credentials,
+                args=("AKIAOPERATORKEY00001", "S" * 40, "us-west-2"),
+            )
+            connect_thread.start()
+            self.assertTrue(validation_started.wait(2))
+            disconnect_thread = threading.Thread(target=disconnect)
+            disconnect_thread.start()
+            self.assertFalse(disconnect_done.wait(0.05))
+            release_validation.set()
+            connect_thread.join(2)
+            disconnect_thread.join(2)
+
+        self.assertFalse(connect_thread.is_alive())
+        self.assertFalse(disconnect_thread.is_alive())
+        self.assertTrue(disconnect_done.is_set())
+        self.assertIsNone(state.read_bedrock_proxy_credential())
+        self.assertEqual(state.read_bedrock_account(), {})
+
+    def test_newer_bedrock_connect_replaces_an_older_slow_connect(self) -> None:
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_done = threading.Event()
+
+        def attest(*, credential=None):  # type: ignore[no-untyped-def]
+            if credential and credential[0] == "AKIAOPERATORKEY00001":
+                first_started.set()
+                self.assertTrue(release_first.wait(2))
+                return dict(self.IDENTITY)
+            return {
+                **self.IDENTITY,
+                "access_key_id": "AKIANEWEROPERATOR001",
+                "account_id": "999999999999",
+            }
+
+        def connect_newer() -> None:
+            orchestrator.replace_and_validate_bedrock_credentials(
+                "AKIANEWEROPERATOR001",
+                "T" * 40,
+                "us-east-2",
+            )
+            second_done.set()
+
+        with patch.object(
+            orchestrator.bedrock_credentials, "read_attested_identity", side_effect=attest
+        ):
+            first_thread = threading.Thread(
+                target=orchestrator.replace_and_validate_bedrock_credentials,
+                args=("AKIAOPERATORKEY00001", "S" * 40, "us-west-2"),
+            )
+            first_thread.start()
+            self.assertTrue(first_started.wait(2))
+            second_thread = threading.Thread(target=connect_newer)
+            second_thread.start()
+            self.assertFalse(second_done.wait(0.05))
+            release_first.set()
+            first_thread.join(2)
+            second_thread.join(2)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertTrue(second_done.is_set())
+        self.assertEqual(
+            state.read_bedrock_proxy_credential(),
+            ("AKIANEWEROPERATOR001", "T" * 40, "us-east-2"),
+        )
+        self.assertEqual(state.read_bedrock_account()["account_id"], "999999999999")
+
+    def test_bedrock_validation_requires_matching_identity_key(self) -> None:
+        identity = dict(self.IDENTITY, access_key_id="AKIADIFFERENTKEY00001")
+        with patch.object(
+            orchestrator.bedrock_credentials, "read_attested_identity", return_value=identity
+        ):
+            status, error = orchestrator.replace_and_validate_bedrock_credentials(
+                "AKIAOPERATORKEY00001", "S" * 40, "us-east-1"
+            )
+        self.assertEqual(status, "error")
+        self.assertIn("different access key id", error or "")
+        self.assertIsNone(state.read_bedrock_access_key_id())
+
+    def test_bedrock_without_a_connected_credential_awaits_connection(self) -> None:
+        self.enable_bedrock()
+        # No credential stored: account_status awaits operator input and no
+        # provider probe runs.
+        with patch.object(
+            orchestrator.pi_agent,
+            "account_status",
+            return_value=("awaiting_login", None, None),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("pi"), "awaiting_login")
+        self.assertEqual(state.read_bedrock_account(), {})
+        self.assertIsNone(state.read_bedrock_proxy_credential())
+
+    def test_bedrock_status_is_local_and_makes_no_aws_call(self) -> None:
+        # Steady-state and forced refreshes alike stay local: STS ran once at
+        # submission, and cost needs no provider read because the proxy meters
+        # it out of each response.
+        self.enable_bedrock()
+        self.connect_bedrock()
+        with patch.object(
+            orchestrator.bedrock_credentials,
+            "read_attested_identity",
+            side_effect=AssertionError("a Bedrock refresh must not call STS"),
+        ):
+            self.assertEqual(orchestrator.refresh_runtime_status("pi"), "active")
+            self.assertEqual(orchestrator.refresh_runtime_status("pi", force_provider_probe=True), "active")
+
+    def test_bedrock_disconnect_deletes_the_one_credential(self) -> None:
+        self.enable_bedrock()
+        self.connect_bedrock()
+        state.save_bedrock_account({"account_id": "123456789012", "access_key_id": "AKIAOPERATORKEY00001"})
+        orchestrator.disconnect_bedrock_connection()
+        self.assertEqual(state.read_bedrock_account(), {})
+        self.assertIsNone(state.read_bedrock_proxy_credential())
+        self.assertIsNone(state.read_bedrock_credential_secret())
+
+    def test_bedrock_disabled_policy_deactivates_pi(self) -> None:
+        # setUp's policy has no pi integration, so the pi runtime deactivates
+        # without any provider probe.
+        with patch.object(orchestrator.pi_agent, "account_status", side_effect=AssertionError("no probe")):
+            self.assertEqual(orchestrator.refresh_runtime_status("pi"), "deactivated")
+
+    def test_pi_and_hermes_project_one_shared_provider_status(self) -> None:
+        save_policy(
+            {
+                "network_integrations": {
+                    "bedrock": {"enabled": True},
+                },
+            },
+            "2026-06-08T00:00:00Z",
+        )
+        identity = {
+            "access_key_id": "AKIAHERMESOPERATOR01",
+            "account_id": "999999999999",
+            "arn": "arn:aws:iam::999999999999:user/hermes-bedrock",
+        }
+        with state.mutation() as cur:
+            state.save_bedrock_credential("AKIAHERMESOPERATOR01", "S" * 40, "us-east-1", cur)
+            state.save_bedrock_account(identity, cur)
+        self.assertEqual(orchestrator.refresh_runtime_status("hermes"), "active")
+        self.assertEqual(state.read_bedrock_account()["account_id"], "999999999999")
+        self.assertEqual(
+            state.read_bedrock_proxy_credential(),
+            ("AKIAHERMESOPERATOR01", "S" * 40, "us-east-1"),
+        )
+        self.assertEqual(orchestrator.runtime_status("pi"), "active")
+        self.assertEqual(orchestrator.runtime_status("hermes"), "active")
+        self.assertIn("bedrock", orchestrator._RUNTIME_STATUSES)
+        self.assertNotIn("pi", orchestrator._RUNTIME_STATUSES)
+        self.assertNotIn("hermes", orchestrator._RUNTIME_STATUSES)
+        orchestrator.disconnect_bedrock_connection()
+        self.assertEqual(state.read_bedrock_account(), {})
+        self.assertIsNone(state.read_bedrock_credential_secret())
+        self.assertEqual(orchestrator.runtime_status("pi"), "awaiting_login")
+        self.assertEqual(orchestrator.runtime_status("hermes"), "awaiting_login")
 
 
 

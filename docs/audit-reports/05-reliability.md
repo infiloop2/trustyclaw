@@ -37,7 +37,7 @@ explicitly (or state that it was skipped):
 - **In scope:** `trustyclaw_agent.slice` limits (`CPUWeight`, `MemoryHigh`/
   `MemoryMax`, `MemorySwapMax`, `TasksMax`) and what they do *not* cover
   (disk, file descriptors, I/O); volume layout separating agent storage from
-  service storage; admin API threading (state lock discipline, six workers /
+  service storage; admin API threading (state lock discipline, twelve workers /
   three-per-runtime claim caps), Postgres via the
   in-repo `pgclient.py` (timeouts, reconnects, transaction hygiene); systemd
   unit ordering, restart policies, and watchdogs; the maintenance thread's
@@ -205,7 +205,7 @@ ordering, idempotency lock use, network-policy and OAuth locks with timeouts,
 database checkout semaphores/timeouts, helper subprocess timeouts, and worker
 claim/release paths. Slow runtime spawns/turns, server closes, helper calls,
 and provider status checks are generally outside the state mutation lock.
-Worker counts are six total and three per runtime; queued tasks and steer
+Worker counts are twelve total and three per runtime; queued tasks and steer
 messages are capped. I did not find a deadlock path in the reviewed code.
 
 REL-C, recovery by reboot: I traced the reboot helper, systemd unit enablement,

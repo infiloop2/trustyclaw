@@ -1600,6 +1600,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("if stat.S_ISLNK(mode):", bootstrap)
         self.assertIn("os.unlink(path)", bootstrap)
         self.assertIn('proxy_state / "network_proxy_ca.key"', bootstrap)
+        self.assertNotIn('proxy_state / "bedrock-routing-secret"', bootstrap)
         self.assertIn('recreate_directory(proxy_state / "generated-certs")', bootstrap)
         self.assertIn("mkfs.ext4 -F -L \"$label\" \"$device\"", bootstrap)
         self.assertIn("UUID=${uuid} ${mount_point} ext4 defaults,nofail 0 2", bootstrap)
@@ -1782,6 +1783,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertNotIn("trustyclaw-proxy:trustyclaw-admin", bootstrap)
         self.assertNotIn("for path in \\", bootstrap)
         self.assertIn("/mnt/trustyclaw-admin/proxy-state/network_proxy_ca.key trustyclaw-proxy:trustyclaw-proxy 600", bootstrap)
+        self.assertNotIn("setup_bedrock_routing_secrets", bootstrap)
         self.assertIn("/mnt/trustyclaw-agent/agent-home trustyclaw-agent:trustyclaw-agent 700", bootstrap)
         self.assertNotIn("chown -R trustyclaw-admin:trustyclaw-admin /mnt/trustyclaw-admin/admin-state", bootstrap)
         self.assertNotIn("chown -R trustyclaw-agent:trustyclaw-agent /mnt/trustyclaw-agent/agent-home", bootstrap)
@@ -1790,6 +1792,8 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn('agent_home / "CLAUDE.md"', bootstrap)
         self.assertIn('agent_home / ".codex" / "config.toml"', bootstrap)
         self.assertIn('agent_home / ".claude" / "settings.json"', bootstrap)
+        self.assertIn('agent_home / ".hermes" / "config.yaml"', bootstrap)
+        self.assertIn('agent_home / ".hermes" / ".env"', bootstrap)
         self.assertIn("AGENT_HOME_SOURCE_DIR=/opt/trustyclaw-host/host/bootstrap/agent-home", bootstrap)
         self.assertIn("install -m 0644 -o root -g root", bootstrap)
         self.assertIn("chattr -f -i", bootstrap)
@@ -1797,6 +1801,8 @@ class DeployUnitTests(unittest.TestCase):
         agent_instructions = Path("host/bootstrap/agent-home/agents_claude.md").read_text()
         codex_config = Path("host/bootstrap/agent-home/.codex/config.toml").read_text()
         claude_settings = Path("host/bootstrap/agent-home/.claude/settings.json").read_text()
+        hermes_config = Path("host/bootstrap/agent-home/.hermes/config.yaml").read_text()
+        hermes_env = Path("host/bootstrap/agent-home/.hermes/.env").read_text()
         self.assertIn("You are running with full permissions", agent_instructions)
         self.assertIn("Do not prompt the operator for local approvals", agent_instructions)
         # The tools section tells the agent how to discover and use bundled tools.
@@ -1812,6 +1818,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("queued for approval as push-<id>", agent_instructions)
         self.assertIn("github_dot_github_rest_write_denied", agent_instructions)
         self.assertIn("TrustyClaw admin UI", agent_instructions)
+        self.assertNotIn("AWS_REGION=", hermes_env)
         self.assertIn("always exposes `app_api`", agent_instructions)
         self.assertIn("listing the tool grants no app access", agent_instructions)
         self.assertIn("do not guess or probe routes", agent_instructions)
@@ -1824,6 +1831,20 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn('sandbox_mode = "danger-full-access"', codex_config)
         self.assertIn('"defaultMode": "bypassPermissions"', claude_settings)
         self.assertIn('"skipDangerousModePermissionPrompt": true', claude_settings)
+        self.assertIn("provider: bedrock", hermes_config)
+        self.assertIn("tirith_enabled: false", hermes_config)
+        self.assertIn("memory_enabled: false", hermes_config)
+        self.assertIn("user_profile_enabled: false", hermes_config)
+        self.assertIn("creation_nudge_interval: 0", hermes_config)
+        self.assertIn("enabled: false", hermes_config)
+        # The managed Hermes config wires the bundled-tools MCP shim exactly
+        # like the managed Codex config layer: same interpreter, module, and
+        # host import path.
+        self.assertIn("mcp_servers:", hermes_config)
+        self.assertIn("trustyclaw:", hermes_config)
+        self.assertIn("command: /usr/bin/python3", hermes_config)
+        self.assertIn('args: ["-m", "host.runtime.agent_shim.mcp_shim"]', hermes_config)
+        self.assertIn("PYTHONPATH: /opt/trustyclaw-host", hermes_config)
         self.assertIn('if [ ! -f "$PROXY_STATE_DIR/network_proxy_ca.key" ]', bootstrap)
         # Managed Codex policy restricts the agent to cached web search and
         # disables Codex-hosted app/plugin connector surfaces.
@@ -1885,8 +1906,11 @@ class DeployUnitTests(unittest.TestCase):
         # them, and the deploy verifies the agent can actually run both CLIs.
         self.assertIn("CODEX_CLI_VERSION=0.144.0", bootstrap)
         self.assertIn("CLAUDE_CODE_VERSION=2.1.206", bootstrap)
+        self.assertIn("HERMES_AGENT_VERSION=0.18.2", bootstrap)
         self.assertIn('"@openai/codex@${CODEX_CLI_VERSION}"', bootstrap)
         self.assertIn('"@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"', bootstrap)
+        self.assertIn('"hermes-agent[bedrock,mcp]==${HERMES_AGENT_VERSION}"', bootstrap)
+        self.assertNotIn("HERMES_ANTHROPIC_SDK_VERSION", bootstrap)
         self.assertIn('"codex-cli ${CODEX_CLI_VERSION}"', bootstrap)
         self.assertIn('"${CLAUDE_CODE_VERSION} (Claude Code)"', bootstrap)
         helper_sources = "\n".join(path.read_text() for path in Path("host/bootstrap/helpers").glob("*.sh"))
@@ -1900,6 +1924,9 @@ class DeployUnitTests(unittest.TestCase):
         self.assertNotIn('oauth.get("billingType")', helper_sources)
         self.assertNotIn('tokens.get("subscriptionType")', helper_sources)
         self.assertNotIn('config.get("claudeCodeFirstTokenDate")', helper_sources)
+        clear_auth = Path("host/bootstrap/helpers/clear-agent-auth.sh").read_text()
+        self.assertNotIn("codex|claude|aws", clear_auth)
+        self.assertNotIn('.aws" / "credentials"', clear_auth)
         self.assertIn("chmod -R a+rX /usr/local/lib/node_modules", bootstrap)
         self.assertIn("chmod 755 /etc/codex", bootstrap)
         self.assertIn("runuser -u trustyclaw-agent -- env HOME=/mnt/trustyclaw-agent/agent-home", helper_sources)
@@ -1922,12 +1949,15 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("MemorySwapMax=5G", bootstrap)
         self.assertIn("fallocate -l 6G /swapfile", bootstrap)
         self.assertIn("TasksMax=4096", bootstrap)
-        for launch_helper in ("run-codex-app-server", "run-claude-code"):
+        for launch_helper in ("run-codex-app-server", "run-claude-code", "run-pi", "run-hermes"):
             launch_source = Path(f"host/bootstrap/helpers/{launch_helper}.sh").read_text()
             self.assertIn(
                 "exec systemd-run --quiet --collect --scope --slice=trustyclaw_agent.slice",
                 launch_source,
             )
+            # Ubuntu 22.04's systemd 249 rejects --pipe together with --scope.
+            # Scope mode already preserves the launcher's synchronous stdio.
+            self.assertNotIn("--pipe", launch_source)
             # The scope must not outlive the admin API: stopping, restarting,
             # or crashing the admin service stops the agent scopes with it.
             self.assertIn("--property=BindsTo=trustyclaw-admin-api.service", launch_source)
@@ -1940,6 +1970,37 @@ class DeployUnitTests(unittest.TestCase):
             self.assertIn('unit_args=(--unit "trustyclaw-agent-thread-$2")', launch_source)
             self.assertIn("shift 2", launch_source)
             self.assertIn('"${unit_args[@]}"', launch_source)
+        for launch_helper in ("run-pi", "run-hermes"):
+            launch_source = Path(f"host/bootstrap/helpers/{launch_helper}.sh").read_text()
+            self.assertIn('export AWS_SECRET_ACCESS_KEY="trustyclaw-bedrock-dummy-secret"', launch_source)
+            self.assertEqual(
+                launch_source.count('AWS_SECRET_ACCESS_KEY="trustyclaw-bedrock-dummy-secret"'), 1
+            )
+        hermes_launcher = Path("host/bootstrap/helpers/run-hermes.sh").read_text()
+        self.assertIn("/usr/local/lib/trustyclaw-host/hermes-stdin.py", hermes_launcher)
+        self.assertNotIn("hermes chat", hermes_launcher)
+        hermes_stdin = Path("host/bootstrap/helpers/hermes-stdin.py").read_text()
+        self.assertIn("sys.stdin.buffer.read", hermes_stdin)
+        self.assertIn("hermes_main(", hermes_stdin)
+        # The one-query path never starts Hermes's own MCP discovery, so the
+        # adapter must connect the bundled-tools shim synchronously and enable
+        # its toolset alongside terminal and file.
+        self.assertIn('importlib.import_module("tools.mcp_tool").discover_mcp_tools()', hermes_stdin)
+        self.assertIn('toolsets="terminal,file,trustyclaw"', hermes_stdin)
+        # Pi has no MCP client, so its launcher loads the root-owned bridge
+        # extension explicitly; --no-extensions must stay (it disables
+        # discovery but honors explicit -e paths), and the bridge must spawn
+        # the same shim module the other harnesses use.
+        pi_launcher = Path("host/bootstrap/helpers/run-pi.sh").read_text()
+        self.assertIn("--no-extensions", pi_launcher)
+        self.assertIn(
+            "--extension /opt/trustyclaw-host/host/runtime/agent_shim/pi_tools_bridge.js",
+            pi_launcher,
+        )
+        pi_bridge = Path("host/runtime/agent_shim/pi_tools_bridge.js").read_text()
+        self.assertIn('"-m", "host.runtime.agent_shim.mcp_shim"', pi_bridge)
+        self.assertIn("pi.registerTool", pi_bridge)
+        self.assertIn('"tools/call"', pi_bridge)
         # App backends are long-running services, so bootstrap creates a
         # separate top-level slice and each generated app service joins it.
         # The lower CPU weight is soft: apps can use idle cores, but the admin
@@ -2171,6 +2232,15 @@ class DeployUnitTests(unittest.TestCase):
         ).read_text()
         self.assertIn('TO "trustyclaw-agent-network";', network_migration)
         self.assertNotIn('"trustyclaw-tools"', network_migration)
+        bedrock_migration = (
+            Path(__file__).resolve().parents[1] / "host" / "migrations" / "0014_bedrock_integration.sql"
+        ).read_text()
+        self.assertIn("CREATE TABLE bedrock_credentials (", bedrock_migration)
+        self.assertIn("region TEXT NOT NULL CHECK", bedrock_migration)
+        self.assertIn('GRANT SELECT ON bedrock_credentials TO "trustyclaw-proxy";', bedrock_migration)
+        self.assertNotIn("bedrock_settings", bedrock_migration)
+        self.assertNotIn("proxy_bedrock_credentials", bedrock_migration)
+        self.assertNotIn("harness_bedrock_settings", bedrock_migration)
         # PG14 leaves the public schema creatable by PUBLIC; only the
         # schema-owning admin role may create objects.
         self.assertIn("REVOKE CREATE ON SCHEMA public FROM PUBLIC;", bootstrap)
@@ -2251,6 +2321,8 @@ class DeployUnitTests(unittest.TestCase):
             "read-agent-file",
             "reboot-host",
             "check-for-upgrade",
+            "run-pi",
+            "run-hermes",
         ):
             script = (Path(f"host/bootstrap/helpers/{name}.sh").read_text()).replace("@PROXY_PORT@", "7445")
             with tempfile.NamedTemporaryFile("w", delete=False) as handle:
@@ -2258,6 +2330,12 @@ class DeployUnitTests(unittest.TestCase):
                 script_path = handle.name
             self.addCleanup(lambda path=script_path: Path(path).unlink(missing_ok=True))
             subprocess.run(["bash", "-n", script_path], check=True)
+
+    def test_run_hermes_uses_bootstrap_config_and_passes_the_runtime_region(self) -> None:
+        launcher = Path("host/bootstrap/helpers/run-hermes.sh").read_text()
+        self.assertIn('AWS_REGION="${region}"', launcher)
+        self.assertNotIn("config.yaml", launcher)
+        self.assertNotIn(".hermes/.env", launcher)
 
     def test_run_claude_code_launcher_combines_web_search_and_thread_scope(self) -> None:
         # The launcher — not its caller — translates the operator's web-search
@@ -2511,6 +2589,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertNotIn("host/bootstrap/agent-home/CLAUDE.md", names)
         self.assertIn("host/bootstrap/agent-home/.codex/config.toml", names)
         self.assertIn("host/bootstrap/agent-home/.claude/settings.json", names)
+        self.assertIn("host/bootstrap/agent-home/.hermes/config.yaml", names)
         # The tools service imports the bundled tool packages at startup; they
         # ship under host/tools inside the host archive.
         self.assertIn("host/tools/host_api.py", names)

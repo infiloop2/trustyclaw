@@ -211,6 +211,7 @@ function renderSetup(guide) {
         <div class="guide-step-copy">
           <h4>${esc(step.title)}</h4>
           <p>${renderSetupDescription(step)}</p>
+          ${step.code ? `<pre class="guide-step-code"><code>${esc(step.code)}</code></pre>` : ""}
           ${step.showCallback && guide.callbackUrl ? `<div class="guide-callback">
             <span class="guide-callback-label">Callback URI for this host</span>
             <div class="guide-callback-value">

@@ -90,7 +90,7 @@ def seed(cur: Any, now: str) -> None:
         ("twitter", "X (Twitter)", "must_have", "Search, read, and publish X posts, replies, and quotes; publishing is approval-gated."),
         ("linkedin", "LinkedIn", "must_have", "Read your profile and publish text-only LinkedIn posts; publishing is approval-gated."),
         ("brave_search", "Brave Search", "must_have", "Research brand, competitors, and topics on the web."),
-        ("linkedin_discovery", "LinkedIn Discovery", "good_to_have", "Research public LinkedIn posts via SerpApi."),
+        ("linkedin_discovery", "LinkedIn Discovery", "good_to_have", "Research public LinkedIn posts via Serper."),
     ]
     for tool_id, title, priority, note in tools:
         cur.execute(

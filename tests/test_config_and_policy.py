@@ -104,6 +104,21 @@ class ConfigTests(unittest.TestCase):
             parse_network_controls(
                 {"network_integrations": {"claude": {"enabled": False, "web_search": True}}})
 
+    def test_bedrock_policy_contains_only_enablement(self) -> None:
+        enabled = parse_network_controls(
+            {"network_integrations": {"bedrock": {"enabled": True}}}
+        )
+        self.assertEqual(
+            enabled.to_json()["network_integrations"]["bedrock"],
+            {"enabled": True},
+        )
+
+    def test_bedrock_region_is_not_network_policy(self) -> None:
+        with self.assertRaisesRegex(ConfigError, r"bedrock has unsupported fields: region"):
+            parse_network_controls(
+                {"network_integrations": {"bedrock": {"enabled": True, "region": "eu-central-1"}}}
+            )
+
     def test_custom_domains_rejects_present_non_object(self) -> None:
         # A present-but-invalid domains value must 400, not silently reset to
         # an empty custom integration (which would erase existing rules on a

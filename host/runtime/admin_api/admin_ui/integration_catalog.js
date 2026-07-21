@@ -140,13 +140,100 @@ export const MANAGED_INTEGRATIONS = {
       ["platform.claude.com", "GET and POST only for the Claude OAuth endpoints"],
     ],
   },
+  bedrock: {
+    label: "AWS Bedrock",
+    summary: "Connect your AWS account once and let your agent run Pi and Hermes tasks through Bedrock in your own account.",
+    protections: [
+      "Inference happens through AWS Bedrock in your own AWS account, which provides maximal data privacy from model providers: the model provider never receives your traffic, and AWS states Bedrock does not store prompts or completions after serving the response, does not share them with model providers, and does not use them to train models.",
+      "No agent process receives your AWS credential. Pi and Hermes sign with fixed dummy values that carry no AWS capability; this host's proxy re-signs allowed requests with your connected IAM key stored encrypted in the host database. Presigned query-string auth and temporary session credentials are denied.",
+      "Only the configured region's Bedrock model APIs are reachable. The Bedrock control plane, other AWS services, and other regions stay blocked, so the key's blast radius on this host is inference only.",
+    ],
+    setupSteps: [
+      {
+        title: "Create a dedicated IAM user",
+        description: "In AWS IAM, create one user for TrustyClaw's shared Pi and Hermes Bedrock connection. Attach this policy, then create a long-term access key. Temporary session credentials are not supported.",
+        code: `{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "bedrock:InvokeModel",
+      "bedrock:InvokeModelWithResponseStream"
+    ],
+    "Resource": "*"
+  }]
+}`,
+        linkUrl: "https://docs.aws.amazon.com/bedrock/latest/userguide/security_iam_id-based-policy-examples.html",
+        linkLabel: "View AWS's Bedrock IAM policy examples",
+      },
+      {
+        title: "Request model access in Bedrock",
+        description: "In the Bedrock console's Model access page, enable the models you plan to use in your region.",
+        linkUrl: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html",
+        linkLabel: "View AWS's model access guide",
+      },
+      { title: "Connect AWS", description: "In Internet Access and Tools, expand AWS Bedrock, paste the access key id and secret access key, choose the region matching your model access, and connect them together." },
+      { title: "Enable Bedrock", description: "Choose Enable. Both Pi and Hermes become available from the shared connection." },
+    ],
+    dataSummary: {
+      items: [
+        {
+          title: "What leaves this host",
+          description: "Assume any host data available to the harness can go to your AWS account, including prompts, conversation history, workspace files and diffs, tool inputs, and tool results.",
+          links: [],
+        },
+        {
+          title: "Where it can go",
+          points: [
+            { label: "Your AWS account only", text: "Everything the agent sends goes to the Bedrock runtime endpoint in this integration's configured region of your own AWS account. Cross-region inference profiles (us. prefixed models) may route between US regions of AWS's own infrastructure." },
+            { label: "Model providers", text: "Never. Bedrock serves the models from AWS-hosted copies; the model providers do not receive your prompts or outputs." },
+          ],
+          links: [],
+        },
+        {
+          title: "What AWS can do with it",
+          description: "AWS treats Bedrock inputs and outputs as your content.",
+          points: [
+            { label: "No training, no sharing", text: "AWS states it does not use Bedrock prompts or completions to train models and does not share them with model providers or other customers." },
+            { label: "Optional features change this", text: "Model invocation logging and Guardrails are off unless you enable them in your account; enabling them stores or processes request data under your own AWS configuration." },
+          ],
+          links: [
+            { url: "https://docs.aws.amazon.com/bedrock/latest/userguide/data-protection.html", label: "AWS Bedrock data protection" },
+            { url: "https://aws.amazon.com/bedrock/faqs/", label: "AWS Bedrock FAQs" },
+          ],
+        },
+        {
+          title: "How long AWS retains it",
+          description: "AWS states Bedrock does not store or log prompts and completions after processing the request; nothing is retained unless you enable invocation logging into your own account.",
+          points: [],
+          links: [
+            { url: "https://docs.aws.amazon.com/bedrock/latest/userguide/data-protection.html", label: "AWS Bedrock data protection" },
+          ],
+        },
+      ],
+    },
+    capabilities: [
+      { name: "Pi and Hermes runtimes", description: "Runs Pi and Hermes on the same DeepSeek, Qwen, and Kimi models through one guarded Bedrock connection." },
+      { name: "Live usage estimates", description: "Provider details show a separate month-to-date estimate for Pi and for Hermes, computed live by this host from the token usage AWS reports in each response and priced at the on-demand catalog rates. AWS bills authoritatively." },
+    ],
+    controls: [
+      "Changing the access key requires the operator to paste and validate the replacement.",
+      "One Bedrock Enable/Disable control governs both runtimes. Pi and Hermes retain separate task processes, toolbar counters, and usage meters, but share one credential, region, account, and network boundary.",
+      "The host-side AWS check (STS identity attestation) runs from the host itself and is not reachable by the agent.",
+    ],
+    networkScope: [
+      ["bedrock-runtime.<region>.amazonaws.com", "POST only, Bedrock model API paths only, re-signed by the proxy with this integration's connected access key; only its configured region"],
+    ],
+  },
   github: {
     label: "GitHub",
     summary: "Connect GitHub and let your agent read repositories and write only to the repositories you choose.",
     protections: [
+      "GitHub credentials never reach the agent: the host injects the working token into requests at the proxy and strips any credential the agent sends, so the token is never returned to or read by the agent.",
       "Reads can reach any public repository and private repositories visible to the credential; writes work only for the repositories you configure.",
       "Repository administration, GraphQL, Git LFS uploads, and other write paths that could reach beyond the configured repositories stay denied.",
       "Keep approval for `.github` pushes enabled. Workflow changes can make GitHub Actions run arbitrary code with network access and repository credentials.",
+      "Search and read query values pass the host parameter guard: values shaped like a secret, credential, or sensitive identifier are denied before the request is sent.",
     ],
     setupSteps: [
       { title: "Choose a credential mode", description: "Use a fine-grained personal access token for the simplest personal setup. Use a GitHub App when you want repository installation scope and short-lived minted tokens." },
@@ -164,7 +251,7 @@ export const MANAGED_INTEGRATIONS = {
       items: [
         {
           title: "What leaves this host",
-          description: "Any data on this host can be written to a repository on the write list, so assume GitHub can receive anything the agent can read here. Reads send only repository paths and query parameters, but GitHub receives and logs that request text with standard metadata whether or not the requested repository exists, so anything the agent puts in a path or query is itself disclosed to GitHub.",
+          description: "Any data on this host can be written to a repository on the write list, so assume GitHub can receive anything the agent can read here. Reads send only repository paths and query parameters, but GitHub receives and logs that request text with standard metadata whether or not the requested repository exists, so anything the agent puts in a path or query is itself disclosed to GitHub. Read query values first pass the host parameter guard (see Technical notes), which denies secret- or credential-shaped values before the request is sent.",
           links: [],
         },
         {
@@ -194,6 +281,7 @@ export const MANAGED_INTEGRATIONS = {
       ],
     },
     controls: [
+      "Parameter guard: agent-authored read query values (search q= and filters) are checked against deterministic rules for secrets, credentials, personal identifiers, and encoded payloads; a match denies the request before it is sent. Repository paths and revision identifiers are exempt.",
       "Disabling GitHub clears the write-repository list; the independently stored credential can remain staged or be cleared separately.",
     ],
     networkScope: [
@@ -213,6 +301,7 @@ export const MANAGED_INTEGRATIONS = {
     protections: [
       "Access is read-only and limited to the public PyPI index, package metadata, and distribution download paths.",
       "Package publishing and arbitrary requests to PyPI or the download host remain denied.",
+      "Requested package names and URL values pass the host parameter guard: anything shaped like a secret, credential, or sensitive identifier is denied before the request is sent.",
     ],
     setupSteps: [
       { title: "Enable Python packages", description: "Choose Enable in Internet Access and Tools. pip and compatible package clients can then resolve and download public distributions." },
@@ -225,7 +314,7 @@ export const MANAGED_INTEGRATIONS = {
       items: [
         {
           title: "What leaves this host",
-          description: "Only package names and versions, the files requested, and standard web request metadata (source IP, request time, client User-Agent). Nothing else on this host is sent.",
+          description: "Only package names and versions, the files requested, and standard web request metadata (source IP, request time, client User-Agent). Nothing else on this host is sent. Requested package names and URL values first pass the host parameter guard (see Technical notes), which denies secret- or credential-shaped values before the request is sent.",
           links: [],
         },
         {
@@ -255,6 +344,9 @@ export const MANAGED_INTEGRATIONS = {
         },
       ],
     },
+    controls: [
+      "Parameter guard: requested package names and URL values are checked against deterministic rules for secrets, credentials, personal identifiers, and encoded payloads; a match denies the request before it is sent.",
+    ],
     networkScope: [
       ["pypi.org", "GET and HEAD only under /simple and /pypi/<package>/json"],
       ["files.pythonhosted.org", "GET and HEAD only under /packages"],
@@ -266,6 +358,7 @@ export const MANAGED_INTEGRATIONS = {
     protections: [
       "Registry and Node.js distribution access is read-only; npm publishing and arbitrary Node.js website paths remain denied.",
       "Only public registry data and release files are available through this integration.",
+      "Requested package names and URL values pass the host parameter guard: anything shaped like a secret, credential, or sensitive identifier is denied before the request is sent.",
     ],
     setupSteps: [
       { title: "Enable NPM Packages", description: "Choose Enable in Internet Access and Tools. npm and compatible clients can then resolve and download public packages and Node.js distributions." },
@@ -278,7 +371,7 @@ export const MANAGED_INTEGRATIONS = {
       items: [
         {
           title: "What leaves this host",
-          description: "Only package names and versions, the files requested, and standard web request metadata (source IP, request time, client User-Agent). Nothing else on this host is sent.",
+          description: "Only package names and versions, the files requested, and standard web request metadata (source IP, request time, client User-Agent). Nothing else on this host is sent. Requested package names and URL values first pass the host parameter guard (see Technical notes), which denies secret- or credential-shaped values before the request is sent.",
           links: [],
         },
         {
@@ -309,6 +402,9 @@ export const MANAGED_INTEGRATIONS = {
         },
       ],
     },
+    controls: [
+      "Parameter guard: requested package names and URL values are checked against deterministic rules for secrets, credentials, personal identifiers, and encoded payloads; a match denies the request before it is sent.",
+    ],
     networkScope: [
       ["registry.npmjs.org", "GET and HEAD only"],
       ["nodejs.org", "GET and HEAD only under /dist"],
@@ -322,6 +418,7 @@ export const CUSTOM_DOMAIN_GUIDE = {
   summary: "Creates an explicit network rule for a domain that is not covered by a managed integration or bundled tool.",
   protections: [
     "Every request must match the configured domain, method, and any path guards. Anything outside the rule is denied and recorded in the network audit log.",
+    "Request URL values pass the host parameter guard: anything shaped like a secret, credential, or sensitive identifier is denied before the request is sent.",
     "Managed-integration domains are reserved, so a custom rule cannot bypass their account, repository, or request-body protections.",
   ],
   setupSteps: [
@@ -336,7 +433,7 @@ export const CUSTOM_DOMAIN_GUIDE = {
     items: [
       {
         title: "What leaves this host",
-        description: "The configured service receives the complete HTTPS request: hostname, path, query parameters, method, headers, cookies or authorization values, body, and source network metadata. Any host data the agent places in a request can go to that service.",
+        description: "The configured service receives the complete HTTPS request: hostname, path, query parameters, method, headers, cookies or authorization values, body, and source network metadata. Any host data the agent places in a request can go to that service. The request URL's path and query values first pass the host parameter guard (see Technical notes), which denies secret- or credential-shaped values before the request is sent; the request body is not scanned.",
         links: [],
       },
       {
@@ -357,6 +454,7 @@ export const CUSTOM_DOMAIN_GUIDE = {
     ],
   },
   controls: [
+    "Parameter guard: request URL path and query values are checked against deterministic rules for secrets, credentials, personal identifiers, and encoded payloads; a match denies the request before it is sent; the request body is not scanned.",
     "Rules validate structurally and publish atomically; an invalid replacement leaves the active policy unchanged.",
   ],
   networkScope: [],

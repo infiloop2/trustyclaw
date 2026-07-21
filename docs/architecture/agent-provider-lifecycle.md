@@ -1,17 +1,21 @@
 # Agent provider lifecycle
 
-How a Codex or Claude Code runtime moves between statuses, which refreshes run
-when, how a provider account becomes anchored and pinned, and what each
-operator action changes. Command-level provider interfaces live in
+How a Codex, Claude Code, Pi, or Hermes runtime moves between statuses, which
+refreshes run when, how a provider account becomes anchored and pinned, and
+what each operator action changes. Command-level provider interfaces live in
 [Runtime harness dependencies](harness-dependencies.md); the proxy guards that
 enforce the pins live in [Network controls](network-controls.md).
 
 ## Runtimes, statuses, and where state lives
 
-Each runtime (`codex` for OpenAI, `claude_code` for Claude) carries one
-status: `deactivated`, `loading`, `awaiting_login`, `active`, or `error`.
+Codex and Claude Code each carry one provider status. AWS Bedrock carries one
+shared status that is projected into the Pi and Hermes runtime rows beside
+their separate running-task counters. There is no Pi- or Hermes-specific
+provider activation state. Status values are `deactivated`, `loading`,
+`awaiting_login`, `active`, or `error`; `awaiting_login` applies only to the
+OAuth providers, while enabled Bedrock is `awaiting_login` or `active`.
 
-- **Status** is derived health, cached in orchestrator process memory. A fresh
+- **Status** is derived provider health, cached in orchestrator process memory. A fresh
   process reports `loading` until its first poll; nothing persists it.
 - **The anchor** is the operator-approved provider account id, stored in the
   database. It is captured only through a completed operator login, is
@@ -20,9 +24,9 @@ status: `deactivated`, `loading`, `awaiting_login`, `active`, or `error`.
 - **The proxy pin** is the per-request credential guard the network proxy
   enforces. It is published only by a refresh that commits `active` and is
   cleared by any refresh that commits anything else.
-- **Credentials** live in the agent user's provider auth files; the provider
-  CLIs own them, including token refresh. TrustyClaw reads them through
-  root-owned helpers and never writes them.
+- **OAuth credentials** live in the agent user's provider auth files; the
+  provider CLIs own them, including token refresh. The shared Bedrock IAM key
+  lives encrypted in the admin database and never reaches an agent process.
 
 ## Anchor versus pin
 
@@ -41,9 +45,19 @@ recently proved it: the value the network proxy checks on every provider
 request. Its shape is whatever each provider's requests actually expose —
 OpenAI requests carry the ChatGPT account id, so the OpenAI pin is that id;
 Claude requests carry only an opaque bearer token, so the Claude pin is
-sha256 of the validated token. The Claude pin therefore rotates with the
-token while the anchor never changes; a rotated token must be re-attested to
-the same anchored account before its hash becomes the new pin.
+sha256 of the validated token.
+The Claude pin therefore rotates with the token while the anchor never
+changes; a rotated token must be re-attested to the same anchored account
+before its hash becomes the new pin. The Bedrock harnesses have no pin and no
+account anchor at all: the agent never holds a real AWS credential. It signs
+with the dummy routing identity shared by the Bedrock launchers and the proxy
+re-signs each allowed request with the operator's key. The routing identity is
+not a Pi-versus-Hermes pin (each harness signs with its own fixed routing key
+id, but only so the proxy attributes usage to the right runtime); the
+connected credential (encrypted in the database, written only by the operator
+API) is the approval. Pi and Hermes are separate task runtimes over one
+provider, connected credential, working proxy credential, cached account
+record, and validation lifecycle.
 
 Publishing the pin is what the `active` transition *means*, which is why the
 two are inseparable:
@@ -100,11 +114,11 @@ rewrites never change the value.
 
 | Status | Meaning | Recheck cadence |
 | --- | --- | --- |
-| `deactivated` | The provider is disabled in the network policy. Pin cleared, processes closed, running tasks failed; queued tasks fail at their next claim. The anchor and the agent's credential files remain, so re-enabling can return directly to `active` with no new login. | every 5 seconds (a backstop: enabling the provider refreshes immediately) |
+| `deactivated` | The provider is disabled in the network policy. The proxy rejects its requests, processes close, and running tasks fail; queued tasks fail at their next claim. The operator-approved account or connected credential remains, so re-enabling can return directly to `active` with no new login. Disabling Bedrock projects `deactivated` into both harness rows and stops both runtime process pools. | every 5 seconds (a backstop: enabling the provider refreshes immediately) |
 | `loading` | No poll has completed yet (process start). | every 5 seconds |
-| `awaiting_login` | No usable credential: none present, not operator-approved, or live validation rejected it. Pin cleared; the anchor, if any, remains. | every 5 seconds |
-| `active` | A live-validated, operator-anchored credential; pin published. | every 5 minutes |
-| `error` | The last check failed for a non-authentication reason; `error_message` carries the cause. Pin cleared. | every 5 seconds |
+| `awaiting_login` | An OAuth runtime needs operator login, or enabled Bedrock needs its shared credential connected. OAuth proxy enforcement state is cleared; the anchor, if any, remains. | every 5 seconds |
+| `active` | An operator-approved OAuth credential with live validation, or an enabled Bedrock provider with a synchronously validated credential row. | every 5 minutes |
+| `error` | The last OAuth check failed, or stored Bedrock state is internally inconsistent. `error_message` carries the cause. Provider errors encountered during a Bedrock task fail that task and do not change this derived status. | every 5 seconds |
 
 Tasks run only against an `active` runtime: a worker that claims a task while
 the runtime is anything else fails it immediately with that status as the
@@ -114,8 +128,8 @@ a missing login.
 
 ## Refresh triggers
 
-Every trigger funnels into the same per-runtime refresh, serialized by one
-lock:
+Every trigger funnels into the same provider-connection refresh. One Bedrock
+refresh updates the shared status shown by both Pi and Hermes:
 
 | Trigger | When |
 | --- | --- |
@@ -123,7 +137,8 @@ lock:
 | Policy change | Disabled providers deactivate synchronously; re-enabled ones refresh in the background. |
 | Operator refresh | `POST /v1/agent-runtime/refresh` (the top-bar refresh button). |
 | Login completion | Claude code submission refreshes directly; Codex device-login completion is observed by the next poll. |
-| Account reset | `POST /v1/agent-runtime/reset-linked-account` refreshes after clearing state. |
+| Credential connect | `POST /v1/agent-runtime/bedrock-credentials` synchronously validates STS identity, atomically stores only a successful key and its metadata, then locally refreshes enabled Bedrock runtimes. |
+| Account reset | OAuth runtimes use `POST /v1/agent-runtime/reset-linked-account`; Bedrock uses `DELETE /v1/agent-runtime/bedrock-credentials`. |
 | Task claim | Claude Code only, before each task turn (see below). |
 
 ## The refresh pipeline
@@ -133,9 +148,11 @@ lock:
    the pin; live processes close and running tasks fail.
 2. **Local account read.** The provider reports its own view: Claude Code via
    `claude auth status` plus the credential-file hash, Codex via
-   `account/read {"refreshToken": false}` on a short-lived app-server. A
-   missing credential is `awaiting_login`.
-3. **Live validation.** A locally cached credential is never sufficient:
+   `account/read {"refreshToken": false}` on a short-lived app-server, and
+   Bedrock via its validated credential/account rows. A missing credential is
+   `awaiting_login`. A present Bedrock row is already validated and becomes
+   `active` without another AWS identity call.
+3. **OAuth live validation.** A locally cached OAuth credential is never sufficient:
    - *Claude, steady token* (anchored, hash unchanged): run the
      `claude -p /usage` probe. The CLI authenticates through the proxy and
      owns refreshing an expired access token; the credential hash is re-read
@@ -162,7 +179,8 @@ lock:
    disable that landed during the slow probe wins), validate the probed
    account against the anchor — reject a changed account, capture a first
    anchor only from step 4/5 evidence — then save the account, publish or
-   clear the pin, and record the status.
+   clear the pin, and record the status. Bedrock has no anchor or pin; it only
+   records the local status.
 7. **Usage backfill (Claude).** A first-capture or just-rotated token could
    not run the usage probe (its pin only went live at the commit), so the
    refresh reads usage once now; the admin UI shows usage immediately after
@@ -183,6 +201,12 @@ pipeline finds. Per state, the work and the provider traffic are:
 | `awaiting_login` → login just completed | Same local reads discover the new credential; Codex also reads the completed login's provider-signed account id (local helper). | One Claude profile attestation (root egress) to bind the new token to its account; Codex validates on its next recheck through the usage read. |
 | `active` (five-minute recheck) | Policy read, local account read, credential hash re-read, commit. | Exactly one authenticated round trip: Claude runs `claude -p /usage` (the CLI may additionally call its OAuth token endpoint if the access token expired — that refresh is the point); Codex runs `account/rateLimits/read`. A Codex failure on a pinned account adds one `account/read {"refreshToken": true}`. A detected Claude rotation adds one profile attestation and one post-commit usage read. |
 | `error` | Same local reads; the verdict memory answers until it expires. | None while the verdict holds; one normal live validation when it expires. |
+
+Bedrock is simpler than this OAuth table. Its five-minute recheck reads policy,
+the credential id, and the account metadata locally, and makes no AWS call at
+all: STS is not called again after credential setup, and the cost display
+needs no provider read because the proxy meters token usage out of each
+Bedrock response as it happens (see the network controls doc).
 
 Pre-task Claude refreshes run this same table and stay memory-only within the
 verdict window. The operator refresh button deliberately bypasses verdict
@@ -210,9 +234,9 @@ and the refresh is what converts its completion into an anchor, a pin, and
    hash), publishes the pin, and commits `active` — within one or two poll
    ticks of the login finishing.
 
-## Live-validation verdict memory
+## OAuth live-validation verdict memory
 
-Every live-validation verdict is remembered in process memory, keyed by the
+Every OAuth live-validation verdict is remembered in process memory, keyed by the
 credential it judged, so validation generates provider traffic at most once
 per scheduled recheck regardless of how often the five-second poll or task
 claims re-enter the refresh. An explicit operator refresh bypasses this memory:
@@ -229,8 +253,57 @@ claims re-enter the refresh. An explicit operator refresh bypasses this memory:
 - **Claude attestations** are memoized per token hash: a token's attested
   identity never changes, so one successful profile fetch answers every later
   recheck (including a runtime parked in account-mismatch `error`).
-- Verdicts are process memory on purpose: a restart revalidates each
-  credential once from scratch.
+- Verdicts are process memory on purpose: a restart revalidates each OAuth
+  credential once from scratch. Bedrock has no verdict memo; its validated row
+  is durable provider state.
+
+## The Bedrock provider lifecycle
+
+The Pi and Hermes runtimes use one Bedrock provider pipeline and credential: one
+static IAM access key pair the operator pastes, instead of an OAuth flow a
+CLI owns. The differences, step by step:
+
+- **Two useful runtime states.** While Bedrock is enabled, both runtime rows
+  show `awaiting_login` until the shared credential is connected, then
+  `active`. There is no separate checking, staged, or credential-error state.
+- **One validated connection.** The connect endpoint passes the credential
+  candidate directly to `sts:GetCallerIdentity`. Only after it succeeds does
+  one transaction store the encrypted credential and selected region with its
+  AWS account and IAM ARN. A rejected replacement never enters the database
+  and leaves any previous validated connection unchanged.
+- **Operator approval is the stored credential.** Only the operator API writes
+  `bedrock_credentials`, and the agent has no database access, so the validated
+  row is the approval. There is no second account anchor, working copy, error
+  latch, or in-memory verdict.
+- **The proxy reads that row directly.** It first enforces Bedrock policy and
+  the fixed dummy routing identity, then decrypts the key only to re-sign the
+  allowed request. Disabling is a soft product state and leaves the row intact.
+  Connecting another key and region validates them from scratch and atomically
+  replaces the connection and metadata.
+- **No per-task convergence.** Static keys never rotate, so like Codex the
+  cached status decides at task claim; there is no pre-task refresh.
+- **Identity is checked at submission.** STS proves the key pair; a rejection
+  returns directly from the credential request with no database change.
+  `bedrock:InvokeModel*` and model access cannot be proven without a billable,
+  model-specific call, so AWS checks those on the first task turn. Any later
+  AWS rejection is the task's descriptive provider error; it does not create
+  stored credential health. Setup does not silently invoke a model or require
+  one probe model.
+- **Cost is metered live, never polled.** The operator-facing month-to-date
+  estimate comes from the token usage AWS reports in every Bedrock response,
+  counted at the proxy per runtime, model, and UTC day, and priced at the
+  host's on-demand catalog rates (see the network controls doc). No billing
+  API is called, no billing IAM permission is required, and the display is
+  current the moment a response completes; Pi and Hermes each show their own
+  meter. AWS remains the authoritative bill.
+
+The admin service does read and decrypt the credential directly from its
+database, but it has no network egress. It injects the key pair into the
+single-shot root-owned `read-aws-account` helper through its environment so
+the helper can make the STS request over direct egress. This keeps the
+existing host boundary intact: neither the admin service nor the agent gains
+internet access, the agent-facing proxy exposes no STS route, and the
+plaintext never touches disk.
 
 ## The pre-task Claude refresh
 
@@ -249,9 +322,17 @@ Codex has no per-task convergence and its cached status decides.
   while the runtime is `awaiting_login` or `error`. Completion produces the
   first-capture evidence in steps 4–5 and clears any remembered failure
   verdict.
-- **Disconnect** (`POST /v1/agent-runtime/reset-linked-account`): one
-  mutation clears the anchor, the pin, and any pending OAuth approval; local
-  agent auth files are wiped, live processes close, running tasks fail, and
-  remembered verdicts are dropped. The next login re-anchors from scratch.
+- **Connect credentials** (`POST /v1/agent-runtime/bedrock-credentials`): the
+  Bedrock connection action. It synchronously validates STS identity, even
+  while Bedrock is disabled, and stores only a successful candidate. The
+  write returns only `accepted`; enabled Bedrock becomes active from the
+  stored validated row.
+- **Disconnect** (`DELETE /v1/agent-runtime/bedrock-credentials`): one mutation
+  deletes the shared credential and cached account metadata; both
+  harnesses' live processes close and running tasks fail. There is no on-disk
+  agent auth or remembered Bedrock verdict to clear. The next credential
+  connect starts from scratch. The live usage counters are retained: they
+  record work already done.
 - **Refresh** (`POST /v1/agent-runtime/refresh`): re-derives status through
-  the pipeline and forces the provider probe instead of reusing a verdict.
+  the pipeline and forces OAuth provider probes. Bedrock has nothing extra to
+  force: its status is local and its usage meters update as responses arrive.

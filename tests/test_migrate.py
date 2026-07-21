@@ -285,6 +285,46 @@ class RepoMigrationDataTests(unittest.TestCase):
                 [("codex", "codex-thread", "provider-thread")],
             )
 
+    def test_0013_removes_only_the_obsolete_serpapi_config(self) -> None:
+        migrate.up(target=12, directory=self.repo_migrations, quiet=True)
+        with db.transaction() as cur:
+            cur.execute(
+                """
+                INSERT INTO tool_config (tool_id, key, value) VALUES
+                    ('linkedin_discovery', 'SERPAPI_API_KEY', 'old-ciphertext'),
+                    ('linkedin_discovery', 'SERPERAPI_API_KEY', 'new-ciphertext'),
+                    ('brave_search', 'BRAVE_SEARCH_API_KEY', 'other-ciphertext')
+                """
+            )
+
+        self.assertEqual(
+            migrate.up(target=13, directory=self.repo_migrations, quiet=True),
+            [13],
+        )
+        with db.transaction() as cur:
+            cur.execute("SELECT tool_id, key FROM tool_config ORDER BY tool_id, key")
+            self.assertEqual(
+                cur.fetchall(),
+                [
+                    ("brave_search", "BRAVE_SEARCH_API_KEY"),
+                    ("linkedin_discovery", "SERPERAPI_API_KEY"),
+                ],
+            )
+
+        self.assertEqual(
+            migrate.down(target=12, directory=self.repo_migrations, quiet=True),
+            [13],
+        )
+        with db.transaction() as cur:
+            cur.execute("SELECT tool_id, key FROM tool_config ORDER BY tool_id, key")
+            self.assertEqual(
+                cur.fetchall(),
+                [
+                    ("brave_search", "BRAVE_SEARCH_API_KEY"),
+                    ("linkedin_discovery", "SERPERAPI_API_KEY"),
+                ],
+            )
+
 
 class AppMigrationTests(unittest.TestCase):
     DB_NAME = "trustyclaw_app_migrate_test"
