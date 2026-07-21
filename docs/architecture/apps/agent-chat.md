@@ -53,7 +53,10 @@ first message) or appends a task to an existing one:
 - `GET /tasks/<task_id>` proxies the host task read so the UI can poll status
   and output. `POST /tasks/<task_id>/cancel|kill|steer` proxy the matching
   host controls; every task id is first checked against `thread_tasks`, so the
-  app only ever touches its own tasks.
+  app only ever touches its own tasks. Hermes has no mid-turn steering input,
+  so its running tasks omit the Steer control; the host also rejects a direct
+  Hermes steer request. The composer queues later input as a new task on the
+  same thread, which runs after the current task finishes.
 - `GET /threads/<thread_id>/events?since=<seq>` proxies the host thread event
   stream so the UI shows every message of every task, not just the prompt and
   final answer: interim agent progress and mid-task operator steering both

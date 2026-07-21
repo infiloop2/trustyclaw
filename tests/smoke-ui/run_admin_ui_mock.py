@@ -92,8 +92,9 @@ TOOL_APPROVAL_GET_RE = re.compile(r"^/v1/tools/([a-z0-9_]+)/approvals/([^/]+)$")
 TOOL_CONFIG_RE = re.compile(r"^/v1/tools/([a-z0-9_]+)/config$")
 TOOL_EVENT_RE = re.compile(r"^/v1/tools/events/([1-9][0-9]*)$")
 MOCK_OAUTH_CODE = "mock-auth-code"
-RUNTIMES = ("codex", "claude_code")
-PROVIDER_BY_RUNTIME = {"codex": "openai", "claude_code": "claude"}
+RUNTIMES = ("codex", "claude_code", "pi", "hermes")
+PROVIDER_BY_RUNTIME = {"codex": "openai", "claude_code": "claude", "pi": "bedrock", "hermes": "bedrock"}
+BEDROCK_RUNTIMES = ("pi", "hermes")
 MAX_RUNNING_PER_RUNTIME = 3
 MAX_RUNNING_TOTAL = 6
 
@@ -107,6 +108,8 @@ PROGRESS_SCRIPT = [
 PROVIDER_TRAFFIC = {
     "codex": ("api.openai.com", "/v1/responses"),
     "claude_code": ("api.anthropic.com", "/v1/messages"),
+    "pi": ("bedrock-runtime.us-east-1.amazonaws.com", "/model/deepseek.v3.2/converse-stream"),
+    "hermes": ("bedrock-runtime.us-east-1.amazonaws.com", "/model/qwen.qwen3-coder-next/converse-stream"),
 }
 
 
@@ -135,6 +138,8 @@ class MockState:
     github_credential: dict[str, Any] | None = None
     codex_oauth: dict[str, str] = field(default_factory=dict)
     claude_oauth: dict[str, str] = field(default_factory=dict)
+    bedrock_access_key_id: str | None = None
+    bedrock_region: str | None = None
     reboot_requested: bool = False
     upgrade_available: bool = True
     usage_refreshes: int = 0
@@ -236,7 +241,11 @@ class MockState:
         integration = managed.get(provider) if isinstance(managed, dict) else None
         if not isinstance(integration, dict) or integration.get("enabled") is not True:
             return "deactivated"
-        return "active" if self.logged_in.get(runtime) else "awaiting_login"
+        if runtime in BEDROCK_RUNTIMES:
+            return "active" if self.bedrock_access_key_id else "awaiting_login"
+        if self.logged_in.get(runtime):
+            return "active"
+        return "awaiting_login"
 
 
 STATE = MockState()
@@ -795,6 +804,13 @@ def route(method: str, path: str, query: dict[str, list[str]], body: Any) -> dic
         return oauth("claude_code", method)
     if path == "/v1/agent-runtime/claude-oauth-login/complete" and method == "POST":
         return complete_claude_oauth(body)
+    if path == "/v1/agent-runtime/bedrock-credentials":
+        if method == "GET":
+            return bedrock_credential_metadata()
+        if method == "POST":
+            return connect_bedrock_credentials(body)
+        if method == "DELETE":
+            return disconnect_bedrock_credentials()
     if path == "/v1/agent-runtime/reset-linked-account" and method == "POST":
         return reset_linked_account(body)
     if path == "/v1/tasks":
@@ -1069,12 +1085,12 @@ def agent_runtime_status_locked() -> dict[str, Any]:
     for task in STATE.tasks:
         if task["status"] == "running":
             active[task["agent_runtime"]].append(task["task_id"])
-    return {
-        "runtimes": [
-            {"type": runtime, "status": STATE.runtime_status(runtime), "active_task_ids": active[runtime]}
-            for runtime in RUNTIMES
-        ]
-    }
+    runtimes = []
+    for runtime in RUNTIMES:
+        status = STATE.runtime_status(runtime)
+        record = {"type": runtime, "status": status, "active_task_ids": active[runtime]}
+        runtimes.append(record)
+    return {"runtimes": runtimes}
 
 
 def agent_accounts() -> dict[str, Any]:
@@ -1083,6 +1099,8 @@ def agent_accounts() -> dict[str, Any]:
         checked_at = STATE.now()
         accounts: list[dict[str, Any]] = []
         for runtime in RUNTIMES:
+            if runtime in BEDROCK_RUNTIMES:
+                continue
             status = STATE.runtime_status(runtime)
             if runtime == "codex":
                 account = {"agent_runtime": runtime, "provider": "openai", "status": status}
@@ -1144,6 +1162,45 @@ def agent_accounts() -> dict[str, Any]:
                 elif STATE.logged_in.get(runtime):
                     account.update({"account_id": "acct_mock_claude", "email": "claude@example.invalid"})
             accounts.append(account)
+        bedrock_status = STATE.runtime_status("pi")
+        bedrock_account: dict[str, Any] = {
+            "provider": "bedrock",
+            "agent_runtimes": list(BEDROCK_RUNTIMES),
+            "status": bedrock_status,
+            # Live per-runtime usage is always present, mirroring the real
+            # accounts payload: the proxy's counters exist independent of the
+            # credential state.
+            "bedrock_usage": {
+                "pi": {
+                    "month_to_date": 12.75,
+                    "currency": "USD",
+                    "requests": 210,
+                    "metered_requests": 208,
+                    "input_tokens": 1_804_211,
+                    "output_tokens": 96_407,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                },
+                "hermes": {
+                    "month_to_date": 0.31,
+                    "currency": "USD",
+                    "requests": 41,
+                    "metered_requests": 41,
+                    "input_tokens": 402_118,
+                    "output_tokens": 31_889,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                },
+            },
+        }
+        if STATE.bedrock_access_key_id and bedrock_status == "active":
+            bedrock_account.update(
+                {
+                    "account_id": "123456789012",
+                    "arn": "arn:aws:iam::123456789012:user/trustyclaw-bedrock",
+                }
+            )
+        accounts.append(bedrock_account)
         return {"accounts": accounts}
 
 
@@ -1152,7 +1209,7 @@ def refresh_agent_accounts(body: Any) -> dict[str, Any]:
         raise ApiError(HTTPStatus.BAD_REQUEST, "request body must be an object")
     runtime = body.get("agent_runtime") if isinstance(body, dict) else None
     if runtime is not None and runtime not in RUNTIMES:
-        raise ApiError(HTTPStatus.BAD_REQUEST, "agent_runtime must be codex or claude_code")
+        raise ApiError(HTTPStatus.BAD_REQUEST, "agent_runtime must be one of " + ", ".join(RUNTIMES))
     with STATE.lock:
         STATE.usage_refreshes += 1
     return agent_accounts()
@@ -1216,24 +1273,75 @@ def complete_claude_oauth(body: Any) -> dict[str, str]:
     return {"status": "accepted"}
 
 
+def connect_bedrock_credentials(body: Any) -> dict[str, str]:
+    if not isinstance(body, dict):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "request body must be an object")
+    unexpected = sorted(set(body) - {"access_key_id", "secret_access_key", "region"})
+    if unexpected:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "unexpected request fields: " + ", ".join(unexpected))
+    access_key_id = body.get("access_key_id")
+    secret_access_key = body.get("secret_access_key")
+    region = body.get("region")
+    if not isinstance(access_key_id, str) or not access_key_id.strip():
+        raise ApiError(HTTPStatus.BAD_REQUEST, "access_key_id must be a non-empty string")
+    if not isinstance(secret_access_key, str) or not secret_access_key.strip():
+        raise ApiError(HTTPStatus.BAD_REQUEST, "secret_access_key must be a non-empty string")
+    if not access_key_id.strip().startswith("AKIA"):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "access_key_id must be a long-term IAM access key id (AKIA...)")
+    if region not in ("us-east-1", "us-east-2", "us-west-2"):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "region must be one of us-east-1, us-east-2, us-west-2")
+    with STATE.lock:
+        STATE.bedrock_access_key_id = access_key_id.strip()
+        STATE.bedrock_region = region
+        enabled = STATE.runtime_status("pi") != "deactivated"
+        if not enabled:
+            return {"status": "accepted"}
+        for bedrock_runtime in BEDROCK_RUNTIMES:
+            STATE.add_agent_event("agent_runtime.active", None, {"agent_runtime": bedrock_runtime})
+        start_queued_tasks_locked()
+        return {"status": "accepted"}
+
+
+def bedrock_credential_metadata() -> dict[str, Any]:
+    with STATE.lock:
+        if STATE.bedrock_access_key_id is None:
+            return {"connected": False}
+        return {
+            "connected": True,
+            "access_key_id": STATE.bedrock_access_key_id,
+            "region": STATE.bedrock_region,
+        }
+
+
+def disconnect_bedrock_credentials() -> dict[str, str]:
+    with STATE.lock:
+        STATE.bedrock_access_key_id = None
+        STATE.bedrock_region = None
+        for runtime in BEDROCK_RUNTIMES:
+            fail_running_tasks_locked(runtime, "the shared AWS Bedrock connection was reset by the operator")
+            STATE.add_agent_event("agent_runtime.linked_account_reset", None, {"agent_runtime": runtime})
+    return {"status": "accepted"}
+
+
 def reset_linked_account(body: Any) -> dict[str, str]:
-    if not isinstance(body, dict) or body.get("agent_runtime") not in RUNTIMES:
-        raise ApiError(HTTPStatus.BAD_REQUEST, "agent_runtime must be codex or claude_code")
+    oauth_runtimes = ("codex", "claude_code")
+    if not isinstance(body, dict) or body.get("agent_runtime") not in oauth_runtimes:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "agent_runtime must be one of " + ", ".join(oauth_runtimes))
     runtime = body["agent_runtime"]
     with STATE.lock:
         # The real reset fails running tasks as part of clearing the anchor.
         fail_running_tasks_locked(runtime, "the linked provider account was reset by the operator")
         STATE.logged_in[runtime] = False
+        STATE.add_agent_event("agent_runtime.linked_account_reset", None, {"agent_runtime": runtime})
         if runtime == "codex":
             STATE.codex_oauth = {}
-        else:
+        elif runtime == "claude_code":
             STATE.claude_oauth = {}
-        STATE.add_agent_event("agent_runtime.linked_account_reset", None, {"agent_runtime": runtime})
         return {"status": "accepted"}
 
 
 def runtime_label(runtime: str) -> str:
-    return "Codex" if runtime == "codex" else "Claude"
+    return {"codex": "Codex", "claude_code": "Claude", "pi": "Pi", "hermes": "Hermes"}[runtime]
 
 
 def create_task(body: Any) -> dict[str, Any]:
@@ -1268,7 +1376,7 @@ def create_task(body: Any) -> dict[str, Any]:
             model = body["model"]
             effort = body["effort"]
             if (
-                agent_runtime not in {"codex", "claude_code"}
+                agent_runtime not in RUNTIMES
                 or session_config_error(agent_runtime, model, effort) is not None
             ):
                 raise ApiError(HTTPStatus.BAD_REQUEST, "invalid task")
@@ -1339,6 +1447,11 @@ def task_route(
         if action == "steer" and method == "POST":
             if task["status"] != "running":
                 raise ApiError(HTTPStatus.CONFLICT, "only running tasks can be steered")
+            if task["agent_runtime"] == "hermes":
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "Hermes tasks do not support steering; create a new task on the same thread_id",
+                )
             message = str((body or {}).get("steer_message", ""))
             STATE.add_agent_event("task.message", task_id, {"message": message, "source": "user"})
             return {"status": "accepted"}
@@ -2025,6 +2138,7 @@ def seed_demo_state() -> None:
                     {"owner": "acme", "repo": "pages-source"},
                 ],
             },
+            "bedrock": {"enabled": True},
             "custom": {
                 "domains": {
                     "api.example.com": {"allow_http_methods": ["GET", "HEAD"], "path_guards": ["^/v1(?:/.*)?$"]},
@@ -2041,6 +2155,8 @@ def seed_demo_state() -> None:
         "updated_at": STATE.now(),
         "validation": {"status": "ok", "checked_at": STATE.now()},
     }
+    STATE.bedrock_access_key_id = "AKIAMOCKOPERATOR0001"
+    STATE.bedrock_region = "us-east-1"
 
 
 def main(argv: list[str] | None = None) -> int:

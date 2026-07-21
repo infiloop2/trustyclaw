@@ -4,19 +4,31 @@ The fresh smoke deploys a real host from scratch, validates the parts unit tests
 cannot, then tears the host down. Before calling
 `python3 -m host.cli.deploy`, it destroys any stale tagged
 `trustyclaw-smoke` EC2 instance, security group, and durable data volumes so the
-strict first-install command starts from empty AWS state. It does not require
-Codex or Claude OAuth; login-dependent runtime checks live in the persistent
-stage test.
+strict first-install command starts from empty AWS state. It supplies no Codex,
+Claude, Pi, or Hermes credential; credential-dependent runtime checks live in
+the persistent stage test.
 
 The smoke covers subnet/SG/IMDSv2/SSH provisioning, bootstrap on real Ubuntu,
 admin API access over the SSH tunnel, auth rejection, and the real admin UI in
 headless Chrome. The browser logs in, opens Mission Pursuit, clicks its
 popovers and agent settings, submits a first mission, verifies the expected
 pre-provider-login failure, and switches the workspace runtime. The remaining
-checks cover task lifecycle edge cases, policy validation, event pagination, concurrent policy replaces,
-proxy protocol edge cases, live network enforcement, managed provider policy
-validation, tool-service/socket boundaries, credential-free tool calls, and
-the network event prune race.
+checks cover all four runtime status/account records and real task insertion,
+the single Bedrock provider policy that governs both Pi and Hermes runtimes,
+every Bedrock pre-credential denial
+(foreign access-key id, cross-region signature, presigned query, session token,
+and unavailable proxy credential), real Pi and Hermes launcher startup through
+their systemd scopes until the proxy's local missing-credential denial, task
+lifecycle edge cases, policy validation,
+event pagination, concurrent policy replaces, proxy protocol edge cases, live
+network enforcement, managed provider policy validation, tool-service/socket
+boundaries, credential-free tool calls, and the network event prune race.
+
+The workflow installs its pinned Playwright driver before AWS credentials are
+injected. The credential-bearing step launches the hosted runner's preinstalled
+Chrome, so it downloads neither code nor a browser while the credentials are
+present. Playwright distinguishes browser launch, page navigation, and app
+frame failures directly.
 
 Assumptions (checked, with clear failures):
 
@@ -34,7 +46,9 @@ Cost: one `t3.small`, one 16 GiB root gp3 volume, one 16 GiB encrypted admin
 volume, and one 8 GiB encrypted agent volume for a few minutes. Teardown
 removes the instance root volume, both
 data volumes, and the smoke security group even if deploy fails before writing a
-result file.
+result file. The harness launcher probes have no Bedrock credential and the
+proxy rejects them before an upstream model request, so they add no inference
+charge.
 
 ```
 export AWS_ACCESS_KEY_ID=...

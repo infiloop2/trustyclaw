@@ -1,8 +1,11 @@
 """Stdio MCP server that forwards tool calls to the host tool sockets.
 
 Agent harnesses cannot call the tool services directly — they speak MCP.
-This shim is the bridge: Claude Code (``--mcp-config``) and Codex
-(``mcp_servers`` in ``/etc/codex/managed_config.toml``) spawn it as
+This shim is the bridge: Claude Code (``--mcp-config``), Codex
+(``mcp_servers`` in ``/etc/codex/managed_config.toml``), Hermes
+(``mcp_servers`` in the managed ``~/.hermes/config.yaml``), and Pi (the
+``pi_tools_bridge.js`` extension beside this module — Pi has no MCP client,
+so the bridge speaks this protocol for it) spawn it as
 ``trustyclaw-agent`` for each session, it serves the MCP handshake plus
 ``tools/list`` and ``tools/call`` over stdio (newline-delimited JSON-RPC),
 and forwards both over Unix sockets whose services authenticate the calling

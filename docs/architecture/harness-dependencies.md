@@ -1,10 +1,10 @@
 # Runtime Harness Dependencies
 
-TrustyClaw treats Codex and Claude Code as external runtime harnesses. The host
-owns process supervision, task state, network policy, and privilege boundaries,
-but it depends on specific CLI protocols, auth files, and network request
-shapes from those harnesses. This document lists the expectations that can
-break when a harness package is upgraded.
+TrustyClaw treats Codex, Claude Code, Pi, and Hermes as external runtime
+harnesses. The host owns process supervision, task state, network policy, and privilege
+boundaries, but it depends on specific CLI protocols, auth files, and network
+request shapes from those harnesses. This document lists the expectations that
+can break when a harness package is upgraded.
 
 ## Current harnesses
 
@@ -12,14 +12,18 @@ break when a harness package is upgraded.
 | --- | --- | --- | --- | --- |
 | Codex | `@openai/codex` | `0.144.0` | `codex` | `host/runtime/admin_api/codex_app_server.py` |
 | Claude Code | `@anthropic-ai/claude-code` | `2.1.206` | `claude_code` | `host/runtime/admin_api/claude_code.py` |
+| Pi | `@earendil-works/pi-coding-agent` | `0.80.10` | `pi` | `host/runtime/admin_api/pi_agent.py` |
+| Hermes | `hermes-agent[bedrock,mcp]` | `0.18.2` | `hermes` | `host/runtime/admin_api/hermes_agent.py` |
 
-Bootstrap installs these packages globally with npm and verifies the exact CLI
-version strings before completing. A version bump should be treated as an
-interface review, not a package-only change.
+Bootstrap installs the npm packages globally with npm, installs Hermes with
+uv into its own dedicated Python 3.12 venv (`/usr/local/lib/hermes-venv`; the
+base image's Python is too old for it), and verifies the exact version
+strings before completing. A version bump should be treated as an interface
+review, not a package-only change.
 
 ## Shared expectations
 
-Both harnesses must keep these properties:
+Every harness must keep these properties:
 
 - They can run non-interactively as `trustyclaw-agent` with `HOME` set to
   `/mnt/trustyclaw-agent/agent-home`.
@@ -485,6 +489,241 @@ request shapes:
 If Claude Code changes its auth domain, token storage, bearer-token use, or
 pre-pin bootstrap endpoints, the managed Claude policy must be updated with the
 harness upgrade.
+
+## Pi harness expectations
+
+Pi is one of the host's two open-source harnesses. Its only provider here is
+Amazon Bedrock in the operator's own AWS account, and its credential is the
+operator-connected IAM access key pair shared with Hermes, so its interfaces
+differ from the OAuth harnesses: there is no login process, no token rotation,
+and no provider-owned credential refresh. The Bedrock credential surface
+(paste, STS attestation) lives in
+``host/runtime/admin_api/bedrock_credentials.py`` and one encrypted
+``bedrock_credentials`` row.
+
+### Process interface
+
+TrustyClaw starts one Pi RPC process per task turn through the `run-pi`
+launcher, which pins the harness surface before any adapter argument:
+
+```text
+pi --provider amazon-bedrock \
+  --no-extensions --no-skills --no-prompt-templates --no-themes \
+  --mode rpc --model <model> --thinking <effort> --session-id <session_id> \
+  [--append-system-prompt <validated app instructions>]
+```
+
+The launcher's required first argument is `region=<aws-region>`, exported as
+`AWS_REGION` so Pi's AWS SDK signs for and calls exactly the
+operator-configured Bedrock region; the proxy enforces the same region
+independently. The launcher also sets `PI_OFFLINE=1` (no startup update or
+catalog fetches; the pinned package ships its model catalog) and
+`AWS_EC2_METADATA_DISABLED=true` (the SDK must read the injected signing
+identity from its environment, never wait on the unreachable
+instance-metadata endpoint). Extension, skill,
+prompt-template, and theme discovery are disabled, and the launcher loads
+exactly one extension explicitly (`--no-extensions` disables discovery but
+honors explicit `-e` paths): the root-owned bundled-tools bridge at
+`/opt/trustyclaw-host/host/runtime/agent_shim/pi_tools_bridge.js`. Pi has no
+MCP client, so that bridge is the adapter: it spawns the same stdio MCP shim
+the other harnesses use, lists its tools once at load, and registers each as
+a Pi custom tool whose execution forwards over the shim's newline-delimited
+JSON-RPC. The shim child inherits Pi's user and thread-scope cgroup, so peer
+credential auth and app-thread identity derivation are unchanged. The tools
+are therefore Pi's built-in `read`, `bash`, `edit`, and `write` plus the
+shim's bundled tools; `AGENTS.md` context files still load, and the host
+installs them root-owned and immutable. A shim that fails to start or serve
+its listing leaves bundled tools unregistered and the session running (the
+shim's own omit-unavailable contract); a missing bridge file fails Pi at
+startup, which a consistent deploy cannot produce because the bridge and the
+launcher flag ship in the same `/opt/trustyclaw-host` tree. Upgrading Pi must
+re-verify that `--no-extensions` keeps honoring explicit `-e` paths and that
+`registerTool` accepts JSON-Schema parameter objects.
+
+RPC mode speaks newline-delimited JSON over stdio. TrustyClaw sends prompts as
+`{"id": ..., "type": "prompt", "message": ...}` (steers add
+`"streamingBehavior": "steer"`) and expects:
+
+| Event | Expected behavior |
+| --- | --- |
+| `response` | Acknowledges a command by `id`; `success: false` fails the turn with its `error`. |
+| `message_end` | Completed messages. Assistant text is read from `message.content[]` blocks where `type == "text"`; `message.stopReason` of `error` or `aborted` fails the turn with `errorMessage`. |
+| `agent_settled` | One per run, emitted only when no retry, compaction, or queued continuation remains. The adapter counts accepted prompts against settles over the ordered stdout stream, so a prompt accepted before a settle is covered by it and a prompt accepted while idle owes one more. |
+
+The client-chosen TrustyClaw thread id and Pi's on-disk session id are
+deliberately different. Pi does not issue a session id, so the host creates an
+opaque UUID on the thread's first turn, stores that provider-session mapping,
+and passes `--session-id` on every turn. Pi creates the session when missing
+and resumes it otherwise, storing it under the agent home so redeploys preserve
+conversation continuity. Keeping the ids separate also means a client thread
+id whose retained mapping was pruned and later reused starts a fresh Pi
+conversation instead of reopening an old on-disk session with the same name.
+This is the same host-thread to provider-session mapping used by Codex, Claude
+Code, and Hermes; Pi differs only because those harnesses return their own id
+after the first turn, while Pi requires the host-generated id up front.
+
+### Auth and account identity
+
+The operator's connected key pair lives encrypted in the `bedrock_credentials`
+database table (secretbox), together with the selected region in one singleton
+row for both harnesses. Only
+long-term IAM keys are accepted (`AKIA...`); temporary session credentials are
+rejected at connect and denied at the proxy. The agent process never receives
+the operator key.
+The `run-pi` launcher injects a fixed dummy AWS access-key id and secret. Pi's
+AWS SDK signs requests with those values; the network proxy checks the dummy
+access-key id, configured region, SigV4 service, and allowed model path, then
+re-signs the exact request with the operator's real key from the single
+validated credential row. The dummy values
+are public and carry no AWS capability. No plaintext operator AWS secret ever
+touches disk or the agent environment. The admin service itself has no network
+egress, so it starts the root-owned
+`/usr/local/lib/trustyclaw-host/read-aws-account` command through one fixed
+sudo rule for each validation read. That short-lived process receives the
+decrypted key pair in its environment (`TRUSTYCLAW_BEDROCK_AWS_*`, which
+`env_keep` preserves across sudo), signs exactly one AWS request with the
+stdlib SigV4 signer, prints the bounded result, and exits. It is not reachable
+from an agent process. The one supported operation is:
+
+- `sts:GetCallerIdentity` (`--attest`) — submission-time validation and identity
+  attestation in one call: STS accepting the signature proves the key pair is
+  valid, and the reported account id and ARN are bound to the credential by
+  AWS, never by agent-writable file contents.
+
+Cost has no helper operation: the operator-facing month-to-date estimate is
+metered live by the network proxy from the token usage AWS reports in each
+Bedrock response, per runtime and model, and priced at the host's on-demand
+catalog rates (see the network controls doc). No billing IAM permission is
+required.
+
+The operator secret key exists in plaintext only inside the admin service, one
+short-lived validation process, and the proxy's re-signing path.
+
+### Network request shape
+
+The Bedrock managed integration depends on Pi's traffic keeping these shapes:
+
+- `bedrock-runtime.<region>.amazonaws.com` is the only Bedrock host, `POST`
+  only, Converse API paths only (`/model/<id>/converse` and
+  `/converse-stream`). Session model ids never contain a path separator.
+- Every request is signed with header-based AWS Signature Version 4; the
+  Authorization header's credential carries the access key id the proxy pins.
+  Query-string (presigned) auth and `X-Amz-Security-Token` are denied.
+- Pi honors `HTTP_PROXY`/`HTTPS_PROXY` and `NODE_EXTRA_CA_CERTS` for its
+  Bedrock traffic, so the data plane traverses the TrustyClaw proxy.
+- Pi must not require the Bedrock control plane (model discovery is its
+  bundled catalog), other AWS services, or other regions without updating the
+  managed integration.
+
+## Hermes harness expectations
+
+Hermes is the host's second open-source harness, on the same Bedrock provider
+connection and provider status as Pi but with separate task capacity. One
+Bedrock integration enables or disables both runtimes. Hermes is a Python
+3.11+ application, so bootstrap
+provisions a dedicated interpreter and venv with ``uv`` rather than the base
+image Python, and pins only ``hermes-agent[bedrock,mcp]``. The Bedrock extra
+brings its native boto3 Converse transport; the mcp extra brings the MCP
+client SDK for the bundled tools shim; the Anthropic provider extra is not
+installed because Hermes exposes only the shared Bedrock provider here.
+
+### Process interface
+
+TrustyClaw runs one Hermes headless chat process per prompt through the
+``run-hermes`` launcher and its small stdin adapter:
+
+```text
+hermes-stdin.py --model <model> [--resume <session_id>]
+stdin: <prompt>
+```
+
+Bootstrap installs a root-owned immutable ``~/.hermes/config.yaml`` alongside
+the managed Codex and Claude configs. It pins provider ``bedrock``, disables
+``tirith``, disables Hermes memory, user-profile, post-turn skill review, and
+curator features, and registers the bundled tools MCP server
+(``mcp_servers.trustyclaw`` spawning ``host.runtime.agent_shim.mcp_shim`` as
+the runtime user, the same shim wiring as the managed Codex and Claude Code
+configs). Bootstrap also owns an immutable empty ``~/.hermes/.env``
+so Hermes cannot replace the launcher's task-scoped region from agent-written
+dotenv state. The launcher's required first argument is
+``region=<aws-region>``; it passes that task-specific value as ``AWS_REGION``.
+The fixed toolsets ``terminal,file,trustyclaw`` limit tools to the terminal,
+files, and the shim's bundled tools (no web, browser, skills, or messaging
+surfaces); ``--yolo`` disables Hermes's approval prompts (the OS/proxy
+boundary is the enforcement); ``-Q`` is quiet mode. The adapter calls the
+pinned Hermes package's one-query API with those fixed toolsets, quiet
+output, approvals disabled, and session-id reporting. Hermes starts MCP
+discovery only from its interactive TUI, gateway, and ACP entrypoints, never
+from the one-query path, so the adapter connects the shim itself with one
+synchronous ``discover_mcp_tools()`` call before the query; a shim that fails
+to serve just leaves bundled tools unregistered for that turn, the same
+omit-unavailable contract the shim applies to its own tool sockets.
+Prompt content travels only over stdin, never process arguments.
+The launcher injects the shared Bedrock dummy credential as
+``AWS_ACCESS_KEY_ID`` and ``AWS_SECRET_ACCESS_KEY``; it never reads the
+operator credential.
+
+Hermes's built-in memory is global to its active profile, not scoped to a
+TrustyClaw task or thread. It stores bounded entries in ``MEMORY.md`` (agent
+notes) and ``USER.md`` (facts and preferences about the user), then adds a
+frozen snapshot to later system prompts. With the memory tool loaded, Hermes
+normally starts an in-process daemon thread every ten user turns. That thread
+creates a second ``AIAgent``, replays the conversation, and may make additional
+model and memory-tool calls. Skill self-improvement is a parallel trigger based
+on tool iterations. It can rewrite agent-created skills through the same
+background-review agent.
+
+TrustyClaw disables both stores, omits the memory and skills toolsets, and sets
+both the skill-review cadence and the separate curator scheduler off. The
+curator is an interactive-CLI startup hook that periodically marks or archives
+unused skills and can optionally run a separate LLM consolidation pass. It is
+not a child OS process: both review mechanisms use daemon threads and extra
+``AIAgent`` objects inside the current Hermes process. TrustyClaw runs the
+single-query API, whose process exits after returning the answer and does not
+wait for those daemon reviews. Enabling the feature therefore requires a
+host-owned completion lifecycle and an explicit cross-thread memory product
+contract; changing the YAML alone would make the extra calls unreliable and
+invisible to TrustyClaw task status.
+
+Expected behavior:
+
+| Signal | Expected behavior |
+| --- | --- |
+| exit code | ``0`` on success; any non-zero exit fails the turn with the process's stderr/stdout tail. |
+| stderr | ``--pass-session-id`` prints a ``session_id: <id>`` line; the host mints nothing, it reads Hermes's id and resumes with ``--resume``. |
+| stdout | The final answer text (minus the session line). |
+
+Hermes does not support steering. ``POST /v1/tasks/{task_id}/steer`` returns
+``409`` for a Hermes task, and Agent Chat does not render its steering control.
+A later instruction is a new task on the same ``thread_id``; the adapter starts
+one new process with ``--resume`` for the stored Hermes session. This keeps one
+API task equal to one Hermes process and one model turn. A task kill terminates
+that task's process; the thread remains available for a later task.
+
+### Bedrock transport
+
+Hermes uses its boto3 Converse transport for the shared DeepSeek, Qwen, and
+Kimi catalog. The Bedrock guard therefore admits only
+``/model/<id>/converse`` and ``/converse-stream``. Hermes honors
+``HTTP_PROXY``/``HTTPS_PROXY`` and reads the proxy CA through
+``SSL_CERT_FILE`` and ``AWS_CA_BUNDLE`` (both set by the launcher to the
+system bundle). IMDS is disabled so boto3 never waits on the
+instance-metadata endpoint.
+
+### Auth and account identity
+
+Identical to Pi's, through the singleton shared credential surface: the
+operator pastes a long-term IAM key and selects a region in the Bedrock provider
+row, the admin service stores them together in the ``bedrock_credentials`` table, and
+``sts:GetCallerIdentity`` attests the account. Only long-term keys are accepted;
+temporary session credentials are denied. The agent side signs with fixed
+dummy values like Pi, using Hermes's own routing key id
+(``AKIATRUSTYCLAWHERMES``; Pi signs as ``AKIATRUSTYCLAWPIBDRK``, both with
+``trustyclaw-bedrock-dummy-secret``), and the proxy re-signs, so Hermes never
+holds the operator's key either. The dummy values carry no AWS capability and
+do not isolate one harness from the other; the per-harness key ids only let
+the proxy attribute each response's reported token usage to the runtime that
+made the request.
 
 ## Upgrade review checklist
 

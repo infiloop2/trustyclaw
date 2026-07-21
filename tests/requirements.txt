@@ -1,3 +1,7 @@
 mypy==1.10.1
 playwright==1.60.0
 pyright[nodejs]==1.1.409
+# Generation-only: build host/param_guard_words.py; the word-divergence test
+# in tests/test_param_guard.py runs when these are present.
+mnemonic==0.21
+wordfreq==3.1.1

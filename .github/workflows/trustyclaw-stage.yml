@@ -22,6 +22,8 @@ on:
           - twitter
           - claude
           - codex
+          - pi
+          - hermes
           - github
 
 permissions:
@@ -182,10 +184,15 @@ jobs:
           STAGE_GITHUB_APP_ID: ${{ secrets.TRUSTYCLAW_STAGE_GITHUB_APP_ID }}
           STAGE_GITHUB_APP_INSTALLATION_ID: ${{ secrets.TRUSTYCLAW_STAGE_GITHUB_APP_INSTALLATION_ID }}
           STAGE_GITHUB_APP_PRIVATE_KEY: ${{ secrets.TRUSTYCLAW_STAGE_GITHUB_APP_PRIVATE_KEY }}
+          # Pi and Hermes share one dedicated IAM user. Stage proves both
+          # harnesses activate and invoke through the same encrypted connection.
+          STAGE_BEDROCK_AWS_ACCESS_KEY_ID: ${{ secrets.TRUSTYCLAW_STAGE_BEDROCK_AWS_ACCESS_KEY_ID }}
+          STAGE_BEDROCK_AWS_SECRET_ACCESS_KEY: ${{ secrets.TRUSTYCLAW_STAGE_BEDROCK_AWS_SECRET_ACCESS_KEY }}
           # Each bundled tool is an individual suite. Enable-only config keys
           # use the uniform TRUSTYCLAW_STAGE_<KEY> secret name. OAuth tools use
           # only the enabled, configured, connected state already stored on the
-          # persistent stage host. The all suite requires and runs every tool.
+          # persistent stage host. The all suite preflights every tool, skips
+          # unavailable credentials, and runs every available tool independently.
           # See docs/development/persistent-aws-stage.md.
           TRUSTYCLAW_STAGE_BRAVE_SEARCH_API_KEY: ${{ secrets.TRUSTYCLAW_STAGE_BRAVE_SEARCH_API_KEY }}
           TRUSTYCLAW_STAGE_IBKR_OAUTH_CONSUMER_KEY: ${{ secrets.TRUSTYCLAW_STAGE_IBKR_OAUTH_CONSUMER_KEY }}
@@ -195,7 +202,7 @@ jobs:
           TRUSTYCLAW_STAGE_IBKR_ENCRYPTION_KEY: ${{ secrets.TRUSTYCLAW_STAGE_IBKR_ENCRYPTION_KEY }}
           TRUSTYCLAW_STAGE_IBKR_DH_PRIME: ${{ secrets.TRUSTYCLAW_STAGE_IBKR_DH_PRIME }}
           TRUSTYCLAW_STAGE_SCRAPECREATORS_API_KEY: ${{ secrets.TRUSTYCLAW_STAGE_SCRAPECREATORS_API_KEY }}
-          TRUSTYCLAW_STAGE_SERPAPI_API_KEY: ${{ secrets.TRUSTYCLAW_STAGE_SERPAPI_API_KEY }}
+          TRUSTYCLAW_STAGE_SERPERAPI_API_KEY: ${{ secrets.TRUSTYCLAW_STAGE_SERPERAPI_API_KEY }}
           TRUSTYCLAW_STAGE_RUNWAY_API_SECRET: ${{ secrets.TRUSTYCLAW_STAGE_RUNWAY_API_SECRET }}
         run: |
           set -euo pipefail
@@ -203,6 +210,7 @@ jobs:
             --result-file trustyclaw-stage.json \
             --ssh-key-env TRUSTYCLAW_STAGE_SSH_KEY \
             --admin-password-env TRUSTYCLAW_STAGE_ADMIN_PASSWORD \
+            --summary-file stage-integration-summary.md \
             --suite "${STAGE_SUITE:-all}" 2>&1 | tee stage-test.log
 
       - name: Stop stage instance
@@ -273,3 +281,7 @@ jobs:
             echo "| Test result | ${test_result} |"
             echo "| Stop instance | ${STOP_OUTCOME:-skipped} |"
           } >> "${GITHUB_STEP_SUMMARY}"
+          if [[ -f stage-integration-summary.md ]]; then
+            printf '\n' >> "${GITHUB_STEP_SUMMARY}"
+            cat stage-integration-summary.md >> "${GITHUB_STEP_SUMMARY}"
+          fi

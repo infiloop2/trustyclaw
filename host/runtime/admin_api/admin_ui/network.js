@@ -3,11 +3,16 @@
 // with per-repository audits, and the GitHub credential controls.
 
 import { api } from "./api.js";
-import { $, badge, esc, informationIcon, inlineCode, inlineMessage, objectValue, replaceIntegrationRows, setHtml } from "./helpers.js";
+import { $, badge, bedrockRuntimeUsage, esc, formatTokenCount, informationIcon, inlineCode, inlineMessage, objectValue, providerRuntime, replaceIntegrationRows, runtimeLabel, RUNTIME_PROVIDERS, setHtml } from "./helpers.js";
 import { providerAccounts, refreshHealth, refreshProviderAccounts, runtimeRecords } from "./health.js";
 import { CUSTOM_DOMAIN_GUIDE, MANAGED_INTEGRATIONS, integrationInfo } from "./integration_catalog.js";
 
 const GITHUB_REPO_INPUT_RE = /^([a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?)\/([a-z0-9._-]{1,100})$/;
+// The AI Inference group in render order. Bedrock backs both Pi and Hermes.
+const INFERENCE_INTEGRATIONS = ["openai", "claude", "bedrock"];
+const BEDROCK_INTEGRATION = "bedrock";
+// Must match SUPPORTED_REGIONS in host/network_integrations/bedrock/manifest.py.
+const BEDROCK_REGIONS = ["us-east-1", "us-east-2", "us-west-2"];
 
 let activeNetworkPolicy = {"network_integrations": {}};
 let expandedIntegrations = new Set();
@@ -15,6 +20,11 @@ let expandedGithubRepoAudits = new Set();
 let customDomainExpanded = false;
 let latestGithubAudits = [];
 let infoPopoverAnchor = null;
+let bedrockCredentialMetadata = { connected: false };
+
+export function setBedrockCredentialMetadata(value) {
+  bedrockCredentialMetadata = value && typeof value === "object" ? value : { connected: false };
+}
 
 export function activePolicy() {
   return activeNetworkPolicy;
@@ -175,7 +185,7 @@ function renderManagedIntegrations() {
           </div>
           <span class="status-chips">
             ${badge(enabled ? "enabled" : "disabled")}
-            ${name === "openai" || name === "claude" ? `<span data-provider-status="${esc(name)}"></span>` : ""}
+            ${INFERENCE_INTEGRATIONS.includes(name) ? `<span data-provider-status="${esc(name)}"></span>` : ""}
           </span>
           <span class="integration-actions">
             <span class="seg">
@@ -191,8 +201,8 @@ function renderManagedIntegrations() {
       </section>`;
   }).join("");
   const byName = new Map(integrations);
-  const inference = ["openai", "claude"].map(name => [name, byName.get(name)]);
-  const managedTools = integrations.filter(([name]) => name !== "openai" && name !== "claude");
+  const inference = INFERENCE_INTEGRATIONS.map(name => [name, byName.get(name)]);
+  const managedTools = integrations.filter(([name]) => !INFERENCE_INTEGRATIONS.includes(name));
   setHtml($("ai-inference-integrations"), renderRows(inference));
   replaceIntegrationRows(toolContainer, "[data-integration]", renderRows(managedTools));
   renderIntegrationAccounts();
@@ -205,6 +215,26 @@ function renderManagedIntegrations() {
 }
 
 function integrationDetailsHtml(name, enabled) {
+  if (name === BEDROCK_INTEGRATION) {
+    const region = bedrockCredentialMetadata.region || "us-east-1";
+    const accountCard = `
+      <div class="detail-card">
+        <div class="detail-card-head"><h3>Shared AWS Bedrock connection</h3></div>
+        <div class="integration-account" data-provider="${esc(name)}"></div>
+        <div class="bedrock-credential-form">
+          <input id="bedrock-access-key-id-${esc(name)}" type="text" placeholder="Access key id (AKIA...)" autocomplete="off" spellcheck="false">
+          <input id="bedrock-secret-access-key-${esc(name)}" type="password" placeholder="Secret access key" autocomplete="off">
+          <label class="bedrock-region-field" for="bedrock-region-${esc(name)}">
+            <span>Region</span>
+            <select id="bedrock-region-${esc(name)}">
+              ${BEDROCK_REGIONS.map(value => `<option value="${esc(value)}"${value === region ? " selected" : ""}>${esc(value)}</option>`).join("")}
+            </select>
+          </label>
+          <button class="primary sm" data-action="connect-bedrock-credentials" data-integration="${esc(name)}">Connect</button>
+        </div>
+      </div>`;
+    return accountCard;
+  }
   if (name === "openai" || name === "claude") {
     const accountCard = `
       <div class="detail-card">
@@ -253,58 +283,110 @@ export function renderIntegrationAccounts() {
       continue;
     }
     const account = providerAccounts().find(entry => entry.provider === provider) || {};
-    const runtime = provider === "claude" ? "claude_code" : "codex";
+    const runtime = providerRuntime(provider);
     const record = runtimeRecords().find(entry => entry.type === runtime) || { status: account.status || "loading" };
-    const identity = account.email || account.account_id;
+    const identity = provider === BEDROCK_INTEGRATION
+      ? (account.arn || account.account_id)
+      : (account.email || account.account_id);
     setHtml(node, record.status === "active" && identity
       ? `<span class="status active">connected: <span class="chip-label">${esc(identity)}</span></span>`
       : record.status === "awaiting_login"
-        ? `<span class="status awaiting_login">login required</span>`
+        ? `<span class="status awaiting_login">${provider === BEDROCK_INTEGRATION ? "credentials required" : "login required"}</span>`
         : badge(record.status || "not-connected"));
   }
   for (const node of document.querySelectorAll(".integration-account[data-provider]")) {
     const provider = node.dataset.provider;
     const account = providerAccounts().find(entry => entry.provider === provider) || {};
-    const runtime = provider === "claude" ? "claude_code" : "codex";
-    const runtimeLabel = runtime === "claude_code" ? "Claude Code" : "Codex";
+    const runtime = providerRuntime(provider);
+    const runtimeLabel = RUNTIME_PROVIDERS[runtime].label;
     const record = runtimeRecords().find(entry => entry.type === runtime) || { status: account.status || "loading" };
     const enabled = objectValue(objectValue(activeNetworkPolicy.network_integrations)[provider]).enabled === true;
-    const identity = account.email || account.account_id;
-    const summary = !enabled && !identity
+    const identity = provider === BEDROCK_INTEGRATION
+      ? (account.arn || account.account_id)
+      : (account.email || account.account_id);
+    const linked = provider === BEDROCK_INTEGRATION ? bedrockCredentialMetadata.connected : Boolean(identity);
+    const summary = !enabled && !linked && provider !== BEDROCK_INTEGRATION
       ? ""
       : record.status === "active" && identity
         ? `Connected account: <span class="connection-identity">${esc(identity)}</span> &middot; only this account is allowed through the proxy.`
         : identity
-          ? `Linked account: <span class="connection-identity">${esc(identity)}</span> &middot; sign in again to reconnect it.`
-          : "No account linked yet. The first login links the account it signs in to, and only that account is then allowed through the proxy.";
+          ? `Linked account: <span class="connection-identity">${esc(identity)}</span> &middot; ${provider === BEDROCK_INTEGRATION ? "enable Bedrock to activate Pi and Hermes." : "sign in again to reconnect it."}`
+          : provider === BEDROCK_INTEGRATION && bedrockCredentialMetadata.connected
+            ? `AWS credential stored: <span class="connection-identity">${esc(bedrockCredentialMetadata.access_key_id || "linked")}</span>. Enable Bedrock to activate Pi and Hermes.`
+            : provider === BEDROCK_INTEGRATION
+              ? "No AWS credential stored yet. Connect a dedicated IAM access key; ensure it has at least these permissions: bedrock:InvokeModel and bedrock:InvokeModelWithResponseStream (required IAM policy). The operator key never enters an agent process."
+            : "No account linked yet. The first login links the account it signs in to, and only that account is then allowed through the proxy.";
     const guidance = record.status === "error"
       ? `<p class="provider-error">${esc(record.error_message || "The last runtime check failed.")}</p>`
       : !enabled
-        ? `<p class="muted">Enable ${esc(MANAGED_INTEGRATIONS[provider].label)} access before starting a login.</p>`
+        ? provider === BEDROCK_INTEGRATION
+          ? bedrockCredentialMetadata.connected
+            ? `<p class="muted">The validated credential remains stored. Enable AWS Bedrock to make Pi and Hermes available.</p>`
+            : ""
+          : `<p class="muted">Enable ${esc(MANAGED_INTEGRATIONS[provider].label)} access before starting a login.</p>`
         : "";
-    const canLogin = enabled && (record.status === "awaiting_login" || record.status === "error");
+    const canLogin = provider !== BEDROCK_INTEGRATION && enabled && (record.status === "awaiting_login" || record.status === "error");
+    const billing = provider === BEDROCK_INTEGRATION ? bedrockBillingMetadata(account) : "";
     setHtml(node, `
       ${summary ? `<p class="connection-summary">${summary}</p>` : ""}
+      ${billing}
       ${guidance}
       <span class="provider-account-actions">
         ${canLogin ? `<button class="sm" data-action="start-login" data-runtime="${esc(runtime)}">Start ${esc(runtimeLabel)} login</button>` : ""}
-        ${identity ? `<button class="ghost sm" data-action="reset-linked-account" data-provider="${esc(provider)}">Disconnect</button>` : ""}
+        ${(provider === BEDROCK_INTEGRATION ? bedrockCredentialMetadata.connected : identity) ? `<button class="ghost sm" data-action="reset-linked-account" data-provider="${esc(provider)}">${provider === BEDROCK_INTEGRATION ? "Disconnect AWS" : "Disconnect"}</button>` : ""}
       </span>`);
     const oauth = document.querySelector(`[data-provider-oauth="${provider}"]`);
     if (oauth && record.status === "active") setHtml(oauth, "");
   }
 }
 
+function bedrockBillingMetadata(account) {
+  // One live usage box per Bedrock runtime: the harnesses share one provider
+  // and credential but meter separately, so Pi and Hermes each show their own
+  // month-to-date estimate.
+  const boxes = ["pi", "hermes"].map(runtime => bedrockRuntimeUsageBox(account, runtime)).join("");
+  if (!boxes) return "";
+  return `<div class="bedrock-usage-boxes">${boxes}</div>`;
+}
+
+function bedrockRuntimeUsageBox(account, runtime) {
+  const usage = bedrockRuntimeUsage(account, runtime);
+  if (!usage) return "";
+  const tokenParts = [
+    `${formatTokenCount(usage.inputTokens)} in`,
+    `${formatTokenCount(usage.outputTokens)} out`,
+  ];
+  if (usage.cacheReadTokens || usage.cacheWriteTokens) {
+    tokenParts.push(`${formatTokenCount(usage.cacheReadTokens + usage.cacheWriteTokens)} cached`);
+  }
+  const unmetered = usage.requests - usage.meteredRequests;
+  const caveatHtml = unmetered > 0
+    ? `<span class="bedrock-usage-caveat">${esc(`${unmetered} of ${usage.requests} requests unmetered`)}</span>`
+    : "";
+  return `
+    <span class="bedrock-usage-box" role="group" aria-label="${esc(`${runtimeLabel(runtime)} month-to-date estimate ${usage.cost}; ${tokenParts.join(", ")} tokens; ${usage.requests} requests`)}">
+      <span class="bedrock-usage-runtime">${esc(runtimeLabel(runtime))}</span>
+      <span class="bedrock-usage-cost">MTD est. <strong>${esc(usage.cost)}</strong></span>
+      <span class="bedrock-usage-tokens">${esc(tokenParts.join(" · "))} · ${esc(String(usage.requests))} req</span>
+      ${caveatHtml}
+    </span>`;
+}
+
 export async function resetLinkedAccount(provider) {
   const label = MANAGED_INTEGRATIONS[provider] ? MANAGED_INTEGRATIONS[provider].label : provider;
-  const message = `Disconnect the linked ${label} account? `
-    + `This clears local ${label} auth and fails running tasks that use it. `
-    + `The agent cannot reach ${label} until a new login links an account.`;
+  const sharedBedrock = provider === BEDROCK_INTEGRATION;
+  const message = sharedBedrock
+    ? "Disconnect the shared AWS Bedrock account? This fails running Pi and Hermes tasks and clears their shared credential. Neither harness can reach Bedrock until credentials are connected again."
+    : `Disconnect the linked ${label} account? This clears local ${label} auth and fails running tasks that use it. The agent cannot reach ${label} until a new login links an account.`;
   if (!confirm(message)) return;
-  const runtime = provider === "claude" ? "claude_code" : "codex";
+  const runtime = providerRuntime(provider);
   try {
-    await api("POST", "/v1/agent-runtime/reset-linked-account", { "agent_runtime": runtime });
-    policyMessage(provider, `${label} account disconnected.`);
+    if (sharedBedrock) {
+      await api("DELETE", "/v1/agent-runtime/bedrock-credentials");
+    } else {
+      await api("POST", "/v1/agent-runtime/reset-linked-account", { "agent_runtime": runtime });
+    }
+    policyMessage(provider, sharedBedrock ? "Shared AWS Bedrock account disconnected." : `${label} account disconnected.`);
     await refreshProviderAccounts();
     await refreshHealth();
   } catch (error) { policyMessage(provider, error.message, true); }
@@ -349,6 +431,29 @@ export async function setIntegrationEnabled(name, enabled) {
     if (enabled && name === "github") value.require_dot_github_approval = true;
     managed[name] = value;
   }, `${MANAGED_INTEGRATIONS[name].label} ${enabled ? "enabled" : "disabled"}.`);
+}
+
+export async function connectBedrockCredentials(name) {
+  if (name !== BEDROCK_INTEGRATION) return;
+  const accessKeyId = ($(`bedrock-access-key-id-${name}`)?.value || "").trim();
+  const secretAccessKey = ($(`bedrock-secret-access-key-${name}`)?.value || "").trim();
+  const region = ($(`bedrock-region-${name}`)?.value || "").trim();
+  if (!accessKeyId || !secretAccessKey || !BEDROCK_REGIONS.includes(region)) {
+    policyMessage(name, "Enter the access key id, secret access key, and region.", true);
+    return;
+  }
+  try {
+    await api("POST", "/v1/agent-runtime/bedrock-credentials", {
+      "access_key_id": accessKeyId,
+      "secret_access_key": secretAccessKey,
+      "region": region,
+    });
+    const secretInput = $(`bedrock-secret-access-key-${name}`);
+    if (secretInput) secretInput.value = "";
+    policyMessage(name, "AWS credential accepted.", false);
+    await refreshProviderAccounts();
+    await refreshHealth();
+  } catch (error) { policyMessage(name, error.message, true); }
 }
 
 export async function setClaudeWebSearch(webSearch) {

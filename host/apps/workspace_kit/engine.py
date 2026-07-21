@@ -2166,7 +2166,7 @@ def _insert_event(cur: Any, content: str, meta: dict[str, Any], created_at: str 
 
 
 def _runtime_label(runtime: str) -> str:
-    return "Claude Code" if runtime == "claude_code" else "Codex"
+    return {"claude_code": "Claude Code", "pi": "Pi", "hermes": "Hermes"}.get(runtime, "Codex")
 
 
 # ---------------------------------------------------------------------------
@@ -2238,7 +2238,12 @@ def _overall_connection_status(
 
 # Mirrors orchestrator._MANAGED_PROVIDER_BY_RUNTIME: each agent runtime's
 # managed network integration id (test_workspace_kit pins the two in sync).
-RUNTIME_PROVIDERS = (("codex", "openai"), ("claude_code", "claude"))
+RUNTIME_PROVIDERS = (
+    ("codex", "openai"),
+    ("claude_code", "claude"),
+    ("pi", "bedrock"),
+    ("hermes", "bedrock"),
+)
 
 
 def _network_integrations_snapshot() -> dict[str, bool] | None:

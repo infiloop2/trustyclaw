@@ -8,6 +8,7 @@ import urllib.parse
 from collections.abc import Mapping
 from typing import cast
 
+from host.param_guard import PARAM_GUARD_PROTECTION, PARAM_GUARD_TECHNICAL_DETAIL
 from host.tools.json_types import JSONObject, JSONValue
 from host.tools.manifest import ActionSpec, ConfigRequirement, DataSummary, DataSummaryCard, DataSummaryLink, DataSummaryPoint, SetupStep, ToolManifest
 from host.tools.results import (
@@ -180,7 +181,9 @@ MANIFEST = ToolManifest(
     protections=(
         "Reading does not require approval. Publishing a post, reply, or quote post happens only after your approval.",
         "Public reads and writes consume X pay-per-use credits. Your X credentials stay encrypted in write-only tool config.",
+        PARAM_GUARD_PROTECTION,
     ),
+    technical_details=(PARAM_GUARD_TECHNICAL_DETAIL,),
     setup_steps=(
         SetupStep(
             title="Create an X developer project and app",
@@ -210,7 +213,7 @@ MANIFEST = ToolManifest(
             DataSummaryCard(
                 title="What leaves this host",
                 points=(
-                    DataSummaryPoint(label="Reads", text="Search queries, post ids, usernames, trend locations, and paging values go to X directly. Query text is received and logged like any other request, so it is itself data sent to X."),
+                    DataSummaryPoint(label="Reads", text="Search queries, post ids, usernames, trend locations, and paging values go to X directly. Query text is received and logged like any other request, so it is itself data sent to X. The search query first passes the host parameter guard (see Technical notes), which denies secret- or credential-shaped values before the request is sent."),
                     DataSummaryPoint(label="Posts, replies, and quote posts", text="A post, reply, or quote post reaches X only after your approval. It sends exactly the approved text and, for a reply or quote post, the target post id."),
                 ),
             ),
@@ -530,7 +533,7 @@ def _tweet_summary(tweet: JSONObject, usernames: dict[str, str]) -> JSONObject:
     }
 
 
-def _search_tweets(access_token: str, tool_input: JSONObject) -> JSONObject:
+def _search_tweets(access_token: str, tool_input: JSONObject, api: HostAPI) -> JSONObject:
     extra = set(tool_input) - {"query", "max_results"}
     if extra:
         raise ToolInputValidationError("X search tool input only supports query and max_results.")
@@ -545,7 +548,7 @@ def _search_tweets(access_token: str, tool_input: JSONObject) -> JSONObject:
     max_results = _int_field(tool_input, "max_results", default=10, low=10, high=100)
     params = encode_query(
         {
-            "query": query,
+            "query": api.outbound.guard_request_parameter_string(query),
             "max_results": str(max_results),
             "tweet.fields": TWEET_FIELDS,
             "expansions": "author_id",
@@ -792,7 +795,7 @@ class XTool:
     def execute(self, action: str, tool_input: JSONObject, api: HostAPI) -> ActionResult:
         try:
             if action == "search_tweets":
-                return ActionExecuted(_search_tweets(X_CREDENTIALS.access_token(api), tool_input))
+                return ActionExecuted(_search_tweets(X_CREDENTIALS.access_token(api), tool_input, api))
             if action == "read_tweet":
                 return ActionExecuted(_read_tweet(X_CREDENTIALS.access_token(api), tool_input))
             if action == "user_tweets":

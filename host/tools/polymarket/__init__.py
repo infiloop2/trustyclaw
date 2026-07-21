@@ -8,6 +8,7 @@ from typing import cast
 from host.tools.json_types import JSONObject, JSONValue
 from host.tools.manifest import ActionSpec, DataSummary, DataSummaryCard, DataSummaryLink, DataSummaryPoint, SetupStep, ToolManifest
 from host.tools.results import ActionExecuted, ActionFailed, ActionResult, ApprovalResult
+from host.param_guard import PARAM_GUARD_PROTECTION, PARAM_GUARD_TECHNICAL_DETAIL, ParamGuardDenied
 from host.tools.host_api import ApprovalRecord, HostAPI
 from host.tools.shared.web import WebRequestError, encode_query, json_request
 
@@ -118,7 +119,9 @@ MANIFEST = ToolManifest(
     protections=(
         "All actions use unauthenticated public market-data GET endpoints. The package has no wallet, private key, token, order, approval, or trading action.",
         "Queries, pagination, result sizes, order-book depth, and history points are bounded; provider payloads are normalized before entering model context.",
+        PARAM_GUARD_PROTECTION,
     ),
+    technical_details=(PARAM_GUARD_TECHNICAL_DETAIL,),
     setup_steps=(
         SetupStep(
             title="Enable Polymarket",
@@ -134,7 +137,8 @@ MANIFEST = ToolManifest(
                 description=(
                     "Only public query parameters: listing and search keywords, market ids or slugs, outcome token ids, sort, "
                     "pagination, and interval values, plus standard web request metadata. There is no account, wallet, or "
-                    "credential to send, and nothing else on this host is sent."
+                    "credential to send, and nothing else on this host is sent. Free-text query values first pass the host "
+                    "parameter guard (see Technical notes), which denies secret- or credential-shaped values before the request is sent."
                 ),
             ),
             DataSummaryCard(
@@ -329,9 +333,11 @@ def _list_events(tool_input: JSONObject) -> JSONObject:
     }
 
 
-def _search(tool_input: JSONObject) -> JSONObject:
+def _search(tool_input: JSONObject, api: HostAPI) -> JSONObject:
     _reject_unknown_fields(tool_input, frozenset({"query", "limit_per_type"}))
-    query = _string_field(tool_input, "query", max_chars=MAX_QUERY_CHARS, required=True)
+    query = api.outbound.guard_request_parameter_string(
+        _string_field(tool_input, "query", max_chars=MAX_QUERY_CHARS, required=True)
+    )
     limit_per_type = _int_field(tool_input, "limit_per_type", default=10, low=1, high=50)
     response = _gamma_request(
         "/public-search",
@@ -370,10 +376,16 @@ def _search(tool_input: JSONObject) -> JSONObject:
     }
 
 
-def _get_market(tool_input: JSONObject) -> JSONObject:
+def _get_market(tool_input: JSONObject, api: HostAPI) -> JSONObject:
     _reject_unknown_fields(tool_input, frozenset({"market_id", "slug"}))
     market_id = _string_field(tool_input, "market_id", max_chars=60)
+    if market_id and not market_id.isdigit():
+        # Gamma market ids are integers; a strict grammar is tighter than the
+        # parameter guard and closes the free-text path segment entirely.
+        raise ToolInputValidationError("Polymarket market_id must be a numeric Gamma id.")
     slug = _string_field(tool_input, "slug", max_chars=200)
+    if slug:
+        slug = api.outbound.guard_request_parameter_string(slug)
     if bool(market_id) == bool(slug):
         raise ToolInputValidationError("Polymarket get_market requires exactly one of tool_input.market_id or tool_input.slug.")
     if market_id:
@@ -459,16 +471,17 @@ class PolymarketTool:
         return None
 
     def execute(self, action: str, tool_input: JSONObject, api: HostAPI) -> ActionResult:
-        del api  # No credentials and no config: the Polymarket data APIs are public.
+        # No credentials and no config: the Polymarket data APIs are public.
+        # api is used only for the outbound parameter guard.
         try:
             if action == "list_markets":
                 return ActionExecuted(_list_markets(tool_input))
             if action == "list_events":
                 return ActionExecuted(_list_events(tool_input))
             if action == "search":
-                return ActionExecuted(_search(tool_input))
+                return ActionExecuted(_search(tool_input, api))
             if action == "get_market":
-                return ActionExecuted(_get_market(tool_input))
+                return ActionExecuted(_get_market(tool_input, api))
             if action == "get_order_book":
                 return ActionExecuted(_get_order_book(tool_input))
             if action == "price_history":
@@ -476,6 +489,10 @@ class PolymarketTool:
             return ActionFailed("Unsupported Polymarket action.")
         except ToolInputValidationError as exc:
             return ActionFailed(exc.message)
+        except ParamGuardDenied as exc:
+            # The guard's message is curated and value-free; surface verbatim
+            # so the agent can rephrase and retry.
+            return ActionFailed(str(exc))
         except WebRequestError as exc:
             if exc.status == 429:
                 return ActionFailed("Polymarket API rate limit was reached.")

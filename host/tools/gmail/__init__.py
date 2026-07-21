@@ -30,6 +30,7 @@ from host.tools.results import (
     ApprovalResult,
 )
 from host.tools.tool import CredentialFlow
+from host.param_guard import ParamGuardDenied
 from host.tools.host_api import ApprovalRecord, HostAPI
 from host.tools.shared.google import GoogleCredentialStore, IntegrationReconnectRequired, clip_text
 
@@ -195,7 +196,7 @@ MANIFEST = ToolManifest(
             DataSummaryCard(
                 title="What leaves this host",
                 points=(
-                    DataSummaryPoint(label="Reads", text="Read queries and their parameters go to Google directly: the Gmail search query, time filters, and message, thread, draft, or label identifiers."),
+                    DataSummaryPoint(label="Reads", text="Read queries and their parameters go to Google directly: the Gmail search query, time filters, and message, thread, draft, or label identifiers. The search query first passes the host parameter guard (see Technical notes): secret- or credential-shaped values are denied, while addresses and other search terms are allowed."),
                     DataSummaryPoint(label="Modifications", text="A change reaches Google only after your approval, and sends exactly what you approved: recipients, subject, and body for a send or draft, or the label and message changes otherwise."),
                 ),
             ),
@@ -312,6 +313,7 @@ MANIFEST = ToolManifest(
     protections=(
         "OAuth tokens stay in the host credential store and are never exposed to the agent. The connection is bound to the Google account you approve.",
         "Reads run directly. Sending mail or changing messages, labels, and drafts waits for explicit operator approval.",
+        "Mailbox search queries pass the host parameter guard: values shaped like a secret or credential are denied before the request is sent.",
     ),
     setup_steps=(
         SetupStep(
@@ -397,11 +399,16 @@ def _gmail_search_time_epoch(tool_input: JSONObject, key: str) -> int:
     return int(parsed.astimezone(timezone.utc).timestamp())
 
 
-def _gmail_search_query(tool_input: JSONObject) -> str:
+def _gmail_search_query(tool_input: JSONObject, api: HostAPI) -> str:
     extra_fields = set(tool_input) - {"query", "start_time", "end_time"}
     if extra_fields:
         raise ToolInputValidationError("Gmail search messages only supports query, start_time, and end_time.")
     query_text = _optional_single_line_text(tool_input, "query")
+    if query_text:
+        # Mailbox search against the connected account: personal identifiers
+        # are legitimate syntax (from:alice@example.com) and Google already
+        # holds the mail, so allow_identifiers; only secret/credential shapes deny.
+        query_text = api.outbound.guard_request_parameter_string(query_text, allow_identifiers=True)
     start_epoch = _gmail_search_time_epoch(tool_input, "start_time")
     end_epoch = _gmail_search_time_epoch(tool_input, "end_time")
     if start_epoch and end_epoch and start_epoch >= end_epoch:
@@ -418,14 +425,14 @@ def _gmail_search_query(tool_input: JSONObject) -> str:
     return " ".join(query_parts)
 
 
-def _draft_list_parameters(tool_input: JSONObject) -> JSONObject:
+def _draft_list_parameters(tool_input: JSONObject, api: HostAPI) -> JSONObject:
     extra_fields = set(tool_input) - {"query", "page_token", "include_spam_trash"}
     if extra_fields:
         raise ToolInputValidationError("Gmail draft list only supports query, page_token, and include_spam_trash.")
     parameters: JSONObject = {"maxResults": DEFAULT_DRAFT_PAGE_LIMIT}
     query = _single_line_text(tool_input.get("query"))
     if query:
-        parameters["q"] = query
+        parameters["q"] = api.outbound.guard_request_parameter_string(query, allow_identifiers=True)
     page_token = _single_line_text(tool_input.get("page_token"))
     if page_token:
         parameters["pageToken"] = page_token
@@ -1081,7 +1088,7 @@ class GmailTool:
                 return ActionFailed("Unsupported Gmail action.")
             access_token = GMAIL_CREDENTIALS.access_token(api)
             if action in GMAIL_DIRECT_ACTIONS:
-                result = self._execute_read(action, tool_input, access_token)
+                result = self._execute_read(action, tool_input, access_token, api)
                 return ActionExecuted(result)
             proposal, action_type = self._proposal(action, tool_input, api, access_token)
             payload = self._approval_payload(action, action_type, proposal, api, access_token)
@@ -1089,6 +1096,8 @@ class GmailTool:
             return ActionPendingApproval(approval.approval_id, approval.summary)
         except ToolInputValidationError as exc:
             return ActionFailed(exc.message)
+        except ParamGuardDenied as exc:
+            return ActionFailed(str(exc))
         except IntegrationReconnectRequired as exc:
             return ActionFailed(str(exc), reconnect_required=True)
         except Exception as exc:
@@ -1113,9 +1122,9 @@ class GmailTool:
         except Exception as exc:
             return ActionFailed(str(exc) or "Gmail action failed after approval.")
 
-    def _execute_read(self, action: str, tool_input: JSONObject, access_token: str) -> JSONObject:
+    def _execute_read(self, action: str, tool_input: JSONObject, access_token: str, api: HostAPI) -> JSONObject:
         if action == "search_messages":
-            query_text = _gmail_search_query(tool_input)
+            query_text = _gmail_search_query(tool_input, api)
             return {"status": "success_executed", "message": "Gmail messages searched.", "query": query_text, "messages": cast(list[JSONValue], gmail_search_messages(access_token, query_text))}
         if action == "read_message":
             if set(tool_input) - {"message_id"}:
@@ -1151,7 +1160,7 @@ class GmailTool:
             response = execute_gmail_api_request(access_token, gmail_operation_request("users.labels.list", {}))
             return {"status": "success_executed", "message": "Gmail labels loaded.", "labels": gmail_label_list_summary(response)}
         if action == "list_drafts":
-            parameters = _draft_list_parameters(tool_input)
+            parameters = _draft_list_parameters(tool_input, api)
             response = execute_gmail_api_request(access_token, gmail_operation_request("users.drafts.list", parameters))
             raw_drafts = response.get("drafts")
             drafts = raw_drafts if isinstance(raw_drafts, list) else []

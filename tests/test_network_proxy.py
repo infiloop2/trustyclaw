@@ -15,11 +15,15 @@ from unittest.mock import patch
 
 import pg_harness
 
+from host.network_integrations.bedrock import guard as bedrock_guard
+from host.network_integrations.bedrock import manifest as bedrock_manifest
+from host.network_integrations.bedrock.manifest import BedrockIntegration
+from host.runtime.core import aws_sigv4
 from host.network_integrations.claude import guard as claude_guard
 from host.network_integrations.claude.manifest import ClaudeIntegration
 from host.config import parse_network_controls
 from host.network_integrations.openai import guard as openai_guard
-from host.runtime.core import network_policy
+from host.runtime.core import network_policy, state
 from host.runtime.core.network_policy import load_policy
 from host.runtime.core.state import save_network_policy as save_policy
 from host.runtime.core.state import save_proxy_claude_account, save_proxy_openai_account_id
@@ -365,6 +369,99 @@ class NetworkProxyTests(unittest.TestCase):
         self.assertEqual(events[-1]["protocol"], "https")
         self.assertEqual(events[-1]["path"], "/secure")
         self.assertEqual(events[-1]["decision"], "allowed")
+
+    def test_bedrock_response_is_metered_for_the_signing_runtime(self) -> None:
+        # End to end through the real proxy handler: an allowed dummy-signed
+        # Converse request is re-signed with the operator key, and the relayed
+        # response's usage still lands on the signing runtime's counter row.
+        # Regression: the meter must be selected from the as-received routing
+        # identity — selecting it after rewrite_request_headers has replaced
+        # the Authorization metered nothing.
+        self.proxy_ca()
+        bedrock_host = "bedrock-runtime.us-east-1.amazonaws.com"
+        response_body = json.dumps(
+            {"output": {}, "usage": {"inputTokens": 321, "outputTokens": 45}}
+        ).encode()
+
+        class ConverseHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length", "0") or "0"))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response_body)))
+                self.end_headers()
+                self.wfile.write(response_body)
+
+            def log_message(self, fmt: str, *args: object) -> None:
+                return
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), ConverseHandler)
+        cert, key = self.self_signed_cert("bedrock-upstream")
+        upstream_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        upstream_context.load_cert_chain(cert, key)
+        upstream.socket = upstream_context.wrap_socket(upstream.socket, server_side=True)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        proxy = self.start_proxy()
+        save_policy(
+            {"network_integrations": {"bedrock": {"enabled": True}}}, "2026-06-08T00:00:00Z"
+        )
+        state.save_bedrock_credential("AKIAOPERATORKEY00001", "S" * 40, "us-east-1")
+
+        path = "/model/deepseek.v3.2/converse"
+        body = b'{"messages":[]}'
+        amz_date = "20260717T120000Z"
+        headers = [
+            ("content-type", "application/json"),
+            ("host", bedrock_host),
+            ("x-amz-date", amz_date),
+        ]
+        authorization, _sig = aws_sigv4.header_signature(
+            method="POST", path=path, query="", headers=headers,
+            signed_headers=("content-type", "host", "x-amz-date"),
+            payload_hash=hashlib.sha256(body).hexdigest(),
+            amz_date=amz_date, date_stamp=amz_date[:8],
+            region="us-east-1", service="bedrock",
+            access_key_id=bedrock_manifest.ROUTING_ACCESS_KEY_IDS["pi"],
+            secret_access_key=bedrock_manifest.ROUTING_SECRET_ACCESS_KEY,
+        )
+        request = (
+            f"POST {path} HTTP/1.1\r\n"
+            f"Host: {bedrock_host}\r\n"
+            "Content-Type: application/json\r\n"
+            f"X-Amz-Date: {amz_date}\r\n"
+            f"Authorization: {authorization}\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n"
+        ).encode() + body
+
+        # The Bedrock host is never resolved in the no-network test sandbox;
+        # dial the local TLS upstream instead. connect_public's own SSRF
+        # refusal is covered by its dedicated tests.
+        upstream_port = upstream.server_address[1]
+        with (
+            patch.object(
+                network_proxy,
+                "connect_public",
+                lambda host, port, timeout: socket.create_connection(
+                    ("127.0.0.1", upstream_port), timeout=timeout
+                ),
+            ),
+            patch(
+                "host.runtime.network_proxy.service.ssl.create_default_context",
+                ssl._create_unverified_context,
+            ),
+        ):
+            response = self.https_via_proxy(
+                proxy.server_address[1], request, host=bedrock_host
+            )
+
+        self.assertIn(b"200", response.split(b"\r\n", 1)[0])
+        self.assertIn(response_body, response)
+        (row,) = state.read_bedrock_usage("1970-01-01")
+        self.assertEqual((row["runtime"], row["model_id"]), ("pi", "deepseek.v3.2"))
+        self.assertEqual((row["requests"], row["metered_requests"]), (1, 1))
+        self.assertEqual((row["input_tokens"], row["output_tokens"]), (321, 45))
 
     def test_https_host_header_must_match_connect_host(self) -> None:
         self.proxy_ca()
@@ -842,6 +939,277 @@ class ExternalUrlRequestGuardTests(unittest.TestCase):
         # But a truthy flag under a non-web type is a renamed web tool: deny.
         self.assertIsNotNone(self.deny({"tools": [{"type": "surf", "external_web_access": True}]}))
         self.assertIsNotNone(self.deny({"tools": [{"type": "surf", "indexed_web_access": True}]}))
+
+
+class BedrockGuardTests(unittest.TestCase):
+    """One Bedrock integration admits the guarded model routes for both task
+    runtimes and re-signs them with one published operator key. Each runtime
+    signs with its own routing key id, which only selects the usage meter."""
+
+    KEY = bedrock_manifest.ROUTING_ACCESS_KEY_IDS["pi"]
+    ROUTING_SECRET = bedrock_manifest.ROUTING_SECRET_ACCESS_KEY
+    REAL = ("AKIABEDROCKOPERATOR1", "operator-secret-000000000000000000000000", "us-east-2")
+    CONFIG = BedrockIntegration(enabled=True)
+    HOST = "bedrock-runtime.us-east-2.amazonaws.com"
+    PATH = "/model/deepseek.v3.2/converse-stream"
+    AMZ_DATE = "20260717T120000Z"
+    BODY = b'{"messages":[]}'
+
+    def signed_request(
+        self,
+        *,
+        access_key_id: str | None = None,
+        host: str | None = None,
+        path: str | None = None,
+        region: str = "us-east-2",
+        service: str = "bedrock",
+        body: bytes | None = None,
+        secret: str | None = None,
+        content_sha_header: bool = False,
+    ) -> list[tuple[str, str]]:
+        """Headers for a request signed the way a harness SDK signs it."""
+        body = body if body is not None else self.BODY
+        headers = [
+            ("content-type", "application/json"),
+            ("host", host or self.HOST),
+            ("x-amz-date", self.AMZ_DATE),
+        ]
+        signed = ["content-type", "host", "x-amz-date"]
+        if content_sha_header:
+            headers.append(("x-amz-content-sha256", hashlib.sha256(body).hexdigest()))
+            signed.insert(2, "x-amz-content-sha256")
+        if secret is None:
+            secret = self.ROUTING_SECRET
+        authorization, _sig = aws_sigv4.header_signature(
+            method="POST",
+            path=path or self.PATH,
+            query="",
+            headers=headers,
+            signed_headers=tuple(signed),
+            payload_hash=hashlib.sha256(body).hexdigest(),
+            amz_date=self.AMZ_DATE,
+            date_stamp=self.AMZ_DATE[:8],
+            region=region,
+            service=service,
+            access_key_id=access_key_id or self.KEY,
+            secret_access_key=secret,
+        )
+        return [*headers, ("authorization", authorization)]
+
+    def deny(
+        self,
+        *,
+        host: str | None = None,
+        path: str | None = None,
+        query: str = "",
+        headers: list[tuple[str, str]] | None = None,
+        credential: tuple[str, str, str] | None | object = ...,
+        config: BedrockIntegration | None = None,
+        method: str = "POST",
+        body: bytes | None = None,
+    ) -> str | None:
+        headers = headers if headers is not None else self.signed_request(host=host, path=path)
+        selected = self.REAL if credential is ... else credential
+        with patch.object(bedrock_guard, "read_bedrock_proxy_credential", return_value=selected):
+            return bedrock_guard.request_denied(
+                config or self.CONFIG, method, host or self.HOST, path or self.PATH, query, headers,
+                body if body is not None else self.BODY,
+            )
+
+    def test_host_allowed_only_for_the_enabled_integration_region(self) -> None:
+        with patch.object(bedrock_guard, "read_bedrock_proxy_credential", return_value=self.REAL):
+            self.assertTrue(bedrock_guard.host_allowed(self.CONFIG, self.HOST.upper()))
+            self.assertFalse(bedrock_guard.host_allowed(self.CONFIG, "bedrock-runtime.us-east-1.amazonaws.com"))
+            self.assertFalse(
+                bedrock_guard.host_allowed(BedrockIntegration(enabled=False), self.HOST)
+            )
+
+    def test_missing_credential_reaches_request_guard_on_supported_hosts(self) -> None:
+        with patch.object(bedrock_guard, "read_bedrock_proxy_credential", return_value=None):
+            self.assertTrue(
+                bedrock_guard.host_allowed(
+                    self.CONFIG, "bedrock-runtime.us-east-1.amazonaws.com"
+                )
+            )
+            self.assertFalse(
+                bedrock_guard.host_allowed(
+                    self.CONFIG, "bedrock-runtime.eu-west-1.amazonaws.com"
+                )
+            )
+
+    def test_enabled_bedrock_allows_converse_route_shapes(self) -> None:
+        for path in (
+            "/model/deepseek.v3.2/converse",
+            "/model/qwen.qwen3-coder-next/converse-stream",
+        ):
+            with self.subTest(path=path):
+                self.assertIsNone(self.deny(path=path, headers=self.signed_request(path=path)))
+
+    def test_the_smithy_content_sha_header_shape_verifies_too(self) -> None:
+        headers = self.signed_request(content_sha_header=True)
+        self.assertIsNone(self.deny(headers=headers))
+
+    def test_each_harness_routing_key_is_admitted(self) -> None:
+        for runtime, key in bedrock_manifest.ROUTING_ACCESS_KEY_IDS.items():
+            with self.subTest(runtime=runtime):
+                self.assertIsNone(self.deny(headers=self.signed_request(access_key_id=key)))
+
+    def test_response_meter_attributes_the_signing_runtime_and_model(self) -> None:
+        for runtime, key in bedrock_manifest.ROUTING_ACCESS_KEY_IDS.items():
+            with self.subTest(runtime=runtime):
+                meter = bedrock_guard.response_meter(
+                    self.CONFIG, "POST", self.HOST, self.PATH, "",
+                    self.signed_request(access_key_id=key), self.BODY,
+                )
+                assert meter is not None
+                self.assertEqual(meter._runtime, runtime)
+                self.assertEqual(meter._model_id, "deepseek.v3.2")
+
+    def test_no_meter_without_a_routing_identity(self) -> None:
+        # response_meter runs only on allowed requests, but it still fails
+        # closed on its own: no parseable routing signature, no meter.
+        self.assertIsNone(
+            bedrock_guard.response_meter(
+                self.CONFIG, "POST", self.HOST, self.PATH, "", [], self.BODY
+            )
+        )
+        self.assertIsNone(
+            bedrock_guard.response_meter(
+                self.CONFIG, "POST", self.HOST, "/foundation-models", "",
+                self.signed_request(), self.BODY,
+            )
+        )
+
+    def test_a_foreign_scope_is_never_resigned(self) -> None:
+        # The proxy must not mint real-key signatures valid for another
+        # service or region, even over an otherwise allowed request.
+        self.assertEqual(
+            self.deny(headers=self.signed_request(service="s3")), "bedrock_signature_invalid"
+        )
+        self.assertEqual(
+            self.deny(headers=self.signed_request(region="us-east-1")), "bedrock_signature_invalid"
+        )
+
+    def test_disabled_integration_fails_closed(self) -> None:
+        config = BedrockIntegration(enabled=False)
+        self.assertEqual(
+            self.deny(config=config),
+            "bedrock_credentials_unavailable",
+        )
+
+    def test_non_model_paths_and_methods_are_denied(self) -> None:
+        self.assertEqual(self.deny(path="/model/deepseek.v3.2/invoke-with-response-stream-x"), "network_policy_denied")
+        self.assertEqual(self.deny(path="/model/deepseek.v3.2/invoke"), "network_policy_denied")
+        self.assertEqual(self.deny(path="/foundation-models"), "network_policy_denied")
+        self.assertEqual(self.deny(method="GET"), "network_policy_denied")
+        # An encoded slash in the model segment normalizes into extra path
+        # segments and fails closed.
+        self.assertEqual(
+            self.deny(path="/model/arn%3Aaws%3Abedrock%2Fprofile/converse"), "network_policy_denied"
+        )
+
+    def test_missing_proxy_credentials_fail_closed(self) -> None:
+        self.assertEqual(
+            self.deny(credential=None), "bedrock_credentials_unavailable"
+        )
+
+    def test_unsigned_request_is_denied(self) -> None:
+        self.assertEqual(self.deny(headers=[]), "bedrock_signature_required")
+        self.assertEqual(
+            self.deny(headers=[("authorization", "Bearer some-token")]), "bedrock_signature_required"
+        )
+
+    def test_foreign_access_key_is_denied(self) -> None:
+        # An agent-smuggled real AWS credential is not a routing identity: the
+        # proxy neither forwards nor re-signs for it.
+        self.assertEqual(
+            self.deny(headers=self.signed_request(access_key_id="AKIAATTACKERKEY00001", secret="attacker")),
+            "bedrock_access_key_mismatch",
+        )
+
+    def test_dummy_signature_is_not_a_security_boundary(self) -> None:
+        # The dummy secret is public and carries no AWS capability. The proxy
+        # signs the exact body it receives only after the structural guard.
+        self.assertIsNone(self.deny(headers=self.signed_request(secret="any-dummy-value")))
+        self.assertIsNone(self.deny(body=b'{"messages":["changed"]}'))
+
+    def test_query_string_auth_is_denied(self) -> None:
+        self.assertEqual(
+            self.deny(query="X-Amz-Signature=abc&X-Amz-Credential=AKIAX%2F20260717"),
+            "bedrock_query_auth_denied",
+        )
+        self.assertEqual(self.deny(query="x-amz-signature=abc"), "bedrock_query_auth_denied")
+
+    def test_session_credentials_are_denied(self) -> None:
+        self.assertEqual(
+            self.deny(headers=[*self.signed_request(), ("X-Amz-Security-Token", "tok")]),
+            "bedrock_session_credentials_denied",
+        )
+
+    def test_rewrite_resigns_with_the_operator_credential(self) -> None:
+        headers = self.signed_request()
+        credential = self.REAL
+        with patch.object(bedrock_guard, "read_bedrock_proxy_credential", return_value=credential):
+            self.assertIsNone(
+                bedrock_guard.request_denied(self.CONFIG, "POST", self.HOST, self.PATH, "", headers, self.BODY)
+            )
+            rewritten = bedrock_guard.rewrite_request_headers(
+                self.CONFIG, "POST", self.HOST, self.PATH, "", headers, self.BODY
+            )
+        authorization = dict((k.lower(), v) for k, v in rewritten)["authorization"]
+        real_key, real_secret, _region = self.REAL
+        expected, _sig = aws_sigv4.header_signature(
+            method="POST",
+            path=self.PATH,
+            query="",
+            headers=headers,
+            signed_headers=("content-type", "host", "x-amz-date"),
+            payload_hash=hashlib.sha256(self.BODY).hexdigest(),
+            amz_date=self.AMZ_DATE,
+            date_stamp=self.AMZ_DATE[:8],
+            region="us-east-2",
+            service="bedrock",
+            access_key_id=real_key,
+            secret_access_key=real_secret,
+        )
+        self.assertEqual(authorization, expected)
+        self.assertIn(real_key, authorization)
+        self.assertNotIn(self.KEY, authorization)
+        # Every other header (including the signed set) is untouched, so the
+        # re-signed request stays byte-faithful to what was verified.
+        self.assertEqual(
+            [(k, v) for k, v in rewritten if k.lower() != "authorization"],
+            [(k, v) for k, v in headers if k.lower() != "authorization"],
+        )
+
+    def test_rewrite_without_a_credential_leaves_the_request_worthless(self) -> None:
+        # A reset racing the request: the published credential vanished
+        # between the deny decision and the rewrite. The dummy signature goes
+        # upstream and AWS rejects it — failure stays closed without secrets.
+        headers = self.signed_request()
+        with patch.object(bedrock_guard, "read_bedrock_proxy_credential", return_value=None):
+            rewritten = bedrock_guard.rewrite_request_headers(
+                self.CONFIG, "POST", self.HOST, self.PATH, "", headers, self.BODY
+            )
+        self.assertEqual(rewritten, headers)
+
+    def test_rewrite_does_not_cross_a_replaced_credential_region(self) -> None:
+        headers = self.signed_request()
+        replacement = ("AKIAREPLACED", "replacement-secret", "us-west-2")
+        with patch.object(
+            bedrock_guard,
+            "read_bedrock_proxy_credential",
+            side_effect=[self.REAL, replacement],
+        ):
+            self.assertIsNone(
+                bedrock_guard.request_denied(
+                    self.CONFIG, "POST", self.HOST, self.PATH, "", headers, self.BODY
+                )
+            )
+            rewritten = bedrock_guard.rewrite_request_headers(
+                self.CONFIG, "POST", self.HOST, self.PATH, "", headers, self.BODY
+            )
+        self.assertEqual(rewritten, headers)
 
 
 class AnthropicServerToolGuardTests(unittest.TestCase):

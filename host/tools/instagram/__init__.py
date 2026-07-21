@@ -136,6 +136,7 @@ MANIFEST = ToolManifest(
         ConfigRequirement(key="INSTAGRAM_APP_SECRET", description="Instagram app secret."),
     ),
     protections=(
+        "Your Instagram app credentials and connected-account OAuth tokens stay in the host credential store and are never returned to or read by the agent.",
         "OAuth connects one professional Instagram account and requests only profile, media, and publishing permissions. Reads are limited to that connected account; public discovery is a separate tool.",
         "Publishing happens only after your approval.",
     ),

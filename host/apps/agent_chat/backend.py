@@ -32,7 +32,7 @@ MAX_REQUEST_BODY_BYTES = 128 * 1024
 # request-body cap; size the response cap to the admin API's own body limit.
 MAX_ADMIN_RESPONSE_BYTES = ADMIN_MAX_REQUEST_BODY_BYTES
 APP_ID = "agent_chat"
-RUNTIME_OPTIONS = {"codex", "claude_code"}
+RUNTIME_OPTIONS = {"codex", "claude_code", "pi", "hermes"}
 
 
 class AppError(Exception):

@@ -73,7 +73,7 @@ class NetworkIntrospectionTests(unittest.TestCase):
         }
         self.assertEqual(
             sorted(by_id),
-            ["claude", "custom", "github", "npm_packages", "openai", "python_packages"],
+            ["bedrock", "claude", "custom", "github", "npm_packages", "openai", "python_packages"],
         )
         self.assertTrue(by_id["github"]["enabled"])
         self.assertEqual(
@@ -154,7 +154,13 @@ class NetworkIntrospectionTests(unittest.TestCase):
         shim.stdin.flush()
         called = json.loads(shim.stdout.readline())
         self.assertFalse(called["result"]["isError"])
-        self.assertIn('"custom"', called["result"]["content"][0]["text"])
+        tool_result = json.loads(called["result"]["content"][0]["text"])
+        self.assertIn("network_integrations", tool_result)
+        self.assertNotIn("result", tool_result)
+        self.assertIn(
+            "custom",
+            {entry["integration_id"] for entry in tool_result["network_integrations"]},
+        )
 
 
 if __name__ == "__main__":

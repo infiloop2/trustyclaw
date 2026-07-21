@@ -22,7 +22,7 @@ import { agentLog, netLog, toolLog, toggleNetDeniedFilter } from "./logs.js";
 import {
   addDomainRule, addGithubRepo, approveGithubPush, closeIntegrationInfo, deleteGithubCredential,
   loadPolicy, openProvider, recheckGithubAudit, rejectGithubPush, removeDomainRule,
-  removeGithubRepo, resetLinkedAccount, setClaudeWebSearch, setGithubCredential, setGithubRequireApproval,
+  removeGithubRepo, resetLinkedAccount, connectBedrockCredentials, setClaudeWebSearch, setGithubCredential, setGithubRequireApproval,
   setIntegrationEnabled, positionIntegrationInfo, refreshPendingGithubPushes, toggleGithubCredentialMode, toggleIntegrationExpansion,
   toggleCustomDomainAccess, toggleGithubRepoAudit, toggleIntegrationInfo,
 } from "./network.js";
@@ -115,6 +115,7 @@ function showTab(name) {
     $(`tab-app-${app.id}`)?.classList.toggle("active-tab", selected);
     const panel = $(`panel-app-${app.id}`);
     if (panel) panel.hidden = !selected;
+    if (selected) loadAppFrame(app);
   }
   setMobileNavOpen(false, closeDrawer);
   refreshVisibleTab(name).catch(() => {});
@@ -233,16 +234,23 @@ function renderAppTabs() {
     panel.hidden = activeTab !== `app:${app.id}`;
     const section = document.createElement("section");
     section.className = "app-frame-section";
-    const iframe = document.createElement("iframe");
-    iframe.className = "app-frame";
-    iframe.title = app.title || app.id;
-    iframe.src = app.ui.iframe_src;
-    iframe.setAttribute("sandbox", app.ui.sandbox.join(" "));
-    section.appendChild(iframe);
     panel.appendChild(section);
     main.appendChild(panel);
-    appFrames.set(app.id, iframe);
+    if (activeTab === `app:${app.id}`) loadAppFrame(app);
   }
+}
+
+function loadAppFrame(app) {
+  if (appFrames.has(app.id)) return;
+  const section = $(`panel-app-${app.id}`)?.querySelector(".app-frame-section");
+  if (!section) return;
+  const iframe = document.createElement("iframe");
+  iframe.className = "app-frame";
+  iframe.title = app.title || app.id;
+  iframe.setAttribute("sandbox", app.ui.sandbox.join(" "));
+  iframe.src = app.ui.iframe_src;
+  section.appendChild(iframe);
+  appFrames.set(app.id, iframe);
 }
 
 function renderHomeHero(heroApp) {
@@ -360,6 +368,7 @@ document.addEventListener("click", event => {
     "disable-github-require-approval": () => setGithubRequireApproval(false),
     "enable-claude-web-search": () => setClaudeWebSearch(true),
     "disable-claude-web-search": () => setClaudeWebSearch(false),
+    "connect-bedrock-credentials": () => connectBedrockCredentials(button.dataset.integration),
     "add-domain-rule": () => addDomainRule(),
     "remove-domain-rule": () => removeDomainRule(button.dataset.domain),
     "set-github-credential": () => setGithubCredential(),

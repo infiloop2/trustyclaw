@@ -9,17 +9,80 @@ from unittest.mock import patch
 
 from host.runtime.tools.tools_host import BUNDLED_TOOLS, validate_against_schema
 from tests.smoke.smoke_aws import SMOKE_TOOL_CALLS, AwsSmoke
-from tests.stage.stage_aws import (
+from tests.stage.stage_aws import StageAwsSmoke, _required_env_path
+from tests.stage.stage_support import (
     STAGE_SUITES,
     TOOL_SUITES,
-    StageAwsSmoke,
-    _github_app_config_from_env,
-    _required_env_path,
+    github_app_config_from_env as _github_app_config_from_env,
     suite_tools,
 )
 
 
 class AwsSmokeTeardownTests(unittest.TestCase):
+    def test_precredential_bedrock_probe_runs_both_real_launchers(self) -> None:
+        smoke = AwsSmoke()
+        smoke.total = 0
+        smoke.passed = 0
+        commands: list[str] = []
+        event_reads = 0
+
+        def fake_ssh(command: str) -> str:
+            commands.append(command)
+            if "SELECT count(*) FROM bedrock_credentials" in command:
+                return "0"
+            return "expected credential failure"
+
+        def fake_events(since: int = 0) -> list[dict]:
+            nonlocal event_reads
+            event_reads += 1
+            if event_reads == 1:
+                return []
+            if event_reads == 2:
+                return [
+                    {
+                        "seq": 1,
+                        "host": "bedrock-runtime.us-east-1.amazonaws.com",
+                        "path": "/model/qwen.qwen3-coder-next/converse",
+                        "decision": "denied",
+                        "reason_code": "bedrock_credentials_unavailable",
+                    }
+                ]
+            if event_reads == 3:
+                return [
+                    {
+                        "seq": 1,
+                        "host": "bedrock-runtime.us-east-1.amazonaws.com",
+                        "path": "/model/qwen.qwen3-coder-next/converse",
+                        "decision": "denied",
+                        "reason_code": "bedrock_credentials_unavailable",
+                    }
+                ]
+            return [
+                {
+                    "seq": 2,
+                    "host": "bedrock-runtime.us-east-1.amazonaws.com",
+                    "path": "/model/qwen.qwen3-coder-next/converse",
+                    "decision": "denied",
+                    "reason_code": "bedrock_credentials_unavailable",
+                }
+            ]
+
+        with (
+            patch.object(smoke, "_api", return_value={}),
+            patch.object(smoke, "_ssh_code", side_effect=fake_ssh),
+            patch.object(smoke, "_network_events", side_effect=fake_events),
+        ):
+            smoke.check_precredential_bedrock_harness_launchers()
+
+        joined = "\n".join(commands)
+        self.assertIn("sudo -u trustyclaw-admin", joined)
+        self.assertIn("/usr/local/lib/trustyclaw-host/run-pi", joined)
+        self.assertEqual(joined.count("--model qwen.qwen3-coder-next"), 2)
+        self.assertIn("sleep 5", joined)
+        self.assertIn("/usr/local/lib/trustyclaw-host/run-hermes", joined)
+        self.assertIn("--model qwen.qwen3-coder-next", joined)
+        self.assertEqual(smoke.passed, 1)
+
     def test_fresh_smoke_uses_strict_deploy_command_and_stdout_result(self) -> None:
         smoke = AwsSmoke()
         with tempfile.TemporaryDirectory() as tmp:
@@ -212,11 +275,16 @@ class StageAwsSmokeTests(unittest.TestCase):
     def test_stage_suite_runtimes_scope_each_suite(self) -> None:
         self.assertEqual(StageAwsSmoke.suite_runtimes("codex"), ("codex",))
         self.assertEqual(StageAwsSmoke.suite_runtimes("claude"), ("claude_code",))
+        self.assertEqual(StageAwsSmoke.suite_runtimes("pi"), ("pi",))
+        self.assertEqual(StageAwsSmoke.suite_runtimes("hermes"), ("hermes",))
         self.assertEqual(StageAwsSmoke.suite_runtimes("github"), ())
         self.assertEqual(StageAwsSmoke.suite_runtimes("brave_search"), ())
         self.assertEqual(StageAwsSmoke.suite_runtimes("gmail"), ())
         self.assertEqual(StageAwsSmoke.suite_runtimes("google_calendar"), ())
-        self.assertEqual(StageAwsSmoke.suite_runtimes("all"), ("codex", "claude_code"))
+        self.assertEqual(
+            StageAwsSmoke.suite_runtimes("all"),
+            ("codex", "claude_code", "pi", "hermes"),
+        )
         self.assertTrue(set(TOOL_SUITES).issubset(STAGE_SUITES))
         self.assertEqual(suite_tools("all"), TOOL_SUITES)
         self.assertEqual(suite_tools("linkedin"), ("linkedin",))
@@ -337,7 +405,7 @@ class StageAwsSmokeTests(unittest.TestCase):
             "STAGE_GITHUB_APP_PRIVATE_KEY",
         )
         with patch.dict("os.environ", {key: "" for key in keys}, clear=False):
-            self.assertIsNone(_github_app_config_from_env())
+            self.assertEqual(_github_app_config_from_env(), (None, None))
         full = {
             "STAGE_GITHUB_WRITE_REPO": "infiloop2/sandbox",
             "STAGE_GITHUB_APP_ID": "123",
@@ -345,14 +413,17 @@ class StageAwsSmokeTests(unittest.TestCase):
             "STAGE_GITHUB_APP_PRIVATE_KEY": "-----BEGIN KEY-----\nx\n-----END KEY-----",
         }
         with patch.dict("os.environ", full, clear=False):
-            config = _github_app_config_from_env()
+            config, error = _github_app_config_from_env()
+        self.assertIsNone(error)
+        assert config is not None
         self.assertEqual(config["owner"], "infiloop2")
         self.assertEqual(config["repo"], "sandbox")
         self.assertEqual(config["app_id"], "123")
         self.assertEqual(config["installation_id"], "456")
         with patch.dict("os.environ", {**full, "STAGE_GITHUB_APP_ID": ""}, clear=False):
-            with self.assertRaises(SystemExit):
-                _github_app_config_from_env()
+            partial, partial_error = _github_app_config_from_env()
+        self.assertIsNone(partial)
+        self.assertIn("STAGE_GITHUB_APP_ID", partial_error or "")
 
     def test_stage_enforcement_policy_lists_stage_repo_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -404,11 +475,20 @@ class WorkflowSmokeTests(unittest.TestCase):
         for option in ("all", *TOOL_SUITES, "claude", "codex", "github"):
             self.assertIn(f"- {option}", stage)
         self.assertIn("--suite", stage)
+        self.assertIn("--summary-file stage-integration-summary.md", stage)
+        self.assertIn('cat stage-integration-summary.md >> "${GITHUB_STEP_SUMMARY}"', stage)
         for env_name in (
             "STAGE_GITHUB_WRITE_REPO",
             "STAGE_GITHUB_APP_ID",
             "STAGE_GITHUB_APP_INSTALLATION_ID",
             "STAGE_GITHUB_APP_PRIVATE_KEY",
+        ):
+            self.assertIn(env_name, stage)
+        for env_name in (
+            "STAGE_BEDROCK_AWS_ACCESS_KEY_ID",
+            "STAGE_BEDROCK_AWS_SECRET_ACCESS_KEY",
+            "TRUSTYCLAW_STAGE_BEDROCK_AWS_ACCESS_KEY_ID",
+            "TRUSTYCLAW_STAGE_BEDROCK_AWS_SECRET_ACCESS_KEY",
         ):
             self.assertIn(env_name, stage)
         for tool_id in TOOL_SUITES:
@@ -423,7 +503,10 @@ class WorkflowSmokeTests(unittest.TestCase):
     def test_fresh_smoke_workflow_uses_fresh_smoke_script(self) -> None:
         smoke = Path(".github/workflows/trustyclaw-smoke.yml").read_text()
 
-        self.assertIn("python3 tests/smoke/smoke_aws.py", smoke)
+        self.assertIn("playwright==1.60.0", smoke)
+        self.assertIn("playwright==1.60.0", Path("tests/requirements.txt").read_text())
+        self.assertIn('"${RUNNER_TEMP}/trustyclaw-smoke-venv/bin/python" tests/smoke/smoke_aws.py', smoke)
+        self.assertLess(smoke.index("playwright==1.60.0"), smoke.index("AWS_ACCESS_KEY_ID"))
         self.assertIn("context trustyclaw-smoke", smoke)
         self.assertIn("github.event_name == 'workflow_dispatch'", smoke)
         self.assertIn("Fresh AWS smoke is already running; wait for the previous smoke to complete.", smoke)

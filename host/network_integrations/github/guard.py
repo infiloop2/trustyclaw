@@ -18,6 +18,7 @@ import base64
 import json
 from urllib.parse import parse_qs
 
+from host.network_integrations.base import request_param_denial
 from host.network_integrations.github import push_gate
 from host.network_integrations.github.manifest import GitHubIntegration
 from host.runtime.core.network_policy import normalized_path, route_allowed
@@ -55,7 +56,15 @@ def host_allowed(config: GitHubIntegration, host: str) -> bool:
     return host.lower() in ROUTES
 
 
-def rewrite_request_headers(host: str, headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
+def rewrite_request_headers(
+    config: object,
+    method: str,
+    host: str,
+    path: str,
+    query: str,
+    headers: list[tuple[str, str]],
+    body: bytes,
+) -> list[tuple[str, str]]:
     """Credential injection: on GitHub domains, strip whatever
     ``Authorization`` the agent sent and inject the active working token
     (``proxy_github_token`` row) instead. The agent never holds the
@@ -65,7 +74,10 @@ def rewrite_request_headers(host: str, headers: list[tuple[str, str]]) -> list[t
     integration cannot claim these domains, so every allowed request here
     came through the GitHub integration. Without a working token the
     request goes upstream unauthenticated (public reads work, private access
-    gets GitHub's plain 401)."""
+    gets GitHub's plain 401). Only ``host`` and ``headers`` matter here; the
+    full request shape in the hook signature exists for integrations that
+    re-sign bodies (Bedrock)."""
+    del config, method, path, query, body
     lowered = host.lower()
     if lowered not in GITHUB_BEARER_DOMAINS and lowered not in GITHUB_BASIC_DOMAINS and lowered not in GITHUB_STRIP_ONLY_DOMAINS:
         return headers
@@ -98,6 +110,19 @@ def request_denied(
         return "network_policy_denied"
     if host.lower() not in GUARDED_HOSTS:
         return None
+    if query and method.upper() in ("GET", "HEAD"):
+        # Read queries (search q=, filters) can reach any public repository, so
+        # their agent-authored values pass the outbound parameter guard. Only
+        # the query is scanned - the reconstructed URL is `https://host?<query>`
+        # with an empty path, because owner/repo/file path segments are the
+        # read surface itself. Both token-shape rules are off: revision ids,
+        # blob shas, and cursors are legitimately long and machine-shaped here.
+        # Writes are not scanned: the guard below already confines them to
+        # configured repositories, so a value in a write query only reaches a
+        # repo you control - there is no public leak to catch.
+        param_denial = request_param_denial("", query, token_rules=False)
+        if param_denial is not None:
+            return param_denial
     write_repos = {(item.owner, item.repo) for item in config.write_repositories}
     require_approval = config.require_dot_github_approval
     method = method.upper()

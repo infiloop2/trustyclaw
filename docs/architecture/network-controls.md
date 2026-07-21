@@ -190,6 +190,28 @@ schema creation and narrow grants. The GitHub push gate uses this pattern for
 `pending_pushes` and quarantined payloads. Integrations do not run migrations
 or gain an independent database identity.
 
+### One provider for shared harness infrastructure
+
+Managed apex claims are disjoint because the proxy resolves each host to one
+integration. Pi and Hermes both use the same Bedrock account, credential-row
+region, billing data, and `bedrock-runtime.<region>.amazonaws.com` endpoints, so
+the policy models those shared concerns as one operator-facing `bedrock`
+integration. Pi and Hermes remain runtime choices, not network integrations.
+
+The agent process never holds the operator's AWS key. Both launchers inject
+the same fixed dummy access-key id and secret. The guard requires the dummy
+access-key id, configured region, SigV4 service `bedrock`, an allowed POST
+model path, and header-based long-term-key authentication. It then discards
+the dummy signature and re-signs the exact method, path, headers, and body with
+the validated operator key from the shared `bedrock_credentials` row. The dummy
+values are public routing markers with no AWS capability and are not a security
+identity between the two shell-capable harnesses.
+
+This keeps the boundary direct: one provider row owns the shared apexes,
+credential, and status. The task API and toolbar project that status into Pi
+and Hermes rows beside their separate running counts. Providers with distinct
+infrastructure (OpenAI, Claude, GitHub) likewise own their apexes directly.
+
 ## Denial Reasons and Agent Introspection
 
 Every proxy denial is one stable snake_case code — the 403 response body, the
@@ -270,10 +292,34 @@ itself — App PEM key, PAT storage — keeps no proxy grant. The row holds
 holds SELECT on `secret_keys` to decrypt it; grants are per-table, so key
 plus row decrypt exactly the proxy's working set and nothing else — in app
 mode a short-lived installation token, refreshed hourly; in pat mode the PAT
-itself, one reason to prefer app mode. Two narrow root helpers
-carry the egress the admin service does not have: `mint-github-app-token`
-(short-lived, installation-wide App tokens) and `audit-github-repo` (the
-repository facts behind the operator warnings). Minted tokens are
+itself, one reason to prefer app mode. Bedrock is simpler: there is one
+proxy-readable `bedrock_credentials` row, stored only after synchronous
+identity validation. The proxy checks
+enablement before decrypting and re-signing; disabling is a soft product state
+and does not copy or delete credential data. Later AWS failures pass back as
+ordinary task errors and do not mutate credential state.
+
+On the Bedrock hosts the proxy also meters usage out of the responses it
+relays. Each harness signs with its own fixed routing key id (`pi` and
+`hermes` entries in the Bedrock manifest), so an allowed invocation selects a
+passive response meter attributed to that runtime. The meter buffers a copy
+of the raw upstream response while the relay forwards it unchanged, then
+parses the token usage AWS reports — the `usage` object of a Converse JSON
+body, or the `metadata` event inside a ConverseStream event stream — and
+increments one `bedrock_usage` counter row per (runtime, model, UTC day)
+under the proxy's own database role. Metering never affects the relay: a
+non-200 response, an unparsed shape, or an oversized body records the request
+with no tokens, and the gap between `requests` and `metered_requests` keeps
+the undercount visible. The admin API prices these counters at the catalog
+rates in the Bedrock manifest to show each runtime's live month-to-date
+estimate; no billing API is ever called.
+
+Narrow root-owned helpers carry
+the credentialed provider egress the admin service does not have:
+`read-aws-account` makes one STS request;
+`mint-github-app-token` creates short-lived, installation-wide App tokens;
+`audit-github-repo` reads repository facts behind operator warnings; and
+`approve-github-push` executes an approved quarantined push. Minted tokens are
 deliberately not scoped to the policy's repository list — the GitHub
 integration guard above is the per-repository boundary on every request,
 and the App installation bounds what the token could reach if the proxy were

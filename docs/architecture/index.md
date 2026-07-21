@@ -1,6 +1,6 @@
 # Architecture
 
-TrustyClaw runs Codex and Claude Code runtimes on an AWS EC2 instance behind
+TrustyClaw runs Codex, Claude Code, Pi, and Hermes runtimes on an AWS EC2 instance behind
 fail-closed network controls. The architecture docs are split by responsibility
 so operators and contributors can jump to the trust boundary they need.
 
@@ -35,7 +35,7 @@ so operators and contributors can jump to the trust boundary they need.
 
 ## Overview
 
-TrustyClaw runs Codex and Claude Code runtimes on an AWS EC2 instance behind
+TrustyClaw runs Codex, Claude Code, Pi, and Hermes runtimes on an AWS EC2 instance behind
 fail-closed network controls. Each task chooses its runtime harness, such as
 Codex or Claude Code. The host is long-lived in normal operation; the EC2
 instance and its root EBS volume carry the

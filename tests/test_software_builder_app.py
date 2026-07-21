@@ -66,9 +66,10 @@ class WorkspaceBaseMigrationTests(unittest.TestCase):
 
     def test_builder_ships_no_domain_migration(self) -> None:
         # Software Builder represents pull requests as generic artifacts. It has
-        # no domain tables, so the only migration is the copied workspace base.
+        # no domain tables, so its migrations are the copied workspace base and
+        # the kit-wide runtime-constraint update.
         migrations = sorted(p.name for p in (BUILDER_DIR / "migrations").glob("*.sql"))
-        self.assertEqual(migrations, ["0001_workspace_base.sql"])
+        self.assertEqual(migrations, ["0001_workspace_base.sql", "0002_pi_hermes_runtimes.sql"])
 
 
 class AgentInstructionsTests(unittest.TestCase):

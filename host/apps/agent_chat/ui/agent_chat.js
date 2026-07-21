@@ -23,7 +23,7 @@ const renderedTurnHtml = new Map();
 let forceScrollBottom = false;
 
 const $ = id => document.getElementById(id);
-const runtimeLabel = runtime => runtime === "claude_code" ? "Claude Code" : runtime === "codex" ? "Codex" : runtime;
+const runtimeLabel = runtime => runtime === "claude_code" ? "Claude Code" : runtime === "codex" ? "Codex" : runtime === "pi" ? "Pi" : runtime === "hermes" ? "Hermes" : runtime;
 const optionLabel = value => value.split(/[-_]/).map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
 const modelLabel = (runtime, value) => runtime === "codex" ? value : optionLabel(value);
 const esc = value => {
@@ -340,7 +340,7 @@ function renderTurn(task, messages) {
       ${stream.join("")}
       ${output}
       ${task.error_message ? `<div class="turn-error"><pre>${esc(task.error_message)}</pre></div>` : ""}
-      ${task.status === "running" ? `
+      ${task.status === "running" && task.agent_runtime !== "hermes" ? `
         <div class="task-steer">
           <input class="task-steer-input" data-task-id="${esc(task.task_id)}" placeholder="Steer this task" aria-label="Steering message for ${esc(task.task_id)}">
           <button class="ghost sm" data-task-action="steer" data-task-id="${esc(task.task_id)}">Steer</button>

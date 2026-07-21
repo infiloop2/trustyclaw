@@ -14,6 +14,18 @@ SESSION_OPTIONS: dict[str, dict[str, tuple[str, ...]]] = {
         "fable": ("high", "max", "ultracode"),
         "sonnet": ("high", "max", "ultracode"),
     },
+    # Both Bedrock harnesses expose the same small model catalog. Pi maps its
+    # efforts onto thinking levels; Hermes's headless CLI has no effort flag.
+    "pi": {
+        "deepseek.v3.2": ("medium", "high", "max"),
+        "qwen.qwen3-coder-next": ("medium", "high", "max"),
+        "moonshotai.kimi-k2.5": ("medium", "high", "max"),
+    },
+    "hermes": {
+        "deepseek.v3.2": ("high",),
+        "qwen.qwen3-coder-next": ("high",),
+        "moonshotai.kimi-k2.5": ("high",),
+    },
 }
 
 
@@ -28,7 +40,7 @@ def public_session_options() -> dict[str, dict[str, list[str]]]:
 def session_config_error(runtime: str, model: object, effort: object) -> str | None:
     models = SESSION_OPTIONS.get(runtime)
     if models is None:
-        return "agent_runtime must be 'codex' or 'claude_code'"
+        return "agent_runtime must be one of " + ", ".join(f"'{name}'" for name in SESSION_OPTIONS)
     if not isinstance(model, str) or model not in models:
         return f"model must be one of {', '.join(models)} for {runtime}"
     efforts = models[model]

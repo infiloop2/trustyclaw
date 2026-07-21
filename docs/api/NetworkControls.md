@@ -34,6 +34,7 @@ integration.
   "network_integrations": {
     "openai": {"enabled": true},
     "claude": {"enabled": true},
+    "bedrock": {"enabled": true},
     "github": {
       "enabled": true,
       "write_repositories": [
@@ -54,7 +55,7 @@ integration.
 
 | Field | Required | Type | Behavior |
 | --- | --- | --- | --- |
-| `network_integrations` | No | object | Integration configs keyed by integration id. Known ids are `openai`, `claude`, `github`, `python_packages`, `npm_packages`, and `custom`. The five provider integrations take an `enabled` boolean; `custom` has no `enabled` field and is enabled exactly while its `domains` map is non-empty (passing `enabled` to `custom` is rejected). A missing key or `enabled: false` disables a provider; a disabled integration carries no other state, and serialization omits it entirely. |
+| `network_integrations` | No | object | Integration configs keyed by integration id. Known ids are `openai`, `claude`, `bedrock`, `github`, `python_packages`, `npm_packages`, and `custom`. The provider integrations take an `enabled` boolean; `custom` has no `enabled` field and is enabled exactly while its `domains` map is non-empty (passing `enabled` to `custom` is rejected). A missing key or `enabled: false` disables a provider; a disabled integration carries no other state, and serialization omits it entirely. |
 | `network_integrations.custom.domains` | No | object | Map of operator-defined domain rules. Keys are exact domains or wildcard suffix domains. Wildcards must start with `*.`, such as `*.example.com`; `*` matches any non-empty hostname prefix ending at that dot. Embedded globs and regex keys are not supported. Domains owned by a provider integration are always rejected here. The custom integration is enabled exactly while this map is non-empty. |
 
 Integration entries are stored exactly as configured. The host parses each
@@ -68,9 +69,15 @@ Every domain owned by a provider integration is reserved: it is rejected in
 `network_integrations.custom.domains` whether or not the integration is
 enabled, so a custom rule can never be broader than the integration's guard. The reserved suffixes are
 `openai.com`, `chatgpt.com`, `anthropic.com`, `claude.ai`, `claude.com`,
+`bedrock-runtime.us-east-1.amazonaws.com`,
+`bedrock-runtime.us-east-2.amazonaws.com`,
+`bedrock-runtime.us-west-2.amazonaws.com`,
 `github.com`, `githubusercontent.com`, `pypi.org`, `pythonhosted.org`,
-`npmjs.org`, and `nodejs.org`, including all their subdomains. Manual rules
-also cannot set provider-specific guard configuration.
+`npmjs.org`, and `nodejs.org`, including all their subdomains. The Bedrock
+integration deliberately reserves only these regional runtime endpoints, so
+custom rules for other AWS services under
+`amazonaws.com` stay possible.
+Manual rules also cannot set provider-specific guard configuration.
 
 ## OpenAI Integration
 
@@ -125,6 +132,51 @@ account metadata plus a SHA-256 hash of the OAuth access token, and denies
 `api.anthropic.com` data-plane requests until the presented bearer token
 matches that stored hash. The unauthenticated `/api/hello` readiness probe
 remains available for Claude Code startup.
+
+## AWS Bedrock Integration
+
+The Pi and Hermes runtimes run through one AWS Bedrock integration in the
+operator's own AWS account. One connection holds their region and IAM
+credential; one `enabled` flag controls access. The linked account, network
+boundary, provider status, and billing record are also shared. Pi and Hermes
+remain distinct task runtimes with separate task counts. The `bedrock`
+integration owns and guards the `bedrock-runtime` apexes:
+
+```json
+{
+  "enabled": true
+}
+```
+
+| Field | Required | Type | Behavior |
+| --- | --- | --- | --- |
+| `enabled` | Yes | boolean | Enables the shared Bedrock integration for both Pi and Hermes. The validated AWS connection, including its region, remains stored independently when this is `false`. |
+
+The stored Bedrock config is not expanded into a generic domain-policy entry.
+The managed-integration registry assigns every supported Bedrock Runtime apex
+to the Bedrock guard. At request time that guard derives the one allowed host
+from the region stored with the connected credential, permits only `POST`, and
+applies `^/model/[^/]+/(?:converse|converse-stream)$` directly. Every other
+supported region remains owned by Bedrock and denied, so it cannot fall through
+to a custom-domain rule.
+
+The Converse paths cover the request shapes used by both harnesses.
+The agent never holds the operator's AWS credential. Each harness receives its
+own fixed access-key id and a fixed dummy secret with no AWS capability. The
+proxy requires one of those dummy access-key ids, the configured region, SigV4
+service `bedrock`, and an allowed model invocation path, then discards the
+agent's signature and re-signs the exact request with the validated operator
+key. A request for another region is rejected at CONNECT; a request signed
+with any other access-key id is denied with `bedrock_access_key_mismatch`. The
+Bedrock control plane and every other AWS service stay closed. Query-string
+(presigned) authentication and temporary session credentials
+(`X-Amz-Security-Token`) are always denied.
+
+Allowed invocations are also metered: the proxy passively parses the token
+usage AWS reports in each relayed response and counts it per runtime (selected
+by the signing harness's key id), model, and UTC day, which powers the live
+per-runtime cost estimates in the admin UI. Metering never alters or gates the
+relayed bytes.
 
 ## GitHub Integration
 

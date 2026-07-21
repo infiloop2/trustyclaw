@@ -6,7 +6,16 @@ export const $ = id => document.getElementById(id);
 export const RUNTIME_PROVIDERS = {
   codex: { label: "Codex", provider: "openai", providerLabel: "OpenAI" },
   claude_code: { label: "Claude Code", provider: "claude", providerLabel: "Claude" },
+  pi: { label: "Pi", provider: "bedrock", providerLabel: "AWS Bedrock" },
+  hermes: { label: "Hermes", provider: "bedrock", providerLabel: "AWS Bedrock" },
 };
+
+export function providerRuntime(provider) {
+  for (const [runtime, meta] of Object.entries(RUNTIME_PROVIDERS)) {
+    if (meta.provider === provider) return runtime;
+  }
+  return null;
+}
 
 export function runtimeLabel(runtime) {
   return RUNTIME_PROVIDERS[runtime]?.label || runtime;
@@ -14,9 +23,13 @@ export function runtimeLabel(runtime) {
 
 export function notice(message, kind) {
   const node = $("notice");
-  node.textContent = message || "";
+  // A 401 already moves the operator to the password prompt. Keep the error
+  // intact for callers and every authenticated view, but omit the redundant
+  // toast when the login screen itself is asking for the password.
+  const visibleMessage = message === "unauthorized" && !$("login").hidden ? "" : message;
+  node.textContent = visibleMessage || "";
   node.classList.toggle("error", kind === "error");
-  if (message) setTimeout(() => { node.textContent = ""; }, 8000);
+  if (visibleMessage) setTimeout(() => { node.textContent = ""; }, 8000);
 }
 
 const inlineMessageTimers = new WeakMap();
@@ -149,4 +162,30 @@ export function eventPayloadText(event) {
 
 export function objectValue(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+export function formatTokenCount(value) {
+  if (value >= 1e9) return `${(value / 1e9).toFixed(1)}B`;
+  if (value >= 1e6) return `${(value / 1e6).toFixed(1)}M`;
+  if (value >= 1e3) return `${(value / 1e3).toFixed(1)}k`;
+  return String(value);
+}
+
+// Month-to-date usage the proxy metered live from Bedrock responses for one
+// runtime (see the bedrock_usage payload on the provider account), formatted
+// for display; null when the payload is absent.
+export function bedrockRuntimeUsage(account, runtime) {
+  const usage = account.bedrock_usage && account.bedrock_usage[runtime];
+  const amount = usage && typeof usage === "object" ? Number(usage.month_to_date) : NaN;
+  if (!Number.isFinite(amount)) return null;
+  const currency = !usage.currency || usage.currency === "USD" ? "$" : `${usage.currency} `;
+  return {
+    cost: `${currency}${amount.toFixed(2)}`,
+    inputTokens: Number(usage.input_tokens) || 0,
+    outputTokens: Number(usage.output_tokens) || 0,
+    cacheReadTokens: Number(usage.cache_read_tokens) || 0,
+    cacheWriteTokens: Number(usage.cache_write_tokens) || 0,
+    requests: Number(usage.requests) || 0,
+    meteredRequests: Number(usage.metered_requests) || 0,
+  };
 }

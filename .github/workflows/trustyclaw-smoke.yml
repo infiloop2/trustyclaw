@@ -129,7 +129,7 @@ jobs:
 
   smoke:
     needs: authorize
-    name: Fresh AWS smoke
+    name: Fresh AWS smoke (${{ needs.authorize.outputs.ref }})
     if: ${{ needs.authorize.result == 'success' }}
     runs-on: ubuntu-latest
     concurrency:
@@ -158,6 +158,24 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "${{ github.api_url }}/repos/${REPO}/statuses/${REF}" \
             -d "${payload}" >/dev/null
+          {
+            echo "## TrustyClaw smoke"
+            echo
+            echo "Testing resolved ref: \`${REF}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      # This step has no AWS credential environment. Install the pinned driver
+      # before the credential-bearing smoke step, and use the runner's existing
+      # Chrome so no browser binary is downloaded alongside AWS secrets.
+      - name: Install pinned Playwright driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "${RUNNER_TEMP}/trustyclaw-smoke-venv"
+          "${RUNNER_TEMP}/trustyclaw-smoke-venv/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --no-cache-dir \
+            'playwright==1.60.0'
 
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
@@ -173,7 +191,7 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
         run: |
           set -euo pipefail
-          python3 tests/smoke/smoke_aws.py
+          "${RUNNER_TEMP}/trustyclaw-smoke-venv/bin/python" tests/smoke/smoke_aws.py
 
       - name: Mark smoke result
         if: ${{ always() }}

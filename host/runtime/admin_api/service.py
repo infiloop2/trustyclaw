@@ -37,12 +37,13 @@ from urllib.parse import parse_qs, urlparse
 
 from host.config import AGENT_RUNTIMES, ConfigError, parse_network_controls
 from host.constants import ADMIN_API_PORT, LOOPBACK, MAX_REQUEST_BODY_BYTES, PROXY_PORT
+from host.network_integrations.bedrock.manifest import SUPPORTED_REGIONS as BEDROCK_REGIONS
 from host.network_integrations.github.push_gate import pending as github_pending_push
 from host.session_options import session_config_error
 # app_backend_admin_api imports this module back to dispatch through route().
 # The cycle is safe with plain module imports: each side binds the module
 # object and reads its attributes only at request time, never during import.
-from host.runtime.admin_api import app_api_proxy, app_backend_api as app_backend_admin_api, claude_code, codex_app_server, github_credential, github_repo_audit, orchestrator, task_status, tools_client as tools_admin_api, upgrade_check
+from host.runtime.admin_api import app_api_proxy, app_backend_api as app_backend_admin_api, bedrock_credentials, claude_code, codex_app_server, github_credential, github_repo_audit, orchestrator, task_status, tools_client as tools_admin_api, upgrade_check
 from host.runtime.core import app_platform, network_policy, state
 from host.runtime.tools import tools_host
 from host.runtime.admin_api.orchestrator import agent_runtime_status
@@ -424,6 +425,13 @@ def route(
             return current_claude_oauth_login()
     if path == "/v1/agent-runtime/claude-oauth-login/complete" and method == "POST":
         return complete_claude_oauth_login(body)
+    if path == "/v1/agent-runtime/bedrock-credentials":
+        if method == "GET":
+            return current_bedrock_credentials()
+        if method == "POST":
+            return connect_bedrock_credentials(body)
+        if method == "DELETE":
+            return disconnect_bedrock_credentials()
     if path == "/v1/agent-runtime/reset-linked-account" and method == "POST":
         return reset_linked_account(body)
     if path == "/v1/tasks":
@@ -875,8 +883,8 @@ def prune_state() -> None:
         state.prune_finished_tasks(cur, FINISHED_TASK_LIMIT)
         # Retained tasks keep their canonical thread; unreferenced mappings use
         # the ordinary per-runtime LRU cap.
-        state.prune_thread_sessions(cur, "codex", THREAD_MAP_LIMIT)
-        state.prune_thread_sessions(cur, "claude_code", THREAD_MAP_LIMIT)
+        for runtime_type in AGENT_RUNTIME_TYPES:
+            state.prune_thread_sessions(cur, runtime_type, THREAD_MAP_LIMIT)
     # Approval expiry and history pruning use their own short mutations.
     tools_host.maintain_approvals()
 
@@ -1046,12 +1054,90 @@ def _claude_completed_token_hash() -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+# Long-term IAM user access key ids only (AKIA prefix, 20 characters).
+# Temporary session credentials (ASIA...) need an X-Amz-Security-Token the
+# proxy deliberately denies, so rejecting them here with a clear message
+# beats the generic STS failure they would otherwise hit.
+BEDROCK_ACCESS_KEY_ID_RE = re.compile(r"^AKIA[0-9A-Z]{16}$")
+
+
+def connect_bedrock_credentials(body: Any) -> dict[str, str]:
+    """Store the operator-pasted AWS key pair and region as one connection.
+
+    Only this operator API
+    writes that row, so the stored credential is the approval. The request
+    synchronously attests the key even while Bedrock is disabled; a failed
+    candidate is never stored and leaves any previous validated connection
+    unchanged."""
+    if not isinstance(body, dict):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "request body must be an object")
+    unexpected = sorted(set(body) - {"access_key_id", "secret_access_key", "region"})
+    if unexpected:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "unexpected request fields: " + ", ".join(unexpected))
+    access_key_id = body.get("access_key_id")
+    secret_access_key = body.get("secret_access_key")
+    region = body.get("region")
+    if not isinstance(access_key_id, str) or not access_key_id.strip():
+        raise ApiError(HTTPStatus.BAD_REQUEST, "access_key_id must be a non-empty string")
+    if not BEDROCK_ACCESS_KEY_ID_RE.fullmatch(access_key_id.strip()):
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            "access_key_id must be a long-term IAM access key id (20 characters, AKIA prefix); "
+            "temporary session credentials (ASIA...) are not supported — create a long-term "
+            "access key for a dedicated IAM user instead",
+        )
+    if not isinstance(secret_access_key, str) or not secret_access_key.strip():
+        raise ApiError(HTTPStatus.BAD_REQUEST, "secret_access_key must be a non-empty string")
+    if region not in BEDROCK_REGIONS:
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            "region must be one of " + ", ".join(BEDROCK_REGIONS),
+        )
+    try:
+        status, error_message = orchestrator.replace_and_validate_bedrock_credentials(
+            access_key_id.strip(),
+            secret_access_key.strip(),
+            region,
+        )
+    except bedrock_credentials.BedrockCredentialsError as exc:
+        raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+    if status != "active":
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            error_message or "AWS credential validation failed",
+        )
+    if not orchestrator.runtime_network_enabled("pi"):
+        return {"status": "accepted"}
+    # Runtime refresh projects the validated row into both harness counters
+    # without another AWS call. The proxy reads that same row directly.
+    orchestrator.refresh_runtime_status("pi")
+    return {"status": "accepted"}
+
+
+def current_bedrock_credentials() -> dict[str, Any]:
+    """Return non-secret metadata for the validated Bedrock credential."""
+    access_key_id = state.read_bedrock_access_key_id()
+    response: dict[str, Any] = {"connected": access_key_id is not None}
+    if access_key_id is not None:
+        response["access_key_id"] = access_key_id
+        region = state.read_bedrock_region()
+        if region is not None:
+            response["region"] = region
+    return response
+
+
+def disconnect_bedrock_credentials() -> dict[str, str]:
+    """Delete the shared AWS connection and stop both Bedrock harnesses."""
+    orchestrator.disconnect_bedrock_connection()
+    return {"status": "accepted"}
+
+
 def reset_linked_account(body: Any) -> dict[str, str]:
     """Delete the linked-account guard: the operator-approved anchor, its
     proxy pin, pending OAuth approval, local agent auth files, and old runtime
     processes. Callable in any runtime status."""
-    if not isinstance(body, dict) or body.get("agent_runtime") not in ("codex", "claude_code"):
-        raise ApiError(HTTPStatus.BAD_REQUEST, "agent_runtime must be codex or claude_code")
+    if not isinstance(body, dict) or body.get("agent_runtime") not in OAUTH_RUNTIME_TYPES:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "agent_runtime must be one of " + ", ".join(OAUTH_RUNTIME_TYPES))
     runtime_type = body["agent_runtime"]
     orchestrator.reset_linked_account(runtime_type)
     try:
@@ -1084,27 +1170,44 @@ def _clear_local_agent_auth(runtime_type: str) -> None:
         raise ApiError(HTTPStatus.CONFLICT, message)
 
 
+AGENT_RUNTIME_TYPES = ("codex", "claude_code", "pi", "hermes")
+BEDROCK_RUNTIME_TYPES = ("pi", "hermes")
+OAUTH_RUNTIME_TYPES = ("codex", "claude_code")
+
+
 def current_agent_accounts() -> dict[str, Any]:
     statuses = orchestrator.all_runtime_status_records()
-    return {"accounts": [_current_agent_account(statuses, "codex"), _current_agent_account(statuses, "claude_code")]}
+    return {
+        "accounts": [
+            _current_agent_account(statuses, "codex"),
+            _current_agent_account(statuses, "claude_code"),
+            _current_bedrock_account(statuses),
+        ]
+    }
 
 
 def refresh_agent_runtime_accounts(body: Any) -> dict[str, Any]:
     runtime_types: tuple[str, ...]
     if body is None:
-        runtime_types = ("codex", "claude_code")
+        runtime_types = AGENT_RUNTIME_TYPES
     elif isinstance(body, dict):
         runtime = body.get("agent_runtime")
         if runtime is None:
-            runtime_types = ("codex", "claude_code")
-        elif isinstance(runtime, str) and runtime in ("codex", "claude_code"):
+            runtime_types = AGENT_RUNTIME_TYPES
+        elif isinstance(runtime, str) and runtime in AGENT_RUNTIME_TYPES:
             runtime_types = (runtime,)
         else:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "agent_runtime must be codex or claude_code")
+            raise ApiError(HTTPStatus.BAD_REQUEST, "agent_runtime must be one of " + ", ".join(AGENT_RUNTIME_TYPES))
     else:
         raise ApiError(HTTPStatus.BAD_REQUEST, "request body must be an object")
     for runtime_type in runtime_types:
-        orchestrator.refresh_runtime_status(runtime_type, force_provider_probe=True)
+        if runtime_type == "hermes" and "pi" in runtime_types:
+            continue
+        force_probe = (
+            runtime_type not in BEDROCK_RUNTIME_TYPES
+            or orchestrator.runtime_network_enabled(runtime_type)
+        )
+        orchestrator.refresh_runtime_status(runtime_type, force_provider_probe=force_probe)
     return current_agent_accounts()
 
 
@@ -1126,11 +1229,80 @@ def _current_agent_account(statuses: dict[str, dict[str, Any]], runtime_type: st
     # The account anchor outlives sessions and deactivation; expose its
     # identity (never plan/usage) so the UI can show which account is linked
     # while the runtime is logged out or in error.
-    for key in ("account_id", "email"):
+    for key in ("account_id", "email", "arn"):
         value = account.get(key)
         if isinstance(value, str) and value:
             response[key] = value
     return response
+
+
+def _current_bedrock_account(statuses: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    # The orchestrator projects one Bedrock provider record into both runtime
+    # rows. Read either projection; there is no second status to reconcile.
+    status = str(statuses.get("pi", {}).get("status", "loading"))
+    response: dict[str, Any] = {
+        "provider": "bedrock",
+        "agent_runtimes": list(BEDROCK_RUNTIME_TYPES),
+        "status": status,
+        # Live usage survives credential state on purpose: the counters record
+        # month-to-date work already done, and reporting them costs one local
+        # aggregate read.
+        "bedrock_usage": _bedrock_live_usage(),
+    }
+    # Credential and display metadata are stored or cleared atomically, so the
+    # account is meaningful only while the validated credential remains.
+    account = state.read_bedrock_account() if state.read_bedrock_access_key_id() else {}
+    if status == "active":
+        response.update(_account_response_metadata(account, "bedrock"))
+        return response
+    for key in ("account_id", "arn"):
+        value = account.get(key)
+        if isinstance(value, str) and value:
+            response[key] = value
+    return response
+
+
+_BEDROCK_USAGE_TOKEN_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+)
+
+
+def _bedrock_live_usage() -> dict[str, dict[str, Any]]:
+    """Month-to-date usage per Bedrock runtime.
+
+    The proxy counts the token usage AWS reports in each allowed response and
+    the USD it priced that response at, per runtime, model, and UTC day. This
+    sums the current month straight from those stored counters — the cost is
+    the recorded figure, not re-priced at read time. It remains an estimate of
+    what AWS will bill, not the bill itself: unmetered requests (``requests``
+    minus ``metered_requests``) are surfaced instead of silently rounding the
+    estimate down."""
+    month_start = time.strftime("%Y-%m-01", time.gmtime())
+    usage: dict[str, dict[str, Any]] = {
+        runtime: {
+            "month_to_date": 0.0,
+            "currency": "USD",
+            "requests": 0,
+            "metered_requests": 0,
+            **{field: 0 for field in _BEDROCK_USAGE_TOKEN_FIELDS},
+        }
+        for runtime in BEDROCK_RUNTIME_TYPES
+    }
+    for row in state.read_bedrock_usage(month_start):
+        summary = usage.get(row["runtime"])
+        if summary is None:
+            continue
+        summary["requests"] += row["requests"]
+        summary["metered_requests"] += row["metered_requests"]
+        summary["month_to_date"] += row["cost_usd"]
+        for field in _BEDROCK_USAGE_TOKEN_FIELDS:
+            summary[field] += row[field]
+    for summary in usage.values():
+        summary["month_to_date"] = round(summary["month_to_date"], 4)
+    return usage
 
 
 def _openai_account_is_operator_approved(account: dict[str, Any]) -> bool:
@@ -1141,16 +1313,25 @@ def _claude_account_is_operator_approved(account: dict[str, Any]) -> bool:
     return account.get("identity_attestation") == orchestrator.CLAUDE_IDENTITY_ATTESTATION
 
 
+# Bedrock is absent on purpose: its usage is computed live from the proxy's
+# token counters (_bedrock_live_usage), never stored on the account row.
+_RUNTIME_USAGE_KEYS = {
+    "codex": "codex_usage",
+    "claude_code": "claude_usage",
+}
+
+
 def _account_response_metadata(account: dict[str, Any], runtime_type: str) -> dict[str, Any]:
-    # The runtime adapters sanitize account metadata at capture (typed
-    # scalars, known keys only) and every active refresh rewrites the stored
-    # row, so this only selects the public fields — no re-normalization.
+    # Provider capture sanitizes metadata before storage; this selects only the
+    # public fields without re-normalizing provider-owned usage shapes.
     response: dict[str, Any] = {}
-    for key in ("account_id", "email", "plan_type"):
+    for key in ("account_id", "email", "plan_type", "arn"):
         value = account.get(key)
         if isinstance(value, str) and value:
             response[key] = value
-    usage_key = "codex_usage" if runtime_type == "codex" else "claude_usage"
+    usage_key = _RUNTIME_USAGE_KEYS.get(runtime_type)
+    if usage_key is None:
+        return response
     usage = account.get(usage_key)
     if isinstance(usage, dict) and usage:
         response[usage_key] = usage
@@ -1249,6 +1430,11 @@ def steer_task(task_id: str, body: Any) -> dict[str, str]:
         task = _require_task(state.get_task(task_id, cur))
         if task["status"] != RUNNING:
             raise ApiError(HTTPStatus.CONFLICT, "only running tasks can be steered")
+        if task["agent_runtime"] == "hermes":
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                "Hermes tasks do not support steering; create a new task on the same thread_id",
+            )
         if state.pending_steer_count(cur, task_id) >= PENDING_STEER_LIMIT:
             raise ApiError(
                 HTTPStatus.CONFLICT,
@@ -1477,13 +1663,13 @@ def _agent_runtime(body: Any) -> str:
         raise ApiError(HTTPStatus.BAD_REQUEST, "request body must be a JSON object")
     value = body.get("agent_runtime")
     if not isinstance(value, str):
-        raise ApiError(HTTPStatus.BAD_REQUEST, "agent_runtime must be 'codex' or 'claude_code'")
+        raise ApiError(HTTPStatus.BAD_REQUEST, "agent_runtime must be one of " + ", ".join(sorted(AGENT_RUNTIMES)))
     return _agent_runtime_value(value)
 
 
 def _agent_runtime_value(value: str) -> str:
     if value not in AGENT_RUNTIMES:
-        raise ApiError(HTTPStatus.BAD_REQUEST, "agent_runtime must be 'codex' or 'claude_code'")
+        raise ApiError(HTTPStatus.BAD_REQUEST, "agent_runtime must be one of " + ", ".join(sorted(AGENT_RUNTIMES)))
     return value
 
 

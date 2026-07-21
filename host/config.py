@@ -14,7 +14,7 @@ from host.network_integrations.registry import NETWORK_INTEGRATIONS, managed_dom
 
 AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,50}$")
 EXACT_DOMAIN_RE = re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
-AGENT_RUNTIMES = {"codex", "claude_code"}
+AGENT_RUNTIMES = {"codex", "claude_code", "pi", "hermes"}
 
 
 class ConfigError(ValueError):
@@ -29,11 +29,14 @@ class NetworkControls:
     integrations: dict[str, IntegrationConfig]
 
     def to_json(self) -> dict[str, Any]:
+        serialized = {
+            integration_id: config.to_json()
+            for integration_id, config in self.integrations.items()
+            if config.enabled
+        }
         return {
             "network_integrations": {
-                integration_id: config.to_json()
-                for integration_id, config in self.integrations.items()
-                if config.enabled
+                integration_id: value for integration_id, value in serialized.items()
             },
         }
 
@@ -169,4 +172,3 @@ def _object(raw: dict[str, Any], key: str, *, required: bool = True) -> dict[str
     if not isinstance(value, dict):
         raise ConfigError(f"{key} must be an object")
     return value
-

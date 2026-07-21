@@ -6,8 +6,11 @@ so it must not import ``host.runtime``.
 
 from __future__ import annotations
 
+import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Protocol
+
+from host.param_guard import find_denial
 
 
 @dataclass(frozen=True)
@@ -89,7 +92,7 @@ def parse_simple_integration(raw: dict[str, Any], context: str) -> ManagedIntegr
 # domain/method/path decision, transport rules, and inspection limits. Kept
 # next to the integration catalogs so the agent introspection tools serve one
 # uniform reason lookup.
-PROXY_DENIAL_REASONS: tuple[DenialReason, ...] = (
+_CORE_PROXY_DENIAL_REASONS: tuple[DenialReason, ...] = (
     DenialReason(
         "network_policy_denied",
         "No network policy rule allows this host, method, and path. The operator can add a "
@@ -143,4 +146,80 @@ PROXY_DENIAL_REASONS: tuple[DenialReason, ...] = (
         "framing, extension, or size), so the connection was closed. Reconnect without "
         "extensions and keep messages under the inspection limit.",
     ),
+)
+
+
+
+
+# --- Outbound request parameter guard on the proxy path ------------------
+#
+# The same deterministic guard that tools apply through
+# ``HostAPI.outbound`` (host.param_guard), run here over the agent-authored
+# free-text dimensions of managed-integration requests: decoded URL path
+# segments and query values. Route allowlists stay authoritative; this adds
+# content strictness on the one dimension they cannot constrain by shape.
+# See docs/architecture/tools/outbound-request-filtering.md.
+
+# Cataloged with the proxy-core reasons (codes are globally unique across
+# the catalog); several integration guards emit these, so they live here
+# rather than in any one integration's manifest.
+_PARAM_GUARD_DENIAL_REASONS: tuple[DenialReason, ...] = (
+    DenialReason(
+        "request_param_too_large",
+        "A request URL value exceeded the parameter guard's fixed length limit. "
+        "Shorten the value and retry.",
+    ),
+    DenialReason(
+        "request_param_encoded_blob_denied",
+        "A request URL value looked like an encoded payload (control characters, "
+        "an overlong unbroken token, or a random-looking string). Rewrite it as "
+        "plain text and retry.",
+    ),
+    DenialReason(
+        "request_param_secret_denied",
+        "A request URL value appeared to contain a secret or credential (API key, "
+        "token, private key, password, or similar). Remove it and retry; secrets "
+        "must never ride in request parameters.",
+    ),
+    DenialReason(
+        "request_param_pii_denied",
+        "A request URL value appeared to contain a personal or financial "
+        "identifier (email, phone, card, account, or code). Remove it and retry.",
+    ),
+)
+
+
+def request_param_denial(path: str, query: str, *, token_rules: bool = True) -> str | None:
+    """Run the parameter guard over a managed-integration request's URL and
+    return the denial code for the first finding, else None.
+
+    The whole reconstructed URL (`https://host<path>?<query>`) is decoded and
+    scanned as one value rather than parsing path segments and query pairs
+    individually. This keeps the proxy path simple and still enforces the
+    credential-named-query-key rule, because scanning a full URL routes
+    through the same `CRED_URL` guard (G10) that parses the query and denies
+    a credential key carrying a long value - so `?access_token=<16+ chars>`
+    is caught without the proxy reparsing anything. The unbroken URL is a
+    plain `https` URL, so the token-length rule does not fire on it; long or
+    encoded payloads inside a path segment are caught by the unnatural-token
+    rule instead.
+
+    Percent-decoding is strict: bytes that are not valid UTF-8 would be
+    smoothed into replacement characters by lenient decoding (and pass the
+    printable rule) while the raw bytes still went upstream - a binary
+    exfiltration channel - so invalid encodings deny outright.
+    """
+    raw = "https://host" + path
+    if query:
+        raw += "?" + query
+    try:
+        decoded = urllib.parse.unquote(raw, errors="strict")
+    except UnicodeDecodeError:
+        return "request_param_encoded_blob_denied"
+    denial = find_denial(decoded, token_rules=token_rules)
+    return denial.reason if denial is not None else None
+
+
+PROXY_DENIAL_REASONS: tuple[DenialReason, ...] = (
+    _CORE_PROXY_DENIAL_REASONS + _PARAM_GUARD_DENIAL_REASONS
 )

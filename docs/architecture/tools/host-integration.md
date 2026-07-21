@@ -13,7 +13,7 @@ are partitioned by `tool_id`.
 ## Where tool code runs, and its internet access
 
 Tool packages make outbound HTTPS calls to third parties (Google, Brave, X,
-LinkedIn, SerpApi, Meta/Instagram, ScrapeCreators, Polymarket, Interactive
+LinkedIn, Serper, Meta/Instagram, ScrapeCreators, Polymarket, Interactive
 Brokers, and Runway) and
 parse their responses, so unlike other host code they need direct egress and are
 the host code most exposed to attacker-influenced data. They run in a **dedicated

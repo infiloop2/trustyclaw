@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 from unittest.mock import patch
 
+from host.param_guard import OutboundGuardService
 from host.tools.host_api import ApprovalRecord, AssetMetadata
 from host.tools.json_types import JSONObject
 from host.tools.manifest import (
@@ -155,6 +156,8 @@ class FakeHostAPI:
     config: dict[str, str] = field(default_factory=default_config)
     approvals: MemoryApprovals = field(default_factory=MemoryApprovals)
     assets: MemoryAssets = field(default_factory=MemoryAssets)
+    # The real guard, not a stub: every tool test exercises the shipped rules.
+    outbound: OutboundGuardService = field(default_factory=OutboundGuardService)
 
 
 def connected_google_api(tool_id: str, scopes: frozenset[str]) -> FakeHostAPI:
@@ -522,6 +525,26 @@ class ToolTests(unittest.TestCase):
         executed = result
         self.assertEqual([call["operation"] for call in calls], ["users.messages.list", "users.messages.get"])
         self.assertEqual(executed.result["messages"][0]["subject"], "Hello")
+
+    def test_gmail_search_query_denies_secrets_but_allows_addresses(self) -> None:
+        # Connected-account query: a mailbox search legitimately carries
+        # addresses (from:alice@example.com passes, exercised above), but a
+        # credential from another context must not reach Google's query logs.
+        api = connected_google_api(gmail.MANIFEST.tool_id, gmail.REQUIRED_GMAIL_SCOPES)
+
+        def fail_if_called(access_token: str, request: JSONObject) -> JSONObject:
+            raise AssertionError("a denied query must not reach the Gmail API")
+
+        with patch.object(gmail_api, "execute_gmail_api_request", side_effect=fail_if_called):
+            result = GmailTool().execute(
+                "search_messages",
+                {"query": "invoice AKIAIOSFODNN7EXAMPLE"},
+                api,
+            )
+        self.assertIsInstance(result, ActionFailed)
+        assert isinstance(result, ActionFailed)
+        self.assertIn("credential", result.error)
+        self.assertIn("retry", result.error)
 
     def test_gmail_write_queues_exact_payload_then_executes_after_approval(self) -> None:
         api = connected_google_api(gmail.MANIFEST.tool_id, gmail.REQUIRED_GMAIL_SCOPES)
@@ -1088,7 +1111,7 @@ class ToolTests(unittest.TestCase):
     def test_gmail_thread_truncation_reports_index_counts(self) -> None:
         messages = [{"id": f"m{i}", "threadId": "t1"} for i in range(105)]
         with patch.object(gmail, "execute_gmail_api_request", return_value={"id": "t1", "messages": messages, "attacker": {"nested": "payload"}}):
-            result = gmail.GmailTool()._execute_read("read_thread", {"thread_id": "t1"}, "token")
+            result = gmail.GmailTool()._execute_read("read_thread", {"thread_id": "t1"}, "token", FakeHostAPI())
         thread = cast(dict, result["thread"])
         self.assertEqual(len(cast(list, thread["messages"])), 100)
         self.assertTrue(thread["messageIndexTruncated"])
@@ -1121,7 +1144,7 @@ class ToolTests(unittest.TestCase):
             ),
             patch.object(gmail, "gmail_draft_preview", return_value={"draftId": "d"}) as preview,
         ):
-            result = gmail.GmailTool()._execute_read("list_drafts", {}, "token")
+            result = gmail.GmailTool()._execute_read("list_drafts", {}, "token", FakeHostAPI())
         drafts = cast(dict, result["drafts"])
         self.assertEqual(len(cast(list, drafts["drafts"])), gmail.DEFAULT_DRAFT_PAGE_LIMIT)
         self.assertEqual(preview.call_count, gmail.DEFAULT_DRAFT_PAGE_LIMIT)

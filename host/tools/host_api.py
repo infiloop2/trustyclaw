@@ -145,6 +145,25 @@ class Assets(Protocol):
 
     def delete(self, asset_id: str) -> None: ...
 
+class Outbound(Protocol):
+    """Host-owned guard for agent-controlled free-text request parameters.
+
+    Tools pass each decoded free-text value bound for a public or third-party
+    endpoint through this guard before request construction. It returns the
+    value unchanged or raises ``ValueError`` with a descriptive, value-free
+    message the tool surfaces verbatim so the agent can rephrase and retry.
+    See docs/architecture/tools/outbound-request-filtering.md for which
+    fields are guarded and why.
+    """
+
+    def guard_request_parameter_string(self, value: str, *, allow_identifiers: bool = False) -> str:
+        """Guard an agent-controlled free-text request value. ``allow_identifiers=True``
+        skips the personal-identifier rules for a query against an account the
+        operator already connected (a mailbox search), where identifiers are
+        legitimate search syntax; secret/credential shapes are still denied."""
+        ...
+
+
 class HostAPI(Protocol):
     """The bundle handed to every tool call, scoped to one tool."""
 
@@ -159,3 +178,6 @@ class HostAPI(Protocol):
 
     @property
     def assets(self) -> Assets: ...
+
+    @property
+    def outbound(self) -> Outbound: ...
