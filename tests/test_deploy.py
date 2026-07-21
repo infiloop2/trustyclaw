@@ -1620,6 +1620,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("/usr/local/lib/trustyclaw-host/read-claude-account", bootstrap)
         self.assertIn("/usr/local/lib/trustyclaw-host/clear-agent-auth", bootstrap)
         self.assertIn("/usr/local/lib/trustyclaw-host/read-agent-file", bootstrap)
+        self.assertIn("/usr/local/lib/trustyclaw-host/stop-agent-thread", bootstrap)
         self.assertIn("/usr/local/lib/trustyclaw-host/check-for-upgrade", bootstrap)
         # Network policy, provider pins, and network events live in the
         # database now (proxy role read-only for policy/pins); the three sudo
@@ -1970,6 +1971,18 @@ class DeployUnitTests(unittest.TestCase):
             self.assertIn('unit_args=(--unit "trustyclaw-agent-thread-$2")', launch_source)
             self.assertIn("shift 2", launch_source)
             self.assertIn('"${unit_args[@]}"', launch_source)
+        # Kill tears down a thread's transient scope through a privileged helper
+        # so an abandoned turn leaves no process holding the scope's name; the
+        # helper is installed and admin may invoke it.
+        self.assertIn("stop-agent-thread", bootstrap)
+        stop_source = Path("host/bootstrap/helpers/stop-agent-thread.sh").read_text()
+        self.assertIn('scope="trustyclaw-agent-thread-${thread_id}.scope"', stop_source)
+        # SIGKILL the cgroup before stop so a child that ignores SIGTERM cannot
+        # hold the scope active past systemd's TimeoutStopSec.
+        self.assertIn('systemctl kill --signal=KILL "${scope}"', stop_source)
+        self.assertIn('systemctl stop "${scope}"', stop_source)
+        self.assertIn('systemctl reset-failed "${scope}"', stop_source)
+        self.assertIn('if ! [[ "${thread_id}" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then', stop_source)
         for launch_helper in ("run-pi", "run-hermes"):
             launch_source = Path(f"host/bootstrap/helpers/{launch_helper}.sh").read_text()
             self.assertIn('export AWS_SECRET_ACCESS_KEY="trustyclaw-bedrock-dummy-secret"', launch_source)

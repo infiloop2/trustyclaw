@@ -21,7 +21,7 @@ import uuid
 from collections import deque
 from typing import Any, Callable
 
-from host.runtime.admin_api import bedrock_credentials
+from host.runtime.admin_api import bedrock_credentials, thread_scope
 
 DEFAULT_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/run-pi"]
 AGENT_CWD = "/mnt/trustyclaw-agent/agent-home"
@@ -66,27 +66,40 @@ class PiSession:
         with self._lock:
             self._closed = True
             proc = self._proc
-        if proc is None:
-            return
-        if proc.stdin is not None:
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
+        if proc is not None:
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-        if proc.stdout is not None:
-            proc.stdout.close()
-        if proc.stderr is not None:
-            proc.stderr.close()
-        self._proc = None
+                # Best-effort signal only: the production launcher runs as root,
+                # so this unprivileged kill fails with EPERM and the root scope
+                # teardown below is the real kill; a same-user command (tests)
+                # just dies here. A signal failure must never escape close() —
+                # the orchestrator keeps a thread fenced when close() raises.
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            if proc.stdout is not None:
+                proc.stdout.close()
+            if proc.stderr is not None:
+                proc.stderr.close()
+            self._proc = None
+        # Last resort after the runtime's own shutdown above: a killed turn
+        # leaves its descendants (a shell still in a long command) in this
+        # thread's systemd scope, keeping the scope's cgroup — and its name —
+        # alive so the next task on this thread cannot recreate it. Free the
+        # scope so close() returns only once the whole cgroup is gone; a clean
+        # exit already emptied it, so this is then a no-op.
+        thread_scope.stop_thread_scope(self._thread_id, self._command, DEFAULT_COMMAND)
 
     def run(
         self,

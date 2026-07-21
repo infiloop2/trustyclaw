@@ -6,6 +6,7 @@ from typing import Any
 import unittest
 from unittest.mock import patch
 
+from host.runtime.admin_api import thread_scope
 from host.runtime.admin_api import codex_app_server as codex_app_server_module
 from host.runtime.admin_api.codex_app_server import (
     CodexAppServer,
@@ -368,6 +369,32 @@ class CodexAppServerTests(unittest.TestCase):
         self.assertEqual(
             codex_app_server_module.CodexAppServer(command=["/bin/echo"])._command, ["/bin/echo"]
         )
+
+    def test_close_stops_the_thread_scope_under_the_production_launcher(self) -> None:
+        # A killed turn's scope keeps the thread name until its whole cgroup is
+        # gone, so close() must stop the scope by name; the launcher folds
+        # --thread-scope into _command, so the id is matched by prefix.
+        server = codex_app_server_module.CodexAppServer(
+            command=codex_app_server_module.DEFAULT_COMMAND, thread_id="stage-1-smoke-kill-codex"
+        )
+        with patch.object(thread_scope.subprocess, "run") as run:
+            server.close()
+        run.assert_called_once()
+        self.assertEqual(
+            run.call_args.args[0],
+            [*thread_scope.STOP_COMMAND, "stage-1-smoke-kill-codex"],
+        )
+
+    def test_close_does_not_stop_a_scope_for_a_test_command_or_threadless_turn(self) -> None:
+        for server in (
+            codex_app_server_module.CodexAppServer(command=["/bin/echo"], thread_id="ws-3"),
+            codex_app_server_module.CodexAppServer(
+                command=codex_app_server_module.DEFAULT_COMMAND, thread_id=None
+            ),
+        ):
+            with patch.object(thread_scope.subprocess, "run") as run:
+                server.close()
+            run.assert_not_called()
 
     def test_initialize_sends_client_name_and_version(self) -> None:
         self.assertEqual(

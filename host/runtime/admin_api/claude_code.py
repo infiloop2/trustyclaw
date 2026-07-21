@@ -20,6 +20,8 @@ import threading
 import time
 from typing import Any, Callable
 
+from host.runtime.admin_api import thread_scope
+
 DEFAULT_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/run-claude-code"]
 DEFAULT_ACCOUNT_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/read-claude-account"]
 AGENT_CWD = "/mnt/trustyclaw-agent/agent-home"
@@ -46,6 +48,15 @@ ATTEST_HELPER_TIMEOUT_SECONDS = 20
 STATUS_TIMEOUT_SECONDS = 45
 USAGE_TIMEOUT_SECONDS = 30
 LOGIN_START_TIMEOUT_SECONDS = 30
+# How long a steered turn waits, after a result that leaves sent user messages
+# unaccounted for, before concluding the steer was merged into the turn that
+# just ended. The pinned CLI folds a mid-turn user message into the running
+# turn and emits a single result for both messages; only a steer that lands
+# between turns starts its own turn, and that turn announces itself with local
+# stream events (system init) within milliseconds, which disarms the deadline.
+# Verified against the real CLI in both timings; the bound only has to beat
+# the CLI's local event-loop latency, not any network round trip.
+STEER_SETTLE_TIMEOUT_SECONDS = 10.0
 LOGIN_URL_RE = re.compile(r"If the browser didn't open, visit: (https://\S+)")
 # Usage lines are parsed one window per line: a window header, a percent, and
 # an optional reset time. Each piece is matched independently so one odd line
@@ -110,27 +121,39 @@ class ClaudeCodeSession:
 
     def close(self) -> None:
         proc = self._proc
-        if proc is None:
-            return
-        if proc.stdin is not None:
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
+        if proc is not None:
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-        if proc.stdout is not None:
-            proc.stdout.close()
-        if proc.stderr is not None:
-            proc.stderr.close()
-        self._proc = None
+                # Best-effort signal only: the production launcher runs as root,
+                # so this unprivileged kill fails with EPERM and the root scope
+                # teardown below is the real kill; a same-user command (tests)
+                # just dies here. A signal failure must never escape close() —
+                # the orchestrator keeps a thread fenced when close() raises.
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            if proc.stdout is not None:
+                proc.stdout.close()
+            if proc.stderr is not None:
+                proc.stderr.close()
+            self._proc = None
+        # Last resort after Claude Code's clean stdin-EOF shutdown above: the
+        # child reaping lives in the harness, but freeing the thread is the
+        # host's invariant, so guarantee the scope cgroup is gone even if a child
+        # outlived it. A clean shutdown already emptied it, so this is then a
+        # no-op — the server is never killed abruptly ahead of its own shutdown.
+        thread_scope.stop_thread_scope(self._thread_id, self._command, DEFAULT_COMMAND)
 
     def run(
         self,
@@ -200,16 +223,49 @@ class ClaudeCodeSession:
         outstanding_user_messages = 1
         last_message = ""
         result_session_id = session_id
+        final: str | None = None
+        settle_deadline: float | None = None
         while True:
             for steer in steer_messages():
                 self._send_user_message(steer)
                 outstanding_user_messages += 1
+                # The CLI acts on every steer — merged into the running turn
+                # or run as its own turn — so more events are coming either way.
+                settle_deadline = None
                 steer_delivered(steer)
             try:
                 message = self._messages.get(timeout=1.0)
             except queue.Empty:
+                if (
+                    settle_deadline is not None
+                    and time.monotonic() >= settle_deadline
+                    and not steer_messages()
+                ):
+                    # A result left sent user messages unaccounted for and the
+                    # CLI has stayed idle since: the steer was merged into the
+                    # turn that just ended, its result already covers every
+                    # message, and no further result is coming (see
+                    # STEER_SETTLE_TIMEOUT_SECONDS).
+                    assert final is not None
+                    self.close()
+                    if not result_session_id:
+                        raise ClaudeCodeError("Claude result did not include a session_id")
+                    return result_session_id, final
                 self._require_proc()
                 continue
+            message_type = message.get("type")
+            if message_type in ("assistant", "user") or (
+                message_type == "system" and message.get("subtype") == "init"
+            ):
+                # Definite turn activity (a queued steer's turn announces
+                # itself with a system init, then assistant/user events): its
+                # own result will settle the count, so stop the clock entirely.
+                settle_deadline = None
+            elif settle_deadline is not None and message_type != "result":
+                # Ambient chatter (stray system notifications, rate-limit
+                # events) is not a new turn: push the deadline back rather
+                # than disarming it, so an idle-but-noisy stream still settles.
+                settle_deadline = time.monotonic() + STEER_SETTLE_TIMEOUT_SECONDS
             if isinstance(message.get("session_id"), str):
                 result_session_id = message["session_id"]
             if message.get("type") == "assistant":
@@ -221,9 +277,14 @@ class ClaudeCodeSession:
                 if message.get("subtype") != "success" or message.get("is_error"):
                     raise ClaudeCodeError(str(message.get("result") or message.get("subtype") or "Claude turn failed"))
                 outstanding_user_messages = max(0, outstanding_user_messages - 1)
-                if outstanding_user_messages:
-                    continue
                 final = str(message.get("result") or last_message or "Task completed.")
+                if outstanding_user_messages:
+                    # Either a queued steer's turn is still running (its events
+                    # disarm the deadline above) or the steer was merged and
+                    # this result is already final; wait for the stream to
+                    # settle instead of forever.
+                    settle_deadline = time.monotonic() + STEER_SETTLE_TIMEOUT_SECONDS
+                    continue
                 self.close()
                 if not result_session_id:
                     raise ClaudeCodeError("Claude result did not include a session_id")

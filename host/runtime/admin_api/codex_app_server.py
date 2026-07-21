@@ -43,6 +43,7 @@ import threading
 import time
 from typing import Any, Callable
 
+from host.runtime.admin_api import thread_scope
 from host.runtime.core.state import read_proxy_openai_account_id
 
 DEFAULT_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/run-codex-app-server"]
@@ -103,6 +104,9 @@ class CodexAppServer:
 
     def __init__(self, command: list[str] | None = None, thread_id: str | None = None) -> None:
         self._command = command or DEFAULT_COMMAND
+        # Kept for the kill path: close() stops this thread's systemd scope by
+        # name. The launcher folds the id into _command below as the run flag.
+        self._thread_id = thread_id
         # The orchestrator sets this only for an app-created task. It is kept
         # separate from the task's user input and applied when a provider
         # thread is created as subordinate developer instructions.
@@ -148,31 +152,42 @@ class CodexAppServer:
 
     def close(self) -> None:
         proc = self._proc
-        if proc is None:
-            return
-        # Closing stdin signals EOF, the app-server's normal shutdown path. This
-        # is the reliable lever: the process is spawned through sudo and may run
-        # as root/agent, so a SIGTERM from an unprivileged service user can raise
-        # PermissionError — terminate()/kill() are best-effort fallbacks only.
-        if proc.stdin is not None:
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            for stop in (proc.terminate, proc.kill):
+        if proc is not None:
+            # Closing stdin signals EOF, the app-server's normal shutdown path.
+            # This is the reliable lever: the process is spawned through sudo and
+            # may run as root/agent, so an unprivileged signal can fail with
+            # EPERM — the kill below is a best-effort fallback only.
+            if proc.stdin is not None:
                 try:
-                    stop()
+                    proc.stdin.close()
+                except OSError:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # Best-effort signal only: the production launcher runs as root,
+                # so this unprivileged kill fails with EPERM and the root scope
+                # teardown below is the real kill; a same-user command (tests)
+                # just dies here. A signal failure must never escape close() —
+                # the orchestrator keeps a thread fenced when close() raises.
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
                     proc.wait(timeout=5)
-                    break
-                except (subprocess.TimeoutExpired, PermissionError, ProcessLookupError, OSError):
-                    continue
-        if proc.stdout is not None:
-            proc.stdout.close()
-        if proc.stderr is not None:
-            proc.stderr.close()
+                except subprocess.TimeoutExpired:
+                    pass
+            if proc.stdout is not None:
+                proc.stdout.close()
+            if proc.stderr is not None:
+                proc.stderr.close()
+        # Last resort after the app-server's clean stdin-EOF shutdown above: the
+        # child reaping lives in the harness, but freeing the thread is the
+        # host's invariant, so guarantee the scope cgroup is gone even if a child
+        # outlived it. A clean shutdown already emptied it, so this is then a
+        # no-op — the server is never killed abruptly ahead of its own shutdown.
+        thread_scope.stop_thread_scope(self._thread_id, self._command, DEFAULT_COMMAND)
 
     def _read_stdout(self) -> None:
         proc = self._proc

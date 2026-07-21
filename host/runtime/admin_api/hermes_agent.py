@@ -22,7 +22,7 @@ import subprocess
 import threading
 from typing import Any, Callable
 
-from host.runtime.admin_api import bedrock_credentials
+from host.runtime.admin_api import bedrock_credentials, thread_scope
 
 DEFAULT_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/run-hermes"]
 AGENT_CWD = "/mnt/trustyclaw-agent/agent-home"
@@ -67,18 +67,29 @@ class HermesSession:
         with self._lock:
             self._closed = True
             proc = self._proc
-        if proc is None:
-            return
-        if proc.poll() is None:
-            proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        if proc is not None and proc.poll() is None:
+            # Best-effort signal only: the production launcher runs as root, so
+            # this unprivileged kill fails with EPERM and the root scope
+            # teardown below is the real kill; a same-user command (tests) just
+            # dies here. A signal failure must never escape close() — the
+            # orchestrator keeps a thread fenced when close() raises.
+            try:
+                proc.kill()
+            except OSError:
+                pass
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
+        # Last resort after the launcher signal above: a killed turn leaves the
+        # runtime's own descendants (a shell still in a long command) in this
+        # thread's systemd scope, keeping the scope's cgroup — and its name —
+        # alive so the next task on this thread cannot recreate it. It runs as
+        # root, so it frees the scope even when the signal above could not, and
+        # close() returns only once the whole cgroup is gone; a clean exit
+        # already emptied it, so this is then a no-op. The orchestrator fences
+        # the thread on exactly this contract.
+        thread_scope.stop_thread_scope(self._thread_id, self._command, DEFAULT_COMMAND)
 
     def run(
         self,

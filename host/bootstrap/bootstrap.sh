@@ -764,6 +764,7 @@ HELPER_NAMES=(
   read-claude-account
   run-pi
   run-hermes
+  stop-agent-thread
   read-aws-account
   clear-agent-auth
   read-agent-file
@@ -866,7 +867,7 @@ cat > /etc/sudoers.d/trustyclaw-host <<'SUDOERS'
 # structurally never receive them. Each harness signs with its own fixed
 # routing identity and the proxy re-signs.
 Defaults!/usr/local/lib/trustyclaw-host/read-aws-account env_keep += "TRUSTYCLAW_BEDROCK_AWS_ACCESS_KEY_ID TRUSTYCLAW_BEDROCK_AWS_SECRET_ACCESS_KEY"
-trustyclaw-admin ALL=(root) NOPASSWD: /usr/local/lib/trustyclaw-host/reboot-host, /usr/local/lib/trustyclaw-host/run-codex-app-server, /usr/local/lib/trustyclaw-host/read-codex-account-id, /usr/local/lib/trustyclaw-host/run-claude-code, /usr/local/lib/trustyclaw-host/read-claude-account, /usr/local/lib/trustyclaw-host/run-pi, /usr/local/lib/trustyclaw-host/run-hermes, /usr/local/lib/trustyclaw-host/read-aws-account, /usr/local/lib/trustyclaw-host/clear-agent-auth, /usr/local/lib/trustyclaw-host/read-agent-file, /usr/local/lib/trustyclaw-host/check-for-upgrade, /usr/local/lib/trustyclaw-host/mint-github-app-token, /usr/local/lib/trustyclaw-host/audit-github-repo, /usr/local/lib/trustyclaw-host/approve-github-push
+trustyclaw-admin ALL=(root) NOPASSWD: /usr/local/lib/trustyclaw-host/reboot-host, /usr/local/lib/trustyclaw-host/run-codex-app-server, /usr/local/lib/trustyclaw-host/read-codex-account-id, /usr/local/lib/trustyclaw-host/run-claude-code, /usr/local/lib/trustyclaw-host/read-claude-account, /usr/local/lib/trustyclaw-host/run-pi, /usr/local/lib/trustyclaw-host/run-hermes, /usr/local/lib/trustyclaw-host/stop-agent-thread, /usr/local/lib/trustyclaw-host/read-aws-account, /usr/local/lib/trustyclaw-host/clear-agent-auth, /usr/local/lib/trustyclaw-host/read-agent-file, /usr/local/lib/trustyclaw-host/check-for-upgrade, /usr/local/lib/trustyclaw-host/mint-github-app-token, /usr/local/lib/trustyclaw-host/audit-github-repo, /usr/local/lib/trustyclaw-host/approve-github-push
 SUDOERS
 chmod 440 /etc/sudoers.d/trustyclaw-host
   # A malformed sudoers drop-in would otherwise surface only when the admin
