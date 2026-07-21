@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from host.runtime.admin_api import claude_code
+from host.runtime.admin_api import claude_code, thread_scope
 
 
 class ClaudeCodeTests(unittest.TestCase):
@@ -21,6 +21,30 @@ class ClaudeCodeTests(unittest.TestCase):
         self.assertEqual(claude_code.ClaudeCodeSession(command=["/bin/echo"])._command, ["/bin/echo"])
         self.assertIsNone(claude_code._subprocess_cwd(claude_code.DEFAULT_COMMAND))
         self.assertEqual(claude_code._subprocess_cwd(session._command), claude_code.AGENT_CWD)
+
+    def test_close_stops_the_thread_scope_under_the_production_launcher(self) -> None:
+        # A killed turn's scope keeps the thread name until its whole cgroup is
+        # gone, so close() must stop the scope by name before the next task on
+        # this thread recreates it.
+        session = claude_code.ClaudeCodeSession(
+            command=claude_code.DEFAULT_COMMAND, thread_id="stage-1-smoke-kill-claude"
+        )
+        with patch.object(thread_scope.subprocess, "run") as run:
+            session.close()
+        run.assert_called_once()
+        self.assertEqual(
+            run.call_args.args[0],
+            [*thread_scope.STOP_COMMAND, "stage-1-smoke-kill-claude"],
+        )
+
+    def test_close_does_not_stop_a_scope_for_a_test_command_or_threadless_turn(self) -> None:
+        for session in (
+            claude_code.ClaudeCodeSession(command=["/bin/echo"], thread_id="mission_pursuit__ws-3"),
+            claude_code.ClaudeCodeSession(command=claude_code.DEFAULT_COMMAND, thread_id=None),
+        ):
+            with patch.object(thread_scope.subprocess, "run") as run:
+                session.close()
+            run.assert_not_called()
 
     def test_read_claude_account_reads_helper_json(self) -> None:
         command = [
@@ -469,6 +493,54 @@ for index, line in enumerate(sys.stdin, start=1):
                     lambda _message: None,
                     delivered.append,
                 )
+        finally:
+            claude_code.AGENT_CWD = original_cwd
+        self.assertEqual(session_id, "session-1")
+        self.assertEqual(delivered, ["steer"])
+        self.assertEqual(output, "STEERED")
+
+    def test_run_turn_returns_when_a_mid_turn_steer_is_merged_into_one_result(self) -> None:
+        # The pinned CLI folds a user message injected mid-turn into the
+        # running turn and emits a single result for both messages, then idles
+        # with stdin open. The turn must settle on that result instead of
+        # waiting forever for a second one.
+        script = r"""
+import json, sys
+
+json.loads(sys.stdin.readline())  # initial message
+json.loads(sys.stdin.readline())  # steer, injected mid-turn
+print(json.dumps({
+    "type": "assistant",
+    "session_id": "session-1",
+    "message": {"content": [{"type": "text", "text": "STEERED"}]},
+}), flush=True)
+print(json.dumps({
+    "type": "result",
+    "subtype": "success",
+    "session_id": "session-1",
+    "result": "STEERED",
+}), flush=True)
+sys.stdin.readline()  # stay alive like the real CLI until stdin EOF
+"""
+        original_cwd = claude_code.AGENT_CWD
+        pending = ["steer"]
+        delivered: list[str] = []
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                claude_code.AGENT_CWD = tmp
+                server = claude_code.ClaudeCodeSession([sys.executable, "-u", "-c", script])
+                server.start()
+                with patch.object(claude_code, "STEER_SETTLE_TIMEOUT_SECONDS", 0.3):
+                    session_id, output = claude_code.run_turn(
+                        server,
+                        "initial",
+                        None,
+                        "opus",
+                        "high",
+                        lambda: [pending.pop(0)] if pending else [],
+                        lambda _message: None,
+                        delivered.append,
+                    )
         finally:
             claude_code.AGENT_CWD = original_cwd
         self.assertEqual(session_id, "session-1")

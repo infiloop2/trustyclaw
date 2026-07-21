@@ -38,6 +38,7 @@
 | `mint-github-app-token` helper | root | admin API via sudo | Mints installation-wide GitHub App tokens through root egress because the admin service has none; the proxy repo guard is the per-repository boundary. |
 | `audit-github-repo` helper | root | admin API via sudo | Reads GitHub repository/security facts with the working token and returns facts without storing secrets. |
 | `approve-github-push` helper | root | admin API via sudo | Replays or cleans up a push held by the `.github` approval gate using the proxy-state quarantine mirror and a working GitHub token piped on stdin. |
+| `stop-agent-thread` helper | root | admin API via sudo | Frees a thread's transient agent scope after a kill: SIGKILLs the scope's cgroup, stops the unit, and clears any failed remnant. |
 | `reboot-host` helper | root | admin API via sudo | Requests a host reboot. |
 
 ## Thread Inventory

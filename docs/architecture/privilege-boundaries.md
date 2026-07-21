@@ -3,7 +3,7 @@
 | User | Purpose | Privileges |
 | --- | --- | --- |
 | `trustyclaw-operator` | Human SSH login. | Full passwordless sudo, and therefore intentionally equivalent to root once logged in. |
-| `trustyclaw-admin` | Runs the admin API; owns admin state (the `trustyclaw_admin` database role, full access). | sudo for exactly fourteen root helpers (below). No internet egress at all. |
+| `trustyclaw-admin` | Runs the admin API; owns admin state (the `trustyclaw_admin` database role, full access). | sudo for exactly fifteen root helpers (below). No internet egress at all. |
 | `trustyclaw-tools` | Runs the bundled tool packages in the dedicated tools service; owns the agent-facing tools socket. | No sudo. Postgres role scoped to the five tool tables plus read access to `secret_keys`. DNS and outbound HTTPS (443) for tool third-party APIs. |
 | `trustyclaw-agent-network` | Runs the network-introspection service and owns its agent-facing socket. | No sudo, secrets, or egress. Postgres role has SELECT-only access to network policy and decision-log tables. |
 | `trustyclaw-agent-app` | Runs the agent-app service; owns the agent-facing app API socket and proxies attributed `app_api` calls to app backends. | No sudo, database access, secrets, or egress. Its only network reach is opening loopback connections to installed app backend ports (the one uid besides `trustyclaw-admin` nftables allows there). |
@@ -45,7 +45,7 @@ guards. If a helper or sudoers entry were writable by a service user, that user
 could turn the sudo rule into arbitrary root execution, so these files stay on
 the root volume as root-owned code.
 
-`trustyclaw-admin`'s sudoers entry allows only fourteen fixed helpers in
+`trustyclaw-admin`'s sudoers entry allows only fifteen fixed helpers in
 `/usr/local/lib/trustyclaw-host/`:
 
 - `reboot-host` — runs `systemctl reboot`.
@@ -63,6 +63,11 @@ the root volume as root-owned code.
   AWS routing values and proxy-only network access, in the agent slice.
 - `run-hermes` — starts one Hermes query as `trustyclaw-agent`, passes the
   prompt over stdin, and uses the same dummy AWS and agent-slice boundary.
+- `stop-agent-thread` — SIGKILLs and stops the transient
+  `trustyclaw-agent-thread-<thread_id>.scope` cgroup and clears any failed
+  remnant, so a killed turn frees its thread's scope name. It validates the
+  thread id against the same pattern the launch helpers enforce and touches
+  only that one unit.
 - `read-aws-account` — receives the shared Bedrock key pair from the admin
   service through its environment and makes exactly one STS identity request.
   Root egress is required because the admin uid has none; the credential is

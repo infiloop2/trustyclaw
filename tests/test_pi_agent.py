@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from host.runtime.admin_api import pi_agent
+from host.runtime.admin_api import pi_agent, thread_scope
 
 
 def _patch_region(region: str | None = "us-east-1"):  # type: ignore[no-untyped-def]
@@ -198,6 +198,30 @@ sys.exit(1)
         self.assertEqual(session._thread_id, "mission_pursuit__ws-3")
         self.assertIsNone(pi_agent._subprocess_cwd(pi_agent.DEFAULT_COMMAND))
         self.assertEqual(pi_agent._subprocess_cwd(session._command), pi_agent.AGENT_CWD)
+
+    def test_close_stops_the_thread_scope_under_the_production_launcher(self) -> None:
+        # A killed turn's scope keeps the thread name until its whole cgroup is
+        # gone, so close() must stop the scope by name before the next task on
+        # this thread recreates it.
+        session = pi_agent.PiSession(
+            command=pi_agent.DEFAULT_COMMAND, thread_id="stage-1-smoke-kill-pi"
+        )
+        with patch.object(thread_scope.subprocess, "run") as run:
+            session.close()
+        run.assert_called_once()
+        self.assertEqual(
+            run.call_args.args[0],
+            [*thread_scope.STOP_COMMAND, "stage-1-smoke-kill-pi"],
+        )
+
+    def test_close_does_not_stop_a_scope_for_a_test_command_or_threadless_turn(self) -> None:
+        for session in (
+            pi_agent.PiSession(command=["/bin/echo"], thread_id="mission_pursuit__ws-3"),
+            pi_agent.PiSession(command=pi_agent.DEFAULT_COMMAND, thread_id=None),
+        ):
+            with patch.object(thread_scope.subprocess, "run") as run:
+                session.close()
+            run.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ flowchart LR
 
         subgraph services["users"]
             direction TB
-            root["root<br/>owns root filesystem + host code<br/>executes fourteen fixed helpers only"]
+            root["root<br/>owns root filesystem + host code<br/>executes fifteen fixed helpers only"]
             admin["trustyclaw-admin<br/>Admin API/UI + orchestrator<br/>127.0.0.1:7443<br/>no internet egress"]
             proxy["trustyclaw-proxy<br/>Network proxy<br/>127.0.0.1:7445<br/>DNS + TCP 80/443 only"]
             tools["trustyclaw-tools<br/>Tool packages + tools.sock<br/>DNS + TCP 443 only"]
@@ -54,7 +54,7 @@ flowchart LR
     cfedge -->|"operator request + admin bearer"| tunnel
     tunnel -->|"forwards to 127.0.0.1:7443"| admin
 
-    admin -->|"fourteen exact sudo helpers"| root
+    admin -->|"fifteen exact sudo helpers"| root
     root -->|"demote into transient runtime scopes"| agent
     root -->|"bootstrap, updates, provider/GitHub helpers"| outside_services
     root -->|"OS, host code, systemd, nftables, helpers"| rootvol

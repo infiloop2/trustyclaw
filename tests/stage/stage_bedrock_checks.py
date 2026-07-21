@@ -176,7 +176,27 @@ class StageBedrockChecks(AwsSmoke):
         ]
         allowed = [event for event in bedrock_events if event["decision"] == "allowed"]
         denied = [event for event in bedrock_events if event["decision"] == "denied"]
-        if not allowed or denied:
+        # A harness may probe an OpenAI-style model catalog (GET /models,
+        # GET /v1/models) on the Bedrock runtime host. Only POST
+        # .../converse[-stream] is an invocation route, so the guard fails a
+        # bare catalog probe closed on the route check; that
+        # network_policy_denied is correct and the Converse task still
+        # completes. Tolerate only that exact benign probe: the guard emits
+        # more specific reasons before the route check (for example
+        # bedrock_query_auth_denied for presigned query auth), so require the
+        # route-denial reason and an empty query and never swallow those. Any
+        # other denial, including a denied invocation, is a real regression.
+        unexpected = [
+            event
+            for event in denied
+            if not (
+                event["method"] == "GET"
+                and event["path"] in {"/models", "/v1/models"}
+                and not event.get("query")
+                and event.get("reason_code") == "network_policy_denied"
+            )
+        ]
+        if not allowed or unexpected:
             raise AssertionError(f"{label} task Bedrock traffic was not cleanly allowed: {bedrock_events}")
         if not any(event["path"].endswith(("/converse", "/converse-stream")) for event in allowed):
             raise AssertionError(f"{label} task used no Bedrock Converse path: {allowed}")

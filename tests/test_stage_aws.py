@@ -370,11 +370,14 @@ import tests.stage.stage_aws
                     {"status": "completed", "output_message": "SURVIVED"},
                 ],
             ),
+            patch.object(stage, "_ssh_code", return_value="not-found") as ssh_code,
         ):
             stage.check_agent_kill_and_thread_survival(expect_steering_denied=True)
 
         self.assertEqual(api_status.call_args_list[0].args[1], "/v1/tasks/task_1/steer")
         self.assertEqual(api_status.call_args_list[1].args[1], "/v1/tasks/task_1/kill")
+        # The kill check asserts the thread's scope unit is gone from systemd.
+        self.assertIn("trustyclaw-agent-thread-smoke-kill-hermes.scope", ssh_code.call_args.args[0])
         self.assertEqual((stage.passed, stage.total), (1, 1))
 
     def test_report_distinguishes_failure_from_unavailable_skip(self) -> None:

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from host.runtime.admin_api import hermes_agent
+from host.runtime.admin_api import hermes_agent, thread_scope
 
 # A scripted fake of the Hermes stdin adapter: one process per prompt, session
 # id on stderr, answer text on stdout, and resume keeps the session id.
@@ -151,6 +151,30 @@ print("session_id: hermes-session-1", file=sys.stderr)
         self.assertEqual(session._thread_id, "mission_pursuit__ws-3")
         self.assertIsNone(hermes_agent._subprocess_cwd(hermes_agent.DEFAULT_COMMAND))
         self.assertEqual(hermes_agent._subprocess_cwd(session._command), hermes_agent.AGENT_CWD)
+
+    def test_close_stops_the_thread_scope_under_the_production_launcher(self) -> None:
+        # A killed turn's scope keeps the thread name until its whole cgroup is
+        # gone, so close() must stop the scope by name before the next task on
+        # this thread recreates it.
+        session = hermes_agent.HermesSession(
+            command=hermes_agent.DEFAULT_COMMAND, thread_id="stage-1-smoke-kill-hermes"
+        )
+        with patch.object(thread_scope.subprocess, "run") as run:
+            session.close()
+        run.assert_called_once()
+        self.assertEqual(
+            run.call_args.args[0],
+            [*thread_scope.STOP_COMMAND, "stage-1-smoke-kill-hermes"],
+        )
+
+    def test_close_does_not_stop_a_scope_for_a_test_command_or_threadless_turn(self) -> None:
+        for session in (
+            hermes_agent.HermesSession(command=["/bin/echo"], thread_id="mission_pursuit__ws-3"),
+            hermes_agent.HermesSession(command=hermes_agent.DEFAULT_COMMAND, thread_id=None),
+        ):
+            with patch.object(thread_scope.subprocess, "run") as run:
+                session.close()
+            run.assert_not_called()
 
 
 if __name__ == "__main__":

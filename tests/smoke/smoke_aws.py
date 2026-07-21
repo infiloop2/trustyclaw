@@ -299,6 +299,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 class AwsSmoke:
+    # Host-side thread ids are the API thread ids verbatim; the stage harness
+    # overrides this with its per-run prefix (see StageAwsSmoke.task_body).
+    thread_prefix = ""
+
     def __init__(self) -> None:
         self.agent_runtime = "codex"
         self.workdir = Path(tempfile.mkdtemp(prefix="smoke-aws-"))
@@ -3182,6 +3186,27 @@ class AwsSmoke:
         if killed["status"] != "cancelled":
             raise AssertionError(f"killed task ended {killed['status']}, expected cancelled")
         print(f"  kill settled in {time.time() - start:.1f}s", flush=True)
+
+        # The kill must also free the thread's transient scope on the host:
+        # close() stops trustyclaw-agent-thread-<id>.scope through the root
+        # stop-agent-thread helper (SIGKILLing any process the runtime left in
+        # the cgroup, such as the sleep above) and reset-failed clears any
+        # failed remnant, so systemd forgets the unit entirely. The task is
+        # marked cancelled before that close completes, so poll briefly. This
+        # pins the mechanism the follow-up task below depends on.
+        scope_unit = f"trustyclaw-agent-thread-{self.thread_prefix}smoke-kill-{self.agent_runtime}.scope"
+        deadline = time.time() + 30
+        while True:
+            load_state = self._ssh_code(
+                f"systemctl show -p LoadState --value {shlex.quote(scope_unit)}"
+            ).strip()
+            if load_state == "not-found":
+                break
+            if time.time() > deadline:
+                raise AssertionError(
+                    f"killed thread scope {scope_unit} still known to systemd: {load_state!r}"
+                )
+            time.sleep(1)
 
         follow = self._api(
             "POST",
