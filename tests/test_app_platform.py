@@ -98,10 +98,39 @@ class AppPlatformTests(unittest.TestCase):
         self.assertTrue(builder.agent_api)
         self.assertEqual(builder.release_stage, "stable")
         self.assertEqual(builder.allocation.port_offset, 6)
+        self.assertEqual(builder.linux_user, "trustyclaw-app-6")
+        self.assertEqual(builder.db_role, "trustyclaw-app-6")
+        self.assertLessEqual(
+            len(builder.linux_user.encode()),
+            app_platform.LINUX_ACCOUNT_NAME_LIMIT,
+        )
         self.assertIn("dedicated capability worker", builder.agent_instructions)
         for app_id, app in apps.items():
             if app_id != builder.id:
                 self.assertFalse(app.capability_worker, app_id)
+
+    def test_app_account_names_are_bounded_at_thirty_two_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fits = "a" * (app_platform.LINUX_ACCOUNT_NAME_LIMIT - len(app_platform.APP_ACCOUNT_PREFIX))
+            too_long = "b" * (len(fits) + 1)
+            another_long = "c" * (len(fits) + 1)
+            self._write_minimal_app(root, fits, host_slot=7)
+            self._write_minimal_app(root, too_long, host_slot=8)
+            self._write_minimal_app(root, another_long, host_slot=9)
+
+            apps = {app.id: app for app in app_platform.installed_apps(root)}
+
+            self.assertEqual(apps[fits].linux_user, f"{app_platform.APP_ACCOUNT_PREFIX}{fits}")
+            self.assertEqual(len(apps[fits].linux_user.encode()), app_platform.LINUX_ACCOUNT_NAME_LIMIT)
+            self.assertEqual(apps[too_long].linux_user, "trustyclaw-app-8")
+            self.assertEqual(apps[another_long].linux_user, "trustyclaw-app-9")
+            self.assertEqual(apps[too_long].db_role, "trustyclaw-app-8")
+            self.assertEqual(len({app.linux_user for app in apps.values()}), 3)
+            self.assertTrue(all(
+                len(app.linux_user.encode()) <= app_platform.LINUX_ACCOUNT_NAME_LIMIT
+                for app in apps.values()
+            ))
 
     def test_installed_apps_have_unique_host_owned_names(self) -> None:
         apps = app_platform.installed_apps()
@@ -306,7 +335,7 @@ class AppPlatformTests(unittest.TestCase):
     def test_manifest_rejects_generated_postgres_identifiers_over_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            app_id = "a" * 49
+            app_id = "a" * 60
             self._write_minimal_app(root, app_id)
 
             with self.assertRaisesRegex(app_platform.AppError, "PostgreSQL 63-byte identifier limit"):

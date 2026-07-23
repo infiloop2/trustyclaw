@@ -31,6 +31,8 @@ APP_UID_BASE = 48000
 APP_UID_MAX = APP_UID_BASE + MAX_INSTALLED_APPS - 1
 APP_PORT_OFFSET_MIN = 0
 APP_PORT_OFFSET_MAX = MAX_INSTALLED_APPS - 1
+APP_ACCOUNT_PREFIX = "trustyclaw-app-"
+LINUX_ACCOUNT_NAME_LIMIT = 32
 ReleaseStage = Literal["stable", "beta"]
 
 
@@ -71,7 +73,10 @@ class AppManifest:
 
     @property
     def linux_user(self) -> str:
-        return f"trustyclaw-app-{self.id}"
+        candidate = f"{APP_ACCOUNT_PREFIX}{self.id}"
+        if len(candidate.encode()) <= LINUX_ACCOUNT_NAME_LIMIT:
+            return candidate
+        return f"{APP_ACCOUNT_PREFIX}{self.allocation.port_offset}"
 
     @property
     def db_schema(self) -> str:

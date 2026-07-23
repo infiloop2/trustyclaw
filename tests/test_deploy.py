@@ -1587,6 +1587,13 @@ class DeployUnitTests(unittest.TestCase):
             self.assertIn(f"User=trustyclaw-app-{app_id}", bootstrap)
             self.assertIn(f"trustyclaw-app-{app_id}.service", bootstrap)
             self.assertIn(f"python3 -m host.runtime.deploy.app_migrate pending {app_id}", bootstrap)
+        self.assertIn(
+            'ensure_group trustyclaw-app-6 "$TRUSTYCLAW_APP_PERSONAL_WEB_APP_BUILDER_GID"',
+            bootstrap,
+        )
+        self.assertIn("User=trustyclaw-app-6", bootstrap)
+        self.assertIn("trustyclaw-app-personal_web_app_builder.service", bootstrap)
+        self.assertNotIn("ensure_group trustyclaw-app-personal_web_app_builder", bootstrap)
         self.assertIn("ensure_user postgres \"$POSTGRES_UID\" postgres /var/lib/postgresql", bootstrap)
         self.assertLess(
             bootstrap.index('ensure_user postgres "$POSTGRES_UID"'),

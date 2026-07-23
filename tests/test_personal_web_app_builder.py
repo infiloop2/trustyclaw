@@ -568,9 +568,9 @@ class PersonalWebAppBuilderDbTests(unittest.TestCase):
                     BEGIN
                       IF NOT EXISTS (
                         SELECT FROM pg_roles
-                        WHERE rolname = 'trustyclaw-app-personal_web_app_builder'
+                        WHERE rolname = 'trustyclaw-app-6'
                       ) THEN
-                        CREATE ROLE "trustyclaw-app-personal_web_app_builder" LOGIN;
+                        CREATE ROLE "trustyclaw-app-6" LOGIN;
                       END IF;
                     END
                     $$;
@@ -578,7 +578,7 @@ class PersonalWebAppBuilderDbTests(unittest.TestCase):
                 )
                 cur.execute(
                     'CREATE SCHEMA IF NOT EXISTS app_personal_web_app_builder '
-                    'AUTHORIZATION "trustyclaw-app-personal_web_app_builder"'
+                    'AUTHORIZATION "trustyclaw-app-6"'
                 )
             app = app_platform.app_by_id(backend.APP_ID)
             assert app is not None
