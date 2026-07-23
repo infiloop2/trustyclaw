@@ -19,6 +19,7 @@ RELEASED_APP_SLOTS = {
     "social_marketer": 3,
     "virality_machine": 4,
     "software_builder": 5,
+    "personal_web_app_builder": 6,
 }
 class AppPlatformTests(unittest.TestCase):
     def test_installed_agent_chat_manifest_derives_host_owned_names(self) -> None:
@@ -85,7 +86,22 @@ class AppPlatformTests(unittest.TestCase):
                 self.assertIsNone(re.search(r"<a(?:\s|>)", index, re.I))
                 self.assertIn("/workspace-kit/view_blocks.css", index)
                 checked += 1
-        self.assertEqual(checked, len(RELEASED_APP_SLOTS) - 1)
+        # Agent Chat and Personal Web App Builder are independent products;
+        # the other released apps use the shared Workspace Kit renderer.
+        self.assertEqual(checked, len(RELEASED_APP_SLOTS) - 2)
+
+    def test_personal_web_app_builder_alone_opts_into_capability_workers(self) -> None:
+        apps = {app.id: app for app in app_platform.installed_apps()}
+
+        builder = apps["personal_web_app_builder"]
+        self.assertTrue(builder.capability_worker)
+        self.assertTrue(builder.agent_api)
+        self.assertEqual(builder.release_stage, "stable")
+        self.assertEqual(builder.allocation.port_offset, 6)
+        self.assertIn("dedicated capability worker", builder.agent_instructions)
+        for app_id, app in apps.items():
+            if app_id != builder.id:
+                self.assertFalse(app.capability_worker, app_id)
 
     def test_installed_apps_have_unique_host_owned_names(self) -> None:
         apps = app_platform.installed_apps()
@@ -116,6 +132,7 @@ class AppPlatformTests(unittest.TestCase):
             {app_id: app.release_stage for app_id, app in apps.items()},
             {
                 "agent_chat": "stable",
+                "personal_web_app_builder": "stable",
                 "mission_pursuit": "beta",
                 "alpha_seeker": "beta",
                 "social_marketer": "beta",

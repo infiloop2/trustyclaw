@@ -211,7 +211,9 @@ function renderAppTabs() {
   // its CTA, and its nav entry sits directly below Home.
   const heroApp = installedApps.find(app => app.id === HERO_APP_ID) || null;
   renderHomeHero(heroApp);
+  const stableApps = installedApps.filter(app => app !== heroApp && app.release_stage !== "beta");
   const betaApps = installedApps.filter(app => app.release_stage === "beta");
+  $("sidebar-stable-apps").hidden = !stableApps.length;
   $("sidebar-apps").hidden = !betaApps.length;
   betaAppsExpanded = false;
   $("sidebar-apps-toggle").setAttribute("aria-expanded", "false");

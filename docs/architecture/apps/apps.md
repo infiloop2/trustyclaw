@@ -58,7 +58,8 @@ is the exact contract the app provides to the host.
     "migrations": "migrations"
   },
   "ui": {
-    "path": "ui"
+    "path": "ui",
+    "capability_worker": false
   }
 }
 ```
@@ -104,6 +105,14 @@ database role.
 does not choose its final URL. The host mounts the UI under a host-derived path
 such as `/v1/apps/<app_id>/ui/`, and uses the app title as the admin tab
 label.
+
+`ui.capability_worker` is an optional boolean that defaults to false. When true,
+the app UI CSP adds `worker-src blob:` so that audited app code can place
+untrusted computation in a dedicated blob worker. This flag does not relax
+`connect-src`, scripts in the app frame, iframe sandboxing, or parent bridge
+capabilities. An app that enables it owns the worker protocol and must keep all
+DOM and backend authority in audited renderer code. Personal Web App Builder
+defines that protocol in [Personal Web App Builder](personal-web-app-builder.md).
 
 Every manifest contains an `agent` object. `agent.instructions` names a UTF-8
 Markdown file inside the app package. The host rejects a package whose
@@ -305,6 +314,13 @@ is browser-enforced, not an app convention. App scripts are external audited
 assets; inline scripts and event handlers are denied. Inline styles remain
 allowed for bounded renderer-owned layout values such as progress widths and
 chart tooltip positions.
+
+An app manifest may opt into blob-backed dedicated workers. The host adds only
+`worker-src blob:` for that app and keeps `connect-src 'none'`, `frame-src
+'none'`, the opaque iframe origin, and every parent bridge restriction. The CSP
+also sends `webrtc 'block'` as a defense-in-depth directive for browsers that
+implement it. A worker opt-in is computation authority, not DOM, navigation,
+network, credential, or host API authority.
 
 App UIs should render agent-authored values as escaped text. They should not
 turn agent-authored strings into runtime anchors or pass them to `window.open`

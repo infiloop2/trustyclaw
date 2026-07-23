@@ -1,0 +1,19 @@
+{
+  "host_slot": 6,
+  "title": "Personal Web App Builder",
+  "release_stage": "stable",
+  "agent": {
+    "instructions": "agent.md",
+    "api": true
+  },
+  "backend": {
+    "entrypoint": "backend.py"
+  },
+  "database": {
+    "migrations": "migrations"
+  },
+  "ui": {
+    "path": "ui",
+    "capability_worker": true
+  }
+}

@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Personal Web App Builder</title>
+<link rel="stylesheet" href="/admin_ui.css">
+<link rel="stylesheet" href="personal_web_app_builder.css">
+</head>
+<body>
+<div class="builder-shell">
+  <header class="builder-bar">
+    <div class="builder-brand">
+      <span class="builder-title">Personal Web App Builder</span>
+      <span id="revision-label" class="revision-label">Empty app</span>
+    </div>
+    <div id="agent-settings" class="agent-settings" aria-label="Builder agent settings">
+      <label>
+        <span>Agent</span>
+        <select id="runtime" aria-label="Builder agent"></select>
+        <span id="runtime-fixed" class="agent-setting-value" hidden></span>
+      </label>
+      <label>
+        <span>Model</span>
+        <select id="model" aria-label="Builder model"></select>
+        <span id="model-fixed" class="agent-setting-value" hidden></span>
+      </label>
+      <label>
+        <span>Level</span>
+        <select id="effort" aria-label="Builder effort level"></select>
+        <span id="effort-fixed" class="agent-setting-value" hidden></span>
+      </label>
+      <span class="agent-settings-help">
+        <button id="agent-settings-help" class="agent-settings-help-button" aria-label="About Builder agent settings" aria-describedby="agent-settings-help-text">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <circle cx="10" cy="10" r="7.25" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M10 9.1v4.1M10 6.7h.01" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <span id="agent-settings-help-text" class="agent-settings-help-text" role="tooltip">Choose Agent, Model, and Level before your first message. After that, they are fixed and cannot be changed in this app version.</span>
+      </span>
+    </div>
+    <div class="builder-actions">
+      <span id="runtime-status" class="runtime-status" hidden></span>
+      <button id="open-chat" class="chat-toggle" aria-expanded="false" aria-controls="chat-drawer">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5.5h12v8H9l-3.5 2v-2H4z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+        Agent chat
+      </button>
+    </div>
+  </header>
+
+  <main class="app-stage" id="app-stage">
+    <div id="empty-state" class="empty-state">
+      <div class="empty-mark">+</div>
+      <h1 id="empty-title">Build your personal app</h1>
+      <p id="empty-description">Open agent chat and describe what you want. The agent can create the interface, behavior, and structured data.</p>
+      <ol id="first-run-how" class="first-run-how" hidden>
+        <li>
+          <strong>Build it through Agent chat</strong>
+          <span>Open Agent chat in the top bar to describe the app you want or ask the agent to revise it.</span>
+        </li>
+        <li>
+          <strong>Use the app directly</strong>
+          <span>Interact with the interface the agent builds. Its controls can update saved data and, when designed to, ask the agent to do more work.</span>
+        </li>
+      </ol>
+      <div id="first-run-guidance" class="first-run-guidance" role="note" hidden>
+        <strong>Choose your agent settings before you start</strong>
+        <span>In this version, Agent, Model, and Level are fixed when you send the first message and cannot be changed afterward.</span>
+      </div>
+      <button id="empty-open-chat" class="primary">Start building</button>
+    </div>
+    <div id="generated-host" class="generated-host" hidden></div>
+  </main>
+
+  <aside id="chat-drawer" class="chat-drawer" aria-label="Agent chat" hidden>
+    <header class="chat-head">
+      <div>
+        <strong>Agent chat</strong>
+        <span>Build, edit, or ask about this app</span>
+      </div>
+      <button id="close-chat" class="icon-button quiet" aria-label="Close agent chat">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      </button>
+    </header>
+    <div id="chat-history" class="chat-history"></div>
+    <footer class="chat-composer">
+      <div id="chat-status" class="chat-status" hidden></div>
+      <div class="composer-row">
+        <textarea id="message" rows="1" placeholder="Describe the app or ask about its data"></textarea>
+        <button id="send-message" class="send-button" aria-label="Send message" title="Send">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 15.5v-11m0 0L5.5 9M10 4.5 14.5 9" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+    </footer>
+  </aside>
+</div>
+
+<script src="personal_web_app_builder.js"></script>
+</body>
+</html>

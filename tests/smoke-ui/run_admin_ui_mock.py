@@ -708,8 +708,8 @@ mockUpgradeNotice.addEventListener("click", async () => {
             if method == "GET":
                 app_asset = app_platform.ui_asset(parsed.path)
                 if app_asset is not None:
-                    _app, asset, content_type = app_asset
-                    self._send_app_asset(HTTPStatus.OK, asset.read_bytes(), content_type)
+                    app, asset, content_type = app_asset
+                    self._send_app_asset(app, HTTPStatus.OK, asset.read_bytes(), content_type)
                     return
             self._authenticate()
             if method == "GET" and parsed.path == "/v1/agent-files/content":
@@ -765,8 +765,15 @@ mockUpgradeNotice.addEventListener("click", async () => {
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_app_asset(self, status: HTTPStatus, data: bytes, content_type: str) -> None:
+    def _send_app_asset(
+        self,
+        app: app_platform.AppManifest,
+        status: HTTPStatus,
+        data: bytes,
+        content_type: str,
+    ) -> None:
         asset_origin = self._asset_origin()
+        worker_policy = "; worker-src blob:; webrtc 'block'" if app.capability_worker else ""
         self.send_response(status.value)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
@@ -779,7 +786,8 @@ mockUpgradeNotice.addEventListener("click", async () => {
             f"font-src 'self' {asset_origin} data:; form-action 'none'; frame-ancestors 'self'; "
             f"img-src 'self' {asset_origin} data:; navigate-to 'self'; object-src 'none'; "
             f"sandbox allow-scripts allow-forms allow-modals; script-src 'self' {asset_origin}; "
-            f"style-src 'self' 'unsafe-inline' {asset_origin}",
+            f"style-src 'self' 'unsafe-inline' {asset_origin}"
+            f"{worker_policy}",
         )
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")

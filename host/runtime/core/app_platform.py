@@ -64,6 +64,10 @@ class AppManifest:
     # tasks get the app_api tool, proxied to the backend's /agent/ routes by
     # the trustyclaw-agent-app service (docs/architecture/apps/agent-app-api.md).
     agent_api: bool = False
+    # Opt-in for an app that executes untrusted computation in a blob-backed
+    # dedicated worker. The worker remains under the app frame's CSP; no
+    # other app gets blob worker execution by default.
+    capability_worker: bool = False
 
     @property
     def linux_user(self) -> str:
@@ -253,7 +257,10 @@ def _load_manifest(path: Path) -> AppManifest:
     ui = _required_object(data, "ui", path)
     _require_exact_keys(backend, {"entrypoint"}, path, "backend")
     _require_exact_keys(database, {"migrations"}, path, "database")
-    _require_exact_keys(ui, {"path"}, path, "ui")
+    _require_exact_keys(ui, {"path"}, path, "ui", optional={"capability_worker"})
+    capability_worker = ui.get("capability_worker", False)
+    if not isinstance(capability_worker, bool):
+        raise AppError(f"{path}: ui.capability_worker must be a boolean")
     backend_entrypoint = _required_child(package_dir, backend, "entrypoint", path)
     migrations_dir = _required_child(package_dir, database, "migrations", path)
     ui_dir = _required_child(package_dir, ui, "path", path)
@@ -275,6 +282,7 @@ def _load_manifest(path: Path) -> AppManifest:
         allocation=allocation,
         agent_instructions=agent_instructions,
         agent_api=agent_api,
+        capability_worker=capability_worker,
     )
     _validate_postgres_identifier(app.db_schema, "database schema", path)
     _validate_postgres_identifier(app.db_role, "database role", path)

@@ -268,6 +268,13 @@ def desktop_smoke(page, url: str) -> None:
     ):
         raise AssertionError("the hero app entry must sit between Home and the other nav tabs")
     expect(page.locator("#stable-app-tabs").get_by_role("button", name="Agent Chat", exact=True)).to_have_count(0)
+    stable_builder_tab = page.locator("#stable-app-tabs").get_by_role(
+        "button", name="Personal Web App Builder", exact=True
+    )
+    expect(stable_builder_tab).to_be_visible()
+    expect(page.locator("#sidebar-stable-apps")).to_be_visible()
+    expect(page.locator("#sidebar-stable-apps").get_by_text("Apps", exact=True)).to_be_visible()
+    expect(page.locator("#sidebar-stable-apps").get_by_role("button", name="Apps", exact=True)).to_have_count(0)
     beta_toggle = page.get_by_role("button", name="Apps (Beta)", exact=True)
     expect(beta_toggle).to_have_attribute("aria-expanded", "false")
     expect(page.locator("#beta-app-tabs")).to_be_hidden()
@@ -277,13 +284,14 @@ def desktop_smoke(page, url: str) -> None:
     # App frames load only when selected. Eagerly navigating every hidden app
     # at login can leave deferred frames at about:blank on a small fresh host.
     expect(page.locator("iframe.app-frame[src]")).to_have_count(0)
-    # Below the hero, the host tabs are grouped: Configuration, then Audit,
-    # then Apps (Beta). The beta explanation is nested in the last heading.
+    # Below the hero, stable non-hero apps have a permanent Apps group. Host
+    # tabs follow, then the existing collapsible Apps (Beta) group.
     headings = page.locator("#sidebar .sidebar-section-title:visible")
-    expect(headings).to_have_count(3)
-    expect(headings.nth(0)).to_have_text("Configuration")
-    expect(headings.nth(1)).to_have_text("Audit")
-    expect(headings.nth(2).get_by_role("button", name="Apps (Beta)", exact=True)).to_be_visible()
+    expect(headings).to_have_count(4)
+    expect(headings.nth(0)).to_have_text("Apps")
+    expect(headings.nth(1)).to_have_text("Configuration")
+    expect(headings.nth(2)).to_have_text("Audit")
+    expect(headings.nth(3).get_by_role("button", name="Apps (Beta)", exact=True)).to_be_visible()
     expect(page.locator("#sidebar-configuration .tab-button")).to_have_count(2)
     expect(page.locator("#sidebar-configuration #tab-network")).to_be_visible()
     expect(page.locator("#sidebar-audit .tab-button")).to_have_count(6)

@@ -307,6 +307,8 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertIn('id="tab-processes"', html)
         self.assertIn('id="processes"', html)
         self.assertIn('id="sidebar-apps"', html)
+        self.assertIn('id="sidebar-stable-apps"', html)
+        self.assertIn('<div class="sidebar-section-title">Apps</div>', html)
         self.assertIn('id="stable-app-tabs"', html)
         self.assertIn('id="beta-app-tabs" hidden', html)
         self.assertIn('data-action="toggle-beta-apps"', html)
@@ -419,11 +421,18 @@ class AdminUiStaticTests(unittest.TestCase):
             "host.runtime.admin_api.app_backend_api.admin_api.route",
             return_value={"tasks": [{"task_id": "task_1", "thread_id": "agent_chat__chat"}]},
         ) as route:
+            query = {"limit": ["20"], "message_bytes": ["12288"]}
             response = app_backend_admin_api.route_app_backend_request(
-                "agent_chat", "GET", "/v1/threads/chat/tasks", {}, None
+                "agent_chat", "GET", "/v1/threads/chat/tasks", query, None
             )
 
-        route.assert_called_once_with("GET", "/v1/threads/agent_chat__chat/tasks", {}, None, app_backend_id="agent_chat")
+        route.assert_called_once_with(
+            "GET",
+            "/v1/threads/agent_chat__chat/tasks",
+            query,
+            None,
+            app_backend_id="agent_chat",
+        )
         self.assertEqual(response["tasks"], [{"task_id": "task_1", "thread_id": "chat"}])
 
     def test_app_backend_thread_events_use_app_prefixed_thread_path(self) -> None:
@@ -1067,6 +1076,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertIn("style-src 'self' 'unsafe-inline'", csp)
         self.assertNotIn("img-src *", csp)
         self.assertNotIn("style-src *", csp)
+        self.assertNotIn("worker-src", csp)
 
         for asset_name, content_type, expected in (
             ("agent_chat.css", "text/css", ".chat-app"),
@@ -1079,6 +1089,21 @@ class AdminApiIntegrationTests(unittest.TestCase):
             self.assertEqual(response.status, 200)
             self.assertTrue(response.headers["Content-Type"].startswith(content_type))
             self.assertIn(expected, asset_body)
+
+    def test_capability_worker_csp_is_scoped_to_personal_web_app_builder(self) -> None:
+        request = urllib.request.Request(
+            f"{self.base_url}/v1/apps/personal_web_app_builder/ui/index.html",
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = response.read().decode()
+
+        self.assertIn("Personal Web App Builder", body)
+        csp = response.headers["Content-Security-Policy"]
+        self.assertIn("connect-src 'none'", csp)
+        self.assertIn("worker-src blob:", csp)
+        self.assertIn("webrtc 'block'", csp)
+        self.assertNotIn("allow-same-origin", csp)
 
     def test_app_api_proxy_does_not_forward_admin_bearer_to_app_backend(self) -> None:
         captured: dict[str, Any] = {}
@@ -1654,6 +1679,10 @@ class AdminApiIntegrationTests(unittest.TestCase):
         _, body = self.request("GET", "/v1/threads/shared/tasks")
         self.assertEqual([task["task_id"] for task in body["tasks"]], ["task_1", "task_2"])
         self.assertEqual(body["tasks"][1]["output_message"], "done")
+        _, bounded = self.request("GET", "/v1/threads/shared/tasks?limit=1&message_bytes=8")
+        self.assertEqual([task["task_id"] for task in bounded["tasks"]], ["task_1"])
+        self.assertLessEqual(len(bounded["tasks"][0]["input_message"].encode()), 8)
+        self.assertTrue(bounded["tasks"][0]["input_message"].endswith("…"))
 
     def test_create_task_rejects_conflicting_configuration_for_existing_threads(self) -> None:
         state = load_state()
