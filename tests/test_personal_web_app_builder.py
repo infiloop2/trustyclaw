@@ -75,6 +75,9 @@ class PersonalWebAppBuilderContractTests(unittest.TestCase):
         self.assertIn("if (!snapshot.session)", source)
         self.assertNotIn("if (!snapshot.tasks.length)", source)
         self.assertIn('fromGeneratedApp ? "/runtime/agent-requests" : "/messages"', source)
+        self.assertIn('/conversation/events?since=${conversationEventsSeq}', source)
+        self.assertIn('event.event_type !== "task.message"', source)
+        self.assertIn("task.output_message !== lastAgentText", source)
         self.assertIn("Always register `app.onLoad`", instructions)
         self.assertIn("Use the full safe authoring palette", instructions)
         self.assertIn("The hard exclusions are security boundaries", instructions)
@@ -272,6 +275,44 @@ class ConversationTests(unittest.TestCase):
             "/v1/threads/builder/tasks?limit=20&message_bytes=12288",
         )
 
+    def test_conversation_events_proxy_the_builder_thread_from_since(self) -> None:
+        events = {
+            "events": [
+                {
+                    "seq": 5,
+                    "task_id": "task_1",
+                    "event_type": "task.message",
+                    "payload": {"message": "Working on it.", "source": "agent"},
+                }
+            ]
+        }
+        with patch.object(backend, "call_admin_api", return_value=events) as host:
+            self.assertEqual(
+                backend.browser_conversation_events({"since": ["2"]}),
+                events,
+            )
+
+        host.assert_called_once_with(
+            "GET",
+            "/v1/threads/builder/events?since=2&limit=5&message_bytes=12288",
+        )
+
+    def test_conversation_events_reject_invalid_queries_before_host_call(self) -> None:
+        invalid_queries = (
+            {"since": ["nope"]},
+            {"since": ["1", "2"]},
+            {"before": ["2"]},
+        )
+        for query in invalid_queries:
+            with (
+                self.subTest(query=query),
+                patch.object(backend, "call_admin_api") as host,
+                self.assertRaises(backend.AppError) as error,
+            ):
+                backend.browser_conversation_events(query)
+            self.assertEqual(error.exception.status, HTTPStatus.BAD_REQUEST)
+            host.assert_not_called()
+
     def test_follow_up_omits_configuration_and_leaves_it_to_the_host(self) -> None:
         host_task = {
             "task_id": "task_2",
@@ -449,6 +490,21 @@ class PersonalWebAppBuilderMockTests(unittest.TestCase):
         self.assertTrue(running["input_message"].startswith("Requested by app:\n"))
         self.assertEqual(queued["status"], "queued")
         self.assertTrue(queued["input_message"].startswith("Requested by user:\n"))
+        initial_events = self.mock._route_app_api(
+            "GET", "conversation/events", None, {"since": ["0"]}
+        )["events"]
+        self.assertEqual(
+            [
+                event["payload"]["source"]
+                for event in initial_events
+                if event["task_id"] == running["task_id"]
+            ],
+            ["user", "agent"],
+        )
+        self.assertEqual(
+            initial_events[-1]["payload"]["message"],
+            self.mock.INTERIM_AGENT_MESSAGE,
+        )
         self.assertEqual(
             self.mock._route_app_api(
                 "POST", f"tasks/{queued['task_id']}/cancel", {}
@@ -463,6 +519,16 @@ class PersonalWebAppBuilderMockTests(unittest.TestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertIn("refreshed the dashboard analysis", completed["output_message"])
         self.assertIn("analysis", self.mock.APP["data"])
+        completed_events = self.mock._route_app_api(
+            "GET",
+            "conversation/events",
+            None,
+            {"since": [str(initial_events[-1]["seq"])]},
+        )["events"]
+        self.assertEqual(
+            completed_events[-1]["payload"]["message"],
+            completed["output_message"],
+        )
 
     def test_mock_conversation_matches_bounded_newest_first_host_view(self) -> None:
         with self.mock.MOCK_LOCK:

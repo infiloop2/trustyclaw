@@ -18,7 +18,7 @@ import re
 import socket
 import time
 from typing import Any
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from host.constants import APP_BACKEND_ADMIN_SOCKET_PATH, LOOPBACK, MAX_REQUEST_BODY_BYTES as ADMIN_MAX_REQUEST_BODY_BYTES
 from host.runtime.core import db
@@ -41,6 +41,10 @@ MAX_STATE_RESPONSE_BYTES = 900 * 1024
 MAX_CHAT_MESSAGE_BYTES = 50_000
 CONVERSATION_TASK_LIMIT = 20
 CONVERSATION_MESSAGE_BYTES = 12 * 1024
+# json.dumps may expand each clipped byte to a six-byte \u00XX escape. Five
+# events with both typed text fields at 12 KiB therefore stay below the 1 MiB
+# app-backend response cap, including envelope headroom.
+CONVERSATION_EVENT_PAGE_LIMIT = 5
 MAX_PATH_DEPTH = 16
 MAX_PATH_KEY_BYTES = 128
 JAVASCRIPT_FORBIDDEN = re.compile(r"\bimport\b")
@@ -78,7 +82,7 @@ class Handler(BaseHTTPRequestHandler):
                 response = route_agent(method, parsed.path, body)
             else:
                 self._require_host_proxy()
-                response = route_browser(method, parsed.path, body)
+                response = route_browser(method, parsed.path, body, parse_qs(parsed.query))
             self._send_json(HTTPStatus.OK, response)
         except AppError as exc:
             self._send_json(exc.status, {"error": {"message": exc.message}})
@@ -124,13 +128,20 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-def route_browser(method: str, path: str, body: Any) -> dict[str, Any]:
+def route_browser(
+    method: str,
+    path: str,
+    body: Any,
+    query: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
     if method == "GET" and path == "/session-options":
         return {"session_options": public_session_options()}
     if method == "GET" and path == "/state":
         return {"app": load_app_state()}
     if method == "GET" and path == "/conversation":
         return browser_conversation()
+    if method == "GET" and path == "/conversation/events":
+        return browser_conversation_events(query or {})
     if method == "POST" and path == "/messages":
         return create_message(body, requested_by="user")
     if method == "POST" and path == "/runtime/agent-requests":
@@ -165,6 +176,33 @@ def browser_conversation() -> dict[str, Any]:
     tasks: list[dict[str, Any]] = host_tasks
     session = _task_session_config(tasks[0]) if tasks else None
     return {"tasks": tasks, "session": session}
+
+
+def browser_conversation_events(query: dict[str, list[str]]) -> dict[str, Any]:
+    unexpected = sorted(set(query) - {"since"})
+    if unexpected:
+        raise AppError(
+            HTTPStatus.BAD_REQUEST,
+            f"unexpected conversation event query fields: {', '.join(unexpected)}",
+        )
+    since_values = query.get("since") or []
+    if len(since_values) > 1:
+        raise AppError(HTTPStatus.BAD_REQUEST, "since must be provided once")
+    parameters = [
+        f"limit={CONVERSATION_EVENT_PAGE_LIMIT}",
+        f"message_bytes={CONVERSATION_MESSAGE_BYTES}",
+    ]
+    if since_values:
+        since = since_values[0]
+        if not since.isdigit():
+            raise AppError(HTTPStatus.BAD_REQUEST, "since must be a non-negative integer")
+        parameters.insert(0, f"since={since}")
+    path = f"/v1/threads/{THREAD_ID}/events?{'&'.join(parameters)}"
+    response = call_admin_api("GET", path)
+    events = response.get("events")
+    if not isinstance(events, list) or not all(isinstance(event, dict) for event in events):
+        raise AppError(HTTPStatus.BAD_GATEWAY, "host admin returned invalid event list")
+    return {"events": events}
 
 
 def create_message(body: Any, *, requested_by: str) -> dict[str, Any]:

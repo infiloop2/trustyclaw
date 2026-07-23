@@ -449,6 +449,45 @@ class AdminUiStaticTests(unittest.TestCase):
         )
         self.assertEqual(response["events"][0]["seq"], 4)
 
+    def test_thread_events_bound_page_and_message_bytes_before_app_proxying(self) -> None:
+        message_bytes = 12 * 1024
+        events = [
+            {
+                "seq": seq,
+                "task_id": "task_1",
+                "event_type": "task.message",
+                "payload": {
+                    "message": "\x01" * (message_bytes + 1),
+                    "error_message": "\x01" * (message_bytes + 1),
+                    "source": "agent",
+                },
+            }
+            for seq in range(1, 6)
+        ]
+        with patch(
+            "host.runtime.admin_api.service.state.page_thread_events",
+            return_value=events,
+        ) as page:
+            response = admin_api.thread_route(
+                "GET",
+                "/v1/threads/thread_1/events",
+                {
+                    "since": ["2"],
+                    "limit": ["5"],
+                    "message_bytes": [str(message_bytes)],
+                },
+            )
+
+        page.assert_called_once_with("thread_1", 2, 5)
+        payload = response["events"][0]["payload"]
+        self.assertLessEqual(len(payload["message"].encode()), message_bytes)
+        self.assertTrue(payload["message"].endswith("…"))
+        self.assertLessEqual(len(payload["error_message"].encode()), message_bytes)
+        self.assertLess(
+            len(json.dumps(response, sort_keys=True).encode()),
+            admin_api.MAX_REQUEST_BODY_BYTES,
+        )
+
     def test_app_backend_bulk_thread_list_is_filtered_to_the_calling_app(self) -> None:
         with patch(
             "host.runtime.admin_api.app_backend_api.admin_api.route",

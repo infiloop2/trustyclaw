@@ -218,6 +218,18 @@ message supplies runtime, model, and effort; later messages omit them. The host
 remains authoritative for whether the thread is new and whether supplied
 configuration matches it. An empty retained history is simply first-run state.
 Retained chat growth cannot make the builder surface unavailable.
+
+The chat also reads the fixed thread's sequenced event stream. It accumulates
+events forward from the last seen sequence and renders each `task.message`
+inline, including interim agent messages while a task is still running. The
+opening user event is already represented by the task's user bubble and is
+not repeated; a final stored output is rendered only when it is not already
+the stream's last agent message. Event reads use pages of five and clip text to
+the conversation's 12 KiB encoded-message bound before the app-backend proxy,
+so one page stays below that hop's response cap. Polls patch only turns whose
+task or event content changed, preserving the reader's scroll position
+elsewhere.
+
 Keeping state and conversation separate prevents a maximum generated bundle
 from consuming the chat history's response budget. Browser routes require the
 host's app proxy marker. Agent routes are limited to reading state and applying

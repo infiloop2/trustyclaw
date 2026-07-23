@@ -943,14 +943,25 @@ def thread_route(method: str, path: str, query: dict[str, list[str]]) -> Any:
         thread_id = parts[2]
         if not THREAD_ID_RE.fullmatch(thread_id):
             raise ApiError(HTTPStatus.NOT_FOUND, "thread route not found")
-        _reject_query_keys(query, {"since", "limit"}, "thread event")
-        return {
-            "events": state.page_thread_events(
-                thread_id,
-                _optional_non_negative_int(query, "since"),
-                _event_page_limit(query),
-            )
-        }
+        _reject_query_keys(query, {"since", "limit", "message_bytes"}, "thread event")
+        message_bytes = _optional_bounded_positive_query_int(
+            query, "message_bytes", THREAD_TASK_MESSAGE_BYTES_LIMIT
+        )
+        events = state.page_thread_events(
+            thread_id,
+            _optional_non_negative_int(query, "since"),
+            _event_page_limit(query),
+        )
+        if message_bytes is not None:
+            for event in events:
+                payload = event.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                for field in ("message", "error_message"):
+                    value = payload.get(field)
+                    if isinstance(value, str):
+                        payload[field] = _clip_encoded_text(value, message_bytes)
+        return {"events": events}
     raise ApiError(HTTPStatus.NOT_FOUND, "thread route not found")
 
 
