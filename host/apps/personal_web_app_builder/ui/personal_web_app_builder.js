@@ -13,12 +13,16 @@ const MAX_EVENT_FIELDS = 64;
 const MAX_EVENT_FIELD_BYTES = 8192;
 const MAX_EVENT_PAYLOAD_BYTES = 64 * 1024;
 const MAX_DATA_VALUE_BYTES = 256 * 1024;
+const CONVERSATION_EVENTS_PAGE = 5;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 const pendingApi = new Map();
 let requestCounter = 0;
 let sessionOptions = {};
 let snapshot = { app: null, tasks: [], session: null };
+let conversationEvents = [];
+let conversationEventsSeq = 0;
+const renderedChatTurns = new Map();
 let renderedRevision = -1;
 let generatedRoot = null;
 let workerRun = null;
@@ -653,51 +657,107 @@ async function sendMessage(forcedMessage = null) {
 
 function renderChat() {
   const history = $("chat-history");
-  history.replaceChildren();
+  const nearBottom = history.scrollHeight - history.scrollTop - history.clientHeight < 48;
   const ordered = snapshot.tasks.slice().sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
   if (!ordered.length) {
+    renderedChatTurns.clear();
+    history.replaceChildren();
     const empty = document.createElement("p");
     empty.className = "chat-empty";
     empty.textContent = "Describe the personal app you want. The agent can build its UI, behavior, and data, then keep changing it here.";
     history.append(empty);
+    syncAgentSettings(snapshot.session);
+    return;
   }
-  for (const task of ordered) {
-    const turn = document.createElement("article");
-    turn.className = "chat-turn";
-    const user = document.createElement("div");
-    user.className = "chat-user";
-    user.textContent = task.input_message || "";
-    turn.append(user);
-    if (task.output_message) {
-      const agent = document.createElement("div");
-      agent.className = "chat-agent";
-      agent.textContent = task.output_message;
-      turn.append(agent);
+  if (history.firstElementChild?.classList.contains("chat-empty")) history.replaceChildren();
+  const messagesByTask = new Map();
+  for (const event of conversationEvents) {
+    if (event.event_type !== "task.message" || typeof event.task_id !== "string") continue;
+    if (!messagesByTask.has(event.task_id)) messagesByTask.set(event.task_id, []);
+    messagesByTask.get(event.task_id).push(event);
+  }
+  ordered.forEach((task, index) => {
+    const messages = messagesByTask.get(task.task_id) || [];
+    const key = JSON.stringify([task, messages]);
+    const current = history.children[index];
+    if (!current || current.dataset.taskId !== task.task_id) {
+      history.insertBefore(renderChatTurn(task, messages), current || null);
+    } else if (renderedChatTurns.get(task.task_id) !== key) {
+      history.replaceChild(renderChatTurn(task, messages), current);
     }
-    if (task.error_message) {
-      const error = document.createElement("div");
-      error.className = "chat-error";
-      error.textContent = task.error_message;
-      turn.append(error);
-    }
-    const meta = document.createElement("div");
-    meta.className = "chat-task-meta";
-    meta.append(document.createTextNode(`${task.status || "unknown"} · ${task.task_id || "task"}`));
-    if (task.status === "queued" || task.status === "running") {
-      const stop = document.createElement("button");
-      stop.className = task.status === "running" ? "danger ghost" : "ghost";
-      stop.textContent = task.status === "running" ? "Stop" : "Cancel";
-      stop.addEventListener("click", async () => {
-        await api("POST", `/tasks/${encodeURIComponent(task.task_id)}/${task.status === "running" ? "kill" : "cancel"}`, {});
-        await refreshSnapshot();
-      });
-      meta.append(stop);
-    }
-    turn.append(meta);
-    history.append(turn);
+    renderedChatTurns.set(task.task_id, key);
+  });
+  while (history.children.length > ordered.length) {
+    history.lastElementChild.remove();
+  }
+  const visibleTaskIds = new Set(ordered.map(task => task.task_id));
+  for (const taskId of renderedChatTurns.keys()) {
+    if (!visibleTaskIds.has(taskId)) renderedChatTurns.delete(taskId);
   }
   syncAgentSettings(snapshot.session);
-  if (!history.matches(":hover")) history.scrollTop = history.scrollHeight;
+  if (nearBottom) history.scrollTop = history.scrollHeight;
+}
+
+function renderChatTurn(task, messages) {
+  const turn = document.createElement("article");
+  turn.className = "chat-turn";
+  turn.dataset.taskId = task.task_id || "";
+  appendChatMessage(turn, "chat-user", task.input_message || "");
+  let inputEchoSkipped = false;
+  let lastAgentText = null;
+  for (const event of messages) {
+    const text = event.payload && event.payload.message;
+    if (typeof text !== "string" || !text) continue;
+    if (event.payload.source === "user") {
+      if (!inputEchoSkipped && text === task.input_message) {
+        inputEchoSkipped = true;
+        continue;
+      }
+      appendChatMessage(turn, "chat-user", text);
+    } else {
+      appendChatMessage(turn, "chat-agent", text);
+      lastAgentText = text;
+    }
+  }
+  if (task.output_message && task.output_message !== lastAgentText) {
+    appendChatMessage(turn, "chat-agent", task.output_message);
+  }
+  if (task.error_message) appendChatMessage(turn, "chat-error", task.error_message);
+  const meta = document.createElement("div");
+  meta.className = "chat-task-meta";
+  meta.append(document.createTextNode(`${task.status || "unknown"} · ${task.task_id || "task"}`));
+  if (task.status === "queued" || task.status === "running") {
+    const stop = document.createElement("button");
+    stop.className = task.status === "running" ? "danger ghost" : "ghost";
+    stop.textContent = task.status === "running" ? "Stop" : "Cancel";
+    stop.addEventListener("click", async () => {
+      await api("POST", `/tasks/${encodeURIComponent(task.task_id)}/${task.status === "running" ? "kill" : "cancel"}`, {});
+      await refreshSnapshot();
+    });
+    meta.append(stop);
+  }
+  turn.append(meta);
+  return turn;
+}
+
+function appendChatMessage(turn, className, text) {
+  const message = document.createElement("div");
+  message.className = className;
+  message.textContent = text;
+  turn.append(message);
+}
+
+async function drainConversationEvents() {
+  for (;;) {
+    const response = await api("GET", `/conversation/events?since=${conversationEventsSeq}`);
+    const events = response.events || [];
+    const fresh = events.filter(event => event.seq > conversationEventsSeq);
+    if (fresh.length) {
+      conversationEvents.push(...fresh);
+      conversationEventsSeq = fresh[fresh.length - 1].seq;
+    }
+    if (fresh.length < CONVERSATION_EVENTS_PAGE) return;
+  }
 }
 
 function setSessionOptions() {
@@ -774,6 +834,7 @@ async function refreshSnapshot() {
       tasks: conversationResponse.tasks || [],
       session: conversationResponse.session || null,
     };
+    await drainConversationEvents();
     if (snapshot.app && next.app.revision < snapshot.app.revision) next.app = snapshot.app;
     snapshot = next;
     if (next.app.revision !== renderedRevision) {

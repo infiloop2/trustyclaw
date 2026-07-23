@@ -23,6 +23,8 @@ AGENT_PROMPT = "Refresh the dashboard analysis from its current structured data.
 LOAD_ONLY_PROMPT = "This load-only request must never start an agent task."
 APP_AGENT_INPUT = f"{builder_backend.REQUEST_PREFIXES['app']}\n{AGENT_PROMPT}"
 MOCK_TASK_SECONDS = 1.0
+CONVERSATION_EVENTS_PAGE = builder_backend.CONVERSATION_EVENT_PAGE_LIMIT
+INTERIM_AGENT_MESSAGE = "Drafting the app structure and checking its saved data."
 LONG_MEDIA_CONDITION = " and ".join(["(min-width: 0px)"] * 40)
 MOCK_LOCK = threading.RLock()
 TASK_DEADLINES: dict[str, float] = {}
@@ -161,6 +163,7 @@ def _completed_task_fixture() -> dict[str, Any]:
 
 APP: dict[str, Any] = {}
 TASKS: list[dict[str, Any]] = []
+EVENTS: list[dict[str, Any]] = []
 HOST_THREAD_SESSION: dict[str, str] | None = None
 
 
@@ -170,6 +173,7 @@ def reset_mock_state() -> None:
         APP.clear()
         APP.update(_empty_app())
         TASKS.clear()
+        EVENTS.clear()
         HOST_THREAD_SESSION = None
         TASK_DEADLINES.clear()
 
@@ -180,18 +184,23 @@ reset_mock_state()
 def route_app_api(
     method: str,
     relative: str,
-    _query: dict[str, list[str]],
+    query: dict[str, list[str]],
     body: Any,
     api_error: ApiErrorFactory,
     _host_api: HostApi,
 ) -> dict[str, Any]:
     try:
-        return _route_app_api(method, relative, body)
+        return _route_app_api(method, relative, body, query)
     except builder_backend.AppError as exc:
         raise api_error(exc.status, exc.message) from exc
 
 
-def _route_app_api(method: str, relative: str, body: Any) -> dict[str, Any]:
+def _route_app_api(
+    method: str,
+    relative: str,
+    body: Any,
+    query: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
     if method == "GET" and relative == "session-options":
         return {"session_options": public_session_options()}
     with MOCK_LOCK:
@@ -211,6 +220,8 @@ def _route_app_api(method: str, relative: str, body: Any) -> dict[str, Any]:
                     if tasks else None
                 ),
             }
+        if method == "GET" and relative == "conversation/events":
+            return _conversation_events(query or {})
         if method == "POST" and relative == "runtime/actions":
             return _runtime_action(body)
         if method == "POST" and relative == "messages":
@@ -232,6 +243,36 @@ def _conversation_tasks() -> list[dict[str, Any]]:
             if isinstance(value, str):
                 task[field] = _clip_message(value)
     return tasks
+
+
+def _conversation_events(query: dict[str, list[str]]) -> dict[str, Any]:
+    unexpected = sorted(set(query) - {"since"})
+    if unexpected:
+        raise builder_backend.AppError(
+            HTTPStatus.BAD_REQUEST,
+            f"unexpected conversation event query fields: {', '.join(unexpected)}",
+        )
+    since_values = query.get("since") or []
+    if len(since_values) > 1:
+        raise builder_backend.AppError(HTTPStatus.BAD_REQUEST, "since must be provided once")
+    since = 0
+    if since_values:
+        if not since_values[0].isdigit():
+            raise builder_backend.AppError(
+                HTTPStatus.BAD_REQUEST,
+                "since must be a non-negative integer",
+            )
+        since = int(since_values[0])
+    events = copy.deepcopy(
+        [event for event in EVENTS if event["seq"] > since][
+            :CONVERSATION_EVENTS_PAGE
+        ]
+    )
+    for event in events:
+        payload = event.get("payload")
+        if isinstance(payload, dict) and isinstance(payload.get("message"), str):
+            payload["message"] = _clip_message(payload["message"])
+    return {"events": events}
 
 
 def _clip_message(value: str) -> str:
@@ -341,8 +382,7 @@ def _create_message(body: Any, *, requested_by: str) -> dict[str, Any]:
         "updated_at": now,
     }
     if status == "running":
-        task["started_at"] = now
-        TASK_DEADLINES[task["task_id"]] = time.monotonic() + MOCK_TASK_SECONDS
+        _start_task(task)
     TASKS.append(task)
     return copy.deepcopy(task)
 
@@ -372,20 +412,22 @@ def _progress_tasks() -> None:
         if task["status"] != "running" or deadline is None or now_monotonic < deadline:
             continue
         now = _now()
+        output_message = (
+            "Built the dashboard with durable priorities and interactive controls."
+            if APP["revision"] == 0
+            else (
+                "Reviewed the current structured data and refreshed the dashboard analysis."
+                if task["input_message"] == APP_AGENT_INPUT
+                else "Updated the personal app from this request."
+            )
+        )
         task.update({
             "status": "completed",
             "updated_at": now,
             "completed_at": now,
-            "output_message": (
-                "Built the dashboard with durable priorities and interactive controls."
-                if APP["revision"] == 0
-                else (
-                    "Reviewed the current structured data and refreshed the dashboard analysis."
-                    if task["input_message"] == APP_AGENT_INPUT
-                    else "Updated the personal app from this request."
-                )
-            ),
+            "output_message": output_message,
         })
+        _append_task_message(task, output_message, "agent")
         TASK_DEADLINES.pop(task["task_id"], None)
         if APP["revision"] == 0:
             APP.clear()
@@ -410,9 +452,29 @@ def _start_next_task() -> None:
     queued = next((task for task in TASKS if task["status"] == "queued"), None)
     if queued is None:
         return
+    _start_task(queued)
+
+
+def _start_task(task: dict[str, Any]) -> None:
     now = _now()
-    queued.update({"status": "running", "updated_at": now, "started_at": now})
-    TASK_DEADLINES[queued["task_id"]] = time.monotonic() + MOCK_TASK_SECONDS
+    task.update({"status": "running", "updated_at": now, "started_at": now})
+    TASK_DEADLINES[task["task_id"]] = time.monotonic() + MOCK_TASK_SECONDS
+    _append_task_message(task, task["input_message"], "user")
+    _append_task_message(task, INTERIM_AGENT_MESSAGE, "agent")
+
+
+def _append_task_message(task: dict[str, Any], message: str, source: str) -> None:
+    seq = EVENTS[-1]["seq"] + 1 if EVENTS else 1
+    EVENTS.append(
+        {
+            "seq": seq,
+            "timestamp": _now(),
+            "event_id": f"event_{seq}",
+            "event_type": "task.message",
+            "task_id": task["task_id"],
+            "payload": {"message": message, "source": source},
+        }
+    )
 
 
 def _now() -> str:
@@ -454,6 +516,7 @@ def desktop_smoke(page: Any) -> None:
     frame.get_by_role("button", name="Send message", exact=True).click()
     expect(frame.locator("#chat-history")).to_contain_text("Requested by user:")
     expect(frame.locator("#chat-history")).to_contain_text("Build a small weekly focus dashboard.")
+    expect(frame.locator("#chat-history")).to_contain_text(INTERIM_AGENT_MESSAGE)
     expect(frame.locator(".dashboard")).to_be_visible(timeout=8_000)
     expect(frame.locator("#runtime")).to_be_disabled()
     expect(frame.locator("#model")).to_be_disabled()
