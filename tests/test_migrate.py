@@ -325,6 +325,108 @@ class RepoMigrationDataTests(unittest.TestCase):
                 ],
             )
 
+    def test_0016_removes_pi_state_and_collapses_bedrock_usage(self) -> None:
+        migrate.up(target=15, directory=self.repo_migrations, quiet=True)
+        with db.transaction() as cur:
+            cur.execute(
+                """
+                INSERT INTO thread_sessions (
+                    agent_runtime, thread_id, provider_session_id, last_used_at, model, effort
+                ) VALUES
+                    ('pi', 'pi-thread', 'pi-session', '2026-07-01T00:00:00Z',
+                     'deepseek.v3.2', 'high'),
+                    ('hermes', 'hermes-thread', 'hermes-session', '2026-07-01T00:00:00Z',
+                     'deepseek.v3.2', 'high')
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO tasks (
+                    number, status, thread_id, input_message, created_at, updated_at
+                ) VALUES
+                    (1, 'completed', 'pi-thread', 'old pi task',
+                     '2026-07-01T00:00:00Z', '2026-07-01T00:00:01Z'),
+                    (2, 'completed', 'hermes-thread', 'kept hermes task',
+                     '2026-07-01T00:00:00Z', '2026-07-01T00:00:01Z')
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO agent_events (
+                    created_at, event_type, task_id, agent_runtime
+                ) VALUES
+                    ('2026-07-01T00:00:00Z', 'task.created', 'task_1', NULL),
+                    ('2026-07-01T00:00:00Z', 'agent_runtime.active', NULL, 'pi'),
+                    ('2026-07-01T00:00:00Z', 'task.created', 'task_2', NULL),
+                    ('2026-07-01T00:00:00Z', 'agent_runtime.active', NULL, 'hermes')
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO bedrock_usage (
+                    runtime, model_id, day, requests, metered_requests,
+                    input_tokens, output_tokens, cost_usd
+                ) VALUES
+                    ('pi', 'deepseek.v3.2', '2026-07-01', 2, 2, 20, 10, 0.1),
+                    ('hermes', 'deepseek.v3.2', '2026-07-01', 3, 3, 30, 15, 0.2)
+                """
+            )
+
+        self.assertEqual(
+            migrate.up(target=16, directory=self.repo_migrations, quiet=True),
+            [16],
+        )
+        with db.transaction() as cur:
+            cur.execute("SELECT agent_runtime, thread_id FROM thread_sessions")
+            self.assertEqual(cur.fetchall(), [("hermes", "hermes-thread")])
+            cur.execute("SELECT number, thread_id FROM tasks")
+            self.assertEqual(cur.fetchall(), [(2, "hermes-thread")])
+            cur.execute(
+                "SELECT task_id, agent_runtime FROM agent_events"
+                " ORDER BY task_id NULLS LAST, agent_runtime"
+            )
+            self.assertEqual(
+                cur.fetchall(),
+                [("task_2", None), (None, "hermes")],
+            )
+            cur.execute(
+                "SELECT model_id, requests, metered_requests, input_tokens,"
+                " output_tokens, cost_usd::double precision FROM bedrock_usage"
+            )
+            self.assertEqual(
+                cur.fetchall(),
+                [("deepseek.v3.2", 3, 3, 30, 15, 0.2)],
+            )
+            cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'bedrock_usage'
+                ORDER BY ordinal_position
+                """
+            )
+            self.assertNotIn("runtime", [row[0] for row in cur.fetchall()])
+
+        with self.assertRaises(Exception), db.transaction() as cur:
+            cur.execute(
+                """
+                INSERT INTO thread_sessions (
+                    agent_runtime, thread_id, provider_session_id, last_used_at, model, effort
+                ) VALUES (
+                    'pi', 'rejected-pi', NULL, '2026-07-01T00:00:00Z',
+                    'deepseek.v3.2', 'high'
+                )
+                """
+            )
+
+        self.assertEqual(
+            migrate.down(target=15, directory=self.repo_migrations, quiet=True),
+            [16],
+        )
+        with db.transaction() as cur:
+            cur.execute("SELECT runtime, model_id, requests FROM bedrock_usage")
+            self.assertEqual(cur.fetchall(), [("hermes", "deepseek.v3.2", 3)])
+
 
 class AppMigrationTests(unittest.TestCase):
     DB_NAME = "trustyclaw_app_migrate_test"
@@ -480,6 +582,91 @@ class AppMigrationTests(unittest.TestCase):
             cur.execute("SELECT thread_id FROM app_agent_chat.threads ORDER BY thread_id")
             self.assertEqual(cur.fetchall(), [("claude-thread",), ("codex-thread",)])
 
+    def test_workspace_apps_clear_saved_pi_runtime_configuration(self) -> None:
+        removal_versions = {
+            "alpha_seeker": 3,
+            "mission_pursuit": 3,
+            "social_marketer": 4,
+            "software_builder": 3,
+            "virality_machine": 5,
+        }
+        apps = {app.id: app for app in app_platform.installed_apps()}
+        for app_id, removal_version in removal_versions.items():
+            app = apps[app_id]
+            with self.subTest(app_id=app_id):
+                with db.transaction() as cur:
+                    cur.execute(
+                        "SELECT 1 FROM pg_roles WHERE rolname = %s",
+                        (app.db_role,),
+                    )
+                    if cur.fetchone() is None:
+                        cur.execute(f'CREATE ROLE "{app.db_role}" LOGIN')
+                    cur.execute(
+                        f'CREATE SCHEMA {app.db_schema} AUTHORIZATION "{app.db_role}"'
+                    )
+                for version in range(1, removal_version):
+                    app_migrate.apply_sql(
+                        app_id,
+                        version,
+                        connection_user=app.db_role,
+                    )
+                    app_migrate.record(app_id, version)
+                with db.transaction(user=app.db_role) as cur:
+                    cur.execute(f"SET LOCAL search_path TO {app.db_schema}")
+                    cur.execute(
+                        """
+                        INSERT INTO workspace (
+                            agent_runtime, model, effort, created_at, updated_at
+                        ) VALUES (
+                            'pi', 'deepseek.v3.2', 'high',
+                            '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z'
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO schedules (
+                            schedule_id, title, prompt, every_minutes, next_run_at,
+                            enabled, created_at, updated_at
+                        ) VALUES (
+                            'legacy-pi-schedule', 'Legacy Pi schedule', 'Run legacy work',
+                            60, '2026-07-01T01:00:00Z', TRUE,
+                            '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z'
+                        )
+                        """
+                    )
+
+                self.assertEqual(_app_up(app_id), [removal_version])
+                with db.transaction() as cur:
+                    cur.execute(
+                        f"SELECT agent_runtime, model, effort FROM {app.db_schema}.workspace"
+                    )
+                    self.assertEqual(cur.fetchone(), (None, None, None))
+                    cur.execute(
+                        f"SELECT enabled FROM {app.db_schema}.schedules"
+                        " WHERE schedule_id = 'legacy-pi-schedule'"
+                    )
+                    self.assertEqual(cur.fetchone(), (False,))
+
+                with self.assertRaises(Exception), db.transaction(user=app.db_role) as cur:
+                    cur.execute(f"SET LOCAL search_path TO {app.db_schema}")
+                    cur.execute(
+                        """
+                        UPDATE workspace
+                        SET agent_runtime = 'pi', model = 'deepseek.v3.2', effort = 'high'
+                        """
+                    )
+                with db.transaction(user=app.db_role) as cur:
+                    cur.execute(f"SET LOCAL search_path TO {app.db_schema}")
+                    cur.execute(
+                        """
+                        UPDATE workspace
+                        SET agent_runtime = 'hermes',
+                            model = 'deepseek.v3.2',
+                            effort = 'high'
+                        """
+                    )
+
     def test_app_migration_cannot_reset_back_to_host_role(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             migrations = Path(temp_dir) / "migrations"
@@ -492,6 +679,7 @@ class AppMigrationTests(unittest.TestCase):
             app = app_platform.AppManifest(
                 id="agent_chat",
                 title="Agent Chat",
+                release_stage="stable",
                 package_dir=Path(temp_dir),
                 backend_entrypoint=Path(temp_dir) / "backend.py",
                 migrations_dir=migrations,

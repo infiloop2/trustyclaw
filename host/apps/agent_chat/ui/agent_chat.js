@@ -12,6 +12,10 @@ let selectedThreadRuntime = null;
 let selectedThreadModel = null;
 let selectedThreadEffort = null;
 let sessionOptions = {};
+let pendingAttachments = [];
+let attachmentActivity = null;
+const ATTACHMENT_LIMIT = 10;
+const ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
 // Render guards: the 5-second poll re-renders only when data actually
 // changed, so a steering draft or the reading scroll position survives
 // refreshes that bring nothing new.
@@ -23,7 +27,7 @@ const renderedTurnHtml = new Map();
 let forceScrollBottom = false;
 
 const $ = id => document.getElementById(id);
-const runtimeLabel = runtime => runtime === "claude_code" ? "Claude Code" : runtime === "codex" ? "Codex" : runtime === "pi" ? "Pi" : runtime === "hermes" ? "Hermes" : runtime;
+const runtimeLabel = runtime => runtime === "claude_code" ? "Claude Code" : runtime === "codex" ? "Codex" : runtime === "hermes" ? "Hermes" : runtime;
 const optionLabel = value => value.split(/[-_]/).map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
 const modelLabel = (runtime, value) => runtime === "codex" ? value : optionLabel(value);
 const esc = value => {
@@ -31,6 +35,7 @@ const esc = value => {
   div.textContent = value == null ? "" : String(value);
   return div.innerHTML;
 };
+const escAttr = value => esc(value).replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 const badge = value => `<span class="status ${esc(value)}">${esc(value)}</span>`;
 const formatDateTime = value => {
   const date = new Date(value);
@@ -52,11 +57,14 @@ const relativeTime = value => {
 
 window.addEventListener("message", event => {
   const message = event.data;
-  if (!message || message.type !== "trustyclaw-app-api-result") return;
+  if (!message || ![
+    "trustyclaw-app-api-result",
+    "trustyclaw-app-upload-file-result",
+  ].includes(message.type)) return;
   const callbacks = pending.get(message.request_id);
   if (!callbacks) return;
   pending.delete(message.request_id);
-  if (message.ok) callbacks.resolve(message.body);
+  if (message.ok) callbacks.resolve(message.cancelled ? null : message.body);
   else callbacks.reject(new Error(message.error || "request failed"));
 });
 
@@ -71,6 +79,25 @@ function api(method, path, body) {
       pending.delete(requestId);
       reject(new Error("request timed out"));
     }, 30000);
+  });
+}
+
+function requestFileUpload(action, selectionId, maximumFiles) {
+  const requestId = String(nextRequestId++);
+  parent.postMessage({
+    type: "trustyclaw-app-upload-file",
+    request_id: requestId,
+    action,
+    ...(selectionId ? { selection_id: selectionId } : {}),
+    ...(maximumFiles ? { max_files: maximumFiles } : {}),
+  }, "*");
+  return new Promise((resolve, reject) => {
+    pending.set(requestId, { resolve, reject });
+    setTimeout(() => {
+      if (!pending.has(requestId)) return;
+      pending.delete(requestId);
+      reject(new Error("file operation timed out"));
+    }, 5 * 60 * 1000);
   });
 }
 
@@ -154,7 +181,7 @@ function setSessionOptions(preferredModel, preferredEffort) {
     $("new-task-effort").innerHTML = "";
     $("new-task-model").disabled = true;
     $("new-task-effort").disabled = true;
-    $("create-task").disabled = true;
+    updateComposerActions();
     return;
   }
   const model = preferredModel && models[preferredModel] ? preferredModel : modelValues[0];
@@ -170,7 +197,78 @@ function setSessionOptions(preferredModel, preferredEffort) {
   $("new-task-effort").value = effort;
   $("new-task-model").disabled = false;
   $("new-task-effort").disabled = false;
-  $("create-task").disabled = false;
+  updateComposerActions();
+}
+
+function updateComposerActions() {
+  const hasSessionOption = Boolean($("new-task-model").value && $("new-task-effort").value);
+  const hasOversizedAttachment = pendingAttachments.some(attachment => attachment.size_bytes > ATTACHMENT_MAX_BYTES);
+  $("create-task").disabled = attachmentActivity !== null || hasOversizedAttachment || !hasSessionOption;
+  $("attach-file").disabled = attachmentActivity !== null || pendingAttachments.length >= ATTACHMENT_LIMIT;
+}
+
+function renderAttachments() {
+  const container = $("attachments");
+  container.hidden = attachmentActivity === null && !pendingAttachments.length;
+  container.innerHTML = [
+    ...pendingAttachments.map(attachment => {
+      const tooLarge = attachment.size_bytes > ATTACHMENT_MAX_BYTES;
+      return `
+        <div class="attachment${tooLarge ? " invalid" : ""}">
+          <span class="attachment-name" title="${escAttr(attachment.original_name)}">${esc(attachment.original_name)}</span>
+          ${tooLarge ? `<span class="attachment-error">25 MiB max</span>` : ""}
+          <button
+            class="attachment-clear"
+            data-remove-attachment="${escAttr(attachment.selection_id)}"
+            aria-label="Remove ${escAttr(attachment.original_name)}"
+            title="Remove ${escAttr(attachment.original_name)}"
+            ${attachmentActivity !== null ? "disabled" : ""}
+          >&times;</button>
+        </div>`;
+    }),
+    attachmentActivity === null ? "" : `<div class="attachment activity"><span>${esc(attachmentActivity)}</span></div>`,
+  ].join("");
+  updateComposerActions();
+}
+
+async function attachFile() {
+  const remaining = ATTACHMENT_LIMIT - pendingAttachments.length;
+  if (remaining <= 0) return;
+  attachmentActivity = "Selecting file…";
+  renderAttachments();
+  try {
+    const response = await requestFileUpload("select", null, remaining);
+    if (response === null) return;
+    if (!Array.isArray(response.selections) || !response.selections.length) {
+      throw new Error("file selection returned an invalid response");
+    }
+    for (const selection of response.selections) {
+      if (
+        typeof selection.selection_id !== "string" ||
+        typeof selection.original_name !== "string" ||
+        typeof selection.size_bytes !== "number"
+      ) {
+        throw new Error("file selection returned an invalid response");
+      }
+    }
+    if (pendingAttachments.length + response.selections.length > ATTACHMENT_LIMIT) {
+      throw new Error(`You can attach up to ${ATTACHMENT_LIMIT} files.`);
+    }
+    pendingAttachments.push(...response.selections);
+  } finally {
+    attachmentActivity = null;
+    renderAttachments();
+  }
+}
+
+async function removeAttachment(selectionId) {
+  const index = pendingAttachments.findIndex(attachment => attachment.selection_id === selectionId);
+  if (index < 0) return;
+  const [attachment] = pendingAttachments.splice(index, 1);
+  renderAttachments();
+  if (!attachment.file) {
+    await requestFileUpload("discard", attachment.selection_id);
+  }
 }
 
 async function showThread(threadId, runtime, model, effort) {
@@ -353,15 +451,40 @@ async function createTask() {
   const runtime = $("new-task-runtime").value;
   const model = $("new-task-model").value;
   const effort = $("new-task-effort").value;
-  if (!message || !model || !effort || $("create-task").disabled) return;
+  if ((!message && !pendingAttachments.length) || !model || !effort || $("create-task").disabled) return;
   // A request without thread_id asks the backend to open a new thread with a
   // generated successive name (thread-1, thread-2, ...).
   const startingNewThread = selectedThreadId === null;
-  const request = { input_message: message };
+  const request = { input_message: "" };
   if (startingNewThread) Object.assign(request, { agent_runtime: runtime, model, effort });
   else request.thread_id = selectedThreadId;
+  for (const [index, attachment] of pendingAttachments.entries()) {
+    if (attachment.file) continue;
+    attachmentActivity = `Uploading ${index + 1} of ${pendingAttachments.length}…`;
+    renderAttachments();
+    try {
+      const response = await requestFileUpload("upload", attachment.selection_id);
+      if (!response.file || typeof response.file.path !== "string" || typeof response.file.name !== "string") {
+        throw new Error("file upload returned an invalid response");
+      }
+      attachment.file = response.file;
+    } finally {
+      attachmentActivity = null;
+      renderAttachments();
+    }
+  }
+  const uploadedFiles = pendingAttachments.map(attachment => attachment.file);
+  const fileReferences = uploadedFiles
+    .map(file => `[User-uploaded file: ${file.path}]`)
+    .join("\n");
+  const inputMessage = uploadedFiles.length
+    ? `${message || (uploadedFiles.length === 1 ? "Please review the uploaded file." : "Please review the uploaded files.")}\n\n${fileReferences}`
+    : message;
+  request.input_message = inputMessage;
   const task = await api("POST", "/tasks", request);
   $("new-task").value = "";
+  pendingAttachments = [];
+  renderAttachments();
   autosizeComposer();
   if (startingNewThread) {
     // A brand-new thread has no prior event stream to keep; start its
@@ -450,7 +573,14 @@ document.addEventListener("click", event => {
     return;
   }
   const taskButton = event.target.closest && event.target.closest("button[data-task-action]");
-  if (taskButton) taskAction(taskButton).catch(error => setStatus(error.message));
+  if (taskButton) {
+    taskAction(taskButton).catch(error => setStatus(error.message));
+    return;
+  }
+  const removeAttachmentButton = event.target.closest && event.target.closest("button[data-remove-attachment]");
+  if (removeAttachmentButton) {
+    removeAttachment(removeAttachmentButton.dataset.removeAttachment).catch(error => setStatus(error.message));
+  }
 });
 
 document.addEventListener("keydown", event => {
@@ -471,6 +601,7 @@ $("new-thread").addEventListener("click", () => {
 });
 $("archive-thread").addEventListener("click", () => archiveSelectedThread().catch(error => setStatus(error.message)));
 $("create-task").addEventListener("click", () => createTask().catch(error => setStatus(error.message)));
+$("attach-file").addEventListener("click", () => attachFile().catch(error => setStatus(error.message)));
 $("new-task-runtime").addEventListener("change", () => setSessionOptions());
 $("new-task-model").addEventListener("change", () => setSessionOptions($("new-task-model").value));
 $("new-task").addEventListener("input", autosizeComposer);
@@ -489,6 +620,7 @@ setSessionOptions();
 updateComposer();
 renderThreadHistory();
 autosizeComposer();
+renderAttachments();
 setSidebarOpen(false);
 refresh();
 setInterval(refresh, 5000);

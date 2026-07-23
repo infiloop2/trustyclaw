@@ -106,21 +106,21 @@ class StageIntegrationChecks(AwsSmoke):
         results: dict[str, str | None] = {}
         for integration in _selected_integrations(suite):
             failures: list[str]
-            if integration in {"codex", "claude", "pi", "hermes"}:
+            if integration in {"codex", "claude", "hermes"}:
                 runtime = "claude_code" if integration == "claude" else integration
                 status = self._wait_for_runtime_status(
                     {"active", "awaiting_login", "deactivated", "error"},
                     runtime=runtime,
                     timeout=180,
                 )
-                if runtime in {"pi", "hermes"}:
+                if runtime == "hermes":
                     failures = []
                     if self.bedrock_secret_error:
                         failures.append(self.bedrock_secret_error)
                     if status != "active":
                         failures.append(
                             f"runtime is {status!r}; set both STAGE_BEDROCK_AWS_* secrets "
-                            "or connect the shared AWS Bedrock credential in the stage admin UI"
+                            "or connect the AWS Bedrock credential in the stage admin UI"
                         )
                 else:
                     failures = [] if status == "active" else [
@@ -246,9 +246,9 @@ class StageIntegrationChecks(AwsSmoke):
             timeout=180,
         )
         if status != "active":
-            if runtime in {"pi", "hermes"}:
+            if runtime == "hermes":
                 raise AssertionError(
-                    f"{runtime} runtime is {status}; connect the shared AWS Bedrock credential, then rerun stage"
+                    f"{runtime} runtime is {status}; connect the AWS Bedrock credential, then rerun stage"
                 )
             raise AssertionError(
                 f"{runtime} runtime is {status}; manually open the stage admin UI, complete OAuth, then rerun stage"

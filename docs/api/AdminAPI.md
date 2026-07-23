@@ -129,7 +129,7 @@ Response fields:
 | `status` | enum | `ok`, `degraded` | Overall host health. `ok` means the admin service, agent runtime supervisor, and network controls are reachable. `degraded` means the admin service is responding but at least one component is not healthy. |
 | `agent_name` | string |  | Host name from the input config. |
 | `agent_runtime.runtimes` | array |  | Status records for every supported runtime. |
-| `agent_runtime.runtimes[].type` | enum | `codex`, `claude_code`, `pi`, `hermes` | Agent runtime type. |
+| `agent_runtime.runtimes[].type` | enum | `codex`, `claude_code`, `hermes` | Agent runtime type. |
 | `agent_runtime.runtimes[].status` | enum | `deactivated`, `loading`, `awaiting_login`, `active`, `error` | Current agent runtime supervisor state. |
 | `agent_runtime.runtimes[].active_task_ids` | string array |  | Currently running task ids for this runtime. |
 | `network_controls.status` | enum | `active`, `error` | Derived network policy enforcement state. |
@@ -154,7 +154,7 @@ Runtime status is `deactivated` when that runtime's managed provider
 integration is disabled, `loading` while the runtime is starting,
 `awaiting_login` while an OAuth runtime needs operator login, `active` while it
 can accept work, and `error` when the runtime supervisor cannot make it
-healthy. Pi and Hermes have no OAuth flow: while Bedrock is enabled they are
+healthy. Hermes has no OAuth flow: while Bedrock is enabled it is
 `awaiting_login` until a validated credential is connected, then `active`.
 
 `network_controls.status` is derived, not stored. It is `active` when the
@@ -191,10 +191,10 @@ Agent runtime endpoints:
 | `POST` | `/v1/agent-runtime/claude-oauth-login` | none | Claude OAuth login response | Starts a Claude Code OAuth login process and returns the login link. |
 | `GET` | `/v1/agent-runtime/claude-oauth-login` | none | Claude OAuth login response | Returns the current Claude Code OAuth login link. |
 | `POST` | `/v1/agent-runtime/claude-oauth-login/complete` | `{"code": "..."}` | status response | Submits the browser login code back to the waiting Claude Code OAuth process. |
-| `GET` | `/v1/agent-runtime/bedrock-credentials` | none | `{"connected": false}` or `{"connected": true, "access_key_id": "AKIA...", "region": "us-east-1"}` | Returns whether the shared Bedrock connection is stored plus its non-secret access key id and region. The secret is never returned. |
-| `POST` | `/v1/agent-runtime/bedrock-credentials` | `{"access_key_id": "AKIA...", "secret_access_key": "...", "region": "us-east-1"}` | `{"status": "accepted"}` | Synchronously validates the one Bedrock long-term IAM access key pair with STS, then stores the credential, region, and account metadata atomically. Validation runs even while Bedrock is disabled; a rejected candidate returns `400`, is not retained, and leaves any previous validated connection unchanged. The one resulting Bedrock status is shown on both Pi and Hermes runtime rows. AWS checks model-specific invocation permission and model access on the first real task, avoiding a paid setup invocation. Later AWS failures are reported by the task that encounters them; they do not create a stored credential-health state. The request accepts exactly these three fields; the secret is never returned. |
-| `DELETE` | `/v1/agent-runtime/bedrock-credentials` | none | status response | Disconnects the shared AWS account, clears its credential, region, and account metadata, then fails running Pi and Hermes tasks. The live usage counters are retained: they record work already done. |
-| `POST` | `/v1/agent-runtime/reset-linked-account` | `{"agent_runtime": "codex"\|"claude_code"}` | status response | Clears the selected OAuth runtime's linked account state. Bedrock uses the credential endpoint above because its connection is shared, not runtime-specific. |
+| `GET` | `/v1/agent-runtime/bedrock-credentials` | none | `{"connected": false}` or `{"connected": true, "access_key_id": "AKIA...", "region": "us-east-1"}` | Returns whether the Bedrock connection is stored plus its non-secret access key id and region. The secret is never returned. |
+| `POST` | `/v1/agent-runtime/bedrock-credentials` | `{"access_key_id": "AKIA...", "secret_access_key": "...", "region": "us-east-1"}` | `{"status": "accepted"}` | Synchronously validates the Bedrock long-term IAM access key pair with STS, then stores the credential, region, and account metadata atomically. Validation runs even while Bedrock is disabled; a rejected candidate returns `400`, is not retained, and leaves any previous validated connection unchanged. AWS checks model-specific invocation permission and model access on the first real task, avoiding a paid setup invocation. Later AWS failures are reported by the task that encounters them; they do not create a stored credential-health state. The request accepts exactly these three fields; the secret is never returned. |
+| `DELETE` | `/v1/agent-runtime/bedrock-credentials` | none | status response | Disconnects the AWS account, clears its credential, region, and account metadata, then fails running Hermes tasks. The live usage counters are retained: they record work already done. |
+| `POST` | `/v1/agent-runtime/reset-linked-account` | `{"agent_runtime": "codex"\|"claude_code"}` | status response | Clears the selected OAuth runtime's linked account state. Bedrock uses the credential endpoint above because it uses an IAM credential instead of OAuth. |
 
 The runtime-specific OAuth login endpoints work while that runtime's status is
 `awaiting_login` or `error` — an errored runtime (changed account, malformed
@@ -212,7 +212,7 @@ ready for a fresh operator login that links an account again.
 `GET /v1/agent-runtime/account` does not accept query parameters; it always returns
 one account-status entry per runtime.
 `POST /v1/agent-runtime/refresh` accepts `{}` to refresh all runtimes, or
-`{"agent_runtime": "codex"}`, `{"agent_runtime": "claude_code"}`, `{"agent_runtime": "pi"}`, or `{"agent_runtime": "hermes"}` to refresh one.
+`{"agent_runtime": "codex"}`, `{"agent_runtime": "claude_code"}`, or `{"agent_runtime": "hermes"}` to refresh one.
 It forces a provider check instead of reusing a remembered live-validation
 verdict. It returns the same response shape as
 `GET /v1/agent-runtime/account`.
@@ -240,7 +240,7 @@ Agent runtime status response fields:
 
 | Field | Type | Values | Meaning |
 | --- | --- | --- | --- |
-| `runtimes[].type` | enum | `codex`, `claude_code`, `pi`, `hermes` | Agent runtime type. |
+| `runtimes[].type` | enum | `codex`, `claude_code`, `hermes` | Agent runtime type. |
 | `runtimes[].status` | enum | `deactivated`, `loading`, `awaiting_login`, `active`, `error` | Current runtime state. Codex uses its rate-limit request and, if that fails, one Codex-owned forced refresh. Claude Code uses a `/usage` probe for the pinned token, or provider profile attestation for a new or rotated token. Bedrock is `active` when the integration is enabled and its synchronously validated credential/account row is present. AWS checks model-specific invocation permission and current credential validity on the first real task; later provider failures are task failures. |
 | `runtimes[].active_task_ids` | string array |  | Currently running task ids for that runtime, in task order. Empty when no task is running. |
 | `runtimes[].error_message` | string | optional | Present only while `status` is `error`: the underlying runtime failure message. |
@@ -297,31 +297,19 @@ Agent account response:
     },
     {
       "provider": "bedrock",
-      "agent_runtimes": ["pi", "hermes"],
+      "agent_runtimes": ["hermes"],
       "status": "active",
       "account_id": "123456789012",
       "arn": "arn:aws:iam::123456789012:user/trustyclaw-bedrock",
       "bedrock_usage": {
-        "pi": {
-          "month_to_date": 1.4276,
-          "currency": "USD",
-          "requests": 210,
-          "metered_requests": 208,
-          "input_tokens": 1804211,
-          "output_tokens": 96407,
-          "cache_read_tokens": 0,
-          "cache_write_tokens": 0
-        },
-        "hermes": {
-          "month_to_date": 0.3102,
-          "currency": "USD",
-          "requests": 41,
-          "metered_requests": 41,
-          "input_tokens": 402118,
-          "output_tokens": 31889,
-          "cache_read_tokens": 0,
-          "cache_write_tokens": 0
-        }
+        "month_to_date": 0.3102,
+        "currency": "USD",
+        "requests": 41,
+        "metered_requests": 41,
+        "input_tokens": 402118,
+        "output_tokens": 31889,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
       }
     }
   ]
@@ -332,10 +320,10 @@ Agent account response fields:
 
 | Field | Type | Values | Meaning |
 | --- | --- | --- | --- |
-| `accounts[].agent_runtime` | enum | `codex`, `claude_code` | Runtime for an OAuth provider record. Absent on the shared Bedrock record. |
-| `accounts[].agent_runtimes` | string array | `["pi", "hermes"]` | Runtimes that use the shared Bedrock provider. Present only on the Bedrock record. |
-| `accounts[].provider` | enum | `openai`, `claude`, `bedrock` | Managed AI provider. Pi and Hermes share the single `bedrock` provider record. |
-| `accounts[].status` | enum | `deactivated`, `loading`, `awaiting_login`, `active`, `error` | Current provider account status. OAuth runtimes use `awaiting_login` when operator login is required. Bedrock has no OAuth flow: its one shared status is `awaiting_login` until a synchronously validated credential is connected, then `active`. That status is projected into both Pi and Hermes runtime rows. Later inference failures are reported on their tasks, not persisted as provider status. |
+| `accounts[].agent_runtime` | enum | `codex`, `claude_code` | Runtime for an OAuth provider record. Absent on the Bedrock record. |
+| `accounts[].agent_runtimes` | string array | `["hermes"]` | Runtime that uses the Bedrock provider. Present only on the Bedrock record. |
+| `accounts[].provider` | enum | `openai`, `claude`, `bedrock` | Managed AI provider. |
+| `accounts[].status` | enum | `deactivated`, `loading`, `awaiting_login`, `active`, `error` | Current provider account status. OAuth runtimes use `awaiting_login` when operator login is required. Bedrock has no OAuth flow: its status is `awaiting_login` until a synchronously validated credential is connected, then `active`. Later inference failures are reported on their tasks, not persisted as provider status. |
 | `accounts[].account_id` | string | optional | The linked provider account id; for `bedrock` this is the 12-digit AWS account id. Present whenever a validated account identity is available. |
 | `accounts[].email` | string | optional | Present when available from the linked account metadata. |
 | `accounts[].arn` | string | optional | The STS-attested IAM identity of the connected AWS credential. Present only on the Bedrock provider record while its account is linked. |
@@ -360,12 +348,12 @@ Agent account response fields:
 | `accounts[].claude_usage.fable_weekly_used_percent` | number | optional | Percent used for the Fable-specific weekly window. |
 | `accounts[].claude_usage.fable_weekly_resets_at` | number | optional | Unix timestamp when the Fable-specific weekly window resets. |
 | `accounts[].claude_usage.last_checked_at` | string | optional | UTC timestamp of the provider read that produced this Claude usage snapshot. Active runtimes are rechecked every 300 seconds; the explicit refresh endpoint forces an immediate provider read. If no usage window parses, `claude_usage` is absent rather than stale. |
-| `accounts[].bedrock_usage` | object | always on the `bedrock` record | Live month-to-date usage, one entry per Bedrock runtime (`pi`, `hermes`). For each allowed Bedrock response the network proxy records the token usage AWS reports and the USD it prices that response at, per runtime, model, and UTC day; this sums the current month from those stored counters, so every accounts read is current with no AWS call. Usage survives credential resets: the counters record work already done. |
-| `accounts[].bedrock_usage.<runtime>.month_to_date` | number |  | Current-month cost: the sum of the USD the proxy priced each metered response at when it recorded it, using the host's on-demand catalog rates. Final once recorded — a later rate edit does not rewrite it. An estimate of what AWS will bill, not the bill itself. |
-| `accounts[].bedrock_usage.<runtime>.currency` | string |  | Always `USD` (the catalog rates' currency). |
-| `accounts[].bedrock_usage.<runtime>.requests` | number |  | Allowed Bedrock invocations forwarded for this runtime this month. |
-| `accounts[].bedrock_usage.<runtime>.metered_requests` | number |  | Invocations whose response carried a parseable usage record. A gap below `requests` means AWS errors or unparsed responses, that is, possible undercounting. A model outside the price table is still metered; its tokens count but it adds nothing to `month_to_date`. |
-| `accounts[].bedrock_usage.<runtime>.input_tokens`, `.output_tokens`, `.cache_read_tokens`, `.cache_write_tokens` | number |  | Month-to-date token totals as AWS reported them per response. The cached-token counters mirror the Converse usage shape but stay zero: Bedrock prompt caching covers only model families outside this catalog. |
+| `accounts[].bedrock_usage` | object | always on the `bedrock` record | Live Hermes month-to-date usage. For each allowed Bedrock response the network proxy records the token usage AWS reports and the USD it prices that response at, per model and UTC day; this sums the current month from those stored counters, so every accounts read is current with no AWS call. Usage survives credential resets: the counters record work already done. |
+| `accounts[].bedrock_usage.month_to_date` | number |  | Current-month cost: the sum of the USD the proxy priced each metered response at when it recorded it, using the host's on-demand catalog rates. Final once recorded; a later rate edit does not rewrite it. An estimate of what AWS will bill, not the bill itself. |
+| `accounts[].bedrock_usage.currency` | string |  | Always `USD` (the catalog rates' currency). |
+| `accounts[].bedrock_usage.requests` | number |  | Allowed Bedrock invocations forwarded this month. |
+| `accounts[].bedrock_usage.metered_requests` | number |  | Invocations whose response carried a parseable usage record. A gap below `requests` means AWS errors or unparsed responses, that is, possible undercounting. A model outside the price table is still metered; its tokens count but it adds nothing to `month_to_date`. |
+| `accounts[].bedrock_usage.input_tokens`, `.output_tokens`, `.cache_read_tokens`, `.cache_write_tokens` | number |  | Month-to-date token totals as AWS reported them per response. The cached-token counters mirror the Converse usage shape but stay zero: Bedrock prompt caching covers only model families outside this catalog. |
 
 Codex OAuth login response:
 
@@ -437,9 +425,9 @@ GET  /v1/threads/{thread_id}/events
 
 Every task belongs to a client-chosen thread (`thread_id`). Tasks on the same
 thread share one runtime conversation and run one at a time in creation order;
-tasks on different threads run in parallel, up to 12 total and up to 3 per
+tasks on different threads run in parallel, up to 9 total and up to 3 per
 runtime. Codex resumes the thread's provider conversation by id on a fresh
-app-server; Claude Code, Pi, and Hermes resume by their recorded provider
+app-server; Claude Code and Hermes resume by their recorded provider
 session ids. To start a fresh conversation with no prior
 context, use a new `thread_id`. A `thread_id` belongs to the first runtime that
 uses it; creating a task for the same `thread_id` with another runtime returns
@@ -459,7 +447,7 @@ Task endpoints:
 | `GET` | `/v1/tasks?last_seen_task_id=<task_id>` | `last_seen_task_id` query parameter is optional | Task list response | Lists up to 5 current and pending tasks with their status, in execution order. |
 | `GET` | `/v1/tasks/{task_id}` | none | Task response | Returns one task. |
 | `PUT` | `/v1/tasks/{task_id}` | Update task request | Task response | Updates one pending task. Only tasks with status `queued` can be updated. |
-| `POST` | `/v1/tasks/{task_id}/steer` | Steer task request | Steer task response | Sends additional steering to one running Codex, Claude Code, or Pi task. Hermes does not support steering; create a new task on the same `thread_id` instead. |
+| `POST` | `/v1/tasks/{task_id}/steer` | Steer task request | Steer task response | Sends additional steering to one running Codex or Claude Code task. Hermes does not support steering; create a new task on the same `thread_id` instead. |
 | `POST` | `/v1/tasks/{task_id}/cancel` | none | Task cancel response | Requests cancellation for one pending task. Only tasks with status `queued` can be cancelled. |
 | `POST` | `/v1/tasks/{task_id}/kill` | none | Task kill response | Kills one running task: its runtime process is terminated and the task becomes `cancelled`. Only tasks with status `running` can be killed; returns `409` otherwise. The thread itself survives — a later task on the same `thread_id` resumes the conversation. |
 | `GET` | `/v1/threads` | none | Thread list response | Lists recent runtime threads, including active queued/running work and retained runtime session mappings. |
@@ -482,9 +470,9 @@ Create task request fields:
 
 | Field | Required | Type | Meaning |
 | --- | --- | --- | --- |
-| `agent_runtime` | New thread | enum | Runtime to execute the task: `codex`, `claude_code`, `pi`, or `hermes`. Supply it together with `model` and `effort`. An existing thread accepts all three when they exactly match its fixed configuration, or none of them. |
-| `model` | New thread | enum | Model for this session. Codex accepts `gpt-5.6-terra`, `gpt-5.6-sol`, or `gpt-5.6-luna`; Claude Code accepts `opus`, `fable`, or `sonnet`; Pi and Hermes accept the Bedrock model ids `deepseek.v3.2`, `qwen.qwen3-coder-next`, or `moonshotai.kimi-k2.5`. Must be supplied together with `agent_runtime` and `effort`. |
-| `effort` | New thread | enum | Effort for this session. Codex accepts `high`, `max`, or `ultra`, except Luna accepts only `high` or `max`. Claude Code accepts `high`, `max`, or `ultracode`; `ultracode` enables its xhigh effort plus dynamic workflow orchestration. Pi accepts `medium`, `high`, or `max`, passed through as its thinking level; Hermes accepts `high` (its headless CLI exposes no effort control). Must be supplied together with `agent_runtime` and `model`. |
+| `agent_runtime` | New thread | enum | Runtime to execute the task: `codex`, `claude_code`, or `hermes`. Supply it together with `model` and `effort`. An existing thread accepts all three when they exactly match its fixed configuration, or none of them. |
+| `model` | New thread | enum | Model for this session. Codex accepts `gpt-5.6-terra`, `gpt-5.6-sol`, or `gpt-5.6-luna`; Claude Code accepts `opus`, `fable`, or `sonnet`; Hermes accepts the Bedrock model ids `deepseek.v3.2`, `qwen.qwen3-coder-next`, or `moonshotai.kimi-k2.5`. Must be supplied together with `agent_runtime` and `effort`. |
+| `effort` | New thread | enum | Effort for this session. Codex accepts `high`, `max`, or `ultra`, except Luna accepts only `high` or `max`. Claude Code accepts `high`, `max`, or `ultracode`; `ultracode` enables its xhigh effort plus dynamic workflow orchestration. Hermes accepts `high` (its headless CLI exposes no effort control). Must be supplied together with `agent_runtime` and `model`. |
 | `input_message` | Yes | string | Task message for the agent runtime. Must be 1 to 50,000 characters. |
 | `thread_id` | Yes | string | Client-generated conversation id this task belongs to. Must be 1 to 64 characters of `A-Z`, `a-z`, `0-9`, `-`, or `_`. The first task requires and fixes the runtime, model, and effort on the thread. Later tasks may omit all three or repeat the complete matching triple; a partial or conflicting configuration returns `400`. Omitting them for an unknown thread also returns `400`. Thread rows referenced by retained tasks are preserved; otherwise the host retains the 100,000 most recently used mappings per runtime. Once a thread is no longer retained, supplying a configuration starts a fresh provider conversation. |
 
@@ -520,7 +508,7 @@ Task response fields:
 | --- | --- | --- | --- |
 | `task_id` | string |  | Host-generated task id. |
 | `status` | enum | `queued`, `running`, `completed`, `failed`, `cancelled` | Current task status. |
-| `agent_runtime` | enum | `codex`, `claude_code`, `pi`, `hermes` | Runtime assigned to this task. |
+| `agent_runtime` | enum | `codex`, `claude_code`, `hermes` | Runtime assigned to this task. |
 | `model` | enum | See create request | Model assigned to this task and its session. |
 | `effort` | enum | See create request | Effort assigned to this task and its session. |
 | `thread_id` | string |  | Conversation thread this task belongs to. |
@@ -574,7 +562,7 @@ Task list response fields:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `tasks` | Task response array | Up to 5 tasks. The first page starts with the running tasks followed by pending tasks in creation order. Later pages continue after `last_seen_task_id`. Completed, failed, and cancelled tasks are not included. |
-| `tasks[].queue_position` | integer | Queue position for this task. `0` marks every currently running task (up to 12 total and up to 3 per runtime run in parallel). Pending tasks use `1`, `2`, `3`, and so on in creation order. If no task is running, pending tasks still start at `1`. A pending task can run ahead of an earlier one when the earlier task waits on a busy thread or when an earlier task's runtime is already at its per-runtime cap. |
+| `tasks[].queue_position` | integer | Queue position for this task. `0` marks every currently running task (up to 9 total and up to 3 per runtime run in parallel). Pending tasks use `1`, `2`, `3`, and so on in creation order. If no task is running, pending tasks still start at `1`. A pending task can run ahead of an earlier one when the earlier task waits on a busy thread or when an earlier task's runtime is already at its per-runtime cap. |
 
 Thread list response:
 
@@ -600,7 +588,7 @@ Thread list response fields:
 | --- | --- | --- |
 | `threads` | thread array | Recent known threads sorted by `last_used_at` descending. |
 | `threads[].thread_id` | string | Client-generated conversation id. |
-| `threads[].agent_runtime` | enum | Runtime for this thread entry: `codex`, `claude_code`, `pi`, or `hermes`. |
+| `threads[].agent_runtime` | enum | Runtime for this thread entry: `codex`, `claude_code`, or `hermes`. |
 | `threads[].model` | enum | Model fixed for this session. |
 | `threads[].effort` | enum | Effort fixed for this session. |
 | `threads[].last_used_at` | string | Latest retained task update or runtime session use timestamp known for this thread/runtime. |
@@ -641,7 +629,7 @@ Steer task request fields:
 
 | Field | Required | Type | Meaning |
 | --- | --- | --- | --- |
-| `steer_message` | Yes | string | Additional steering message for a running Codex, Claude Code, or Pi task. Must be 1 to 50,000 characters. A task holds at most 20 undelivered steer messages at a time; delivered steers leave the queue (their content is preserved as `task.message` events). Hermes rejects steering because its headless process has no mid-turn input channel. |
+| `steer_message` | Yes | string | Additional steering message for a running Codex or Claude Code task. Must be 1 to 50,000 characters. A task holds at most 20 undelivered steer messages at a time; delivered steers leave the queue (their content is preserved as `task.message` events). Hermes rejects steering because its headless process has no mid-turn input channel. |
 
 Steer task response:
 
@@ -805,19 +793,19 @@ agent_runtime.deactivated
 It is emitted when a queued task is cancelled or a running task is killed.
 
 `agent_runtime.active` uses `task_id: null` and payload
-`{"agent_runtime": "codex"}`, `{"agent_runtime": "claude_code"}`, `{"agent_runtime": "pi"}`, or `{"agent_runtime": "hermes"}`.
+`{"agent_runtime": "codex"}`, `{"agent_runtime": "claude_code"}`, or `{"agent_runtime": "hermes"}`.
 
 `agent_runtime.login_completed` uses `task_id: null` and payload
-`{"agent_runtime": "codex"}` or `{"agent_runtime": "claude_code"}`. Pi and
-Hermes have no login flow.
+`{"agent_runtime": "codex"}` or `{"agent_runtime": "claude_code"}`. Hermes has
+no login flow.
 
 `agent_runtime.linked_account_reset` uses `task_id: null` and payload
-`{"agent_runtime": "codex"}`, `{"agent_runtime": "claude_code"}`, `{"agent_runtime": "pi"}`, or `{"agent_runtime": "hermes"}` when an
+`{"agent_runtime": "codex"}`, `{"agent_runtime": "claude_code"}`, or `{"agent_runtime": "hermes"}` when an
 operator reset cleared that runtime's linked account (the audit record of the
 reset-linked-account endpoint).
 
 `agent_runtime.deactivated` uses `task_id: null` and payload
-`{"agent_runtime": "codex"}`, `{"agent_runtime": "claude_code"}`, `{"agent_runtime": "pi"}`, or `{"agent_runtime": "hermes"}` when a
+`{"agent_runtime": "codex"}`, `{"agent_runtime": "claude_code"}`, or `{"agent_runtime": "hermes"}` when a
 runtime is disabled because its managed provider integration is disabled.
 
 ## Agent Files
@@ -825,6 +813,7 @@ runtime is disabled because its managed provider integration is disabled.
 ```text
 GET /v1/agent-files?path=<path>
 GET /v1/agent-files/read?path=<path>
+POST /v1/agent-files/upload?filename=<name>
 ```
 
 Agent file endpoints:
@@ -833,6 +822,7 @@ Agent file endpoints:
 | --- | --- | --- | --- | --- |
 | `GET` | `/v1/agent-files?path=<path>` | `path` query parameter is optional; default `/` | Agent file list response | Lists one directory under the agent home, including hidden entries. |
 | `GET` | `/v1/agent-files/read?path=<path>` | `path` query parameter is optional; default `/` | Agent file read response | Reads one regular file under the agent home as a UTF-8 text preview. |
+| `POST` | `/v1/agent-files/upload?filename=<name>` | Raw file bytes; `Content-Length` is required | `{"file": {...}}` | Uploads one file into the agent home's `user-files/` directory. The body is capped at 25 MiB. |
 
 The API treats `/` as `/mnt/trustyclaw-agent/agent-home`. Paths that resolve
 outside that home are rejected. Symlinks are not supported: directory listings
@@ -875,6 +865,28 @@ Agent file read response:
 File reads are capped at 1 MiB. If the file is larger, `truncated` is `true`
 and `content` contains the first 1 MiB decoded with replacement characters for
 invalid UTF-8 bytes.
+
+Upload `filename` is the original basename, not a path. It must be non-empty,
+at most 200 UTF-8 bytes, and contain no slash, backslash, NUL, or control
+character. The host publishes a completed upload atomically under
+`user-files/` and prefixes its stored name with a sortable UTC timestamp. It
+never overwrites an existing file. Incomplete uploads are removed.
+
+```json
+{
+  "file": {
+    "path": "user-files/20260722T120000.123456Z_reference.png",
+    "name": "20260722T120000.123456Z_reference.png",
+    "original_name": "reference.png",
+    "size_bytes": 12345,
+    "uploaded_at": "2026-07-22T12:00:00.123456Z"
+  }
+}
+```
+
+`path` is relative to `/mnt/trustyclaw-agent/agent-home`, which is also the
+agent runtime's working directory. Uploads are durable workspace data and are
+not pruned automatically.
 
 ## Agent Processes
 
@@ -1179,6 +1191,7 @@ host-derived resources assigned to each one:
     {
       "id": "agent_chat",
       "title": "Agent Chat",
+      "release_stage": "stable",
       "backend": {
         "api_route": "/v1/apps/agent_chat/api/"
       },
@@ -1194,6 +1207,7 @@ host-derived resources assigned to each one:
 | Field | Meaning |
 | --- | --- |
 | `apps[].id`, `title` | Stable manifest id and operator-facing title. |
+| `apps[].release_stage` | Required manifest stage: `stable` or `beta`. The admin shell places beta apps in a collapsed group; this field grants no additional authority. |
 | `apps[].backend.api_route` | Authenticated admin API prefix that reverse-proxies to this app backend. |
 | `apps[].ui.iframe_src` | Static entry point mounted by the admin API. |
 | `apps[].ui.sandbox` | iframe permissions the admin shell applies. `allow-same-origin` is deliberately absent, so the app frame has an opaque origin. |

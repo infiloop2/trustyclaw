@@ -387,7 +387,7 @@ def desktop_smoke(page: Any) -> None:
     from playwright.sync_api import expect
 
     expect(page.locator("#sidebar-apps")).to_contain_text("Apps")
-    page.locator("#app-tabs").get_by_role("button", name="Social Marketer", exact=True).click()
+    page.locator("#beta-app-tabs").get_by_role("button", name="Social Marketer", exact=True).click()
     expect(page.locator("#panel-app-social_marketer")).to_be_visible()
     frame = page.frame_locator('iframe[title="Social Marketer"]')
 
@@ -456,7 +456,7 @@ def mobile_smoke(page: Any) -> None:
     expect(page.locator("#sidebar-apps")).to_contain_text("Apps")
     page.locator("#mobile-nav-toggle").click()
     expect(page.locator("#nav-backdrop")).to_be_visible()
-    page.locator("#app-tabs").get_by_role("button", name="Social Marketer", exact=True).click()
+    page.locator("#beta-app-tabs").get_by_role("button", name="Social Marketer", exact=True).click()
     expect(page.locator("#nav-backdrop")).to_be_hidden()
     expect(page.locator("#panel-app-social_marketer")).to_be_visible()
     frame = page.frame_locator('iframe[title="Social Marketer"]')

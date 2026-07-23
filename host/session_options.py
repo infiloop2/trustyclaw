@@ -14,13 +14,7 @@ SESSION_OPTIONS: dict[str, dict[str, tuple[str, ...]]] = {
         "fable": ("high", "max", "ultracode"),
         "sonnet": ("high", "max", "ultracode"),
     },
-    # Both Bedrock harnesses expose the same small model catalog. Pi maps its
-    # efforts onto thinking levels; Hermes's headless CLI has no effort flag.
-    "pi": {
-        "deepseek.v3.2": ("medium", "high", "max"),
-        "qwen.qwen3-coder-next": ("medium", "high", "max"),
-        "moonshotai.kimi-k2.5": ("medium", "high", "max"),
-    },
+    # Hermes's headless CLI has no effort flag.
     "hermes": {
         "deepseek.v3.2": ("high",),
         "qwen.qwen3-coder-next": ("high",),

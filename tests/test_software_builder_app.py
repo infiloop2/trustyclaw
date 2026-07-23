@@ -69,7 +69,10 @@ class WorkspaceBaseMigrationTests(unittest.TestCase):
         # no domain tables, so its migrations are the copied workspace base and
         # the kit-wide runtime-constraint update.
         migrations = sorted(p.name for p in (BUILDER_DIR / "migrations").glob("*.sql"))
-        self.assertEqual(migrations, ["0001_workspace_base.sql", "0002_pi_hermes_runtimes.sql"])
+        self.assertEqual(
+            migrations,
+            ["0001_workspace_base.sql", "0002_pi_hermes_runtimes.sql", "0003_remove_pi_runtime.sql"],
+        )
 
 
 class AgentInstructionsTests(unittest.TestCase):

@@ -567,7 +567,7 @@ def read_claude_account(cur: Any = None) -> dict[str, Any]:
 
 
 def save_bedrock_account(account: dict[str, Any] | None, cur: Any = None) -> None:
-    """Cache the shared AWS-attested identity for both harnesses."""
+    """Cache the AWS-attested identity for Hermes."""
     _save_provider_account("bedrock", account or {}, cur)
 
 
@@ -861,9 +861,9 @@ _BEDROCK_USAGE_COUNTERS = (
 
 
 def record_bedrock_usage(
-    runtime: str, model_id: str, usage: dict[str, int] | None, cost_usd: float
+    model_id: str, usage: dict[str, int] | None, cost_usd: float
 ) -> None:
-    """Add one allowed Bedrock invocation to its (runtime, model, UTC day)
+    """Add one allowed Bedrock invocation to its (model, UTC day)
     counter row. Runs in the proxy process under its own database role.
     ``usage`` is the token usage AWS reported in the response, or None when
     the response carried none (an AWS error, or a shape the meter could not
@@ -892,12 +892,11 @@ def record_bedrock_usage(
     )
     with db.transaction() as cur:
         cur.execute(
-            "INSERT INTO bedrock_usage (runtime, model_id, day, requests, "
+            "INSERT INTO bedrock_usage (model_id, day, requests, "
             + ", ".join(columns)
-            + ") VALUES (%s, %s, %s, 1, %s, %s, %s, %s, %s, %s)"
-            " ON CONFLICT (runtime, model_id, day) DO UPDATE SET " + assignments,
+            + ") VALUES (%s, %s, 1, %s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (model_id, day) DO UPDATE SET " + assignments,
             (
-                runtime,
                 model_id,
                 time.strftime("%Y-%m-%d", time.gmtime()),
                 *(counters[column] for column in _BEDROCK_USAGE_COUNTERS),
@@ -907,26 +906,25 @@ def record_bedrock_usage(
 
 
 def read_bedrock_usage(since_day: str) -> list[dict[str, Any]]:
-    """Per-(runtime, model) counter totals for UTC days >= ``since_day``
+    """Per-model counter totals for UTC days >= ``since_day``
     (an ISO date, typically the first of the current month). ``cost_usd`` is
     the summed recorded cost — the final figure, not a re-priced estimate."""
     with db.transaction() as cur:
         cur.execute(
-            "SELECT runtime, model_id, SUM(requests), "
+            "SELECT model_id, SUM(requests), "
             + ", ".join(f"SUM({column})" for column in _BEDROCK_USAGE_COUNTERS)
             + ", SUM(cost_usd)"
-            + " FROM bedrock_usage WHERE day >= %s GROUP BY runtime, model_id"
-            " ORDER BY runtime, model_id",
+            + " FROM bedrock_usage WHERE day >= %s GROUP BY model_id"
+            " ORDER BY model_id",
             (since_day,),
         )
         rows = cur.fetchall()
     return [
         {
-            "runtime": str(row[0]),
-            "model_id": str(row[1]),
-            "requests": int(row[2]),
-            **{column: int(row[3 + index]) for index, column in enumerate(_BEDROCK_USAGE_COUNTERS)},
-            "cost_usd": float(row[3 + len(_BEDROCK_USAGE_COUNTERS)]),
+            "model_id": str(row[0]),
+            "requests": int(row[1]),
+            **{column: int(row[2 + index]) for index, column in enumerate(_BEDROCK_USAGE_COUNTERS)},
+            "cost_usd": float(row[2 + len(_BEDROCK_USAGE_COUNTERS)]),
         }
         for row in rows
     ]

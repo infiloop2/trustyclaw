@@ -1,6 +1,6 @@
 """Bedrock request guard, proxy re-signing, and usage-meter selection.
 
-Pi and Hermes sign with fixed dummy AWS values that carry no provider
+Hermes signs with fixed dummy AWS values that carry no provider
 capability. The proxy admits only the configured region's model invocation
 routes with an expected dummy access-key id and Bedrock SigV4 scope, then
 re-signs the exact request body and signed headers with the active operator
@@ -8,9 +8,7 @@ credential. The operator key never enters an agent process. Query-string auth,
 temporary session credentials, the Bedrock control plane, other AWS services,
 and unconfigured regions fail closed.
 
-Each harness signs with its own routing key id, so an allowed invocation also
-selects a response meter attributed to that runtime (see
-``host.network_integrations.bedrock.usage``).
+An allowed invocation also selects its response usage meter.
 """
 
 from __future__ import annotations
@@ -20,7 +18,7 @@ import re
 from host.network_integrations.bedrock import usage
 from host.network_integrations.bedrock.manifest import (
     BedrockIntegration,
-    ROUTING_ACCESS_KEY_IDS,
+    ROUTING_ACCESS_KEY_ID,
     SUPPORTED_REGIONS,
     region_host,
 )
@@ -28,12 +26,11 @@ from host.runtime.core import aws_sigv4
 from host.runtime.core.network_policy import normalized_path, route_allowed
 from host.runtime.core.state import read_bedrock_proxy_credential
 
-# Pi and Hermes both use Bedrock Converse. Session model ids never contain a
+# Hermes uses Bedrock Converse. Session model ids never contain a
 # path separator, so one segment is enough; an encoded slash in the model
 # segment normalizes into extra segments and fails closed.
 _MODEL_ROUTE_RE = re.compile(r"^/model/([^/]+)/(?:converse|converse-stream)$")
 ROUTES = (("POST",), (_MODEL_ROUTE_RE.pattern,))
-_RUNTIMES_BY_ROUTING_KEY = {key: runtime for runtime, key in ROUTING_ACCESS_KEY_IDS.items()}
 _QUERY_AUTH_RE = re.compile(r"(?:^|&)x-amz-(?:signature|credential)=", re.IGNORECASE)
 
 
@@ -72,7 +69,7 @@ def request_denied(
     parsed = aws_sigv4.parse_authorization(header_map.get("authorization", ""))
     if parsed is None:
         return "bedrock_signature_required"
-    if parsed.access_key_id not in _RUNTIMES_BY_ROUTING_KEY:
+    if parsed.access_key_id != ROUTING_ACCESS_KEY_ID:
         return "bedrock_access_key_mismatch"
     if not config.enabled:
         return "bedrock_credentials_unavailable"
@@ -110,7 +107,7 @@ def rewrite_request_headers(
     parsed = aws_sigv4.parse_authorization(header_map.get("authorization", ""))
     if parsed is None:
         return headers
-    if parsed.access_key_id not in _RUNTIMES_BY_ROUTING_KEY:
+    if parsed.access_key_id != ROUTING_ACCESS_KEY_ID:
         return headers
     credential = read_bedrock_proxy_credential()
     if credential is None:
@@ -157,18 +154,14 @@ def response_meter(
     """The usage meter for this allowed model invocation, or None.
 
     Runs only after ``request_denied`` returned None, so the route and signing
-    identity are already vetted; this re-reads both purely to attribute the
-    response to the invoking runtime and model."""
+    identity are already vetted; this re-reads the route purely to identify
+    the invoked model."""
     del config, method, host, query, body
     match = _MODEL_ROUTE_RE.match(normalized_path(path))
     if match is None:
         return None
-    header_map = {key.lower(): value for key, value in headers}
-    parsed = aws_sigv4.parse_authorization(header_map.get("authorization", ""))
-    runtime = _RUNTIMES_BY_ROUTING_KEY.get(parsed.access_key_id) if parsed else None
-    if runtime is None:
-        return None
-    return usage.BedrockResponseMeter(runtime, match.group(1)[:256])
+    del headers
+    return usage.BedrockResponseMeter(match.group(1)[:256])
 
 
 def _with_host_header(headers: list[tuple[str, str]], host: str) -> list[tuple[str, str]]:

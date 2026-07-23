@@ -58,6 +58,18 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* The host owns app-requested file selection. Keep the input rendered because
+   Safari/iOS may ignore programmatic clicks on display:none file controls. */
+.host-file-picker {
+  height: 1px;
+  left: -10000px;
+  opacity: 0;
+  pointer-events: none;
+  position: fixed;
+  top: 0;
+  width: 1px;
+}
+
 /* Ambient backdrop: faint top glow + hairline grid, kept very quiet. */
 .bg-glow {
   background:
@@ -129,6 +141,14 @@ body {
 }
 
 .runtime-overview {
+  display: flex;
+  justify-content: center;
+  min-width: 0;
+  /* Anchor for the phone's floating usage overlay (position: absolute below). */
+  position: relative;
+}
+
+.runtime-overview-panel {
   /* stretch so every box takes the tallest box's height (the ring boxes); the
      Bedrock stat boxes grow to match. One row only — a wrapped row would grow
      the fixed desktop topbar past its reserved height and overlap the page. */
@@ -140,6 +160,38 @@ body {
 }
 
 .runtime-refresh { align-self: center; flex: 0 0 auto; }
+
+/* Collapsed usage pill: a full-width, thumb-sized toggle reading
+   "Agent usage · N running / All idle" with a chevron. It only earns its keep
+   on a phone, where the three boxes would otherwise own a quarter of the screen;
+   desktop keeps the panel inline and leaves this hidden (display: none here,
+   flipped to flex in the phone media query). */
+.runtime-overview-toggle {
+  align-items: center;
+  background: rgba(16, 21, 29, 0.85);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  color: var(--text);
+  cursor: pointer;
+  display: none;
+  gap: 0.5rem;
+  min-height: 2.5rem;
+  padding: 0.3rem 0.7rem;
+  width: 100%;
+}
+
+.runtime-overview-toggle:hover { background: var(--surface-2); border-color: var(--border-strong); }
+.rot-icon { align-items: center; color: var(--text-dim); display: flex; flex: 0 0 auto; }
+.rot-label { font-size: 0.82rem; font-weight: 650; }
+.rot-summary {
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  margin-left: auto;
+}
+.rot-summary.busy { color: var(--accent); }
+.rot-chevron { align-items: center; color: var(--text-dim); display: flex; flex: 0 0 auto; transition: transform 160ms ease; }
+.runtime-overview.expanded .rot-chevron { transform: rotate(180deg); }
 
 .runtime-summary {
   align-items: center;
@@ -162,7 +214,7 @@ button.runtime-summary:hover {
   border-color: var(--border-strong);
 }
 
-/* A Bedrock runtime box (Pi, Hermes) shows a pay-per-token readout in place of
+/* The Hermes runtime box shows a pay-per-token readout in place of
    the subscription quota rings: three stacked figures (input, output, cost)
    that mirror the ring row, so the box shell (shared .runtime-summary) reads at
    the same visual weight. */
@@ -294,13 +346,6 @@ button.runtime-summary:hover {
   gap: 0.14rem;
   min-width: 0;
   padding: 0.4rem 0.55rem;
-}
-.bedrock-usage-runtime {
-  color: var(--text-dim);
-  font-family: var(--font-mono);
-  font-size: 0.55rem;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 .bedrock-usage-cost { font-size: 0.82rem; }
 .bedrock-usage-tokens { color: var(--text-dim); font-family: var(--font-mono); font-size: 0.62rem; }
@@ -515,6 +560,31 @@ main { min-width: 0; }
   align-items: center;
   display: flex;
   gap: 0.35rem;
+}
+
+button.sidebar-apps-toggle {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  display: inline-flex;
+  font: inherit;
+  gap: 0.3rem;
+  letter-spacing: inherit;
+  padding: 0;
+  text-transform: inherit;
+}
+
+button.sidebar-apps-toggle:hover,
+button.sidebar-apps-toggle:focus-visible {
+  background: transparent;
+  color: var(--accent);
+}
+
+.sidebar-apps-chevron { transition: transform 0.12s ease; }
+
+.sidebar-apps-toggle[aria-expanded="true"] .sidebar-apps-chevron {
+  transform: rotate(90deg);
 }
 
 button.sidebar-info-button {
@@ -2201,13 +2271,35 @@ a:hover { text-decoration: underline; }
   .brand { grid-area: brand; }
   button.mobile-nav-toggle.icon-button { display: inline-flex; flex: 0 0 auto; }
   .agent-chip { display: inline-flex; max-width: min(40vw, 15rem); }
-  .runtime-overview { display: grid; grid-area: runtimes; grid-template-columns: repeat(2, minmax(0, 1fr)) auto; width: 100%; }
+  /* Collapsed by default: only the slim pill shows, so an open app keeps the
+     full screen. Tapping the pill drops the three boxes down as a floating
+     overlay (position: absolute) so the app underneath keeps its size instead
+     of reflowing; a tap outside, the pill, or Escape dismisses it. */
+  .runtime-overview { display: block; grid-area: runtimes; width: 100%; }
+  .runtime-overview-toggle { display: flex; }
+  .runtime-overview-panel { display: none; }
+  .runtime-overview.expanded .runtime-overview-panel {
+    backdrop-filter: blur(18px);
+    background: rgba(12, 16, 23, 0.97);
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+    display: grid;
+    gap: 0.35rem;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    left: 0;
+    padding: 0.5rem;
+    position: absolute;
+    right: 0;
+    top: calc(100% + 0.4rem);
+    z-index: 90;
+  }
   .topbar-actions { grid-area: actions; }
 
   .runtime-summary { min-width: 0; width: 100%; }
-  /* Four runtime boxes fill the two columns (two rows); the refresh button
-     sits in its own column, centered across both rows. */
-  .runtime-overview > .runtime-refresh { align-self: center; grid-column: 3; grid-row: 1 / span 2; }
+  /* The phone folds the hard refresh into the open gesture (opening re-polls the
+     providers), so the panel carries no separate refresh button. */
+  .runtime-overview-panel > .runtime-refresh { display: none; }
 
   .shell {
     gap: 0.9rem;
@@ -2378,13 +2470,8 @@ a:hover { text-decoration: underline; }
 @media (max-width: 430px) {
   .brand-name { display: none; }
   .agent-chip { max-width: 43vw; }
-  .runtime-overview { grid-template-columns: minmax(0, 1fr) auto; }
-  .runtime-overview > .runtime-summary { grid-column: 1; }
-  .runtime-overview > .runtime-summary:nth-child(1) { grid-row: 1; }
-  .runtime-overview > .runtime-summary:nth-child(2) { grid-row: 2; }
-  .runtime-overview > .runtime-summary:nth-child(3) { grid-row: 3; }
-  .runtime-overview > .runtime-summary:nth-child(4) { grid-row: 4; }
-  .runtime-refresh { align-self: center; grid-column: 2; grid-row: 1 / span 4; }
+  /* Narrow phones stack the three boxes in a single column inside the overlay. */
+  .runtime-overview.expanded .runtime-overview-panel { grid-template-columns: minmax(0, 1fr); }
   .runtime-summary { gap: 0.25rem; padding-left: 0.4rem; padding-right: 0.3rem; }
   .runtime-summary-copy { font-size: 0.7rem; }
   .runtime-state { max-width: 8rem; }

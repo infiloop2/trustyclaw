@@ -95,3 +95,4 @@ privilege escalation.
 | Path | Access | Contents |
 | --- | --- | --- |
 | `/mnt/trustyclaw-agent/agent-home/` | agent writable, with selected immutable root-owned files | Agent runtime auth, provider session files, CLI caches, workspace data, and the small bootstrap-managed instruction/config files installed after symlink slots are sanitized. |
+| `/mnt/trustyclaw-agent/agent-home/user-files/` | agent writable | Durable operator uploads. Stored names begin with a UTC upload timestamp; uploads publish atomically and are not pruned automatically. |

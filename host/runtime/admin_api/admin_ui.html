@@ -70,6 +70,7 @@
         <span>Home</span>
       </button>
       <div id="hero-app-tab"></div>
+      <div id="stable-app-tabs"></div>
       <div class="sidebar-divider" aria-hidden="true"></div>
       <div id="sidebar-configuration" class="sidebar-section">
         <div class="sidebar-section-title">Configuration</div>
@@ -113,13 +114,16 @@
       <div class="sidebar-divider" aria-hidden="true"></div>
       <div id="sidebar-apps" class="sidebar-section">
         <div class="sidebar-section-title sidebar-beta-title">
-          <span>Apps (Beta)</span>
+          <button id="sidebar-apps-toggle" class="sidebar-apps-toggle" data-action="toggle-beta-apps" aria-expanded="false" aria-controls="beta-app-tabs">
+            <svg class="sidebar-apps-chevron" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="m4 2 4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>Apps (Beta)</span>
+          </button>
           <button class="sidebar-info-button" aria-label="About beta apps" aria-describedby="beta-info-popover">
             <span aria-hidden="true">i</span>
             <span id="beta-info-popover" class="sidebar-info-popover" role="tooltip">These apps are under development and may not function properly.</span>
           </button>
         </div>
-        <div id="app-tabs"></div>
+        <div id="beta-app-tabs" hidden></div>
       </div>
     </nav>
 

@@ -2166,7 +2166,7 @@ def _insert_event(cur: Any, content: str, meta: dict[str, Any], created_at: str 
 
 
 def _runtime_label(runtime: str) -> str:
-    return {"claude_code": "Claude Code", "pi": "Pi", "hermes": "Hermes"}.get(runtime, "Codex")
+    return {"claude_code": "Claude Code", "hermes": "Hermes"}.get(runtime, "Codex")
 
 
 # ---------------------------------------------------------------------------
@@ -2241,7 +2241,6 @@ def _overall_connection_status(
 RUNTIME_PROVIDERS = (
     ("codex", "openai"),
     ("claude_code", "claude"),
-    ("pi", "bedrock"),
     ("hermes", "bedrock"),
 )
 

@@ -1,4 +1,4 @@
-"""Shared AWS Bedrock and Pi/Hermes checks for persistent stage."""
+"""AWS Bedrock and Hermes checks for persistent stage."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from tests.stage.stage_support import CHEAP_MODELS, RUNTIME_LABELS
 
 
 class StageBedrockChecks(AwsSmoke):
-    """Bedrock setup, credential-boundary, task, and shared lifecycle checks."""
+    """Bedrock setup, credential-boundary, task, and lifecycle checks."""
 
     if TYPE_CHECKING:
         stage_bedrock_credential: tuple[str, str] | None
@@ -30,17 +30,13 @@ class StageBedrockChecks(AwsSmoke):
         def require_runtime_active(self, runtime: str) -> None: ...
 
     def autoconfigure_bedrock(self, suite: str) -> None:
-        """Validate one CI credential and enable the shared provider."""
-        selected = (
-            ("pi", "hermes")
-            if suite == "all"
-            else (suite,) if suite in {"pi", "hermes"} else ()
-        )
+        """Validate one CI credential and enable the provider."""
+        selected = ("hermes",) if suite in {"all", "hermes"} else ()
         if not selected or self.stage_bedrock_credential is None:
             return
 
         access_key_id, secret_access_key = self.stage_bedrock_credential
-        self._step("validate and enable the shared AWS Bedrock stage credential")
+        self._step("validate and enable the AWS Bedrock stage credential")
         try:
             result = self._api(
                 "POST",
@@ -53,11 +49,11 @@ class StageBedrockChecks(AwsSmoke):
             )
         except Exception as exc:  # noqa: BLE001 - preflight reports the integration independently
             self.bedrock_secret_error = (
-                f"shared Bedrock stage credential validation failed: {type(exc).__name__}: {exc}"
+                f"Bedrock stage credential validation failed: {type(exc).__name__}: {exc}"
             )
             return
         if result != {"status": "accepted"}:
-            raise AssertionError(f"shared Bedrock stage credential was not accepted: {result}")
+            raise AssertionError(f"Bedrock stage credential was not accepted: {result}")
 
         controls = self._api("GET", "/v1/network/policy").get("network_controls") or {}
         integrations = dict(controls.get("network_integrations") or {})
@@ -70,17 +66,17 @@ class StageBedrockChecks(AwsSmoke):
             )
             if status != "active":
                 raise AssertionError(
-                    f"shared Bedrock stage credential did not activate {runtime}: {status}"
+                    f"Bedrock stage credential did not activate {runtime}: {status}"
                 )
         self._ok(
-            f"shared Bedrock credential validated and activated for {', '.join(selected)} "
+            f"Bedrock credential validated and activated for {', '.join(selected)} "
             f"in {SMOKE_BEDROCK_REGION}"
         )
 
     def check_bedrock_auth_and_task(self) -> None:
         """Prove one Bedrock harness through the real proxy and model."""
         runtime = self.agent_runtime
-        if runtime not in {"pi", "hermes"}:
+        if runtime != "hermes":
             raise AssertionError(f"Bedrock check selected non-Bedrock runtime {runtime!r}")
         label = RUNTIME_LABELS[runtime]
         region = SMOKE_BEDROCK_REGION
@@ -92,22 +88,20 @@ class StageBedrockChecks(AwsSmoke):
         if (
             account.get("status") != "active"
             or account.get("provider") != "bedrock"
-            or account.get("agent_runtimes") != ["pi", "hermes"]
+            or account.get("agent_runtimes") != ["hermes"]
             or not account.get("account_id")
             or not account.get("arn")
         ):
-            raise AssertionError(f"shared Bedrock account has unexpected shape: {account}")
+            raise AssertionError(f"Bedrock account has unexpected shape: {account}")
         usage = account.get("bedrock_usage")
-        if not isinstance(usage, dict) or set(usage) != {"pi", "hermes"}:
-            raise AssertionError(f"shared Bedrock account omitted per-runtime usage: {account}")
-        for runtime_usage in usage.values():
-            estimate = runtime_usage.get("month_to_date")
-            if not isinstance(estimate, (int, float)) or estimate < 0:
-                raise AssertionError(f"Bedrock live usage estimate is invalid: {usage}")
-            if runtime_usage.get("currency") != "USD":
-                raise AssertionError(f"Bedrock live usage currency is invalid: {usage}")
-        # The real model task below must advance this runtime's own meter.
-        baseline_usage = dict(usage[runtime])
+        if not isinstance(usage, dict):
+            raise AssertionError(f"Bedrock account omitted usage: {account}")
+        estimate = usage.get("month_to_date")
+        if not isinstance(estimate, (int, float)) or estimate < 0:
+            raise AssertionError(f"Bedrock live usage estimate is invalid: {usage}")
+        if usage.get("currency") != "USD":
+            raise AssertionError(f"Bedrock live usage currency is invalid: {usage}")
+        baseline_usage = dict(usage)
         self._assert_provider_metadata(runtime, account)
 
         encrypted_rows = self._ssh_code(
@@ -222,7 +216,7 @@ class StageBedrockChecks(AwsSmoke):
         # completed tasks must have advanced this runtime's own counters, and
         # metering (not just request counting) must have parsed real response
         # shapes.
-        live_usage = self._agent_account(runtime).get("bedrock_usage", {}).get(runtime, {})
+        live_usage = self._agent_account(runtime).get("bedrock_usage", {})
         for counter in ("requests", "metered_requests", "input_tokens", "output_tokens"):
             if live_usage.get(counter, 0) <= baseline_usage.get(counter, 0):
                 raise AssertionError(
@@ -241,15 +235,14 @@ class StageBedrockChecks(AwsSmoke):
         )
 
     def check_bedrock_disable_stages_credential_for_reenable(self) -> None:
-        """One provider toggle deactivates both runtimes and retains its credential."""
-        self._step("shared Bedrock disable and re-enable")
+        """The provider toggle deactivates Hermes and retains its credential."""
+        self._step("Bedrock disable and re-enable")
         policy = self.enforcement_policy()
         policy["network_integrations"].pop("bedrock")
         self._api("PUT", "/v1/network/policy", policy)
-        for runtime in ("pi", "hermes"):
-            status = self._wait_for_runtime_status({"deactivated"}, runtime=runtime, timeout=90)
-            if status != "deactivated":
-                raise AssertionError(f"disabling Bedrock did not deactivate {runtime}: {status}")
+        status = self._wait_for_runtime_status({"deactivated"}, runtime="hermes", timeout=90)
+        if status != "deactivated":
+            raise AssertionError(f"disabling Bedrock did not deactivate Hermes: {status}")
         rows = self._ssh_code(
             "sudo -u postgres psql -tA -d trustyclaw_admin -c "
             "'SELECT count(*) FROM bedrock_credentials'"
@@ -258,8 +251,7 @@ class StageBedrockChecks(AwsSmoke):
             raise AssertionError(f"disabled Bedrock must retain its validated credential: {rows}")
 
         self._api("PUT", "/v1/network/policy", self.enforcement_policy())
-        for runtime in ("pi", "hermes"):
-            status = self._wait_for_runtime_status({"active", "error"}, runtime=runtime, timeout=180)
-            if status != "active":
-                raise AssertionError(f"re-enabling Bedrock did not reactivate {runtime}: {status}")
-        self._ok("one provider toggle deactivated and reactivated both Bedrock harnesses")
+        status = self._wait_for_runtime_status({"active", "error"}, runtime="hermes", timeout=180)
+        if status != "active":
+            raise AssertionError(f"re-enabling Bedrock did not reactivate Hermes: {status}")
+        self._ok("the provider toggle deactivated and reactivated Hermes")

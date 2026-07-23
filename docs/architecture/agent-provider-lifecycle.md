@@ -1,6 +1,6 @@
 # Agent provider lifecycle
 
-How a Codex, Claude Code, Pi, or Hermes runtime moves between statuses, which
+How a Codex, Claude Code, or Hermes runtime moves between statuses, which
 refreshes run when, how a provider account becomes anchored and pinned, and
 what each operator action changes. Command-level provider interfaces live in
 [Runtime harness dependencies](harness-dependencies.md); the proxy guards that
@@ -8,10 +8,7 @@ enforce the pins live in [Network controls](network-controls.md).
 
 ## Runtimes, statuses, and where state lives
 
-Codex and Claude Code each carry one provider status. AWS Bedrock carries one
-shared status that is projected into the Pi and Hermes runtime rows beside
-their separate running-task counters. There is no Pi- or Hermes-specific
-provider activation state. Status values are `deactivated`, `loading`,
+Each runtime carries one provider status. Status values are `deactivated`, `loading`,
 `awaiting_login`, `active`, or `error`; `awaiting_login` applies only to the
 OAuth providers, while enabled Bedrock is `awaiting_login` or `active`.
 
@@ -25,7 +22,7 @@ OAuth providers, while enabled Bedrock is `awaiting_login` or `active`.
   enforces. It is published only by a refresh that commits `active` and is
   cleared by any refresh that commits anything else.
 - **OAuth credentials** live in the agent user's provider auth files; the
-  provider CLIs own them, including token refresh. The shared Bedrock IAM key
+  provider CLIs own them, including token refresh. The Bedrock IAM key
   lives encrypted in the admin database and never reaches an agent process.
 
 ## Anchor versus pin
@@ -48,16 +45,12 @@ Claude requests carry only an opaque bearer token, so the Claude pin is
 sha256 of the validated token.
 The Claude pin therefore rotates with the token while the anchor never
 changes; a rotated token must be re-attested to the same anchored account
-before its hash becomes the new pin. The Bedrock harnesses have no pin and no
+before its hash becomes the new pin. Hermes has no pin and no
 account anchor at all: the agent never holds a real AWS credential. It signs
-with the dummy routing identity shared by the Bedrock launchers and the proxy
+with a dummy routing identity and the proxy
 re-signs each allowed request with the operator's key. The routing identity is
-not a Pi-versus-Hermes pin (each harness signs with its own fixed routing key
-id, but only so the proxy attributes usage to the right runtime); the
-connected credential (encrypted in the database, written only by the operator
-API) is the approval. Pi and Hermes are separate task runtimes over one
-provider, connected credential, working proxy credential, cached account
-record, and validation lifecycle.
+not an account pin; the connected credential (encrypted in the database,
+written only by the operator API) is the approval.
 
 Publishing the pin is what the `active` transition *means*, which is why the
 two are inseparable:
@@ -114,9 +107,9 @@ rewrites never change the value.
 
 | Status | Meaning | Recheck cadence |
 | --- | --- | --- |
-| `deactivated` | The provider is disabled in the network policy. The proxy rejects its requests, processes close, and running tasks fail; queued tasks fail at their next claim. The operator-approved account or connected credential remains, so re-enabling can return directly to `active` with no new login. Disabling Bedrock projects `deactivated` into both harness rows and stops both runtime process pools. | every 5 seconds (a backstop: enabling the provider refreshes immediately) |
+| `deactivated` | The provider is disabled in the network policy. The proxy rejects its requests, processes close, and running tasks fail; queued tasks fail at their next claim. The operator-approved account or connected credential remains, so re-enabling can return directly to `active` with no new login. Disabling Bedrock projects `deactivated` into the Hermes runtime row and stops its process pool. | every 5 seconds (a backstop: enabling the provider refreshes immediately) |
 | `loading` | No poll has completed yet (process start). | every 5 seconds |
-| `awaiting_login` | An OAuth runtime needs operator login, or enabled Bedrock needs its shared credential connected. OAuth proxy enforcement state is cleared; the anchor, if any, remains. | every 5 seconds |
+| `awaiting_login` | An OAuth runtime needs operator login, or enabled Bedrock needs its credential connected. OAuth proxy enforcement state is cleared; the anchor, if any, remains. | every 5 seconds |
 | `active` | An operator-approved OAuth credential with live validation, or an enabled Bedrock provider with a synchronously validated credential row. | every 5 minutes |
 | `error` | The last OAuth check failed, or stored Bedrock state is internally inconsistent. `error_message` carries the cause. Provider errors encountered during a Bedrock task fail that task and do not change this derived status. | every 5 seconds |
 
@@ -128,8 +121,7 @@ a missing login.
 
 ## Refresh triggers
 
-Every trigger funnels into the same provider-connection refresh. One Bedrock
-refresh updates the shared status shown by both Pi and Hermes:
+Every trigger funnels into the same provider-connection refresh:
 
 | Trigger | When |
 | --- | --- |
@@ -259,12 +251,12 @@ claims re-enter the refresh. An explicit operator refresh bypasses this memory:
 
 ## The Bedrock provider lifecycle
 
-The Pi and Hermes runtimes use one Bedrock provider pipeline and credential: one
+Hermes uses one Bedrock provider pipeline and credential: one
 static IAM access key pair the operator pastes, instead of an OAuth flow a
 CLI owns. The differences, step by step:
 
-- **Two useful runtime states.** While Bedrock is enabled, both runtime rows
-  show `awaiting_login` until the shared credential is connected, then
+- **Two useful runtime states.** While Bedrock is enabled, Hermes shows
+  `awaiting_login` until the credential is connected, then
   `active`. There is no separate checking, staged, or credential-error state.
 - **One validated connection.** The connect endpoint passes the credential
   candidate directly to `sts:GetCallerIdentity`. Only after it succeeds does
@@ -291,11 +283,10 @@ CLI owns. The differences, step by step:
   one probe model.
 - **Cost is metered live, never polled.** The operator-facing month-to-date
   estimate comes from the token usage AWS reports in every Bedrock response,
-  counted at the proxy per runtime, model, and UTC day, and priced at the
+  counted at the proxy per model and UTC day, and priced at the
   host's on-demand catalog rates (see the network controls doc). No billing
   API is called, no billing IAM permission is required, and the display is
-  current the moment a response completes; Pi and Hermes each show their own
-  meter. AWS remains the authoritative bill.
+  current the moment a response completes. AWS remains the authoritative bill.
 
 The admin service does read and decrypt the credential directly from its
 database, but it has no network egress. It injects the key pair into the
@@ -328,8 +319,8 @@ Codex has no per-task convergence and its cached status decides.
   write returns only `accepted`; enabled Bedrock becomes active from the
   stored validated row.
 - **Disconnect** (`DELETE /v1/agent-runtime/bedrock-credentials`): one mutation
-  deletes the shared credential and cached account metadata; both
-  harnesses' live processes close and running tasks fail. There is no on-disk
+  deletes the credential and cached account metadata; Hermes's live processes
+  close and running tasks fail. There is no on-disk
   agent auth or remembered Bedrock verdict to clear. The next credential
   connect starts from scratch. The live usage counters are retained: they
   record work already done.

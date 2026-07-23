@@ -41,12 +41,15 @@
       <div id="status" class="app-status" hidden></div>
       <div class="composer">
         <textarea id="new-task" rows="1" placeholder="Describe a task for the agent"></textarea>
+        <div id="attachments" class="attachments" aria-label="Attachments" hidden></div>
         <div class="composer-bar">
+          <button class="attach-button" id="attach-file" aria-label="Attach files" title="Attach up to 10 files (25 MiB each)">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m7.2 10.8 4.7-4.7a2.4 2.4 0 0 1 3.4 3.4l-6.2 6.2a4 4 0 0 1-5.7-5.7l6.4-6.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          </button>
           <div class="composer-options" id="composer-options">
             <select id="new-task-runtime" class="composer-pill" aria-label="Runtime">
               <option value="codex">Codex</option>
               <option value="claude_code">Claude Code</option>
-              <option value="pi">Pi</option>
               <option value="hermes">Hermes</option>
             </select>
             <select id="new-task-model" class="composer-pill" aria-label="Model"></select>

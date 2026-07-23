@@ -5,7 +5,7 @@ cannot, then tears the host down. Before calling
 `python3 -m host.cli.deploy`, it destroys any stale tagged
 `trustyclaw-smoke` EC2 instance, security group, and durable data volumes so the
 strict first-install command starts from empty AWS state. It supplies no Codex,
-Claude, Pi, or Hermes credential; credential-dependent runtime checks live in
+Claude, or Hermes credential; credential-dependent runtime checks live in
 the persistent stage test.
 
 The smoke covers subnet/SG/IMDSv2/SSH provisioning, bootstrap on real Ubuntu,
@@ -13,12 +13,12 @@ admin API access over the SSH tunnel, auth rejection, and the real admin UI in
 headless Chrome. The browser logs in, opens Mission Pursuit, clicks its
 popovers and agent settings, submits a first mission, verifies the expected
 pre-provider-login failure, and switches the workspace runtime. The remaining
-checks cover all four runtime status/account records and real task insertion,
-the single Bedrock provider policy that governs both Pi and Hermes runtimes,
+checks cover all three runtime status/account records and real task insertion,
+the Bedrock provider policy that governs Hermes,
 every Bedrock pre-credential denial
 (foreign access-key id, cross-region signature, presigned query, session token,
-and unavailable proxy credential), real Pi and Hermes launcher startup through
-their systemd scopes until the proxy's local missing-credential denial, task
+and unavailable proxy credential), real Hermes launcher startup through its
+systemd scope until the proxy's local missing-credential denial, task
 lifecycle edge cases, policy validation,
 event pagination, concurrent policy replaces, proxy protocol edge cases, live
 network enforcement, managed provider policy validation, tool-service/socket

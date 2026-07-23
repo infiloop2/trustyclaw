@@ -267,8 +267,13 @@ def desktop_smoke(page, url: str) -> None:
         or not home_tab_box["y"] < hero_box["y"] < network_tab_box["y"]
     ):
         raise AssertionError("the hero app entry must sit between Home and the other nav tabs")
-    expect(page.locator("#app-tabs").get_by_role("button", name="Agent Chat", exact=True)).to_have_count(0)
-    expect(page.locator("#app-tabs").get_by_role("button", name="Mission Pursuit", exact=True)).to_be_visible()
+    expect(page.locator("#stable-app-tabs").get_by_role("button", name="Agent Chat", exact=True)).to_have_count(0)
+    beta_toggle = page.get_by_role("button", name="Apps (Beta)", exact=True)
+    expect(beta_toggle).to_have_attribute("aria-expanded", "false")
+    expect(page.locator("#beta-app-tabs")).to_be_hidden()
+    beta_toggle.click()
+    expect(beta_toggle).to_have_attribute("aria-expanded", "true")
+    expect(page.locator("#beta-app-tabs").get_by_role("button", name="Mission Pursuit", exact=True)).to_be_visible()
     # App frames load only when selected. Eagerly navigating every hidden app
     # at login can leave deferred frames at about:blank on a small fresh host.
     expect(page.locator("iframe.app-frame[src]")).to_have_count(0)
@@ -278,7 +283,7 @@ def desktop_smoke(page, url: str) -> None:
     expect(headings).to_have_count(3)
     expect(headings.nth(0)).to_have_text("Configuration")
     expect(headings.nth(1)).to_have_text("Audit")
-    expect(headings.nth(2).locator(":scope > span").first).to_have_text("Apps (Beta)")
+    expect(headings.nth(2).get_by_role("button", name="Apps (Beta)", exact=True)).to_be_visible()
     expect(page.locator("#sidebar-configuration .tab-button")).to_have_count(2)
     expect(page.locator("#sidebar-configuration #tab-network")).to_be_visible()
     expect(page.locator("#sidebar-audit .tab-button")).to_have_count(6)
@@ -295,17 +300,19 @@ def desktop_smoke(page, url: str) -> None:
     expect(page.locator("#panel-home")).to_be_visible()
     expect(page.locator("#runtime-overview")).to_contain_text("Codex")
     expect(page.locator("#runtime-overview")).to_contain_text("Claude Code")
-    expect(page.locator("#runtime-overview")).to_contain_text("Pi")
     expect(page.locator("#runtime-overview")).to_contain_text("Hermes")
     expect(page.locator("#runtime-overview")).to_contain_text("deactivated")
     expect(page.locator("#runtime-overview").get_by_label("Refresh provider status and usage")).to_be_visible()
     expect(page.locator(".topbar-actions").get_by_label("Refresh provider status and usage")).to_have_count(0)
+    # The phone-only collapse pill stays out of the way on a wide viewport; the
+    # boxes sit inline in the top bar.
+    expect(page.locator(".runtime-overview-toggle")).to_be_hidden()
     # Before any login there is no usage: all four rings (5h and weekly for
     # Codex and Claude Code) render the unavailable "--" form rather than 0%.
     # Bedrock billing is reconciliation metadata in the provider details, not
     # a primary toolbar value.
     expect(page.locator("#runtime-overview .usage-ring.unavailable")).to_have_count(4)
-    expect(page.locator("#runtime-overview .runtime-summary-bedrock")).to_have_count(2)
+    expect(page.locator("#runtime-overview .runtime-summary-bedrock")).to_have_count(1)
     expect(page.locator("#runtime-overview")).to_contain_text("--")
     expect(page.locator("#panel-home").get_by_text("Agent runtimes")).to_have_count(0)
     expect(page.locator("#panel-home").get_by_text("Provider usage")).to_have_count(0)
@@ -502,11 +509,11 @@ def desktop_smoke(page, url: str) -> None:
         ["AI Inference", "Tools", "Manual"]
     )
     expect(page.locator("#ai-inference-integrations .integration-row h2")).to_have_text(
-        ["OpenAI", "Claude", "AWS Bedrock"]
+        ["OpenAI", "Claude", "Hermes (AWS Bedrock)"]
     )
     bedrock_row = page.locator(".integration-row[data-integration='bedrock']")
     expect(bedrock_row.locator(".integration-subtitle")).to_have_text(
-        "Connect your AWS account once and let your agent run Pi and Hermes tasks through Bedrock in your own account."
+        "Connect your AWS account and let Hermes run tasks through Bedrock in your own account."
     )
     tool_labels = page.locator("#tools > .integration-row h2").all_text_contents()
     assert tool_labels == sorted(tool_labels, key=str.casefold)
@@ -734,12 +741,11 @@ def desktop_smoke(page, url: str) -> None:
     expect(page.locator(".integration-row[data-integration]", has_text="Claude")).to_contain_text("No account linked yet")
     expect(openai_row.get_by_role("button", name="Disconnect")).to_have_count(0)
     # Bedrock is one provider row and one validated credential, region, account,
-    # and billing record. Pi and Hermes remain separate runtime counters.
+    # and billing record for Hermes.
     bedrock_row = page.locator(".integration-row[data-integration='bedrock']")
     expect(bedrock_row).to_have_count(1)
-    expect(page.locator(".integration-row[data-integration='pi']")).to_have_count(0)
     expect(page.locator(".integration-row[data-integration='hermes']")).to_have_count(0)
-    bedrock_row.get_by_label("Toggle AWS Bedrock details").click()
+    bedrock_row.get_by_label("Toggle Hermes (AWS Bedrock) details").click()
     expect(bedrock_row).to_contain_text("No AWS credential stored yet")
     expect(bedrock_row).to_contain_text("required IAM policy")
     page.locator("#bedrock-access-key-id-bedrock").fill("AKIAMOCKOPERATOR0001")
@@ -753,69 +759,63 @@ def desktop_smoke(page, url: str) -> None:
     expect(bedrock_row).to_contain_text("AKIAMOCKOPERATOR0001")
     bedrock_row.get_by_role("button", name="Enable", exact=True).click()
     expect(page.locator("[data-integration-message='bedrock']")).to_contain_text(
-        "AWS Bedrock enabled"
+        "Hermes (AWS Bedrock) enabled"
     )
     expect(bedrock_row).to_contain_text("enabled")
     expect(bedrock_row).to_contain_text("arn:aws:iam::123456789012:user/trustyclaw-bedrock")
-    # Two separate live usage boxes, one per harness, each with its own
-    # month-to-date estimate metered from Bedrock responses.
-    expect(bedrock_row.locator(".bedrock-usage-box")).to_have_count(2)
-    expect(bedrock_row.locator(".bedrock-usage-box", has_text="Pi")).to_contain_text("MTD est. $12.75")
-    expect(bedrock_row.locator(".bedrock-usage-box", has_text="Pi")).to_contain_text("1.8M in")
-    expect(bedrock_row.locator(".bedrock-usage-box", has_text="Pi")).to_contain_text("2 of 210 requests unmetered")
-    expect(bedrock_row.locator(".bedrock-usage-box", has_text="Hermes")).to_contain_text("MTD est. $0.31")
+    # One live month-to-date estimate is metered from Hermes's Bedrock responses.
+    expect(bedrock_row.locator(".bedrock-usage-box")).to_have_count(1)
+    expect(bedrock_row.locator(".bedrock-usage-box")).to_contain_text("MTD est. $12.75")
+    expect(bedrock_row.locator(".bedrock-usage-box")).to_contain_text("1.8M in")
+    expect(bedrock_row.locator(".bedrock-usage-box")).to_contain_text("2 of 210 requests unmetered")
+    expect(bedrock_row.locator(".bedrock-usage-box")).not_to_contain_text("Hermes")
     expect(bedrock_row).not_to_contain_text("Cost Explorer")
     expect(page.locator("#bedrock-region-bedrock")).to_have_value("us-west-2")
-    # Pi and Hermes are separate per-runtime toolbar boxes, each with its own
-    # live month-to-date estimate (labelled "MTD est." to flag it is an
-    # estimate, not the authoritative AWS bill) and its own per-runtime status.
-    pi_box = page.locator("#runtime-overview .runtime-summary", has_text="Pi")
+    # Hermes has one live month-to-date estimate, labelled "MTD est." to flag
+    # it is an estimate rather than the authoritative AWS bill.
     hermes_box = page.locator("#runtime-overview .runtime-summary", has_text="Hermes")
-    expect(pi_box).to_contain_text("MTD est.")
-    expect(pi_box).to_contain_text("$12.75")
-    expect(pi_box).to_contain_text("1.8M")
     expect(hermes_box).to_contain_text("MTD est.")
-    expect(hermes_box).to_contain_text("$0.31")
+    expect(hermes_box).to_contain_text("$12.75")
+    expect(hermes_box).to_contain_text("1.8M")
     expect(page.locator("#runtime-overview .bedrock-toolbar-lag")).to_have_count(0)
-    expect(pi_box).to_contain_text("active")
-    expect(pi_box.locator(".runtime-running-badge")).to_have_count(0)
+    expect(hermes_box).to_contain_text("active")
+    expect(hermes_box.locator(".runtime-running-badge")).to_have_count(0)
     counter_task_response = page.request.post(
         f"{url.rstrip('/')}/v1/tasks",
         headers={"Authorization": f"Bearer {PASSWORD}"},
         data={
-            "agent_runtime": "pi",
+            "agent_runtime": "hermes",
             "model": "deepseek.v3.2",
-            "effort": "medium",
-            "input_message": "Exercise the Pi toolbar running counter.",
-            "thread_id": "toolbar-pi-counter",
+            "effort": "high",
+            "input_message": "Exercise the Hermes toolbar running counter.",
+            "thread_id": "toolbar-hermes-counter",
         },
     )
     if not counter_task_response.ok:
         raise AssertionError(
-            f"could not create Pi toolbar counter task: {counter_task_response.status} "
+            f"could not create Hermes toolbar counter task: {counter_task_response.status} "
             f"{counter_task_response.text()}"
         )
     counter_task = counter_task_response.json()
-    expect(pi_box).to_contain_text("1 running", timeout=8000)
+    expect(hermes_box).to_contain_text("1 running", timeout=8000)
     killed = page.request.post(
         f"{url.rstrip('/')}/v1/tasks/{counter_task['task_id']}/kill",
         headers={"Authorization": f"Bearer {PASSWORD}"},
     )
     if not killed.ok:
-        raise AssertionError(f"could not stop Pi toolbar counter task: {killed.status} {killed.text()}")
-    expect(pi_box.locator(".runtime-running-badge")).to_have_count(0, timeout=8000)
-    expect(hermes_box).to_contain_text("active")
-    expect(hermes_box.locator(".runtime-running-badge")).to_have_count(0)
-    # Disconnect and reconnect operate on the one shared resource.
+        raise AssertionError(f"could not stop Hermes toolbar counter task: {killed.status} {killed.text()}")
+    # The toolbar refreshes on a five-second poll, after the other dashboard
+    # sections in the same tick. Allow a full poll cycle under CI load.
+    expect(hermes_box.locator(".runtime-running-badge")).to_have_count(0, timeout=12000)
+    # Disconnect and reconnect operate on the one Bedrock resource.
     page.once("dialog", lambda dialog: dialog.accept())
     bedrock_row.get_by_role("button", name="Disconnect AWS", exact=True).click()
     expect(page.locator("[data-integration-message='bedrock']")).to_contain_text(
-        "Shared AWS Bedrock account disconnected"
+        "AWS Bedrock account disconnected"
     )
     expect(bedrock_row).to_contain_text("No AWS credential stored yet")
     expect(bedrock_row.locator(".provider-error")).to_have_count(0)
     expect(bedrock_row.get_by_role("button", name="Disconnect AWS", exact=True)).to_have_count(0)
-    expect(pi_box).to_contain_text("awaiting login")
     expect(hermes_box).to_contain_text("awaiting login")
     page.locator("#bedrock-access-key-id-bedrock").fill("AKIAMOCKOPERATOR0003")
     page.locator("#bedrock-secret-access-key-bedrock").fill("S" * 40)
@@ -1486,7 +1486,22 @@ def mobile_smoke(page, url: str) -> None:
     page.locator("#upgrade-notice").focus()
     expect(page.locator("#upgrade-popover")).to_be_visible()
     expect(page.locator("#nav-backdrop")).to_be_hidden()
-    # Both runtimes are active by now (the desktop pass logged them in);
+    # On a phone the three usage boxes collapse behind a single pill so an open
+    # app keeps the full screen; the boxes stay hidden until the pill is tapped.
+    overview_toggle = page.locator(".runtime-overview-toggle")
+    expect(overview_toggle).to_be_visible()
+    expect(overview_toggle).to_contain_text("Agent usage")
+    expect(overview_toggle).to_have_attribute("aria-expanded", "false")
+    expect(page.locator("#runtime-overview .runtime-summary").first).to_be_hidden()
+    # Opening runs the hard provider refresh (the phone's replacement for a
+    # separate refresh button) and drops the panel as a floating overlay.
+    with page.expect_request(re.compile(r"/v1/agent-runtime/refresh")):
+        overview_toggle.click()
+    expect(overview_toggle).to_have_attribute("aria-expanded", "true")
+    expect(page.locator("#runtime-overview .runtime-overview-panel")).to_have_css("position", "absolute")
+    # The overlay carries no refresh button; the open gesture is the refresh.
+    expect(page.locator("#runtime-overview .runtime-refresh")).to_be_hidden()
+    # Both subscription runtimes are active by now (the desktop pass logged them in);
     # Claude Code carries the extra model-week ring.
     for runtime, rings in (("Codex", 2), ("Claude Code", 3)):
         summary = page.locator("#runtime-overview .runtime-summary", has_text=runtime)
@@ -1494,14 +1509,14 @@ def mobile_smoke(page, url: str) -> None:
         expect(summary.locator(".usage-ring")).to_have_count(rings)
         for index in range(rings):
             expect(summary.locator(".usage-ring").nth(index)).to_be_visible()
-    pi_box = page.locator("#runtime-overview .runtime-summary", has_text="Pi")
     hermes_box = page.locator("#runtime-overview .runtime-summary", has_text="Hermes")
-    expect(pi_box).to_be_visible()
     expect(hermes_box).to_be_visible()
-    expect(page.locator("#runtime-overview .runtime-summary-bedrock")).to_have_count(2)
-    # Each box is its own live per-runtime usage readout; there is no shared
-    # provider total.
-    expect(page.locator("#runtime-overview .runtime-stat-cost")).to_have_count(2)
+    expect(page.locator("#runtime-overview .runtime-summary-bedrock")).to_have_count(1)
+    expect(page.locator("#runtime-overview .runtime-stat-cost")).to_have_count(1)
+    # Escape dismisses the overlay like a menu; the boxes hide again.
+    page.keyboard.press("Escape")
+    expect(overview_toggle).to_have_attribute("aria-expanded", "false")
+    expect(page.locator("#runtime-overview .runtime-summary").first).to_be_hidden()
     # The hero navigator is the phone's entry into chat: visible on home
     # without opening the drawer, with a thumb-sized CTA.
     expect(page.locator("#home-hero")).to_contain_text("Agent Chat")

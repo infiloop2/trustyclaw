@@ -423,7 +423,7 @@ class NetworkProxyTests(unittest.TestCase):
             payload_hash=hashlib.sha256(body).hexdigest(),
             amz_date=amz_date, date_stamp=amz_date[:8],
             region="us-east-1", service="bedrock",
-            access_key_id=bedrock_manifest.ROUTING_ACCESS_KEY_IDS["pi"],
+            access_key_id=bedrock_manifest.ROUTING_ACCESS_KEY_ID,
             secret_access_key=bedrock_manifest.ROUTING_SECRET_ACCESS_KEY,
         )
         request = (
@@ -459,7 +459,7 @@ class NetworkProxyTests(unittest.TestCase):
         self.assertIn(b"200", response.split(b"\r\n", 1)[0])
         self.assertIn(response_body, response)
         (row,) = state.read_bedrock_usage("1970-01-01")
-        self.assertEqual((row["runtime"], row["model_id"]), ("pi", "deepseek.v3.2"))
+        self.assertEqual(row["model_id"], "deepseek.v3.2")
         self.assertEqual((row["requests"], row["metered_requests"]), (1, 1))
         self.assertEqual((row["input_tokens"], row["output_tokens"]), (321, 45))
 
@@ -942,11 +942,10 @@ class ExternalUrlRequestGuardTests(unittest.TestCase):
 
 
 class BedrockGuardTests(unittest.TestCase):
-    """One Bedrock integration admits the guarded model routes for both task
-    runtimes and re-signs them with one published operator key. Each runtime
-    signs with its own routing key id, which only selects the usage meter."""
+    """The Bedrock integration admits Hermes model routes and re-signs them
+    with the published operator key."""
 
-    KEY = bedrock_manifest.ROUTING_ACCESS_KEY_IDS["pi"]
+    KEY = bedrock_manifest.ROUTING_ACCESS_KEY_ID
     ROUTING_SECRET = bedrock_manifest.ROUTING_SECRET_ACCESS_KEY
     REAL = ("AKIABEDROCKOPERATOR1", "operator-secret-000000000000000000000000", "us-east-2")
     CONFIG = BedrockIntegration(enabled=True)
@@ -1049,30 +1048,20 @@ class BedrockGuardTests(unittest.TestCase):
         headers = self.signed_request(content_sha_header=True)
         self.assertIsNone(self.deny(headers=headers))
 
-    def test_each_harness_routing_key_is_admitted(self) -> None:
-        for runtime, key in bedrock_manifest.ROUTING_ACCESS_KEY_IDS.items():
-            with self.subTest(runtime=runtime):
-                self.assertIsNone(self.deny(headers=self.signed_request(access_key_id=key)))
+    def test_hermes_routing_key_is_admitted(self) -> None:
+        self.assertIsNone(self.deny(headers=self.signed_request()))
 
-    def test_response_meter_attributes_the_signing_runtime_and_model(self) -> None:
-        for runtime, key in bedrock_manifest.ROUTING_ACCESS_KEY_IDS.items():
-            with self.subTest(runtime=runtime):
-                meter = bedrock_guard.response_meter(
-                    self.CONFIG, "POST", self.HOST, self.PATH, "",
-                    self.signed_request(access_key_id=key), self.BODY,
-                )
-                assert meter is not None
-                self.assertEqual(meter._runtime, runtime)
-                self.assertEqual(meter._model_id, "deepseek.v3.2")
-
-    def test_no_meter_without_a_routing_identity(self) -> None:
-        # response_meter runs only on allowed requests, but it still fails
-        # closed on its own: no parseable routing signature, no meter.
-        self.assertIsNone(
-            bedrock_guard.response_meter(
-                self.CONFIG, "POST", self.HOST, self.PATH, "", [], self.BODY
-            )
+    def test_response_meter_records_the_invoked_model(self) -> None:
+        meter = bedrock_guard.response_meter(
+            self.CONFIG, "POST", self.HOST, self.PATH, "",
+            self.signed_request(), self.BODY,
         )
+        assert meter is not None
+        self.assertEqual(meter._model_id, "deepseek.v3.2")
+
+    def test_no_meter_without_a_model_route(self) -> None:
+        # response_meter runs only after request admission, so only the route
+        # must be parsed again to identify the model.
         self.assertIsNone(
             bedrock_guard.response_meter(
                 self.CONFIG, "POST", self.HOST, "/foundation-models", "",

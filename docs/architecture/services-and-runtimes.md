@@ -49,8 +49,8 @@
 | Tools socket handler threads | tools service | One per agent tool call (and per delegated operator operation), bounded by a concurrency cap; tool packages run their third-party requests on these threads. |
 | Network-introspection socket handler threads | agent-network service | One per local request, bounded by a concurrency cap; calls perform read-only policy or denial queries. |
 | Maintenance thread | admin API | Periodically prunes bounded state and event history. |
-| Runtime status poller | admin API/orchestrator | Rechecks provider health; the one Bedrock result is projected into both Pi and Hermes runtime rows. |
-| Task worker threads | admin API/orchestrator | Twelve total workers claim queued tasks; at most three tasks run per runtime. Each turn spawns and closes its own runtime process. |
+| Runtime status poller | admin API/orchestrator | Rechecks provider health, including Hermes's Bedrock connection. |
+| Task worker threads | admin API/orchestrator | Nine total workers claim queued tasks; at most three tasks run per runtime. Each turn spawns and closes its own runtime process. |
 | Proxy handler threads | network proxy | One per proxied connection, capped so buffered request bodies cannot exhaust memory. |
 | Proxy certificate lock users | network proxy | Serialize per-host certificate generation so concurrent TLS CONNECTs do not race on cert files. |
 
@@ -80,7 +80,7 @@ session's selected model on Codex thread start/resume and its model and effort
 on every turn. Claude Code does not expose the same app-server protocol, so the
 host runs one CLI process per turn
 with the selected `--model` and `--effort`, then resumes the Claude session id
-recorded for the user thread. Both runtimes persist login/session state under
+recorded for the user thread. Both OAuth runtimes persist login/session state under
 `agent-home`, so restarted admin services can
 re-derive active status from the agent user's home directory.
 

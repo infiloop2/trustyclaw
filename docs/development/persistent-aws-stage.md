@@ -4,7 +4,7 @@ Stage is the long-lived environment for login-dependent checks. The workflow
 upgrades or recreates one fixed host, `trustyclaw-stage` in `us-east-1`, using a
 stable admin password and a persistent operator SSH endpoint. The admin and
 agent data volumes are preserved, so Codex and Claude OAuth sessions and the
-validated shared AWS Bedrock credential survive across upgrades.
+validated AWS Bedrock credential survive across upgrades.
 
 The stage workflow uses the lifecycle commands in this order:
 
@@ -29,7 +29,7 @@ workflow passes the generated stage SSH key path through `--ssh-key-env
 TRUSTYCLAW_STAGE_SSH_KEY`.
 
 The stage test takes a `--suite` argument selecting which checks run: `claude`,
-`codex`, `pi`, `hermes`, or `github` run that integration's checks plus the shared preamble, every
+`codex`, `hermes`, or `github` run that integration's checks plus the shared preamble, every
 bundled tool id runs that one tool's live check, and `all` (the default) runs
 the complete integration matrix. Every run performs its credential preflight
 before any integration test. A focused suite fails when its selected
@@ -38,19 +38,19 @@ skipped, then runs every available integration independently, so a missing
 secret, unconfigured OAuth account, expired provider session, or failed live
 integration cannot hide the results for the rest.
 
-The preflight checks live Codex, Claude Code, Pi, and Hermes runtime status, GitHub's
+The preflight checks live Codex, Claude Code, and Hermes runtime status, GitHub's
 credential validation plus its sandbox write repository, and every bundled
 tool's enablement, config, and OAuth connection state. A tool credential that
 looks configured but is rejected by its first provider request is reclassified
 as unavailable and skipped in `all`; the same result fails a focused tool run.
 The test never starts an interactive OAuth flow.
 
-Pi and Hermes are two runtime suites backed by one AWS Bedrock provider row and
-one long-term IAM access key pair. When the two `STAGE_BEDROCK_AWS_*`
+Hermes is backed by one AWS Bedrock provider row and one long-term IAM access
+key pair. When the two `STAGE_BEDROCK_AWS_*`
 environment values are present, stage submits that pair once. The endpoint
 synchronously checks STS identity before returning
 `accepted`; a failed candidate is deleted. Stage then enables Bedrock in
-`us-east-1`, which activates both harnesses. If the values are absent, the test
+`us-east-1`, which activates Hermes. If the values are absent, the test
 uses an already validated credential stored on the persistent host.
 
 GitHub is the exception to "manual setup": when the `STAGE_GITHUB_*` stage
@@ -69,39 +69,38 @@ suite.
 
 The `all` suite covers the runtime checks omitted from fresh smoke: Codex
 account guards and real web-search task traffic, Claude bearer-token guards and
-real task traffic, Pi and Hermes credential-boundary checks and real Bedrock
+real task traffic, Hermes credential-boundary checks and real Bedrock
 Converse traffic, mixed Codex/Claude concurrency, steering, kill and thread
-survival, persisted thread recall, shared Bedrock disable/re-enable behavior,
+survival, persisted thread recall, Bedrock disable/re-enable behavior,
 runtime deactivation behavior, host reboot
 recovery, the network event prune race, the live bundled-tool checks against
 real third-party APIs (see below), and the GitHub write
-end-to-end. Cross-runtime checks run when all four runtimes pass. A
+end-to-end. Cross-runtime checks run when all three runtimes pass. A
 single-runtime suite runs only that runtime's guard, task,
 steering, and kill checks; `github` runs only the GitHub write end-to-end; and
 a bundled tool id runs only that tool's live provider check.
 
 The live concurrency scenario uses three Codex and three Claude tasks. The
 provider-neutral orchestrator tests separately prove the same three-task cap
-for Pi and Hermes, avoiding six additional paid Bedrock turns merely to repeat
-the scheduler invariant.
+for Hermes, avoiding three additional paid Bedrock turns merely to repeat the
+scheduler invariant.
 
 All agent tasks use the least expensive exposed options: Codex uses
 `gpt-5.6-luna` with `high` effort, and Claude Code uses `sonnet` with `high`
-effort; Pi and Hermes both use `qwen.qwen3-coder-next` with `high` effort.
+effort; Hermes uses `qwen.qwen3-coder-next` with `high` effort.
 This includes concurrency,
 steering, recovery, and the MCP catalog check. Every runtime asks its agent to
 call `list_bundled_tools` and verify the dynamically discovered catalog:
 Codex and Claude Code reach the shim through their own MCP clients, Hermes
-through its MCP client wired by the managed config, and Pi through the
-root-owned `pi_tools_bridge.js` extension.
+through its MCP client wired by the managed config.
 
 ## Harness layout and failure diagnostics
 
 `tests/stage/stage_aws.py` is the CLI, suite orchestration, and shared host
 lifecycle. `stage_support.py` owns integration selection, result reporting, and
 the GitHub Actions summary. `stage_integration_checks.py` owns Codex, Claude
-Code, and GitHub checks. `stage_bedrock_checks.py` owns the shared credential,
-Pi, and Hermes checks. `stage_tool_checks.py` owns bundled-tool preflight and
+Code, and GitHub checks. `stage_bedrock_checks.py` owns the Bedrock credential
+and Hermes checks. `stage_tool_checks.py` owns bundled-tool preflight and
 the deterministic live MCP scenarios. New tool coverage belongs in the tool
 module; adding a bundled tool does not require editing suite registration.
 
@@ -184,11 +183,11 @@ the existing stage instance for the run and stops it afterward. Dollar totals
 therefore depend on the operator's model plans, X plan, API-key plans, and EC2
 runtime; the table states the fixed request or credit units the harness controls.
 
-Pi and Hermes each make a short Bedrock task, a session-resume turn, an MCP
-catalog turn, a running task that stage kills, and a post-kill recovery turn.
-Pi also makes a steering task. While the Hermes kill target is running, stage
+Hermes makes a short Bedrock task, a session-resume turn, an MCP catalog turn,
+a running task that stage kills, and a post-kill recovery turn. While the
+Hermes kill target is running, stage
 proves that steering is rejected; this denial invokes no additional model
-turn. Both harnesses use Qwen
+turn. Hermes uses Qwen
 3 Coder Next, the least expensive of the three exposed Bedrock models for short
 stage prompts. The model turns are paid Bedrock inference calls;
 the exact token cost varies with model output and runtime behavior. Credential
@@ -219,7 +218,7 @@ aws iam attach-user-policy \
 aws iam create-access-key --user-name trustyclaw-host-stage
 ```
 
-Create a separate IAM user for the shared Pi/Hermes Bedrock connection. The
+Create a separate IAM user for the Hermes Bedrock connection. The
 host-stage IAM user above manages EC2 and is not exposed to inference:
 
 ```bash
@@ -261,8 +260,8 @@ Add these repository secrets and variables:
 | `TRUSTYCLAW_STAGE_AWS_SECRET_ACCESS_KEY` | Secret access key for the stage IAM user. |
 | `TRUSTYCLAW_STAGE_SSH_PRIVATE_KEY` | Full contents of `~/.ssh/trustyclaw/stage_operator`. |
 | `TRUSTYCLAW_STAGE_ADMIN_PASSWORD` | Stable password generated above. |
-| `TRUSTYCLAW_STAGE_BEDROCK_AWS_ACCESS_KEY_ID` | Access key id for one dedicated Bedrock IAM user shared by Pi and Hermes. |
-| `TRUSTYCLAW_STAGE_BEDROCK_AWS_SECRET_ACCESS_KEY` | Secret access key paired with the shared Bedrock access key id. |
+| `TRUSTYCLAW_STAGE_BEDROCK_AWS_ACCESS_KEY_ID` | Access key id for one dedicated Bedrock IAM user. |
+| `TRUSTYCLAW_STAGE_BEDROCK_AWS_SECRET_ACCESS_KEY` | Secret access key paired with the Bedrock access key id. |
 | `TRUSTYCLAW_STAGE_GITHUB_WRITE_REPO` | Sandbox write repo as `owner/repo` (branches are pushed and deleted there, so use a dedicated sandbox, never a real repo). |
 | `TRUSTYCLAW_STAGE_GITHUB_APP_ID` | Numeric GitHub App id whose installation can push to the sandbox repo. |
 | `TRUSTYCLAW_STAGE_GITHUB_APP_INSTALLATION_ID` | Numeric installation id of that App on the sandbox repo. |
@@ -275,10 +274,10 @@ and write repo manually through the admin UI. A partial secret set makes GitHub
 unavailable: `all` reports and skips it, while a focused `github` run fails.
 
 The two `TRUSTYCLAW_STAGE_BEDROCK_AWS_*` secrets are also optional as a pair.
-When set, each `pi`, `hermes`, or `all` run validates and installs them before
-preflight. When absent, the run uses the shared credential already stored on
-the host. A partial pair makes Pi and Hermes unavailable; `all` skips both,
-while either focused harness suite fails.
+When set, each `hermes` or `all` run validates and installs them before
+preflight. When absent, the run uses the credential already stored on the
+host. A partial pair makes Hermes unavailable; `all` skips it, while a focused
+Hermes suite fails.
 
 The stage account also needs a default VPC with a public default subnet in
 `us-east-1`.
@@ -292,12 +291,12 @@ persistent environment, so upgrades must use the stable mainline version and
 mainline migration path.
 
 The `workflow_dispatch` form takes a **suite** input (`all`, each bundled tool
-id, `claude`, `codex`, `pi`, `hermes`, or `github`; default `all`) that maps to the test's
+id, `claude`, `codex`, `hermes`, or `github`; default `all`) that maps to the test's
 `--suite` argument. Use a single-provider suite to exercise or debug just that
 integration, for example `github` once the GitHub credential and sandbox write
 repo are configured, `brave_search` once its key secret is set, or `codex`/`claude`
-while GitHub is still being set up. Use `pi` or `hermes` to isolate one harness
-while retaining the same shared Bedrock provider. Each suite still runs its scoped
+while GitHub is still being set up. Use `hermes` to isolate the Bedrock harness.
+Each suite still runs its scoped
 configuration preflight first. The GitHub Actions summary ends with one row per
 integration showing credential availability, pass/fail/skip, and a concise
 detail. Available failures make the workflow fail; unavailable integrations do
@@ -324,10 +323,10 @@ target exists. That workflow can only be dispatched by a repository admin from
 `main`; it starts the existing tagged `trustyclaw-stage` EC2 instance and
 prints the SSH tunnel command.
 
-If the shared Bedrock credential is missing or no longer passes STS and Cost
-Explorer validation, `all` skips both Pi and Hermes and either focused suite
-fails. Restore it by setting both Bedrock repository secrets, or by entering
-the shared credential once in the AWS Bedrock row in the admin UI.
+If the Bedrock credential is missing or no longer passes STS validation,
+`all` skips Hermes and the focused suite fails. Restore it by setting both
+Bedrock repository secrets, or by entering the credential once in the AWS
+Bedrock row in the admin UI.
 
 Every focused `github` run, and each `all` run where GitHub is available,
 exercises the GitHub write paths end to end. This depends on GitHub being

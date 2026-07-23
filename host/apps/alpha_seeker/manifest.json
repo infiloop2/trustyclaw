@@ -1,6 +1,7 @@
 {
   "host_slot": 2,
   "title": "Alpha Seeker",
+  "release_stage": "beta",
   "agent": {
     "instructions": "agent.md",
     "api": true

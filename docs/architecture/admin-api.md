@@ -59,8 +59,19 @@ orchestrator, the selected runtime client, or the fixed sudo helpers. Agent
 file list/read routes cross into the private agent home through
 `read-agent-file`, which demotes to `trustyclaw-agent`, confines paths to
 `agent-home`, rejects symlinks, caps listing scan work and responses at 1,000
-entries, opens files nonblocking, and caps reads at 1 MiB. The orchestrator
-runs twelve worker threads, with a claim cap of three tasks per agent runtime:
+entries, opens files nonblocking, and caps reads at 1 MiB.
+
+The raw upload route uses a separate fixed `upload-agent-file` helper. The
+admin service requires an exact `Content-Length`, caps it at 25 MiB, and
+streams the body through stdin without buffering it in memory. The helper
+demotes to `trustyclaw-agent`, rejects unsafe or oversized basenames, opens the
+real `user-files/` directory without following symlinks, writes a hidden
+temporary file, and publishes it with a no-overwrite hard link only after all
+declared bytes are durable. This gives upload and runtime access the same
+filesystem authority and leaves no partial file at the returned task path.
+
+The orchestrator runs nine worker threads, with a claim cap of three tasks per
+agent runtime.
 
 `GET /v1/agent-processes` is a read-only diagnostic endpoint. It walks
 descendant `cgroup.procs` files under `trustyclaw_agent.slice`, then reads
@@ -70,7 +81,7 @@ their task finishes, and child processes normally inherit the runtime cgroup
 and show up in the same agent slice.
 
 - Every task names a client-chosen `thread_id`. The first task also names an
-  `agent_runtime` (`codex`, `claude_code`, `pi`, or `hermes`) and one allowed
+  `agent_runtime` (`codex`, `claude_code`, or `hermes`) and one allowed
   model/effort pair, which binds all four values and starts a runtime
   conversation. Later tasks
   may omit the runtime, model, and effort; the host loads the thread's fixed
@@ -78,17 +89,16 @@ and show up in the same agent slice.
   (the maps live in the `thread_sessions` table, capped at the 100,000 most
   recently used per runtime). Tasks on one runtime/thread pair run serially in
   creation order; tasks on different
-  pairs run in parallel, up to twelve total and up to three per runtime.
+  pairs run in parallel, up to nine total and up to three per runtime.
 - Each running task gets its own runtime process, spawned through the sudo
   helper and closed when the turn ends. Codex turns resume their provider
-  thread by id on a fresh app-server; Claude Code, Pi, and Hermes turns resume
+  thread by id on a fresh app-server; Claude Code and Hermes turns resume
   by session id.
 - A task runs as one agent turn. Codex receives the selected model on thread
   start/resume and the selected model and effort on every turn; it uses
   `turn/steer` for steering. Claude Code receives `--model` and `--effort` on
   every new or resumed CLI process and receives steering as additional
-  stream-json user messages. Pi receives the selected model and thinking
-  effort through its RPC process and supports steering. Hermes receives the
+  stream-json user messages. Hermes receives the
   selected model through its single-shot process and rejects steering because
   that process has no mid-turn input channel. Each completed agent message becomes a
   `task.message` event, and the last one becomes the task's `output_message`.

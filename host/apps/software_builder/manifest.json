@@ -1,6 +1,7 @@
 {
   "host_slot": 5,
   "title": "Software Builder",
+  "release_stage": "beta",
   "agent": {
     "instructions": "agent.md",
     "api": true

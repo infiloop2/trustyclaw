@@ -56,10 +56,11 @@ for the service/user map.
 
 Agents speak MCP, so the host bridges MCP to the tool runtime with a shim:
 
-- Both harnesses spawn `python3 -m host.runtime.agent_shim.mcp_shim` as
-  `trustyclaw-agent` — Claude Code through `--mcp-config` (with
+- All three harnesses spawn `python3 -m host.runtime.agent_shim.mcp_shim` as
+  `trustyclaw-agent`: Claude Code through `--mcp-config` (with
   `--strict-mcp-config` making it the only server), Codex through `mcp_servers`
-  in the root-owned managed config `/etc/codex/managed_config.toml`.
+  in the root-owned managed config `/etc/codex/managed_config.toml`, and Hermes
+  through its root-owned managed config and headless adapter.
 - The shim is a dumb stdio-to-socket pipe: `tools/list` and `tools/call` forward
   to the tools socket `/run/trustyclaw-tools/tools.sock`. It holds no state and
   no secrets. A **`tools/call`** failure — including the tools service being

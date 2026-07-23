@@ -70,6 +70,8 @@ MANAGED_AGENT_FILES = (
     "/mnt/trustyclaw-agent/agent-home/CLAUDE.md",
     "/mnt/trustyclaw-agent/agent-home/.codex/config.toml",
     "/mnt/trustyclaw-agent/agent-home/.claude/settings.json",
+    "/mnt/trustyclaw-agent/agent-home/.hermes/config.yaml",
+    "/mnt/trustyclaw-agent/agent-home/.hermes/.env",
 )
 
 # path, owner, group, mode, is_directory
@@ -84,6 +86,7 @@ PATH_FACTS: tuple[PathFact, ...] = (
     ("/mnt/trustyclaw-agent/agent-home", "trustyclaw-agent", "trustyclaw-agent", 0o700, True),
     ("/mnt/trustyclaw-agent/agent-home/.codex", "trustyclaw-agent", "trustyclaw-agent", 0o700, True),
     ("/mnt/trustyclaw-agent/agent-home/.claude", "trustyclaw-agent", "trustyclaw-agent", 0o700, True),
+    ("/mnt/trustyclaw-agent/agent-home/.hermes", "trustyclaw-agent", "trustyclaw-agent", 0o700, True),
     ("/mnt/trustyclaw-admin/proxy-state", "trustyclaw-proxy", "trustyclaw-proxy", 0o700, True),
     (
         "/mnt/trustyclaw-admin/proxy-state/generated-certs",
@@ -125,6 +128,8 @@ PATH_FACTS: tuple[PathFact, ...] = (
     ("/mnt/trustyclaw-agent/agent-home/CLAUDE.md", "root", "root", 0o644, False),
     ("/mnt/trustyclaw-agent/agent-home/.codex/config.toml", "root", "root", 0o644, False),
     ("/mnt/trustyclaw-agent/agent-home/.claude/settings.json", "root", "root", 0o644, False),
+    ("/mnt/trustyclaw-agent/agent-home/.hermes/config.yaml", "root", "root", 0o644, False),
+    ("/mnt/trustyclaw-agent/agent-home/.hermes/.env", "root", "root", 0o644, False),
 )
 
 CLOUDFLARE_PATH_FACTS: tuple[PathFact, ...] = (

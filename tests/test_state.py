@@ -743,8 +743,8 @@ class StateStorageTests(unittest.TestCase):
 
 
 class BedrockUsageCounterTests(unittest.TestCase):
-    """The proxy-written live usage counters: one row per (runtime, model,
-    UTC day), incremented per allowed invocation, aggregated per month for
+    """The proxy-written live usage counters: one row per (model, UTC day),
+    incremented per allowed invocation, aggregated per month for
     the admin API's cost estimate."""
 
     def setUp(self) -> None:
@@ -761,21 +761,19 @@ class BedrockUsageCounterTests(unittest.TestCase):
     # NUMERIC(_,6)-representable value rather than re-deriving a rate.
     COST = 0.0625
 
-    def test_usage_increments_one_row_per_runtime_model_and_day(self) -> None:
-        state.record_bedrock_usage("pi", "deepseek.v3.2", dict(self.USAGE), self.COST)
-        state.record_bedrock_usage("pi", "deepseek.v3.2", dict(self.USAGE), self.COST)
-        state.record_bedrock_usage("pi", "moonshotai.kimi-k2.5", dict(self.USAGE), self.COST)
-        state.record_bedrock_usage("hermes", "deepseek.v3.2", dict(self.USAGE), self.COST)
+    def test_usage_increments_one_row_per_model_and_day(self) -> None:
+        state.record_bedrock_usage("deepseek.v3.2", dict(self.USAGE), self.COST)
+        state.record_bedrock_usage("deepseek.v3.2", dict(self.USAGE), self.COST)
+        state.record_bedrock_usage("moonshotai.kimi-k2.5", dict(self.USAGE), self.COST)
         rows = state.read_bedrock_usage("1970-01-01")
         self.assertEqual(
-            [(row["runtime"], row["model_id"], row["requests"]) for row in rows],
+            [(row["model_id"], row["requests"]) for row in rows],
             [
-                ("hermes", "deepseek.v3.2", 1),
-                ("pi", "deepseek.v3.2", 2),
-                ("pi", "moonshotai.kimi-k2.5", 1),
+                ("deepseek.v3.2", 2),
+                ("moonshotai.kimi-k2.5", 1),
             ],
         )
-        doubled = rows[1]
+        doubled = rows[0]
         self.assertEqual(doubled["metered_requests"], 2)
         self.assertEqual(doubled["input_tokens"], 200)
         self.assertEqual(doubled["output_tokens"], 80)
@@ -785,7 +783,7 @@ class BedrockUsageCounterTests(unittest.TestCase):
 
     def test_unmetered_request_counts_without_tokens_or_cost(self) -> None:
         # A cost is passed, but an unmetered response records none of it.
-        state.record_bedrock_usage("pi", "deepseek.v3.2", None, self.COST)
+        state.record_bedrock_usage("deepseek.v3.2", None, self.COST)
         (row,) = state.read_bedrock_usage("1970-01-01")
         self.assertEqual(row["requests"], 1)
         self.assertEqual(row["metered_requests"], 0)
@@ -793,12 +791,12 @@ class BedrockUsageCounterTests(unittest.TestCase):
         self.assertEqual(row["cost_usd"], 0.0)
 
     def test_read_since_day_excludes_prior_months(self) -> None:
-        state.record_bedrock_usage("pi", "deepseek.v3.2", dict(self.USAGE), self.COST)
+        state.record_bedrock_usage("deepseek.v3.2", dict(self.USAGE), self.COST)
         with db.transaction() as cur:
             cur.execute(
-                "INSERT INTO bedrock_usage (runtime, model_id, day, requests, metered_requests,"
+                "INSERT INTO bedrock_usage (model_id, day, requests, metered_requests,"
                 " input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)"
-                " VALUES ('pi', 'deepseek.v3.2', '2001-01-31', 7, 7, 999, 999, 0, 0)",
+                " VALUES ('deepseek.v3.2', '2001-01-31', 7, 7, 999, 999, 0, 0)",
             )
         (row,) = state.read_bedrock_usage("2001-02-01")
         self.assertEqual(row["requests"], 1)

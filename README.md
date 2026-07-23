@@ -430,17 +430,20 @@ curl -H "Authorization: Bearer <admin-password>" \
 Full admin API documentation is in
 [`docs/api/AdminAPI.md`](docs/api/AdminAPI.md).
 
-With SSH operator access, give the agent files from your machine by uploading
-them as the operator and moving them into the agent-owned home directory:
+Upload a file through the authenticated admin API. The host stores it in the
+durable agent workspace with a sortable UTC timestamp prefix and returns the
+relative path to reference in a task:
 
 ```bash
-HOST=trustyclaw-operator@<public-dns>
-
-ssh -i <private-key-path> "$HOST" 'rm -rf /tmp/trustyclaw-upload'
-scp -i <private-key-path> -r ./my-files "$HOST":/tmp/trustyclaw-upload
-ssh -i <private-key-path> "$HOST" \
-  'sudo rm -rf /mnt/trustyclaw-agent/agent-home/inbox && sudo mv /tmp/trustyclaw-upload /mnt/trustyclaw-agent/agent-home/inbox && sudo chown -R trustyclaw-agent:trustyclaw-agent /mnt/trustyclaw-agent/agent-home/inbox'
+curl -H "Authorization: Bearer <admin-password>" \
+  --data-binary @./reference.png \
+  'http://127.0.0.1:7443/v1/agent-files/upload?filename=reference.png'
 ```
+
+Agent Chat exposes this flow through the attachment button in its task
+composer. It keeps up to ten selections in browser memory until Send, then
+uploads each file and adds the returned `user-files/...` paths to the task
+message.
 
 ## Internals
 

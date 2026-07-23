@@ -141,17 +141,17 @@ export const MANAGED_INTEGRATIONS = {
     ],
   },
   bedrock: {
-    label: "AWS Bedrock",
-    summary: "Connect your AWS account once and let your agent run Pi and Hermes tasks through Bedrock in your own account.",
+    label: "Hermes (AWS Bedrock)",
+    summary: "Connect your AWS account and let Hermes run tasks through Bedrock in your own account.",
     protections: [
       "Inference happens through AWS Bedrock in your own AWS account, which provides maximal data privacy from model providers: the model provider never receives your traffic, and AWS states Bedrock does not store prompts or completions after serving the response, does not share them with model providers, and does not use them to train models.",
-      "No agent process receives your AWS credential. Pi and Hermes sign with fixed dummy values that carry no AWS capability; this host's proxy re-signs allowed requests with your connected IAM key stored encrypted in the host database. Presigned query-string auth and temporary session credentials are denied.",
+      "The agent process never receives your AWS credential. Hermes signs with fixed dummy values that carry no AWS capability; this host's proxy re-signs allowed requests with your connected IAM key stored encrypted in the host database. Presigned query-string auth and temporary session credentials are denied.",
       "Only the configured region's Bedrock model APIs are reachable. The Bedrock control plane, other AWS services, and other regions stay blocked, so the key's blast radius on this host is inference only.",
     ],
     setupSteps: [
       {
         title: "Create a dedicated IAM user",
-        description: "In AWS IAM, create one user for TrustyClaw's shared Pi and Hermes Bedrock connection. Attach this policy, then create a long-term access key. Temporary session credentials are not supported.",
+        description: "In AWS IAM, create one user for TrustyClaw's Hermes Bedrock connection. Attach this policy, then create a long-term access key. Temporary session credentials are not supported.",
         code: `{
   "Version": "2012-10-17",
   "Statement": [{
@@ -172,8 +172,8 @@ export const MANAGED_INTEGRATIONS = {
         linkUrl: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html",
         linkLabel: "View AWS's model access guide",
       },
-      { title: "Connect AWS", description: "In Internet Access and Tools, expand AWS Bedrock, paste the access key id and secret access key, choose the region matching your model access, and connect them together." },
-      { title: "Enable Bedrock", description: "Choose Enable. Both Pi and Hermes become available from the shared connection." },
+      { title: "Connect AWS", description: "In Internet Access and Tools, expand Hermes (AWS Bedrock), paste the access key id and secret access key, choose the region matching your model access, and connect them together." },
+      { title: "Enable Bedrock", description: "Choose Enable. Hermes becomes available." },
     ],
     dataSummary: {
       items: [
@@ -213,12 +213,12 @@ export const MANAGED_INTEGRATIONS = {
       ],
     },
     capabilities: [
-      { name: "Pi and Hermes runtimes", description: "Runs Pi and Hermes on the same DeepSeek, Qwen, and Kimi models through one guarded Bedrock connection." },
-      { name: "Live usage estimates", description: "Provider details show a separate month-to-date estimate for Pi and for Hermes, computed live by this host from the token usage AWS reports in each response and priced at the on-demand catalog rates. AWS bills authoritatively." },
+      { name: "Hermes runtime", description: "Runs Hermes on DeepSeek, Qwen, and Kimi models through one guarded Bedrock connection." },
+      { name: "Live usage estimate", description: "Provider details show a month-to-date estimate computed live by this host from the token usage AWS reports in each response and priced at the on-demand catalog rates. AWS bills authoritatively." },
     ],
     controls: [
       "Changing the access key requires the operator to paste and validate the replacement.",
-      "One Bedrock Enable/Disable control governs both runtimes. Pi and Hermes retain separate task processes, toolbar counters, and usage meters, but share one credential, region, account, and network boundary.",
+      "One Bedrock Enable/Disable control governs Hermes and its credential, region, account, and network boundary.",
       "The host-side AWS check (STS identity attestation) runs from the host itself and is not reachable by the agent.",
     ],
     networkScope: [

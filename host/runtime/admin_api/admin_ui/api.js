@@ -40,3 +40,21 @@ export async function apiBlob(path) {
   }
   return response.blob();
 }
+
+export async function apiUpload(file) {
+  const response = await fetch(`/v1/agent-files/upload?filename=${encodeURIComponent(file.name)}`, {
+    method: "POST",
+    headers: { "Authorization": "Bearer " + getPassword() },
+    body: file,
+  });
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (_) {}
+  if (response.status === 401) { unauthorizedHandler(); throw new Error("unauthorized"); }
+  if (!response.ok) {
+    throw new Error(data && data.error ? data.error.message : response.statusText || `upload failed (${response.status})`);
+  }
+  if (!data) throw new Error("file upload returned an invalid response");
+  return data;
+}

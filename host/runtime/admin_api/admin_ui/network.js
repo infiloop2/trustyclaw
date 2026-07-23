@@ -3,12 +3,12 @@
 // with per-repository audits, and the GitHub credential controls.
 
 import { api } from "./api.js";
-import { $, badge, bedrockRuntimeUsage, esc, formatTokenCount, informationIcon, inlineCode, inlineMessage, objectValue, providerRuntime, replaceIntegrationRows, runtimeLabel, RUNTIME_PROVIDERS, setHtml } from "./helpers.js";
+import { $, badge, bedrockUsage, esc, formatTokenCount, informationIcon, inlineCode, inlineMessage, objectValue, providerRuntime, replaceIntegrationRows, runtimeLabel, RUNTIME_PROVIDERS, setHtml } from "./helpers.js";
 import { providerAccounts, refreshHealth, refreshProviderAccounts, runtimeRecords } from "./health.js";
 import { CUSTOM_DOMAIN_GUIDE, MANAGED_INTEGRATIONS, integrationInfo } from "./integration_catalog.js";
 
 const GITHUB_REPO_INPUT_RE = /^([a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?)\/([a-z0-9._-]{1,100})$/;
-// The AI Inference group in render order. Bedrock backs both Pi and Hermes.
+// The AI Inference group in render order.
 const INFERENCE_INTEGRATIONS = ["openai", "claude", "bedrock"];
 const BEDROCK_INTEGRATION = "bedrock";
 // Must match SUPPORTED_REGIONS in host/network_integrations/bedrock/manifest.py.
@@ -219,7 +219,7 @@ function integrationDetailsHtml(name, enabled) {
     const region = bedrockCredentialMetadata.region || "us-east-1";
     const accountCard = `
       <div class="detail-card">
-        <div class="detail-card-head"><h3>Shared AWS Bedrock connection</h3></div>
+        <div class="detail-card-head"><h3>AWS Bedrock connection</h3></div>
         <div class="integration-account" data-provider="${esc(name)}"></div>
         <div class="bedrock-credential-form">
           <input id="bedrock-access-key-id-${esc(name)}" type="text" placeholder="Access key id (AKIA...)" autocomplete="off" spellcheck="false">
@@ -310,9 +310,9 @@ export function renderIntegrationAccounts() {
       : record.status === "active" && identity
         ? `Connected account: <span class="connection-identity">${esc(identity)}</span> &middot; only this account is allowed through the proxy.`
         : identity
-          ? `Linked account: <span class="connection-identity">${esc(identity)}</span> &middot; ${provider === BEDROCK_INTEGRATION ? "enable Bedrock to activate Pi and Hermes." : "sign in again to reconnect it."}`
+          ? `Linked account: <span class="connection-identity">${esc(identity)}</span> &middot; ${provider === BEDROCK_INTEGRATION ? "enable Bedrock to activate Hermes." : "sign in again to reconnect it."}`
           : provider === BEDROCK_INTEGRATION && bedrockCredentialMetadata.connected
-            ? `AWS credential stored: <span class="connection-identity">${esc(bedrockCredentialMetadata.access_key_id || "linked")}</span>. Enable Bedrock to activate Pi and Hermes.`
+            ? `AWS credential stored: <span class="connection-identity">${esc(bedrockCredentialMetadata.access_key_id || "linked")}</span>. Enable Bedrock to activate Hermes.`
             : provider === BEDROCK_INTEGRATION
               ? "No AWS credential stored yet. Connect a dedicated IAM access key; ensure it has at least these permissions: bedrock:InvokeModel and bedrock:InvokeModelWithResponseStream (required IAM policy). The operator key never enters an agent process."
             : "No account linked yet. The first login links the account it signs in to, and only that account is then allowed through the proxy.";
@@ -321,7 +321,7 @@ export function renderIntegrationAccounts() {
       : !enabled
         ? provider === BEDROCK_INTEGRATION
           ? bedrockCredentialMetadata.connected
-            ? `<p class="muted">The validated credential remains stored. Enable AWS Bedrock to make Pi and Hermes available.</p>`
+            ? `<p class="muted">The validated credential remains stored. Enable AWS Bedrock to make Hermes available.</p>`
             : ""
           : `<p class="muted">Enable ${esc(MANAGED_INTEGRATIONS[provider].label)} access before starting a login.</p>`
         : "";
@@ -341,16 +341,12 @@ export function renderIntegrationAccounts() {
 }
 
 function bedrockBillingMetadata(account) {
-  // One live usage box per Bedrock runtime: the harnesses share one provider
-  // and credential but meter separately, so Pi and Hermes each show their own
-  // month-to-date estimate.
-  const boxes = ["pi", "hermes"].map(runtime => bedrockRuntimeUsageBox(account, runtime)).join("");
-  if (!boxes) return "";
-  return `<div class="bedrock-usage-boxes">${boxes}</div>`;
+  const box = bedrockUsageBox(account);
+  return box ? `<div class="bedrock-usage-boxes">${box}</div>` : "";
 }
 
-function bedrockRuntimeUsageBox(account, runtime) {
-  const usage = bedrockRuntimeUsage(account, runtime);
+function bedrockUsageBox(account) {
+  const usage = bedrockUsage(account);
   if (!usage) return "";
   const tokenParts = [
     `${formatTokenCount(usage.inputTokens)} in`,
@@ -364,8 +360,7 @@ function bedrockRuntimeUsageBox(account, runtime) {
     ? `<span class="bedrock-usage-caveat">${esc(`${unmetered} of ${usage.requests} requests unmetered`)}</span>`
     : "";
   return `
-    <span class="bedrock-usage-box" role="group" aria-label="${esc(`${runtimeLabel(runtime)} month-to-date estimate ${usage.cost}; ${tokenParts.join(", ")} tokens; ${usage.requests} requests`)}">
-      <span class="bedrock-usage-runtime">${esc(runtimeLabel(runtime))}</span>
+    <span class="bedrock-usage-box" role="group" aria-label="${esc(`Month-to-date estimate ${usage.cost}; ${tokenParts.join(", ")} tokens; ${usage.requests} requests`)}">
       <span class="bedrock-usage-cost">MTD est. <strong>${esc(usage.cost)}</strong></span>
       <span class="bedrock-usage-tokens">${esc(tokenParts.join(" · "))} · ${esc(String(usage.requests))} req</span>
       ${caveatHtml}
@@ -376,7 +371,7 @@ export async function resetLinkedAccount(provider) {
   const label = MANAGED_INTEGRATIONS[provider] ? MANAGED_INTEGRATIONS[provider].label : provider;
   const sharedBedrock = provider === BEDROCK_INTEGRATION;
   const message = sharedBedrock
-    ? "Disconnect the shared AWS Bedrock account? This fails running Pi and Hermes tasks and clears their shared credential. Neither harness can reach Bedrock until credentials are connected again."
+    ? "Disconnect the AWS Bedrock account? This fails running Hermes tasks and clears its credential. Hermes cannot reach Bedrock until credentials are connected again."
     : `Disconnect the linked ${label} account? This clears local ${label} auth and fails running tasks that use it. The agent cannot reach ${label} until a new login links an account.`;
   if (!confirm(message)) return;
   const runtime = providerRuntime(provider);
@@ -386,7 +381,7 @@ export async function resetLinkedAccount(provider) {
     } else {
       await api("POST", "/v1/agent-runtime/reset-linked-account", { "agent_runtime": runtime });
     }
-    policyMessage(provider, sharedBedrock ? "Shared AWS Bedrock account disconnected." : `${label} account disconnected.`);
+    policyMessage(provider, sharedBedrock ? "AWS Bedrock account disconnected." : `${label} account disconnected.`);
     await refreshProviderAccounts();
     await refreshHealth();
   } catch (error) { policyMessage(provider, error.message, true); }

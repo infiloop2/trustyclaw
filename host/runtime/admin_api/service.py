@@ -148,6 +148,9 @@ OAUTH_LOGIN_STATUSES = ("awaiting_login", "error")
 REBOOT_HELPER_TIMEOUT_SECONDS = 10
 AGENT_FILE_HELPER_TIMEOUT_SECONDS = 10
 AGENT_FILE_HELPER_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/read-agent-file"]
+AGENT_FILE_UPLOAD_HELPER_COMMAND = ["/usr/bin/sudo", "-n", "/usr/local/lib/trustyclaw-host/upload-agent-file"]
+AGENT_FILE_UPLOAD_MAX_BYTES = 25 * 1024 * 1024
+AGENT_FILE_UPLOAD_FILENAME_MAX_BYTES = 200
 AGENT_FILE_STREAM_MAX_BYTES = 200_000_000
 AGENT_FILE_STREAM_MEDIA_TYPES = {".mp4": "video/mp4", ".mov": "video/quicktime"}
 AGENT_AUTH_CLEAR_HELPER_TIMEOUT_SECONDS = 10
@@ -206,10 +209,15 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_app_ui_asset(*app_asset)
                     return
             self._authenticate()
+            bridge_app_id = self.headers.get("X-TrustyClaw-App-Bridge", "") or None
             if method == "GET" and path.path == "/v1/agent-files/content":
                 self._send_agent_file(_agent_file_path(parse_qs(path.query)))
                 return
-            bridge_app_id = self.headers.get("X-TrustyClaw-App-Bridge", "") or None
+            if method == "POST" and path.path == "/v1/agent-files/upload":
+                if bridge_app_id is not None:
+                    raise ApiError(HTTPStatus.FORBIDDEN, "app bridge requests may only target the app's own API")
+                self._send_agent_file_upload(parse_qs(path.query))
+                return
             response = route(
                 method, path.path, parse_qs(path.query), self._read_body(), bridge_app_id=bridge_app_id
             )
@@ -381,6 +389,102 @@ class Handler(BaseHTTPRequestHandler):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+
+    def _send_agent_file_upload(self, query: dict[str, list[str]]) -> None:
+        filename = _agent_file_upload_filename(query)
+        length = self._content_length(AGENT_FILE_UPLOAD_MAX_BYTES)
+        process = subprocess.Popen(
+            [*AGENT_FILE_UPLOAD_HELPER_COMMAND, filename, str(length)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert process.stdin is not None
+        assert process.stdout is not None
+        assert process.stderr is not None
+        try:
+            remaining = length
+            while remaining:
+                chunk = self.rfile.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "upload ended before Content-Length bytes were received")
+                process.stdin.write(chunk)
+                remaining -= len(chunk)
+            process.stdin.close()
+            process.wait(timeout=AGENT_FILE_HELPER_TIMEOUT_SECONDS)
+        except BrokenPipeError as exc:
+            try:
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+            try:
+                process.wait(timeout=AGENT_FILE_HELPER_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                self._terminate_agent_file_upload_helper(process)
+                raise ApiError(HTTPStatus.GATEWAY_TIMEOUT, "agent file upload helper timed out") from exc
+        except subprocess.TimeoutExpired as exc:
+            if process.poll() is None:
+                self._terminate_agent_file_upload_helper(process)
+            raise ApiError(HTTPStatus.GATEWAY_TIMEOUT, "agent file upload helper timed out") from exc
+        except BaseException:
+            try:
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+            if process.poll() is None:
+                try:
+                    # EOF lets the helper run its finally block and remove a
+                    # partial .uploading-* file after a short client body.
+                    process.wait(timeout=AGENT_FILE_HELPER_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    self._terminate_agent_file_upload_helper(process)
+            raise
+        stdout = process.stdout.read(64 * 1024).decode("utf-8", "replace")
+        stderr = process.stderr.read(64 * 1024).decode("utf-8", "replace")
+        if process.returncode != 0:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST if process.returncode == 2 else HTTPStatus.INTERNAL_SERVER_ERROR,
+                _helper_error_message(stdout, stderr) or "agent file upload helper failed",
+            )
+        try:
+            uploaded = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "agent file upload helper returned invalid JSON") from exc
+        if (
+            not isinstance(uploaded, dict)
+            or not isinstance(uploaded.get("name"), str)
+            or uploaded.get("original_name") != filename
+            or uploaded.get("path") != f"user-files/{uploaded.get('name')}"
+            or uploaded.get("size_bytes") != length
+            or not isinstance(uploaded.get("uploaded_at"), str)
+        ):
+            raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "agent file upload helper returned invalid JSON")
+        self._send_json(HTTPStatus.OK, {"file": uploaded})
+
+
+    @staticmethod
+    def _terminate_agent_file_upload_helper(process: subprocess.Popen[bytes]) -> None:
+        try:
+            process.kill()
+            process.wait(timeout=AGENT_FILE_HELPER_TIMEOUT_SECONDS)
+        except (PermissionError, subprocess.TimeoutExpired):
+            # The admin user may not be allowed to signal a sudo helper after
+            # it demotes. Never turn the request timeout into an unbounded wait.
+            pass
+
+    def _content_length(self, maximum: int) -> int:
+        raw = self.headers.get("Content-Length")
+        if raw is None:
+            raise ApiError(HTTPStatus.LENGTH_REQUIRED, "Content-Length is required")
+        try:
+            length = int(raw)
+        except ValueError as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "malformed Content-Length") from exc
+        if length < 0:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "malformed Content-Length")
+        if length > maximum:
+            raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, f"upload exceeds {maximum} bytes")
+        return length
 
 
 def route(
@@ -1106,11 +1210,11 @@ def connect_bedrock_credentials(body: Any) -> dict[str, str]:
             HTTPStatus.BAD_REQUEST,
             error_message or "AWS credential validation failed",
         )
-    if not orchestrator.runtime_network_enabled("pi"):
+    if not orchestrator.runtime_network_enabled("hermes"):
         return {"status": "accepted"}
-    # Runtime refresh projects the validated row into both harness counters
-    # without another AWS call. The proxy reads that same row directly.
-    orchestrator.refresh_runtime_status("pi")
+    # Runtime refresh reads the validated row without another AWS call. The
+    # proxy reads that same row directly.
+    orchestrator.refresh_runtime_status("hermes")
     return {"status": "accepted"}
 
 
@@ -1127,7 +1231,7 @@ def current_bedrock_credentials() -> dict[str, Any]:
 
 
 def disconnect_bedrock_credentials() -> dict[str, str]:
-    """Delete the shared AWS connection and stop both Bedrock harnesses."""
+    """Delete the AWS connection and stop Hermes."""
     orchestrator.disconnect_bedrock_connection()
     return {"status": "accepted"}
 
@@ -1170,8 +1274,7 @@ def _clear_local_agent_auth(runtime_type: str) -> None:
         raise ApiError(HTTPStatus.CONFLICT, message)
 
 
-AGENT_RUNTIME_TYPES = ("codex", "claude_code", "pi", "hermes")
-BEDROCK_RUNTIME_TYPES = ("pi", "hermes")
+AGENT_RUNTIME_TYPES = ("codex", "claude_code", "hermes")
 OAUTH_RUNTIME_TYPES = ("codex", "claude_code")
 
 
@@ -1201,10 +1304,8 @@ def refresh_agent_runtime_accounts(body: Any) -> dict[str, Any]:
     else:
         raise ApiError(HTTPStatus.BAD_REQUEST, "request body must be an object")
     for runtime_type in runtime_types:
-        if runtime_type == "hermes" and "pi" in runtime_types:
-            continue
         force_probe = (
-            runtime_type not in BEDROCK_RUNTIME_TYPES
+            runtime_type != "hermes"
             or orchestrator.runtime_network_enabled(runtime_type)
         )
         orchestrator.refresh_runtime_status(runtime_type, force_provider_probe=force_probe)
@@ -1237,12 +1338,10 @@ def _current_agent_account(statuses: dict[str, dict[str, Any]], runtime_type: st
 
 
 def _current_bedrock_account(statuses: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    # The orchestrator projects one Bedrock provider record into both runtime
-    # rows. Read either projection; there is no second status to reconcile.
-    status = str(statuses.get("pi", {}).get("status", "loading"))
+    status = str(statuses.get("hermes", {}).get("status", "loading"))
     response: dict[str, Any] = {
         "provider": "bedrock",
-        "agent_runtimes": list(BEDROCK_RUNTIME_TYPES),
+        "agent_runtimes": ["hermes"],
         "status": status,
         # Live usage survives credential state on purpose: the counters record
         # month-to-date work already done, and reporting them costs one local
@@ -1270,38 +1369,31 @@ _BEDROCK_USAGE_TOKEN_FIELDS = (
 )
 
 
-def _bedrock_live_usage() -> dict[str, dict[str, Any]]:
-    """Month-to-date usage per Bedrock runtime.
+def _bedrock_live_usage() -> dict[str, Any]:
+    """Month-to-date Bedrock usage.
 
     The proxy counts the token usage AWS reports in each allowed response and
-    the USD it priced that response at, per runtime, model, and UTC day. This
+    the USD it priced that response at, per model and UTC day. This
     sums the current month straight from those stored counters — the cost is
     the recorded figure, not re-priced at read time. It remains an estimate of
     what AWS will bill, not the bill itself: unmetered requests (``requests``
     minus ``metered_requests``) are surfaced instead of silently rounding the
     estimate down."""
     month_start = time.strftime("%Y-%m-01", time.gmtime())
-    usage: dict[str, dict[str, Any]] = {
-        runtime: {
-            "month_to_date": 0.0,
-            "currency": "USD",
-            "requests": 0,
-            "metered_requests": 0,
-            **{field: 0 for field in _BEDROCK_USAGE_TOKEN_FIELDS},
-        }
-        for runtime in BEDROCK_RUNTIME_TYPES
+    usage: dict[str, Any] = {
+        "month_to_date": 0.0,
+        "currency": "USD",
+        "requests": 0,
+        "metered_requests": 0,
+        **{field: 0 for field in _BEDROCK_USAGE_TOKEN_FIELDS},
     }
     for row in state.read_bedrock_usage(month_start):
-        summary = usage.get(row["runtime"])
-        if summary is None:
-            continue
-        summary["requests"] += row["requests"]
-        summary["metered_requests"] += row["metered_requests"]
-        summary["month_to_date"] += row["cost_usd"]
+        usage["requests"] += row["requests"]
+        usage["metered_requests"] += row["metered_requests"]
+        usage["month_to_date"] += row["cost_usd"]
         for field in _BEDROCK_USAGE_TOKEN_FIELDS:
-            summary[field] += row[field]
-    for summary in usage.values():
-        summary["month_to_date"] = round(summary["month_to_date"], 4)
+            usage[field] += row[field]
+    usage["month_to_date"] = round(usage["month_to_date"], 4)
     return usage
 
 
@@ -1750,6 +1842,23 @@ def _agent_file_path(query: dict[str, list[str]]) -> str:
         raise ApiError(HTTPStatus.BAD_REQUEST, "path contains a NUL byte")
     if len(value) > 4096:
         raise ApiError(HTTPStatus.BAD_REQUEST, "path is too long")
+    return value
+
+
+def _agent_file_upload_filename(query: dict[str, list[str]]) -> str:
+    _reject_query_keys(query, {"filename"}, "agent file upload")
+    value = _one(query, "filename")
+    if value is None or value in {"", ".", ".."}:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "filename must be non-empty")
+    if any(character in value for character in ("/", "\\", "\0")):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "filename must not contain path separators or a NUL byte")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "filename must not contain control characters")
+    if len(value.encode("utf-8")) > AGENT_FILE_UPLOAD_FILENAME_MAX_BYTES:
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            f"filename must be at most {AGENT_FILE_UPLOAD_FILENAME_MAX_BYTES} UTF-8 bytes",
+        )
     return value
 
 

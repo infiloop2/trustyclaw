@@ -19,7 +19,7 @@ from tests.stage.stage_support import (
 
 
 class AwsSmokeTeardownTests(unittest.TestCase):
-    def test_precredential_bedrock_probe_runs_both_real_launchers(self) -> None:
+    def test_precredential_bedrock_probe_runs_real_hermes_launcher(self) -> None:
         smoke = AwsSmoke()
         smoke.total = 0
         smoke.passed = 0
@@ -76,9 +76,7 @@ class AwsSmokeTeardownTests(unittest.TestCase):
 
         joined = "\n".join(commands)
         self.assertIn("sudo -u trustyclaw-admin", joined)
-        self.assertIn("/usr/local/lib/trustyclaw-host/run-pi", joined)
-        self.assertEqual(joined.count("--model qwen.qwen3-coder-next"), 2)
-        self.assertIn("sleep 5", joined)
+        self.assertEqual(joined.count("--model qwen.qwen3-coder-next"), 1)
         self.assertIn("/usr/local/lib/trustyclaw-host/run-hermes", joined)
         self.assertIn("--model qwen.qwen3-coder-next", joined)
         self.assertEqual(smoke.passed, 1)
@@ -275,7 +273,6 @@ class StageAwsSmokeTests(unittest.TestCase):
     def test_stage_suite_runtimes_scope_each_suite(self) -> None:
         self.assertEqual(StageAwsSmoke.suite_runtimes("codex"), ("codex",))
         self.assertEqual(StageAwsSmoke.suite_runtimes("claude"), ("claude_code",))
-        self.assertEqual(StageAwsSmoke.suite_runtimes("pi"), ("pi",))
         self.assertEqual(StageAwsSmoke.suite_runtimes("hermes"), ("hermes",))
         self.assertEqual(StageAwsSmoke.suite_runtimes("github"), ())
         self.assertEqual(StageAwsSmoke.suite_runtimes("brave_search"), ())
@@ -283,7 +280,7 @@ class StageAwsSmokeTests(unittest.TestCase):
         self.assertEqual(StageAwsSmoke.suite_runtimes("google_calendar"), ())
         self.assertEqual(
             StageAwsSmoke.suite_runtimes("all"),
-            ("codex", "claude_code", "pi", "hermes"),
+            ("codex", "claude_code", "hermes"),
         )
         self.assertTrue(set(TOOL_SUITES).issubset(STAGE_SUITES))
         self.assertEqual(suite_tools("all"), TOOL_SUITES)

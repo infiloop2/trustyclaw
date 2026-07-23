@@ -3,7 +3,7 @@
 Every task turn runs inside a systemd scope named after its host thread
 (``trustyclaw-agent-thread-<thread_id>.scope``, created by the run-*
 launchers). Freeing that scope after a turn — killed or completed — is a host
-invariant shared by all four runtimes, so it lives here rather than in each
+invariant shared by all three runtimes, so it lives here rather than in each
 adapter: the privileged stop-agent-thread helper SIGKILLs the scope's whole
 cgroup and returns once the unit is gone, so a same-thread follow-up can
 recreate the name. See ``host/bootstrap/helpers/stop-agent-thread.sh``.

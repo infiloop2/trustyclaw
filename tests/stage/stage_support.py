@@ -18,16 +18,14 @@ STAGE_AGENT_NAME = "trustyclaw-stage"
 CHEAP_MODELS = {
     "codex": "gpt-5.6-luna",
     "claude_code": "sonnet",
-    "pi": "qwen.qwen3-coder-next",
     "hermes": "qwen.qwen3-coder-next",
 }
 CHEAP_EFFORT = "high"
 TOOL_SUITES = tuple(sorted(BUNDLED_TOOLS))
-STAGE_SUITES = ("all", *TOOL_SUITES, "claude", "codex", "pi", "hermes", "github")
+STAGE_SUITES = ("all", *TOOL_SUITES, "claude", "codex", "hermes", "github")
 RUNTIME_LABELS = {
     "codex": "Codex",
     "claude_code": "Claude Code",
-    "pi": "Pi",
     "hermes": "Hermes",
 }
 
@@ -146,7 +144,7 @@ def github_app_config_from_env() -> tuple[dict[str, str] | None, str | None]:
 
 
 def bedrock_credential_from_env() -> tuple[tuple[str, str] | None, str | None]:
-    """Read the optional shared Bedrock stage credential."""
+    """Read the optional Bedrock stage credential."""
     access_key_env, secret_key_env = STAGE_BEDROCK_ENV
     access_key_id = (os.environ.get(access_key_env) or "").strip()
     secret_access_key = (os.environ.get(secret_key_env) or "").strip()
@@ -155,7 +153,7 @@ def bedrock_credential_from_env() -> tuple[tuple[str, str] | None, str | None]:
     if not access_key_id or not secret_access_key:
         missing = access_key_env if not access_key_id else secret_key_env
         return None, (
-            f"incomplete shared Bedrock stage credential: set both {access_key_env} and "
+            f"incomplete Bedrock stage credential: set both {access_key_env} and "
             f"{secret_key_env}; missing {missing}"
         )
     return (access_key_id, secret_access_key), None
@@ -168,12 +166,10 @@ def integration_label(integration: str) -> str:
         return "Codex"
     if integration == "github":
         return "GitHub"
-    if integration == "pi":
-        return "Pi"
     if integration == "hermes":
         return "Hermes"
-    if integration == "bedrock_shared":
-        return "Shared AWS Bedrock"
+    if integration == "bedrock":
+        return "AWS Bedrock"
     if integration == "runtime_interoperability":
         return "Runtime interoperability"
     return BUNDLED_TOOLS[integration].manifest.display_name
@@ -181,7 +177,7 @@ def integration_label(integration: str) -> str:
 
 def selected_integrations(suite: str) -> tuple[str, ...]:
     if suite == "all":
-        return ("codex", "claude", "pi", "hermes", "github", *TOOL_SUITES)
+        return ("codex", "claude", "hermes", "github", *TOOL_SUITES)
     return (suite,)
 
 

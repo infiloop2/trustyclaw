@@ -1,6 +1,7 @@
 {
   "host_slot": 0,
   "title": "Agent Chat",
+  "release_stage": "stable",
   "agent": {
     "instructions": "agent.md",
     "api": false

@@ -190,26 +190,23 @@ schema creation and narrow grants. The GitHub push gate uses this pattern for
 `pending_pushes` and quarantined payloads. Integrations do not run migrations
 or gain an independent database identity.
 
-### One provider for shared harness infrastructure
+### One provider for Hermes infrastructure
 
 Managed apex claims are disjoint because the proxy resolves each host to one
-integration. Pi and Hermes both use the same Bedrock account, credential-row
-region, billing data, and `bedrock-runtime.<region>.amazonaws.com` endpoints, so
-the policy models those shared concerns as one operator-facing `bedrock`
-integration. Pi and Hermes remain runtime choices, not network integrations.
+integration. Hermes uses one Bedrock account, credential-row region, billing
+data, and `bedrock-runtime.<region>.amazonaws.com` endpoints, so the policy
+models those concerns as one operator-facing `bedrock` integration.
 
-The agent process never holds the operator's AWS key. Both launchers inject
-the same fixed dummy access-key id and secret. The guard requires the dummy
+The agent process never holds the operator's AWS key. The Hermes launcher
+injects a fixed dummy access-key id and secret. The guard requires the dummy
 access-key id, configured region, SigV4 service `bedrock`, an allowed POST
 model path, and header-based long-term-key authentication. It then discards
 the dummy signature and re-signs the exact method, path, headers, and body with
 the validated operator key from the shared `bedrock_credentials` row. The dummy
-values are public routing markers with no AWS capability and are not a security
-identity between the two shell-capable harnesses.
+values are public routing markers with no AWS capability.
 
-This keeps the boundary direct: one provider row owns the shared apexes,
-credential, and status. The task API and toolbar project that status into Pi
-and Hermes rows beside their separate running counts. Providers with distinct
+This keeps the boundary direct: one provider row owns the apexes, credential,
+and status. Providers with distinct
 infrastructure (OpenAI, Claude, GitHub) likewise own their apexes directly.
 
 ## Denial Reasons and Agent Introspection
@@ -300,13 +297,12 @@ and does not copy or delete credential data. Later AWS failures pass back as
 ordinary task errors and do not mutate credential state.
 
 On the Bedrock hosts the proxy also meters usage out of the responses it
-relays. Each harness signs with its own fixed routing key id (`pi` and
-`hermes` entries in the Bedrock manifest), so an allowed invocation selects a
-passive response meter attributed to that runtime. The meter buffers a copy
+relays. Hermes signs with a fixed routing key id, so an allowed invocation
+selects a passive response meter. The meter buffers a copy
 of the raw upstream response while the relay forwards it unchanged, then
 parses the token usage AWS reports — the `usage` object of a Converse JSON
 body, or the `metadata` event inside a ConverseStream event stream — and
-increments one `bedrock_usage` counter row per (runtime, model, UTC day)
+increments one `bedrock_usage` counter row per (model, UTC day)
 under the proxy's own database role. Metering never affects the relay: a
 non-200 response, an unparsed shape, or an oversized body records the request
 with no tokens, and the gap between `requests` and `metered_requests` keeps
