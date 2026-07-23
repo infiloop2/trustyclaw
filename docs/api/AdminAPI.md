@@ -451,7 +451,7 @@ Task endpoints:
 | `POST` | `/v1/tasks/{task_id}/cancel` | none | Task cancel response | Requests cancellation for one pending task. Only tasks with status `queued` can be cancelled. |
 | `POST` | `/v1/tasks/{task_id}/kill` | none | Task kill response | Kills one running task: its runtime process is terminated and the task becomes `cancelled`. Only tasks with status `running` can be killed; returns `409` otherwise. The thread itself survives — a later task on the same `thread_id` resumes the conversation. |
 | `GET` | `/v1/threads` | none | Thread list response | Lists recent runtime threads, including active queued/running work and retained runtime session mappings. |
-| `GET` | `/v1/threads/{thread_id}/tasks` | none | Task list response | Lists retained tasks for one thread, newest first by `updated_at` with task id as a tiebreaker. |
+| `GET` | `/v1/threads/{thread_id}/tasks` | Optional `limit` and `message_bytes` query parameters | Task list response | Lists retained tasks for one thread, newest first by `updated_at` with task id as a tiebreaker. `limit` defaults to 1,000 and is capped there. When supplied, `message_bytes` truncates each input, output, and error string to that many encoded bytes, capped at 200,000, before the response crosses a proxy boundary. |
 | `GET` | `/v1/threads/{thread_id}/events?since=<seq>&limit=<n>` | `since` and `limit` query parameters are optional | Event list response | Streams one thread's task events across all of its tasks, oldest first, with `seq > since`. `limit` defaults to 100 and is capped there. |
 
 Create task request:
@@ -1207,7 +1207,7 @@ host-derived resources assigned to each one:
 | Field | Meaning |
 | --- | --- |
 | `apps[].id`, `title` | Stable manifest id and operator-facing title. |
-| `apps[].release_stage` | Required manifest stage: `stable` or `beta`. The admin shell places beta apps in a collapsed group; this field grants no additional authority. |
+| `apps[].release_stage` | Required manifest stage: `stable` or `beta`. The admin shell places stable non-hero apps in the always-visible Apps section and beta apps in a collapsed Apps (Beta) group; this field grants no additional authority. |
 | `apps[].backend.api_route` | Authenticated admin API prefix that reverse-proxies to this app backend. |
 | `apps[].ui.iframe_src` | Static entry point mounted by the admin API. |
 | `apps[].ui.sandbox` | iframe permissions the admin shell applies. `allow-same-origin` is deliberately absent, so the app frame has an opaque origin. |

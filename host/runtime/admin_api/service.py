@@ -134,6 +134,7 @@ MESSAGE_LIMIT = 50_000
 MAINTENANCE_INTERVAL_SECONDS = 3600  # scheduled state cleanup cadence (not per-request)
 FINISHED_TASK_LIMIT = 100_000  # finished tasks kept as history before the oldest are pruned
 THREAD_TASK_LIMIT = 1000
+THREAD_TASK_MESSAGE_BYTES_LIMIT = 200_000
 THREAD_MAP_LIMIT = 100_000  # user thread -> runtime session mappings kept before LRU pruning
 # Queued tasks and undelivered steers are the two operator-driven inputs that
 # would otherwise grow admin state without bound (active tasks are never
@@ -240,13 +241,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_app_ui_asset(self, _app: app_platform.AppManifest, asset: Path, content_type: str) -> None:
+    def _send_app_ui_asset(self, app: app_platform.AppManifest, asset: Path, content_type: str) -> None:
         data = asset.read_bytes()
         self.send_response(HTTPStatus.OK.value)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self._send_ui_cache_headers()
-        self._send_app_ui_security_headers()
+        self._send_app_ui_security_headers(app)
         self.end_headers()
         self.wfile.write(data)
 
@@ -259,8 +260,9 @@ class Handler(BaseHTTPRequestHandler):
         for name, value in SECURITY_HEADERS.items():
             self.send_header(name, value)
 
-    def _send_app_ui_security_headers(self) -> None:
+    def _send_app_ui_security_headers(self, app: app_platform.AppManifest) -> None:
         asset_origin = self._app_ui_asset_origin()
+        worker_policy = "; worker-src blob:; webrtc 'block'" if app.capability_worker else ""
         self.send_header(
             "Content-Security-Policy",
             "default-src 'none'; "
@@ -275,7 +277,8 @@ class Handler(BaseHTTPRequestHandler):
             "object-src 'none'; "
             "sandbox allow-scripts allow-forms allow-modals; "
             f"script-src 'self' {asset_origin}; "
-            f"style-src 'self' 'unsafe-inline' {asset_origin}",
+            f"style-src 'self' 'unsafe-inline' {asset_origin}"
+            f"{worker_policy}",
         )
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -928,7 +931,14 @@ def thread_route(method: str, path: str, query: dict[str, list[str]]) -> Any:
         thread_id = parts[2]
         if not THREAD_ID_RE.fullmatch(thread_id):
             raise ApiError(HTTPStatus.NOT_FOUND, "thread route not found")
-        return list_thread_tasks(thread_id)
+        _reject_query_keys(query, {"limit", "message_bytes"}, "thread task")
+        return list_thread_tasks(
+            thread_id,
+            limit=_bounded_positive_query_int(query, "limit", THREAD_TASK_LIMIT, THREAD_TASK_LIMIT),
+            message_bytes=_optional_bounded_positive_query_int(
+                query, "message_bytes", THREAD_TASK_MESSAGE_BYTES_LIMIT
+            ),
+        )
     if len(parts) == 4 and parts[3] == "events" and method == "GET":
         thread_id = parts[2]
         if not THREAD_ID_RE.fullmatch(thread_id):
@@ -1496,8 +1506,18 @@ def list_threads() -> dict[str, Any]:
     return {"threads": ordered}
 
 
-def list_thread_tasks(thread_id: str) -> dict[str, Any]:
-    return {"tasks": [public_task(task) for task in state.tasks_for_thread(thread_id, THREAD_TASK_LIMIT)]}
+def list_thread_tasks(
+    thread_id: str,
+    *,
+    limit: int = THREAD_TASK_LIMIT,
+    message_bytes: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "tasks": [
+            public_task(task, message_bytes=message_bytes)
+            for task in state.tasks_for_thread(thread_id, limit)
+        ]
+    }
 
 
 def get_task(task_id: str) -> dict[str, Any]:
@@ -1681,7 +1701,12 @@ def _proc_meminfo() -> dict[str, int]:
     return values
 
 
-def public_task(task: dict[str, Any], queue_position: int | None = None) -> dict[str, Any]:
+def public_task(
+    task: dict[str, Any],
+    queue_position: int | None = None,
+    *,
+    message_bytes: int | None = None,
+) -> dict[str, Any]:
     value = {
         "task_id": task["task_id"],
         "status": task["status"],
@@ -1689,14 +1714,14 @@ def public_task(task: dict[str, Any], queue_position: int | None = None) -> dict
         "model": task["model"],
         "effort": task["effort"],
         "thread_id": task["thread_id"],
-        "input_message": task["input_message"],
+        "input_message": _clip_encoded_text(task["input_message"], message_bytes),
         "created_at": task["created_at"],
         "updated_at": task["updated_at"],
     }
     if task.get("output_message") is not None:
-        value["output_message"] = task["output_message"]
+        value["output_message"] = _clip_encoded_text(task["output_message"], message_bytes)
     if task.get("error_message") is not None:
-        value["error_message"] = task["error_message"]
+        value["error_message"] = _clip_encoded_text(task["error_message"], message_bytes)
     if queue_position is not None:
         value["queue_position"] = queue_position
     return value
@@ -1873,6 +1898,48 @@ def _optional_non_negative_int(query: dict[str, list[str]], key: str) -> int | N
     if parsed < 0:
         raise ApiError(HTTPStatus.BAD_REQUEST, f"{key} must be non-negative")
     return parsed
+
+
+def _bounded_positive_query_int(
+    query: dict[str, list[str]],
+    key: str,
+    default: int,
+    maximum: int,
+) -> int:
+    value = _one(query, key)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"{key} must be an integer") from exc
+    if parsed < 1:
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"{key} must be positive")
+    if parsed > maximum:
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"{key} must be at most {maximum}")
+    return parsed
+
+
+def _optional_bounded_positive_query_int(
+    query: dict[str, list[str]],
+    key: str,
+    maximum: int,
+) -> int | None:
+    if _one(query, key) is None:
+        return None
+    return _bounded_positive_query_int(query, key, maximum, maximum)
+
+
+def _clip_encoded_text(value: str, maximum: int | None) -> str:
+    if maximum is None:
+        return value
+    encoded = value.encode()
+    if len(encoded) <= maximum:
+        return value
+    suffix = "…".encode()
+    if maximum < len(suffix):
+        return encoded[:maximum].decode(errors="ignore")
+    return encoded[: maximum - len(suffix)].decode(errors="ignore") + "…"
 
 
 def _network_event_decision(query: dict[str, list[str]]) -> str | None:
