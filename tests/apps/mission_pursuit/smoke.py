@@ -475,7 +475,7 @@ def desktop_smoke(page: Any) -> None:
     from playwright.sync_api import expect
 
     expect(page.locator("#sidebar-apps")).to_contain_text("Apps")
-    page.locator("#app-tabs").get_by_role("button", name="Mission Pursuit", exact=True).click()
+    page.locator("#beta-app-tabs").get_by_role("button", name="Mission Pursuit", exact=True).click()
     expect(page.locator("#panel-app-mission_pursuit")).to_be_visible()
     frame = page.frame_locator('iframe[title="Mission Pursuit"]')
 
@@ -655,7 +655,7 @@ def mobile_smoke(page: Any) -> None:
     expect(page.locator("#sidebar-apps")).to_contain_text("Apps")
     page.locator("#mobile-nav-toggle").click()
     expect(page.locator("#nav-backdrop")).to_be_visible()
-    page.locator("#app-tabs").get_by_role("button", name="Mission Pursuit", exact=True).click()
+    page.locator("#beta-app-tabs").get_by_role("button", name="Mission Pursuit", exact=True).click()
     expect(page.locator("#nav-backdrop")).to_be_hidden()
     expect(page.locator("#panel-app-mission_pursuit")).to_be_visible()
     app_frame = page.locator('iframe[title="Mission Pursuit"]')

@@ -67,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=STAGE_SUITES,
         default="all",
         help=(
-            "Which test suite to run. 'claude', 'codex', 'pi', 'hermes', or 'github' run that integration's "
+            "Which test suite to run. 'claude', 'codex', 'hermes', or 'github' run that integration's "
             "checks only (plus the shared preamble); each bundled tool id runs that tool's "
             "live check; 'all' (default) checks credentials for every integration first, "
             "skips unavailable integrations, and runs every available integration "
@@ -84,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
     run_network_baseline = 0
     try:
         stage.open_tunnel()
-        # One optional credential configures the shared Bedrock provider. The
+        # One optional credential configures the Bedrock provider. The
         # POST validates it synchronously before the provider is enabled.
         stage.autoconfigure_bedrock(suite)
         # Install the GitHub App credential and sandbox write repo from CI
@@ -108,7 +108,6 @@ def main(argv: list[str] | None = None) -> int:
             for integration, runtime in (
                 ("codex", "codex"),
                 ("claude", "claude_code"),
-                ("pi", "pi"),
                 ("hermes", "hermes"),
             )
             if availability.get(integration) is None and integration in availability
@@ -159,21 +158,6 @@ def main(argv: list[str] | None = None) -> int:
 
             if _record_check(report, "claude", check_claude, "guards, MCP catalog, tasks, steering, and kill recovery"):
                 passed_runtimes.append("claude_code")
-        if availability.get("pi") is None and "pi" in availability:
-            def check_pi() -> None:
-                stage.agent_runtime = "pi"
-                stage.check_bedrock_auth_and_task()
-                stage.check_agent_mcp_catalog("pi")
-                stage.check_agent_steering()
-                stage.check_agent_kill_and_thread_survival()
-
-            if _record_check(
-                report,
-                "pi",
-                check_pi,
-                "shared credential boundary, real task, MCP catalog, session resume, steering, and kill recovery",
-            ):
-                passed_runtimes.append("pi")
         if availability.get("hermes") is None and "hermes" in availability:
             def check_hermes() -> None:
                 stage.agent_runtime = "hermes"
@@ -185,30 +169,30 @@ def main(argv: list[str] | None = None) -> int:
                 report,
                 "hermes",
                 check_hermes,
-                "shared credential boundary, real task, MCP catalog, session resume, steering denial, and kill recovery",
+                "credential boundary, real task, MCP catalog, session resume, steering denial, and kill recovery",
             ):
                 passed_runtimes.append("hermes")
 
         if suite == "all":
-            if {"pi", "hermes"}.issubset(passed_runtimes):
+            if "hermes" in passed_runtimes:
                 _record_check(
                     report,
-                    "bedrock_shared",
+                    "bedrock",
                     stage.check_bedrock_disable_stages_credential_for_reenable,
-                    "one provider toggle deactivated and restored both harnesses",
+                    "the provider toggle deactivated and restored Hermes",
                 )
             else:
                 report.add(
-                    "Shared AWS Bedrock",
+                    "AWS Bedrock",
                     "unavailable",
                     "skipped",
-                    "requires successful Pi and Hermes integration checks",
+                    "requires a successful Hermes integration check",
                 )
 
         if suite == "all":
             if passed_runtimes == list(SMOKE_RUNTIMES):
                 def check_cross_runtime() -> None:
-                    stage.check_both_runtimes_active()
+                    stage.check_all_runtimes_active()
                     stage.check_agent_parallelism()
                     stage.check_agent_thread_recall()
                     stage.check_runtime_deactivation_stops_running_tasks()
@@ -225,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
                     "Runtime interoperability",
                     "unavailable",
                     "skipped",
-                    "requires successful Codex, Claude Code, Pi, and Hermes integration checks",
+                    "requires successful Codex, Claude Code, and Hermes integration checks",
                 )
 
         if availability.get("github") is None and "github" in availability:
@@ -403,12 +387,12 @@ class StageAwsSmoke(StageToolChecks, StageBedrockChecks, StageIntegrationChecks)
     @staticmethod
     def suite_runtimes(suite: str) -> tuple[str, ...]:
         """Provider runtimes the selected suite exercises (and therefore needs
-        available). 'github' and tool suites need none; 'all' needs all four."""
+        available). 'github' and tool suites need none; 'all' needs all three."""
         if suite == "codex":
             return ("codex",)
         if suite == "claude":
             return ("claude_code",)
-        if suite in {"pi", "hermes"}:
+        if suite == "hermes":
             return (suite,)
         if suite == "github" or suite in TOOL_SUITES:
             return ()

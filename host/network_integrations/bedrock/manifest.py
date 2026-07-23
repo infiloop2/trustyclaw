@@ -1,9 +1,8 @@
-"""AWS Bedrock shared by the Pi and Hermes runtimes.
+"""AWS Bedrock used by the Hermes runtime.
 
 Bedrock is one operator-facing network integration: one enablement, region,
-credential, account, billing record, and status. Enabling it
-makes both Pi and Hermes available as task runtimes; their task processes and
-counters remain separate.
+credential, account, billing record, and status. Enabling it makes Hermes
+available as a task runtime.
 
 The agent receives only a fixed dummy AWS identity. The proxy enforces the
 configured Bedrock host, region, service, and invocation routes, then re-signs
@@ -35,18 +34,11 @@ def region_host(region: str) -> str:
     return f"bedrock-runtime.{region}.amazonaws.com"
 
 
-# Fixed dummy values handed to the Bedrock SDKs, one access key id per
-# harness so the proxy can attribute each request — and the token usage AWS
-# reports in its response — to the runtime that made it. AKIA format keeps
-# the SDKs on their ordinary long-term-key path. They carry no AWS
+# Fixed dummy values handed to Hermes's Bedrock SDK. AKIA format keeps the SDK
+# on its ordinary long-term-key path. They carry no AWS
 # capability; the proxy replaces their signature only after the request
-# passes the Bedrock guard. Attribution is display metadata, not a security
-# boundary: both launchers run as the same agent uid, so the ids only route
-# usage to the right meter.
-ROUTING_ACCESS_KEY_IDS = {
-    "pi": "AKIATRUSTYCLAWPIBDRK",
-    "hermes": "AKIATRUSTYCLAWHERMES",
-}
+# passes the Bedrock guard.
+ROUTING_ACCESS_KEY_ID = "AKIATRUSTYCLAWHERMES"
 ROUTING_SECRET_ACCESS_KEY = "trustyclaw-bedrock-dummy-secret"
 
 # Hardcoded on-demand Bedrock inference rates for the session model catalog,
@@ -103,7 +95,7 @@ MANIFEST = IntegrationManifest(
     integration_id="bedrock",
     display_name="AWS Bedrock",
     description=(
-        "AWS Bedrock inference used by the Pi and Hermes task runtimes. It owns the "
+        "AWS Bedrock inference used by the Hermes task runtime. It owns the "
         "Bedrock Runtime hosts and admits only model invocation requests addressed to "
         "the configured region with the fixed dummy SDK identity. The proxy re-signs "
         "allowed requests with the operator's connected IAM key."
@@ -112,7 +104,7 @@ MANIFEST = IntegrationManifest(
     denial_reasons=(
         DenialReason(
             "bedrock_credentials_unavailable",
-            "The shared Pi and Hermes connection has no active operator-connected AWS credential (not "
+            "The Hermes connection has no active operator-connected AWS credential (not "
             "connected yet, or its last validation failed), so Bedrock requests fail closed. "
             "Ask the operator to connect or refresh an AWS access key under AWS Bedrock AI "
             "inference in the admin UI.",
@@ -120,20 +112,20 @@ MANIFEST = IntegrationManifest(
         DenialReason(
             "bedrock_signature_required",
             "Requests to Bedrock must carry an AWS Signature Version 4 Authorization header. "
-            "Use the managed Pi or Hermes runtime, which supplies the dummy SDK identity "
+            "Use the managed Hermes runtime, which supplies the dummy SDK identity "
             "automatically.",
         ),
         DenialReason(
             "bedrock_access_key_mismatch",
-            "The request is not signed with a Bedrock harness's routing identity, so no "
-            "integration authorizes it. Bedrock is reachable only through the managed Pi or "
-            "Hermes runtime, each of which signs with its own fixed routing key; other AWS "
+            "The request is not signed with Hermes's Bedrock routing identity, so no "
+            "integration authorizes it. Bedrock is reachable only through the managed "
+            "Hermes runtime, which signs with a fixed routing key; other AWS "
             "credentials are denied.",
         ),
         DenialReason(
             "bedrock_signature_invalid",
             "The request's SigV4 scope does not match the configured Bedrock region and "
-            "service. Use the managed Pi or Hermes runtime unmodified.",
+            "service. Use the managed Hermes runtime unmodified.",
         ),
         DenialReason(
             "bedrock_query_auth_denied",
@@ -144,7 +136,7 @@ MANIFEST = IntegrationManifest(
         DenialReason(
             "bedrock_session_credentials_denied",
             "Temporary AWS session credentials (X-Amz-Security-Token) are denied on this host. "
-            "Only the harness runtimes' Authorization-header signing is accepted.",
+            "Only Hermes's Authorization-header signing is accepted.",
         ),
     ),
 )

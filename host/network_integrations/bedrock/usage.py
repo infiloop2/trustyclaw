@@ -5,8 +5,8 @@ Converse returns a JSON body with a top-level ``usage`` object, and
 ConverseStream ends with a ``metadata`` event carrying the same shape inside
 its vnd.amazon.eventstream framing. The proxy feeds the raw upstream response
 bytes through a meter while relaying them unchanged; when the relay ends, the
-meter parses the buffered response and adds one increment to the invoking
-runtime's (model, UTC day) counter row.
+meter parses the buffered response and adds one increment to the
+(model, UTC day) counter row.
 
 Metering is strictly passive and the relay is never affected: a non-200
 response, an unrecognized shape, or a response larger than the metering
@@ -36,8 +36,7 @@ _STATUS_RE = re.compile(rb"^HTTP/1\.[01] (\d{3}) ")
 class BedrockResponseMeter:
     """Buffers one upstream response and records its usage when it ends."""
 
-    def __init__(self, runtime: str, model_id: str) -> None:
-        self._runtime = runtime
+    def __init__(self, model_id: str) -> None:
         self._model_id = model_id
         self._buffer = bytearray()
         self._overflowed = False
@@ -79,7 +78,6 @@ class BedrockResponseMeter:
             ) or 0.0
         try:
             record_bedrock_usage(
-                self._runtime,
                 manifest.catalog_model_id(self._model_id),
                 usage,
                 cost_usd,

@@ -33,7 +33,7 @@ flowchart LR
             agentnetwork["trustyclaw-agent-network<br/>Network introspection socket<br/>no egress"]
             agentapp["trustyclaw-agent-app<br/>app_api proxy + agent-app.sock<br/>loopback to app ports only"]
             apps["trustyclaw-app-*<br/>App backends<br/>host-slot uid, port, schema<br/>no egress"]
-            agent["trustyclaw-agent<br/>Codex + Claude Code + Pi + Hermes<br/>no sudo, DB role, or direct egress"]
+            agent["trustyclaw-agent<br/>Codex + Claude Code + Hermes<br/>no sudo, DB role, or direct egress"]
             db["postgres<br/>trustyclaw_admin<br/>Unix socket only, peer auth"]
             tunnel["cloudflared<br/>Tunnel connector<br/>DNS, TCP 443/7844, UDP 7844"]
         end

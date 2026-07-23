@@ -82,6 +82,7 @@ files:
 {
   "host_slot": 6,
   "title": "My Workspace App",
+  "release_stage": "stable",
   "agent": {"instructions": "agent.md", "api": true},
   "backend": {"entrypoint": "backend.py"},
   "database": {"migrations": "migrations"},

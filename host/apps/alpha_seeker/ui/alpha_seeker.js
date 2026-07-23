@@ -21,7 +21,7 @@ const DOMAIN_PANELS = [
 const DOMAIN_IDS = new Set(DOMAIN_PANELS.map(panel => panel.id));
 
 const $ = id => document.getElementById(id);
-const runtimeLabel = runtime => runtime === "claude_code" ? "Claude Code" : runtime === "codex" ? "Codex" : runtime === "pi" ? "Pi" : runtime === "hermes" ? "Hermes" : runtime;
+const runtimeLabel = runtime => runtime === "claude_code" ? "Claude Code" : runtime === "codex" ? "Codex" : runtime === "hermes" ? "Hermes" : runtime;
 const optionLabel = value => String(value).split(/[-_]/).map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
 const modelLabel = (runtime, model) => runtime === "codex" ? model : optionLabel(model);
 const formatDateTime = value => {

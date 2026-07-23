@@ -13,7 +13,7 @@ from pathlib import Path
 import json
 import mimetypes
 import re
-from typing import Any
+from typing import Any, Literal, cast
 
 from host.constants import APP_PORT_BASE
 
@@ -31,6 +31,7 @@ APP_UID_BASE = 48000
 APP_UID_MAX = APP_UID_BASE + MAX_INSTALLED_APPS - 1
 APP_PORT_OFFSET_MIN = 0
 APP_PORT_OFFSET_MAX = MAX_INSTALLED_APPS - 1
+ReleaseStage = Literal["stable", "beta"]
 
 
 class AppError(Exception):
@@ -48,6 +49,7 @@ class AppAllocation:
 class AppManifest:
     id: str
     title: str
+    release_stage: ReleaseStage
     package_dir: Path
     backend_entrypoint: Path
     migrations_dir: Path
@@ -94,6 +96,7 @@ class AppManifest:
         return {
             "id": self.id,
             "title": self.title,
+            "release_stage": self.release_stage,
             "backend": {"api_route": self.api_route},
             "ui": {
                 "iframe_src": f"{self.ui_route}index.html",
@@ -193,7 +196,10 @@ def _load_manifest(path: Path) -> AppManifest:
         raise AppError(f"{path}: manifest must be an object")
     package_dir = path.parent
     _require_exact_keys(
-        data, {"host_slot", "title", "backend", "database", "ui", "agent"}, path, "manifest",
+        data,
+        {"host_slot", "title", "release_stage", "backend", "database", "ui", "agent"},
+        path,
+        "manifest",
     )
     agent_value = _required_object(data, "agent", path)
     _require_exact_keys(agent_value, {"instructions", "api"}, path, "agent")
@@ -239,6 +245,9 @@ def _load_manifest(path: Path) -> AppManifest:
     title = _required_string(data, "title", path)
     if "\n" in title or "\r" in title:
         raise AppError(f"{path}: title must be a single line")
+    release_stage = _required_string(data, "release_stage", path)
+    if release_stage not in {"stable", "beta"}:
+        raise AppError(f"{path}: release_stage must be 'stable' or 'beta'")
     backend = _required_object(data, "backend", path)
     database = _required_object(data, "database", path)
     ui = _required_object(data, "ui", path)
@@ -257,6 +266,7 @@ def _load_manifest(path: Path) -> AppManifest:
     app = AppManifest(
         id=app_id,
         title=title,
+        release_stage=cast(ReleaseStage, release_stage),
         package_dir=package_dir,
         backend_entrypoint=backend_entrypoint,
         migrations_dir=migrations_dir,

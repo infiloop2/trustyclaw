@@ -131,43 +131,43 @@ class ParseUsageTests(unittest.TestCase):
 
 class BedrockResponseMeterTests(unittest.TestCase):
     def test_finish_records_parsed_usage_once(self) -> None:
-        meter = usage.BedrockResponseMeter("pi", "deepseek.v3.2")
+        meter = usage.BedrockResponseMeter("deepseek.v3.2")
         raw = http_response(json.dumps({"usage": USAGE}).encode())
         with patch.object(usage, "record_bedrock_usage") as record:
             meter.feed(raw[:20])
             meter.feed(raw[20:])
             meter.finish()
             meter.finish()  # idempotent: one relay records once
-        record.assert_called_once_with("pi", "deepseek.v3.2", COUNTERS, COST)
+        record.assert_called_once_with("deepseek.v3.2", COUNTERS, COST)
 
     def test_unparsed_response_still_counts_the_request(self) -> None:
-        meter = usage.BedrockResponseMeter("hermes", "qwen.qwen3-coder-next")
+        meter = usage.BedrockResponseMeter("qwen.qwen3-coder-next")
         with patch.object(usage, "record_bedrock_usage") as record:
             meter.feed(http_response(b"boom", status=b"500 Internal Server Error"))
             meter.finish()
-        record.assert_called_once_with("hermes", "qwen.qwen3-coder-next", None, 0.0)
+        record.assert_called_once_with("qwen.qwen3-coder-next", None, 0.0)
 
     def test_unknown_model_records_under_the_other_bucket_at_zero_cost(self) -> None:
         # A model outside the catalog collapses into 'other' (bounding the row
         # count) and is unpriced, so its tokens still count but cost is 0.
-        meter = usage.BedrockResponseMeter("pi", "some.unlisted-model")
+        meter = usage.BedrockResponseMeter("some.unlisted-model")
         raw = http_response(json.dumps({"usage": USAGE}).encode())
         with patch.object(usage, "record_bedrock_usage") as record:
             meter.feed(raw)
             meter.finish()
-        record.assert_called_once_with("pi", "other", COUNTERS, 0.0)
+        record.assert_called_once_with("other", COUNTERS, 0.0)
 
     def test_oversized_response_is_dropped_not_buffered(self) -> None:
-        meter = usage.BedrockResponseMeter("pi", "deepseek.v3.2")
+        meter = usage.BedrockResponseMeter("deepseek.v3.2")
         with patch.object(usage, "MAX_METERED_RESPONSE_BYTES", 64):
             meter.feed(b"x" * 65)
             self.assertEqual(len(meter._buffer), 0)
             with patch.object(usage, "record_bedrock_usage") as record:
                 meter.finish()
-        record.assert_called_once_with("pi", "deepseek.v3.2", None, 0.0)
+        record.assert_called_once_with("deepseek.v3.2", None, 0.0)
 
     def test_a_recording_failure_never_escapes_finish(self) -> None:
-        meter = usage.BedrockResponseMeter("pi", "deepseek.v3.2")
+        meter = usage.BedrockResponseMeter("deepseek.v3.2")
         with patch.object(usage, "record_bedrock_usage", side_effect=RuntimeError("db down")):
             meter.finish()  # must not raise: the response was already relayed
 
@@ -176,7 +176,7 @@ class PricingTests(unittest.TestCase):
     def test_every_catalog_model_has_a_hardcoded_rate(self) -> None:
         # A catalog model missing from the price table would silently record
         # $0 cost for its traffic; pin the two lists together.
-        catalog = {model for runtime in ("pi", "hermes") for model in SESSION_OPTIONS[runtime]}
+        catalog = set(SESSION_OPTIONS["hermes"])
         self.assertEqual(catalog, set(MODEL_PRICING_PER_MILLION))
 
     def test_estimate_prices_input_output_and_conservative_cache(self) -> None:
@@ -215,12 +215,12 @@ class ForwardUntilCloseMeterTests(unittest.TestCase):
         raw = http_response(json.dumps({"usage": USAGE}).encode())
         upstream = _Socket([raw[:33], raw[33:]])
         client = _Socket()
-        meter = usage.BedrockResponseMeter("pi", "deepseek.v3.2")
+        meter = usage.BedrockResponseMeter("deepseek.v3.2")
         with patch.object(usage, "record_bedrock_usage") as record:
             proxy_service.forward_until_close(upstream, client, meter)  # type: ignore[arg-type]
         self.assertEqual(client.sent, raw)  # the relayed bytes are untouched
         self.assertTrue(upstream.closed)
-        record.assert_called_once_with("pi", "deepseek.v3.2", COUNTERS, COST)
+        record.assert_called_once_with("deepseek.v3.2", COUNTERS, COST)
 
     def test_an_aborted_relay_still_counts_the_request(self) -> None:
         class Failing(_Socket):
@@ -228,11 +228,11 @@ class ForwardUntilCloseMeterTests(unittest.TestCase):
                 raise OSError("client went away")
 
         upstream = _Socket([b"HTTP/1.1 200 OK\r\n"])
-        meter = usage.BedrockResponseMeter("hermes", "deepseek.v3.2")
+        meter = usage.BedrockResponseMeter("deepseek.v3.2")
         with patch.object(usage, "record_bedrock_usage") as record:
             with self.assertRaises(OSError):
                 proxy_service.forward_until_close(upstream, Failing(), meter)  # type: ignore[arg-type]
-        record.assert_called_once_with("hermes", "deepseek.v3.2", None, 0.0)
+        record.assert_called_once_with("deepseek.v3.2", None, 0.0)
 
     def test_relay_without_a_meter_is_unchanged(self) -> None:
         upstream = _Socket([b"data"])

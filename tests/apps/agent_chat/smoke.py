@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from http import HTTPStatus
+from pathlib import Path
 import re
+import tempfile
 from typing import Any, Callable
 
 from host.session_options import public_session_options
@@ -103,7 +105,8 @@ def desktop_smoke(page: Any) -> None:
     # Apps section, and the home tab opens with its Begin chat CTA.
     expect(page.locator("#home-hero")).to_contain_text("Agent Chat")
     expect(page.locator("#sidebar-apps")).to_contain_text("Apps")
-    expect(page.locator("#app-tabs").get_by_role("button", name="Agent Chat", exact=True)).to_have_count(0)
+    expect(page.locator("#stable-app-tabs").get_by_role("button", name="Agent Chat", exact=True)).to_have_count(0)
+    expect(page.locator("#beta-app-tabs").get_by_role("button", name="Agent Chat", exact=True)).to_have_count(0)
     page.locator("#home-hero").get_by_role("button", name="Begin chat", exact=True).click()
     expect(page.locator("#panel-app-agent_chat")).to_be_visible()
     page.get_by_role("button", name="Home", exact=True).click()
@@ -113,7 +116,7 @@ def desktop_smoke(page: Any) -> None:
 
     expect(frame.locator(".app-frame-title")).to_have_text("Agent Chat")
     expect(frame.locator("#status")).to_be_hidden()
-    # A lived-in list: several threads across both runtimes and task states.
+    # A lived-in list: several threads across runtimes and task states.
     expect(frame.locator("#threads")).to_contain_text("website-redesign")
     expect(frame.locator("#threads")).to_contain_text("thread-1")
 
@@ -127,6 +130,39 @@ def desktop_smoke(page: Any) -> None:
     # The operator never types a thread id: the composer has no thread field
     # and the backend generates the next successive name on send.
     expect(frame.locator("#new-task-thread")).to_have_count(0)
+    upload_requests = []
+    page.on(
+        "request",
+        lambda request: upload_requests.append(request.url)
+        if "/v1/agent-files/upload?" in request.url
+        else None,
+    )
+    with page.expect_file_chooser() as chooser:
+        frame.get_by_role("button", name="Attach files").click()
+    chooser.value.set_files([
+        {
+            "name": "reference image.png",
+            "mimeType": "image/png",
+            "buffer": b"mock-image-bytes",
+        },
+        {
+            "name": "notes.txt",
+            "mimeType": "text/plain",
+            "buffer": b"remove me",
+        },
+        {
+            "name": "brief.pdf",
+            "mimeType": "application/pdf",
+            "buffer": b"mock-pdf-bytes",
+        },
+    ])
+    expect(frame.locator("#attachments .attachment")).to_have_count(3)
+    expect(frame.locator("#attachments")).to_contain_text("reference image.png")
+    expect(frame.locator("#attachments")).to_contain_text("brief.pdf")
+    frame.get_by_role("button", name="Remove notes.txt").click()
+    expect(frame.locator("#attachments .attachment")).to_have_count(2)
+    expect(frame.locator("#attachments")).not_to_contain_text("notes.txt")
+    assert upload_requests == [], "selecting and removing attachments must not upload them before Send"
     frame.locator("#new-task").fill("agent app smoke task")
     frame.locator("#new-task-runtime").select_option("codex")
     expect(frame.locator("#new-task-model option")).to_have_count(3)
@@ -135,10 +171,52 @@ def desktop_smoke(page: Any) -> None:
     expect(frame.locator("#new-task-effort")).not_to_contain_text("Ultra")
     frame.locator("#new-task-effort").select_option("max")
     frame.get_by_role("button", name="Send").click()
+    expect(frame.locator("#status")).to_contain_text("Service Unavailable")
+    expect(frame.locator(".thread-title")).to_have_text("New thread")
+    assert len(upload_requests) == 2, "the first Send must stop after the second attachment fails"
+    frame.get_by_role("button", name="Send").click()
     expect(frame.locator(".thread-title")).to_have_text(re.compile(r"^thread-[0-9]+$"))
+    assert len(upload_requests) == 3, "retry must upload only the unfinished attachment"
+    assert sum("reference%20image.png" in url for url in upload_requests) == 1
+    assert sum("brief.pdf" in url for url in upload_requests) == 2
     generated_thread = frame.locator(".thread-title").inner_text()
     expect(frame.locator("#thread-detail")).to_contain_text("agent app smoke task")
+    expect(frame.locator("#thread-detail")).to_contain_text(
+        "[User-uploaded file: user-files/20260722T120000.000000Z_reference image.png]"
+    )
+    expect(frame.locator("#thread-detail")).to_contain_text(
+        "[User-uploaded file: user-files/20260722T120000.000000Z_brief.pdf]"
+    )
+    expect(frame.locator("#thread-detail")).not_to_contain_text("notes.txt")
     expect(frame.locator("#thread-detail")).to_contain_text("task_")
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        oversized = Path(temporary_directory) / "oversized.bin"
+        with oversized.open("wb") as file:
+            file.truncate(25 * 1024 * 1024 + 1)
+        with page.expect_file_chooser() as chooser:
+            frame.get_by_role("button", name="Attach files").click()
+        chooser.value.set_files(str(oversized))
+        expect(frame.locator("#attachments")).to_contain_text("25 MiB max")
+        expect(frame.get_by_role("button", name="Send")).to_be_disabled()
+        assert len(upload_requests) == 3, "an oversized selection must not start an upload"
+        frame.get_by_role("button", name="Remove oversized.bin").click()
+        expect(frame.locator("#attachments")).to_be_hidden()
+        expect(frame.get_by_role("button", name="Send")).to_be_enabled()
+    with page.expect_file_chooser() as chooser:
+        frame.get_by_role("button", name="Attach files").click()
+    chooser.value.set_files(
+        [
+            {
+                "name": f"extra-{index}.txt",
+                "mimeType": "text/plain",
+                "buffer": b"extra",
+            }
+            for index in range(11)
+        ]
+    )
+    expect(frame.locator("#status")).to_have_text("You can attach up to 10 files.")
+    expect(frame.locator("#attachments")).to_be_hidden()
+    assert len(upload_requests) == 3, "too many selections must not start an upload"
     frame.locator("#new-task").fill("agent app smoke follow up")
     frame.get_by_role("button", name="Send").click()
     expect(frame.locator("#thread-detail")).to_contain_text("agent app smoke follow up")
@@ -248,6 +326,9 @@ def _assert_mobile_composer_ergonomics(frame: Any) -> None:
     send_box = frame.locator("#create-task").bounding_box()
     if not send_box or send_box["height"] < 43 or send_box["width"] < 43:
         raise AssertionError(f"send button is below thumb size on a phone: {send_box}")
+    attach_box = frame.locator("#attach-file").bounding_box()
+    if not attach_box or attach_box["height"] < 43 or attach_box["width"] < 43:
+        raise AssertionError(f"attach button is below thumb size on a phone: {attach_box}")
     clipped = frame.locator(".composer").evaluate(
         "element => element.getBoundingClientRect().bottom > window.innerHeight + 1"
     )

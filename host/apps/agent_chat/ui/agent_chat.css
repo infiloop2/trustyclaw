@@ -325,6 +325,9 @@ button.icon-button.quiet svg { height: 18px; width: 18px; }
   border-radius: 20px;
   display: grid;
   gap: 0.3rem;
+  /* minmax(0, 1fr) so a wide child row (the mobile selector grid) is pinned to
+     the composer width and truncates instead of overflowing the padding. */
+  grid-template-columns: minmax(0, 1fr);
   padding: 0.6rem 0.6rem 0.5rem 0.95rem;
 }
 
@@ -346,6 +349,61 @@ button.icon-button.quiet svg { height: 18px; width: 18px; }
   outline: none;
 }
 
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.attachments[hidden] { display: none; }
+
+.attachment {
+  align-items: center;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text-dim);
+  display: flex;
+  font-size: 0.76rem;
+  gap: 0.45rem;
+  max-width: 100%;
+  padding: 0.35rem 0.45rem 0.35rem 0.65rem;
+  width: fit-content;
+}
+
+.attachment span {
+  max-width: min(28rem, 60vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment.invalid {
+  border-color: var(--danger);
+}
+
+.attachment-error {
+  color: var(--danger);
+  flex: 0 0 auto;
+}
+
+.attachment.activity {
+  color: var(--text-dim);
+}
+
+button.attachment-clear {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: var(--text-dim);
+  display: inline-flex;
+  font-size: 1.1rem;
+  height: 1.4rem;
+  justify-content: center;
+  padding: 0;
+  width: 1.4rem;
+}
+
 .composer-bar {
   align-items: center;
   display: flex;
@@ -359,6 +417,27 @@ button.icon-button.quiet svg { height: 18px; width: 18px; }
   gap: 0.35rem;
   min-width: 0;
 }
+
+.attach-button {
+  align-items: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: var(--text-dim);
+  display: inline-flex;
+  flex: 0 0 auto;
+  height: 2rem;
+  justify-content: center;
+  padding: 0;
+  width: 2rem;
+}
+
+.attach-button:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.attach-button svg { height: 17px; width: 17px; }
 
 .composer-pill {
   background: transparent;
@@ -449,13 +528,60 @@ button.icon-button.quiet svg { height: 18px; width: 18px; }
 
   .composer-hint { display: none; }
 
-  /* 16px fields so iOS does not zoom the page when a control is focused,
-     and thumb-sized primary targets. */
-  .composer textarea, .composer-pill, .task-steer-input { font-size: 16px; }
+  /* 16px text fields so iOS does not zoom the page when an editable control is
+     focused. The selectors sit a step smaller (14px) than the prompt text since
+     they are secondary; a native <select> opens a picker rather than a caret,
+     so it does not trigger the focus-zoom that text inputs do. */
+  .composer textarea, .task-steer-input { font-size: 16px; }
 
-  .composer-pill { min-height: 2.35rem; }
+  /* A native <select> sizes to its widest option and resists flex-shrinking, so
+     at 16px these three read as oversized lozenges that wrap or overflow. Lay
+     them out as a fixed three-column grid on their own full-width row (attach
+     and send drop to the row below): minmax(0, ...) tracks pin the columns to
+     the container width so a long value truncates inside its cell instead of
+     pushing the row past the composer edge. The model column is widest since
+     its value is the longest and most worth reading. Each chip gets a filled
+     surface, compact radius, and a small custom chevron for the dropdown. */
+  .composer-bar { flex-wrap: wrap; min-width: 0; }
+  .composer-options {
+    display: grid;
+    flex-basis: 100%;
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.75fr) minmax(0, 0.95fr);
+    min-width: 0;
+    order: 1;
+  }
+  .attach-button { order: 2; }
+  .send-button { order: 3; }
+
+  .composer-pill {
+    appearance: none;
+    -webkit-appearance: none;
+    background-color: var(--surface-3);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Cpath d='M5.5 8l4.5 4.5L14.5 8' fill='none' stroke='%238b98ab' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-position: right 0.35rem center;
+    background-repeat: no-repeat;
+    background-size: 11px;
+    border-color: transparent;
+    border-radius: 9px;
+    color: var(--text);
+    font-size: 14px;
+    min-height: 2.1rem;
+    min-width: 0;
+    overflow: hidden;
+    padding: 0.2rem 1.05rem 0.2rem 0.5rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    width: 100%;
+  }
+
+  .composer-pill:hover, .composer-pill:focus { background-color: var(--surface-2); }
 
   .send-button {
+    height: 2.75rem;
+    width: 2.75rem;
+  }
+
+  .attach-button {
     height: 2.75rem;
     width: 2.75rem;
   }

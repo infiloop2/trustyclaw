@@ -57,8 +57,8 @@ import tests.stage.stage_aws
 
     def test_all_selects_every_runtime_github_and_bundled_tool(self) -> None:
         selected = _selected_integrations("all")
-        self.assertEqual(selected[:5], ("codex", "claude", "pi", "hermes", "github"))
-        self.assertEqual(selected[5:], TOOL_SUITES)
+        self.assertEqual(selected[:4], ("codex", "claude", "hermes", "github"))
+        self.assertEqual(selected[4:], TOOL_SUITES)
         self.assertEqual(set(TOOL_SUITES), set(BUNDLED_TOOLS))
 
     def test_agent_catalog_parser_requires_unique_string_tool_ids(self) -> None:
@@ -218,7 +218,7 @@ import tests.stage.stage_aws
         self.assertIsNone(error)
         self.assertEqual(credential, ("AKIASTAGE", "stage-secret"))
 
-    def test_bedrock_autoconfiguration_validates_once_then_enables_both_harnesses(self) -> None:
+    def test_bedrock_autoconfiguration_validates_once_then_enables_hermes(self) -> None:
         stage = StageAwsSmoke.__new__(StageAwsSmoke)
         stage.total = 0
         stage.passed = 0
@@ -265,7 +265,7 @@ import tests.stage.stage_aws
         self.assertIn("github", policy["network_integrations"])
         self.assertEqual(
             [call.kwargs["runtime"] for call in wait.call_args_list],
-            ["pi", "hermes"],
+            ["hermes"],
         )
 
     def test_bedrock_autoconfiguration_reports_rejected_candidate_to_preflight(self) -> None:
@@ -275,7 +275,7 @@ import tests.stage.stage_aws
         stage.stage_bedrock_credential = ("AKIASTAGE", "invalid-secret")
         stage.bedrock_secret_error = None
         with patch.object(stage, "_api", side_effect=RuntimeError("STS denied")):
-            stage.autoconfigure_bedrock("pi")
+            stage.autoconfigure_bedrock("hermes")
         self.assertIn("STS denied", stage.bedrock_secret_error or "")
 
     def test_all_preflight_returns_each_unavailable_integration_without_raising(self) -> None:
@@ -287,7 +287,7 @@ import tests.stage.stage_aws
             patch.object(
                 stage,
                 "_wait_for_runtime_status",
-                side_effect=["active", "awaiting_login", "active", "active"],
+                side_effect=["active", "awaiting_login", "active"],
             ) as wait,
             patch.object(stage, "_github_config_failures", return_value=["credential validation is 'error'"]),
             patch.object(stage, "_tool_credential_failures", side_effect=lambda tool: [] if tool == "polymarket" else [f"{tool}: missing"]),
@@ -296,7 +296,6 @@ import tests.stage.stage_aws
 
         self.assertIsNone(availability["codex"])
         self.assertIn("awaiting_login", availability["claude"] or "")
-        self.assertIsNone(availability["pi"])
         self.assertIsNone(availability["hermes"])
         self.assertIn("validation", availability["github"] or "")
         self.assertIsNone(availability["polymarket"])
@@ -314,7 +313,6 @@ import tests.stage.stage_aws
             {
                 "codex": "gpt-5.6-luna",
                 "claude_code": "sonnet",
-                "pi": "qwen.qwen3-coder-next",
                 "hermes": "qwen.qwen3-coder-next",
             },
         )
@@ -324,14 +322,12 @@ import tests.stage.stage_aws
         stage.agent_runtime = "codex"
         codex = stage.task_body("test", "codex")
         claude = stage.task_body("test", "claude", runtime="claude_code")
-        pi = stage.task_body("test", "pi", runtime="pi")
         hermes = stage.task_body("test", "hermes", runtime="hermes")
         self.assertEqual((codex["model"], codex["effort"]), (CHEAP_MODELS["codex"], CHEAP_EFFORT))
         self.assertEqual(
             (claude["model"], claude["effort"]),
             (CHEAP_MODELS["claude_code"], CHEAP_EFFORT),
         )
-        self.assertEqual((pi["model"], pi["effort"]), (CHEAP_MODELS["pi"], CHEAP_EFFORT))
         self.assertEqual(
             (hermes["model"], hermes["effort"]),
             (CHEAP_MODELS["hermes"], CHEAP_EFFORT),

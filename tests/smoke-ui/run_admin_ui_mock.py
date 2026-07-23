@@ -81,6 +81,7 @@ SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
 }
 PASSWORD = "dev"
+FAILED_UPLOADS_ONCE: set[str] = set()
 TASK_RE = re.compile(r"^/v1/tasks/([^/]+)(?:/(steer|cancel|kill|events))?$")
 THREAD_TASKS_RE = re.compile(r"^/v1/threads/([^/]+)/tasks$")
 THREAD_EVENTS_RE = re.compile(r"^/v1/threads/([^/]+)/events$")
@@ -92,9 +93,8 @@ TOOL_APPROVAL_GET_RE = re.compile(r"^/v1/tools/([a-z0-9_]+)/approvals/([^/]+)$")
 TOOL_CONFIG_RE = re.compile(r"^/v1/tools/([a-z0-9_]+)/config$")
 TOOL_EVENT_RE = re.compile(r"^/v1/tools/events/([1-9][0-9]*)$")
 MOCK_OAUTH_CODE = "mock-auth-code"
-RUNTIMES = ("codex", "claude_code", "pi", "hermes")
-PROVIDER_BY_RUNTIME = {"codex": "openai", "claude_code": "claude", "pi": "bedrock", "hermes": "bedrock"}
-BEDROCK_RUNTIMES = ("pi", "hermes")
+RUNTIMES = ("codex", "claude_code", "hermes")
+PROVIDER_BY_RUNTIME = {"codex": "openai", "claude_code": "claude", "hermes": "bedrock"}
 MAX_RUNNING_PER_RUNTIME = 3
 MAX_RUNNING_TOTAL = 6
 
@@ -108,7 +108,6 @@ PROGRESS_SCRIPT = [
 PROVIDER_TRAFFIC = {
     "codex": ("api.openai.com", "/v1/responses"),
     "claude_code": ("api.anthropic.com", "/v1/messages"),
-    "pi": ("bedrock-runtime.us-east-1.amazonaws.com", "/model/deepseek.v3.2/converse-stream"),
     "hermes": ("bedrock-runtime.us-east-1.amazonaws.com", "/model/qwen.qwen3-coder-next/converse-stream"),
 }
 
@@ -241,7 +240,7 @@ class MockState:
         integration = managed.get(provider) if isinstance(managed, dict) else None
         if not isinstance(integration, dict) or integration.get("enabled") is not True:
             return "deactivated"
-        if runtime in BEDROCK_RUNTIMES:
+        if runtime == "hermes":
             return "active" if self.bedrock_access_key_id else "awaiting_login"
         if self.logged_in.get(runtime):
             return "active"
@@ -264,7 +263,7 @@ def seed_state() -> None:
 
     The seeded story: the operator ran a few threads earlier today, one deploy
     task failed against the network policy, and provider access was later
-    switched off — which is why both runtimes start out deactivated.
+    switched off, which is why every runtime starts out deactivated.
     """
     seed_tasks = [
         {
@@ -582,7 +581,7 @@ def seed_state() -> None:
             STATE.add_agent_event("task.cancelled", task_id, {}, ago(spec["completed_min"]))
     STATE.next_task_number = len(seed_tasks) + 1
 
-    # Providers were switched off ~70 minutes ago; both runtimes deactivated.
+    # Providers were switched off ~70 minutes ago; every runtime is deactivated.
     for runtime in RUNTIMES:
         STATE.add_agent_event("agent_runtime.deactivated", None, {"agent_runtime": runtime}, ago(70))
 
@@ -715,6 +714,23 @@ mockUpgradeNotice.addEventListener("click", async () => {
             self._authenticate()
             if method == "GET" and parsed.path == "/v1/agent-files/content":
                 self._send(HTTPStatus.OK, b"\x00\x00\x00\x18ftypmp42mock-video", "video/mp4")
+                return
+            if method == "POST" and parsed.path == "/v1/agent-files/upload":
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                self.rfile.read(length)
+                filename = (parse_qs(parsed.query).get("filename") or ["upload.bin"])[0]
+                if filename == "brief.pdf" and filename not in FAILED_UPLOADS_ONCE:
+                    FAILED_UPLOADS_ONCE.add(filename)
+                    self._send(HTTPStatus.SERVICE_UNAVAILABLE, b"mock proxy failure", "text/plain")
+                    return
+                stored_name = f"20260722T120000.000000Z_{filename}"
+                self._send_json(HTTPStatus.OK, {"file": {
+                    "path": f"user-files/{stored_name}",
+                    "name": stored_name,
+                    "original_name": filename,
+                    "size_bytes": length,
+                    "uploaded_at": "2026-07-22T12:00:00Z",
+                }})
                 return
             response = route(method, parsed.path, parse_qs(parsed.query), self._read_body())
             self._send_json(HTTPStatus.OK, response)
@@ -1099,7 +1115,7 @@ def agent_accounts() -> dict[str, Any]:
         checked_at = STATE.now()
         accounts: list[dict[str, Any]] = []
         for runtime in RUNTIMES:
-            if runtime in BEDROCK_RUNTIMES:
+            if runtime == "hermes":
                 continue
             status = STATE.runtime_status(runtime)
             if runtime == "codex":
@@ -1162,35 +1178,23 @@ def agent_accounts() -> dict[str, Any]:
                 elif STATE.logged_in.get(runtime):
                     account.update({"account_id": "acct_mock_claude", "email": "claude@example.invalid"})
             accounts.append(account)
-        bedrock_status = STATE.runtime_status("pi")
+        bedrock_status = STATE.runtime_status("hermes")
         bedrock_account: dict[str, Any] = {
             "provider": "bedrock",
-            "agent_runtimes": list(BEDROCK_RUNTIMES),
+            "agent_runtimes": ["hermes"],
             "status": bedrock_status,
-            # Live per-runtime usage is always present, mirroring the real
+            # Live usage is always present, mirroring the real
             # accounts payload: the proxy's counters exist independent of the
             # credential state.
             "bedrock_usage": {
-                "pi": {
-                    "month_to_date": 12.75,
-                    "currency": "USD",
-                    "requests": 210,
-                    "metered_requests": 208,
-                    "input_tokens": 1_804_211,
-                    "output_tokens": 96_407,
-                    "cache_read_tokens": 0,
-                    "cache_write_tokens": 0,
-                },
-                "hermes": {
-                    "month_to_date": 0.31,
-                    "currency": "USD",
-                    "requests": 41,
-                    "metered_requests": 41,
-                    "input_tokens": 402_118,
-                    "output_tokens": 31_889,
-                    "cache_read_tokens": 0,
-                    "cache_write_tokens": 0,
-                },
+                "month_to_date": 12.75,
+                "currency": "USD",
+                "requests": 210,
+                "metered_requests": 208,
+                "input_tokens": 1_804_211,
+                "output_tokens": 96_407,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
             },
         }
         if STATE.bedrock_access_key_id and bedrock_status == "active":
@@ -1293,11 +1297,10 @@ def connect_bedrock_credentials(body: Any) -> dict[str, str]:
     with STATE.lock:
         STATE.bedrock_access_key_id = access_key_id.strip()
         STATE.bedrock_region = region
-        enabled = STATE.runtime_status("pi") != "deactivated"
+        enabled = STATE.runtime_status("hermes") != "deactivated"
         if not enabled:
             return {"status": "accepted"}
-        for bedrock_runtime in BEDROCK_RUNTIMES:
-            STATE.add_agent_event("agent_runtime.active", None, {"agent_runtime": bedrock_runtime})
+        STATE.add_agent_event("agent_runtime.active", None, {"agent_runtime": "hermes"})
         start_queued_tasks_locked()
         return {"status": "accepted"}
 
@@ -1317,9 +1320,8 @@ def disconnect_bedrock_credentials() -> dict[str, str]:
     with STATE.lock:
         STATE.bedrock_access_key_id = None
         STATE.bedrock_region = None
-        for runtime in BEDROCK_RUNTIMES:
-            fail_running_tasks_locked(runtime, "the shared AWS Bedrock connection was reset by the operator")
-            STATE.add_agent_event("agent_runtime.linked_account_reset", None, {"agent_runtime": runtime})
+        fail_running_tasks_locked("hermes", "the AWS Bedrock connection was reset by the operator")
+        STATE.add_agent_event("agent_runtime.linked_account_reset", None, {"agent_runtime": "hermes"})
     return {"status": "accepted"}
 
 
@@ -1341,7 +1343,7 @@ def reset_linked_account(body: Any) -> dict[str, str]:
 
 
 def runtime_label(runtime: str) -> str:
-    return {"codex": "Codex", "claude_code": "Claude", "pi": "Pi", "hermes": "Hermes"}[runtime]
+    return {"codex": "Codex", "claude_code": "Claude", "hermes": "Hermes"}[runtime]
 
 
 def create_task(body: Any) -> dict[str, Any]:

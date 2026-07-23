@@ -33,8 +33,9 @@ class AppPlatformTests(unittest.TestCase):
         self.assertEqual(agent_chat.port, APP_PORT_BASE)
         self.assertIn("You are working in Agent Chat", agent_chat.agent_instructions)
         self.assertFalse(agent_chat.agent_api)
+        self.assertEqual(agent_chat.release_stage, "stable")
         self.assertEqual(agent_chat.public()["ui"]["iframe_src"], "/v1/apps/agent_chat/ui/index.html")
-        self.assertEqual(set(agent_chat.public()), {"id", "title", "backend", "ui"})
+        self.assertEqual(set(agent_chat.public()), {"id", "title", "release_stage", "backend", "ui"})
         self.assertEqual(set(agent_chat.public()["backend"]), {"api_route"})
         self.assertEqual(set(agent_chat.public()["ui"]), {"iframe_src", "sandbox"})
         allocation = agent_chat.allocation
@@ -111,6 +112,17 @@ class AppPlatformTests(unittest.TestCase):
         apps = {app.id: app for app in app_platform.installed_apps()}
 
         self.assertEqual(set(apps), set(RELEASED_APP_SLOTS))
+        self.assertEqual(
+            {app_id: app.release_stage for app_id, app in apps.items()},
+            {
+                "agent_chat": "stable",
+                "mission_pursuit": "beta",
+                "alpha_seeker": "beta",
+                "social_marketer": "beta",
+                "virality_machine": "beta",
+                "software_builder": "beta",
+            },
+        )
         for app_id, host_slot in RELEASED_APP_SLOTS.items():
             with self.subTest(app_id=app_id):
                 app = apps[app_id]
@@ -225,11 +237,23 @@ class AppPlatformTests(unittest.TestCase):
             with self.assertRaisesRegex(app_platform.AppError, "unsupported agent_api"):
                 app_platform.installed_apps(root)
 
-    def test_manifest_rejects_release_stage(self) -> None:
+    def test_manifest_rejects_invalid_release_stage(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            self._write_minimal_app(root, "bad_app", extra={"release_stage": "beta"})
-            with self.assertRaisesRegex(app_platform.AppError, "unsupported release_stage"):
+            self._write_minimal_app(root, "bad_app", release_stage="preview")
+            with self.assertRaisesRegex(app_platform.AppError, "must be 'stable' or 'beta'"):
+                app_platform.installed_apps(root)
+
+    def test_manifest_requires_release_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_minimal_app(root, "bad_app")
+            manifest_path = root / "bad_app" / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            del manifest["release_stage"]
+            manifest_path.write_text(json.dumps(manifest))
+
+            with self.assertRaisesRegex(app_platform.AppError, "missing release_stage"):
                 app_platform.installed_apps(root)
 
     def test_ui_asset_resolves_only_inside_app_ui_directory(self) -> None:
@@ -359,6 +383,7 @@ class AppPlatformTests(unittest.TestCase):
         *,
         host_slot: int = 0,
         title: str | None = None,
+        release_stage: str = "stable",
         extra: dict[str, object] | None = None,
         agent_instructions: str | None = "Instructions for this app.",
         agent_api: bool = False,
@@ -371,6 +396,7 @@ class AppPlatformTests(unittest.TestCase):
         manifest: dict[str, object] = {
             "host_slot": host_slot,
             "title": app_id if title is None else title,
+            "release_stage": release_stage,
             "backend": {"entrypoint": "backend.py"},
             "database": {"migrations": "migrations"},
             "ui": {"path": "ui"},

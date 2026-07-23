@@ -1,8 +1,8 @@
 """Hermes runtime adapter (AWS Bedrock inference).
 
-Hermes (NousResearch's hermes-agent) runs on the same Bedrock provider and
-credential as Pi. Its supported automation surface here is the headless
-one-query API behind a stdin adapter: one process per prompt, quiet output,
+Hermes (NousResearch's hermes-agent) runs on AWS Bedrock. Its supported
+automation surface here is the headless one-query API behind a stdin adapter:
+one process per prompt, quiet output,
 approvals disabled (the OS/proxy boundary is the enforcement), fixed
 terminal/file/bundled-tools toolsets with the host MCP shim connected, and
 reported/resumed session ids. The launcher pins the provider and environment;
@@ -11,8 +11,8 @@ this adapter supplies only the prompt, model, and session selection.
 Hermes has no mid-turn steering channel in this mode. Each API task maps to
 exactly one Hermes process and model turn; later input starts a new task on
 the same thread and resumes its stored Hermes session. The provider's
-credential surface (operator paste, STS attestation) is shared with every
-Bedrock-backed harness in ``host.runtime.admin_api.bedrock_credentials``.
+credential surface (operator paste and STS attestation) is owned by
+``host.runtime.admin_api.bedrock_credentials``.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ TURN_TIMEOUT_SECONDS = 45 * 60
 # look like a flag: require a leading alphanumeric.
 SESSION_ID_RE = re.compile(r"^session_id:\s*([A-Za-z0-9][\S]*)\s*$", re.MULTILINE)
 # The orchestrator talks to every provider module through one contract; the
-# shared Bedrock connection satisfies the account side of it.
+# Bedrock connection satisfies the account side of it.
 account_status = bedrock_credentials.account_status
 
 
@@ -133,7 +133,7 @@ class HermesSession:
             if self._closed:
                 raise HermesAgentError("Hermes turn was closed")
             # No operator credential crosses this boundary: the launcher
-            # injects the shared Bedrock routing identity and the network
+            # injects the dummy Bedrock routing identity and the network
             # proxy re-signs each allowed request with the operator's real key.
             self._proc = subprocess.Popen(
                 argv,

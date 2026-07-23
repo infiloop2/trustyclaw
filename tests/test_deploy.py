@@ -1620,6 +1620,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("/usr/local/lib/trustyclaw-host/read-claude-account", bootstrap)
         self.assertIn("/usr/local/lib/trustyclaw-host/clear-agent-auth", bootstrap)
         self.assertIn("/usr/local/lib/trustyclaw-host/read-agent-file", bootstrap)
+        self.assertIn("/usr/local/lib/trustyclaw-host/upload-agent-file", bootstrap)
         self.assertIn("/usr/local/lib/trustyclaw-host/stop-agent-thread", bootstrap)
         self.assertIn("/usr/local/lib/trustyclaw-host/check-for-upgrade", bootstrap)
         # Network policy, provider pins, and network events live in the
@@ -1931,6 +1932,12 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("chmod -R a+rX /usr/local/lib/node_modules", bootstrap)
         self.assertIn("chmod 755 /etc/codex", bootstrap)
         self.assertIn("runuser -u trustyclaw-agent -- env HOME=/mnt/trustyclaw-agent/agent-home", helper_sources)
+        upload_helper = Path("host/bootstrap/helpers/upload-agent-file.sh").read_text()
+        self.assertIn(
+            "/usr/bin/python3 /opt/trustyclaw-host/host/runtime/root_helpers/upload_agent_file.py",
+            upload_helper,
+        )
+        self.assertNotIn("PYTHONPATH", upload_helper)
         self.assertNotIn("-c 'approval_policy=", helper_sources)
         self.assertNotIn("-c 'sandbox_mode=", helper_sources)
         # Agent runtimes are resource-limited: bootstrap installs a slice with
@@ -1950,7 +1957,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn("MemorySwapMax=5G", bootstrap)
         self.assertIn("fallocate -l 6G /swapfile", bootstrap)
         self.assertIn("TasksMax=4096", bootstrap)
-        for launch_helper in ("run-codex-app-server", "run-claude-code", "run-pi", "run-hermes"):
+        for launch_helper in ("run-codex-app-server", "run-claude-code", "run-hermes"):
             launch_source = Path(f"host/bootstrap/helpers/{launch_helper}.sh").read_text()
             self.assertIn(
                 "exec systemd-run --quiet --collect --scope --slice=trustyclaw_agent.slice",
@@ -1983,7 +1990,7 @@ class DeployUnitTests(unittest.TestCase):
         self.assertIn('systemctl stop "${scope}"', stop_source)
         self.assertIn('systemctl reset-failed "${scope}"', stop_source)
         self.assertIn('if ! [[ "${thread_id}" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then', stop_source)
-        for launch_helper in ("run-pi", "run-hermes"):
+        for launch_helper in ("run-hermes",):
             launch_source = Path(f"host/bootstrap/helpers/{launch_helper}.sh").read_text()
             self.assertIn('export AWS_SECRET_ACCESS_KEY="trustyclaw-bedrock-dummy-secret"', launch_source)
             self.assertEqual(
@@ -2000,20 +2007,6 @@ class DeployUnitTests(unittest.TestCase):
         # its toolset alongside terminal and file.
         self.assertIn('importlib.import_module("tools.mcp_tool").discover_mcp_tools()', hermes_stdin)
         self.assertIn('toolsets="terminal,file,trustyclaw"', hermes_stdin)
-        # Pi has no MCP client, so its launcher loads the root-owned bridge
-        # extension explicitly; --no-extensions must stay (it disables
-        # discovery but honors explicit -e paths), and the bridge must spawn
-        # the same shim module the other harnesses use.
-        pi_launcher = Path("host/bootstrap/helpers/run-pi.sh").read_text()
-        self.assertIn("--no-extensions", pi_launcher)
-        self.assertIn(
-            "--extension /opt/trustyclaw-host/host/runtime/agent_shim/pi_tools_bridge.js",
-            pi_launcher,
-        )
-        pi_bridge = Path("host/runtime/agent_shim/pi_tools_bridge.js").read_text()
-        self.assertIn('"-m", "host.runtime.agent_shim.mcp_shim"', pi_bridge)
-        self.assertIn("pi.registerTool", pi_bridge)
-        self.assertIn('"tools/call"', pi_bridge)
         # App backends are long-running services, so bootstrap creates a
         # separate top-level slice and each generated app service joins it.
         # The lower CPU weight is soft: apps can use idle cores, but the admin
@@ -2110,6 +2103,7 @@ class DeployUnitTests(unittest.TestCase):
             app = app_platform.AppManifest(
                 id="custom_app",
                 title="Custom $(touch /tmp/unsafe)",
+                release_stage="stable",
                 package_dir=app_dir,
                 backend_entrypoint=backend,
                 migrations_dir=migrations,
@@ -2332,9 +2326,9 @@ class DeployUnitTests(unittest.TestCase):
             "read-claude-account",
             "clear-agent-auth",
             "read-agent-file",
+            "upload-agent-file",
             "reboot-host",
             "check-for-upgrade",
-            "run-pi",
             "run-hermes",
         ):
             script = (Path(f"host/bootstrap/helpers/{name}.sh").read_text()).replace("@PROXY_PORT@", "7445")
@@ -2598,6 +2592,7 @@ class DeployUnitTests(unittest.TestCase):
         # on the delivered tree.
         self.assertIn("VERSION", names)
         self.assertIn("host/bootstrap/agent-home/agents_claude.md", names)
+        self.assertIn("host/runtime/root_helpers/upload_agent_file.py", names)
         self.assertNotIn("host/bootstrap/agent-home/AGENTS.md", names)
         self.assertNotIn("host/bootstrap/agent-home/CLAUDE.md", names)
         self.assertIn("host/bootstrap/agent-home/.codex/config.toml", names)

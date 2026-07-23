@@ -2,7 +2,7 @@
 
 import { api } from "./api.js";
 import {
-  $, badge, bedrockRuntimeUsage, clampPercent, esc, formatTokenCount, gib, inlineMessage,
+  $, badge, bedrockUsage, clampPercent, esc, formatTokenCount, gib, inlineMessage,
   notice, setHtml, RUNTIME_PROVIDERS,
 } from "./helpers.js";
 import { renderIntegrationAccounts, setBedrockCredentialMetadata } from "./network.js";
@@ -149,26 +149,77 @@ export async function refreshProviderUsage() {
   await refreshHealth();
 }
 
+// On a phone the three usage boxes take a quarter of the screen, so they collapse
+// behind a single top-bar pill and apps get the full viewport. The pill toggles
+// this; desktop ignores the state (CSS keeps the panel inline at all times). The
+// choice is held here so it survives the 5-second re-render.
+let overviewExpanded = false;
+
+export function toggleRuntimeOverview() {
+  overviewExpanded = !overviewExpanded;
+  applyOverviewExpanded();
+  // Opening runs the same hard refresh as the desktop button: a POST that forces
+  // the backend to re-poll every provider for live usage (distinct from the
+  // 5-second tick, which only re-reads current state). The phone reaches that
+  // action through the open gesture instead of a separate button; reopening
+  // pulls again.
+  if (overviewExpanded) refreshProviderUsage().catch(() => {});
+}
+
+export function collapseRuntimeOverview() {
+  if (!overviewExpanded) return;
+  overviewExpanded = false;
+  applyOverviewExpanded();
+}
+
+function applyOverviewExpanded() {
+  const container = $("runtime-overview");
+  if (!container) return;
+  container.classList.toggle("expanded", overviewExpanded);
+  const toggle = container.querySelector(".runtime-overview-toggle");
+  if (toggle) toggle.setAttribute("aria-expanded", String(overviewExpanded));
+}
+
+function runtimeRunningCount() {
+  return latestRuntimes.reduce(
+    (total, runtime) => total + (Array.isArray(runtime.active_task_ids) ? runtime.active_task_ids.length : 0),
+    0,
+  );
+}
+
 function renderRuntimeOverview() {
   const container = $("runtime-overview");
   if (!container) return;
   const bedrockAccount = latestAccounts.find(entry => entry.provider === "bedrock") || {};
-  // The top toolbar is per agent runtime: one box each for Codex, Claude Code,
-  // Pi, and Hermes. Every box shows that runtime's own process status and its
-  // own usage. Pi and Hermes are separate boxes even though they share one
-  // Bedrock credential — credential state is managed per provider in the
-  // Internet Access and Tools tab, not here, so the toolbar stays purely
-  // per-runtime.
+  // The top toolbar has one box per agent runtime.
   const boxes = [
     subscriptionSummary("codex"),
     subscriptionSummary("claude_code"),
-    bedrockSummary("pi", bedrockAccount),
     bedrockSummary("hermes", bedrockAccount),
   ].join("");
-  setHtml(container, `${boxes}
-    <button class="ghost sm icon-button runtime-refresh" data-action="refresh-provider-usage" title="Refresh provider status and usage" aria-label="Refresh provider status and usage">
-      <svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><path d="M16.2 6.5A6.8 6.8 0 1 0 17 10M16.2 3.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    </button>`);
+  // The collapsed pill carries the one live signal worth reading at a glance —
+  // whether any agent is working — while the per-runtime usage waits behind the
+  // tap. The panel is always fresh (the 5-second poll re-renders it), so opening
+  // it is enough to read current usage; the refresh button forces a re-poll.
+  const running = runtimeRunningCount();
+  const summaryText = running ? `${running} running` : "All idle";
+  const summaryLabel = running
+    ? `${running} agent task${running === 1 ? "" : "s"} running`
+    : "All agent runtimes idle";
+  setHtml(container, `
+    <button class="runtime-overview-toggle" data-action="toggle-runtime-overview" aria-expanded="${overviewExpanded}" aria-controls="runtime-overview-panel" aria-label="Agent usage: ${esc(summaryLabel)}. Show per-runtime status and usage">
+      <span class="rot-icon" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 20 20"><path d="M3.5 14.5a6.5 6.5 0 1 1 13 0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M10 14.5 13 8.6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></span>
+      <span class="rot-label">Agent usage</span>
+      <span class="rot-summary${running ? " busy" : ""}">${esc(summaryText)}</span>
+      <span class="rot-chevron" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 20 20"><path d="m5.5 8 4.5 4.5L14.5 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+    </button>
+    <div class="runtime-overview-panel" id="runtime-overview-panel">
+      ${boxes}
+      <button class="ghost sm icon-button runtime-refresh" data-action="refresh-provider-usage" title="Refresh provider status and usage" aria-label="Refresh provider status and usage">
+        <svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><path d="M16.2 6.5A6.8 6.8 0 1 0 17 10M16.2 3.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </div>`);
+  applyOverviewExpanded();
 }
 
 // The shared top-bar box for one runtime: a status dot, the runtime label and
@@ -221,12 +272,11 @@ function subscriptionSummary(runtime) {
   return runtimeSummaryCard(runtime, usageHtml, usageSummaryText);
 }
 
-// A Bedrock runtime (Pi, Hermes): usage is pay-per-token, so the readout is a
+// Hermes usage is pay-per-token, so the readout is a
 // month-to-date cost estimate with token totals, not a quota ring. The numbers
-// come from the shared provider account's per-runtime usage map, but the box is
-// otherwise driven by the runtime's own status.
+// come from the provider account and the box is driven by Hermes's status.
 function bedrockSummary(runtime, account) {
-  const usage = bedrockRuntimeUsage(account, runtime);
+  const usage = bedrockUsage(account);
   const usageHtml = bedrockUsageReadout(usage);
   let usageSummaryText = "no metered usage yet";
   if (usage) {
@@ -242,7 +292,7 @@ function bedrockSummary(runtime, account) {
 
 // The right-hand readout for a Bedrock box: three stacked figures — input
 // tokens, output tokens, and the cost — mirroring the subscription boxes' row
-// of usage rings so all four boxes read at the same visual weight. The cost is
+// of usage rings so all three boxes read at the same visual weight. The cost is
 // labelled "MTD est." to flag that it is a metered estimate, not the AWS bill.
 // Placeholder dashes keep the box populated before any usage has been metered.
 function bedrockUsageReadout(usage) {
@@ -338,7 +388,7 @@ function usageRing(label, window) {
 }
 
 async function showOauth(start, runtime) {
-  if (runtime === "pi" || runtime === "hermes") return; // no OAuth flow; credentials connect in the integration card
+  if (runtime === "hermes") return; // no OAuth flow; credentials connect in the integration card
   const provider = runtime === "claude_code" ? "claude" : "openai";
   // The card target is re-queried after each await: the 5-second poll can
   // re-render the provider card while the request is in flight, and writing

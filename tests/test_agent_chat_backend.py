@@ -43,11 +43,6 @@ class AgentChatBackendTests(unittest.TestCase):
                         "fable": ["high", "max", "ultracode"],
                         "sonnet": ["high", "max", "ultracode"],
                     },
-                    "pi": {
-                        "deepseek.v3.2": ["medium", "high", "max"],
-                        "qwen.qwen3-coder-next": ["medium", "high", "max"],
-                        "moonshotai.kimi-k2.5": ["medium", "high", "max"],
-                    },
                     "hermes": {
                         "deepseek.v3.2": ["high"],
                         "qwen.qwen3-coder-next": ["high"],

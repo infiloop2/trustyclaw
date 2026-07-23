@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, call, patch
 import subprocess
 from typing import Any
 import urllib.error
+from urllib.parse import quote
 import urllib.request
 
 import pg_harness
@@ -48,20 +49,17 @@ def save_approved_openai_account(account_id: str, **extra: Any) -> None:
     )
 
 
-# The zeroed live-usage payload every accounts read carries for a Bedrock
-# runtime that has no metered requests this month.
+# The zeroed live-usage payload every accounts read carries when Bedrock has
+# no metered requests this month.
 EMPTY_BEDROCK_USAGE = {
-    runtime: {
-        "month_to_date": 0.0,
-        "currency": "USD",
-        "requests": 0,
-        "metered_requests": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0,
-    }
-    for runtime in ("pi", "hermes")
+    "month_to_date": 0.0,
+    "currency": "USD",
+    "requests": 0,
+    "metered_requests": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0,
 }
 
 
@@ -86,6 +84,40 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertIn(
             'task.status === "running" && task.agent_runtime !== "hermes"',
             script,
+        )
+
+    def test_app_upload_bridge_uses_a_host_owned_file_picker(self) -> None:
+        runtime = Path(__file__).parents[1] / "host/runtime/admin_api/admin_ui"
+        app = (runtime / "app.js").read_text()
+        api = (runtime / "api.js").read_text()
+        chat = (
+            Path(__file__).parents[1] / "host/apps/agent_chat/ui/agent_chat.js"
+        ).read_text()
+        css = (runtime.parent / "admin_ui.css").read_text()
+        self.assertIn('message.type === "trustyclaw-app-upload-file"', app)
+        self.assertIn('input.type = "file"', app)
+        self.assertIn("input.multiple = true", app)
+        self.assertIn('input.className = "host-file-picker"', app)
+        self.assertNotIn("input.hidden = true", app)
+        self.assertIn(".host-file-picker", css)
+        self.assertIn("opacity: 0", css)
+        self.assertIn("navigator.userActivation && !navigator.userActivation.isActive", app)
+        self.assertIn("catch (_error)", app)
+        self.assertIn("const APP_UPLOAD_SELECTION_LIMIT = 10", app)
+        self.assertIn("appSelections.set(selectionId, file)", app)
+        self.assertIn('if (action !== "upload")', app)
+        self.assertIn("body = await apiUpload(selected)", app)
+        self.assertIn("upload failed (${response.status})", api)
+        self.assertIn("/v1/agent-files/upload?filename=", api)
+        self.assertIn("const ATTACHMENT_LIMIT = 10", chat)
+        self.assertIn("const ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024", chat)
+        self.assertIn(
+            "attachment.size_bytes > ATTACHMENT_MAX_BYTES",
+            chat,
+        )
+        self.assertIn(
+            "for (const [index, attachment] of pendingAttachments.entries())",
+            chat,
         )
 
     def test_connection_guide_preserves_network_and_data_disclosure_contracts(self) -> None:
@@ -132,12 +164,12 @@ class AdminUiStaticTests(unittest.TestCase):
         css = (runtime / "admin_ui.css").read_text()
         combined = "\n".join((catalog, guide, health, network, css))
 
-        self.assertIn('label: "AWS Bedrock"', catalog)
+        self.assertIn('label: "Hermes (AWS Bedrock)"', catalog)
+        self.assertNotIn("bedrock-usage-runtime", combined)
         self.assertNotIn("AWS Bedrock AI inference", combined)
-        # Two separate live usage boxes, one per Bedrock runtime, in both the
-        # per-runtime toolbar boxes and the provider panel; the Cost Explorer
-        # display is gone with the polling it required.
-        self.assertIn("bedrockRuntimeUsage(account, runtime)", health)
+        # One live usage box for Hermes in both the toolbar and provider panel;
+        # the Cost Explorer display is gone with the polling it required.
+        self.assertIn("bedrockUsage(account)", health)
         self.assertIn("runtime-summary-bedrock", combined)
         self.assertIn("bedrock-usage-box", network)
         self.assertIn("MTD est.", health)
@@ -149,7 +181,6 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertIn('id="bedrock-region-', network)
         self.assertIn('"region": region', network)
         self.assertNotIn("setBedrockRegion", combined)
-        self.assertNotIn("The toolbar keeps separate Pi and Hermes running-task counters.", combined)
         self.assertIn("credentials required", network)
         self.assertIn("bedrock:InvokeModel", catalog)
         self.assertIn("bedrock:InvokeModelWithResponseStream", catalog)
@@ -276,8 +307,9 @@ class AdminUiStaticTests(unittest.TestCase):
         self.assertIn('id="tab-processes"', html)
         self.assertIn('id="processes"', html)
         self.assertIn('id="sidebar-apps"', html)
-        self.assertIn('id="app-tabs"', html)
-        self.assertIn('id="app-tabs"', html)
+        self.assertIn('id="stable-app-tabs"', html)
+        self.assertIn('id="beta-app-tabs" hidden', html)
+        self.assertIn('data-action="toggle-beta-apps"', html)
         self.assertIn("under development and may not function properly", html)
         app_js = (runtime / "admin_ui" / "app.js").read_text()
         self.assertIn("trustyclaw-app-api", app_js)
@@ -507,6 +539,205 @@ class AdminUiStaticTests(unittest.TestCase):
                 with self.assertRaises(admin_api.ApiError) as error:
                     admin_api.route("GET", path, {}, None, bridge_app_id="other-app")
                 self.assertEqual(error.exception.status, HTTPStatus.FORBIDDEN)
+
+
+class AgentFileUploadHttpTests(unittest.TestCase):
+    def setUp(self) -> None:
+        password_hash = hashlib.sha256(b"admin-secret").hexdigest()
+        self.config_patch = patch(
+            "host.runtime.admin_api.service.load_config",
+            return_value={"admin_password_sha256": password_hash},
+        )
+        self.config_patch.start()
+        self.addCleanup(self.config_patch.stop)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), admin_api.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def raw_request(self, request: bytes) -> bytes:
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=5) as sock:
+            sock.sendall(request)
+            sock.shutdown(socket.SHUT_WR)
+            chunks: list[bytes] = []
+            while chunk := sock.recv(65536):
+                chunks.append(chunk)
+            return b"".join(chunks)
+
+    def test_upload_streams_to_the_fixed_helper(self) -> None:
+        class RecordingStdin(io.BytesIO):
+            written = b""
+
+            def close(self) -> None:
+                self.written = self.getvalue()
+                super().close()
+
+        payload = b"mock-image-bytes"
+        process = MagicMock()
+        process.stdin = RecordingStdin()
+        process.stdout = io.BytesIO(json.dumps({
+            "path": "user-files/20260722T120000.000000Z_reference image.png",
+            "name": "20260722T120000.000000Z_reference image.png",
+            "original_name": "reference image.png",
+            "size_bytes": len(payload),
+            "uploaded_at": "2026-07-22T12:00:00Z",
+        }).encode())
+        process.stderr = io.BytesIO()
+        process.returncode = 0
+        process.wait.return_value = 0
+
+        request = urllib.request.Request(
+            f"{self.base_url}/v1/agent-files/upload?filename={quote('reference image.png')}",
+            data=payload,
+            method="POST",
+            headers={"Authorization": "Bearer admin-secret"},
+        )
+        with (
+            patch("host.runtime.admin_api.service.subprocess.Popen", return_value=process) as popen,
+            urllib.request.urlopen(request, timeout=5) as response,
+        ):
+            self.assertEqual(response.status, 200)
+            body = json.loads(response.read())
+
+        self.assertEqual(body["file"]["path"], "user-files/20260722T120000.000000Z_reference image.png")
+        self.assertEqual(process.stdin.written, payload)
+        self.assertEqual(
+            popen.call_args.args[0],
+            [*admin_api.AGENT_FILE_UPLOAD_HELPER_COMMAND, "reference image.png", str(len(payload))],
+        )
+
+    def test_upload_requires_auth_and_rejects_invalid_requests_before_starting_helper(self) -> None:
+        payload = b"bytes"
+        unauthenticated = urllib.request.Request(
+            f"{self.base_url}/v1/agent-files/upload?filename=photo.png",
+            data=payload,
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(unauthenticated, timeout=5)
+        self.assertEqual(error.exception.code, 401)
+
+        with patch("host.runtime.admin_api.service.subprocess.Popen") as popen:
+            for path in (
+                "/v1/agent-files/upload?filename=..%2Fphoto.png",
+                "/v1/agent-files/upload?filename=photo.png&extra=1",
+            ):
+                with self.subTest(path=path), self.assertRaises(urllib.error.HTTPError) as error:
+                    request = urllib.request.Request(
+                        f"{self.base_url}{path}",
+                        data=payload,
+                        method="POST",
+                        headers={"Authorization": "Bearer admin-secret"},
+                    )
+                    urllib.request.urlopen(request, timeout=5)
+                self.assertEqual(error.exception.code, 400)
+            popen.assert_not_called()
+
+    def test_upload_cap_and_app_bridge_scope_are_enforced_before_body_read(self) -> None:
+        auth = "Authorization: Bearer admin-secret\r\n"
+        oversized = self.raw_request(
+            b"POST /v1/agent-files/upload?filename=photo.png HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            + auth.encode()
+            + f"Content-Length: {admin_api.AGENT_FILE_UPLOAD_MAX_BYTES + 1}\r\n\r\n".encode()
+        )
+        self.assertIn(b" 413 ", oversized)
+        self.assertIn(b"upload exceeds", oversized)
+
+        bridge = urllib.request.Request(
+            f"{self.base_url}/v1/agent-files/upload?filename=photo.png",
+            data=b"bytes",
+            method="POST",
+            headers={
+                "Authorization": "Bearer admin-secret",
+                "X-TrustyClaw-App-Bridge": "agent_chat",
+            },
+        )
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(bridge, timeout=5)
+        self.assertEqual(error.exception.code, 403)
+        self.assertIn("only target the app's own API", error.exception.read().decode())
+
+    def test_short_upload_gives_helper_time_to_remove_its_partial_file(self) -> None:
+        process = MagicMock()
+        process.stdin = io.BytesIO()
+        process.stdout = io.BytesIO()
+        process.stderr = io.BytesIO()
+        process.poll.return_value = None
+        process.wait.return_value = 2
+
+        with patch("host.runtime.admin_api.service.subprocess.Popen", return_value=process):
+            response = self.raw_request(
+                b"POST /v1/agent-files/upload?filename=photo.png HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Authorization: Bearer admin-secret\r\n"
+                b"Content-Length: 20\r\n\r\n"
+                b"short"
+            )
+
+        self.assertIn(b" 400 ", response)
+        self.assertIn(b"upload ended before Content-Length", response)
+        self.assertTrue(process.stdin.closed)
+        process.wait.assert_called_once_with(timeout=admin_api.AGENT_FILE_HELPER_TIMEOUT_SECONDS)
+        process.kill.assert_not_called()
+
+    def test_helper_epipe_returns_its_actionable_error(self) -> None:
+        process = MagicMock()
+        process.stdin.write.side_effect = BrokenPipeError
+        process.stdout = io.BytesIO(b'{"error":{"message":"user-files must not be a symlink"}}')
+        process.stderr = io.BytesIO()
+        process.returncode = 2
+        process.wait.return_value = 2
+
+        request = urllib.request.Request(
+            f"{self.base_url}/v1/agent-files/upload?filename=photo.png",
+            data=b"bytes",
+            method="POST",
+            headers={"Authorization": "Bearer admin-secret"},
+        )
+        with (
+            patch("host.runtime.admin_api.service.subprocess.Popen", return_value=process),
+            self.assertRaises(urllib.error.HTTPError) as error,
+        ):
+            urllib.request.urlopen(request, timeout=5)
+
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn("user-files must not be a symlink", error.exception.read().decode())
+        process.wait.assert_called_once_with(timeout=admin_api.AGENT_FILE_HELPER_TIMEOUT_SECONDS)
+        process.kill.assert_not_called()
+
+    def test_upload_timeout_with_denied_kill_never_waits_unbounded(self) -> None:
+        process = MagicMock()
+        process.stdin = io.BytesIO()
+        process.stdout = io.BytesIO()
+        process.stderr = io.BytesIO()
+        process.poll.return_value = None
+
+        def wait(*, timeout: int | None = None) -> int:
+            if timeout is None:
+                raise AssertionError("upload cleanup used an unbounded wait")
+            raise subprocess.TimeoutExpired(cmd="upload-agent-file", timeout=timeout)
+
+        process.wait.side_effect = wait
+        process.kill.side_effect = PermissionError("signal denied")
+        request = urllib.request.Request(
+            f"{self.base_url}/v1/agent-files/upload?filename=photo.png",
+            data=b"bytes",
+            method="POST",
+            headers={"Authorization": "Bearer admin-secret"},
+        )
+        with (
+            patch("host.runtime.admin_api.service.subprocess.Popen", return_value=process),
+            self.assertRaises(urllib.error.HTTPError) as error,
+        ):
+            urllib.request.urlopen(request, timeout=5)
+
+        self.assertEqual(error.exception.code, 504)
+        self.assertIn("agent file upload helper timed out", error.exception.read().decode())
+        process.wait.assert_called_once_with(timeout=admin_api.AGENT_FILE_HELPER_TIMEOUT_SECONDS)
+        process.kill.assert_called_once_with()
 
 
 class AgentProcessSnapshotTests(unittest.TestCase):
@@ -2720,7 +2951,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                     },
                     {
                         "provider": "bedrock",
-                        "agent_runtimes": ["pi", "hermes"],
+                        "agent_runtimes": ["hermes"],
                         "status": "loading",
                         "bedrock_usage": EMPTY_BEDROCK_USAGE,
                     },
@@ -2805,7 +3036,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                     {"agent_runtime": "claude_code", "provider": "claude", "status": "awaiting_login"},
                     {
                         "provider": "bedrock",
-                        "agent_runtimes": ["pi", "hermes"],
+                        "agent_runtimes": ["hermes"],
                         "status": "loading",
                         "bedrock_usage": EMPTY_BEDROCK_USAGE,
                     },
@@ -2913,7 +3144,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                     },
                     {
                         "provider": "bedrock",
-                        "agent_runtimes": ["pi", "hermes"],
+                        "agent_runtimes": ["hermes"],
                         "status": "loading",
                         "bedrock_usage": EMPTY_BEDROCK_USAGE,
                     },
@@ -2958,25 +3189,17 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual([account["provider"] for account in body["accounts"]], ["openai", "claude", "bedrock"])
 
     def test_agent_runtime_refresh_endpoint_forces_requested_bedrock_runtime(self) -> None:
-        for runtime_type in ("pi", "hermes"):
-            save_policy(
-                {
-                    "network_integrations": {
-                        "bedrock": {"enabled": True}
-                    }
-                },
-                "2026-06-08T00:00:00Z",
+        save_policy(
+            {"network_integrations": {"bedrock": {"enabled": True}}},
+            "2026-06-08T00:00:00Z",
+        )
+        with patch("host.runtime.admin_api.service.orchestrator.refresh_runtime_status") as refresh:
+            self.request(
+                "POST",
+                "/v1/agent-runtime/refresh",
+                {"agent_runtime": "hermes"},
             )
-            with (
-                self.subTest(runtime_type=runtime_type),
-                patch("host.runtime.admin_api.service.orchestrator.refresh_runtime_status") as refresh,
-            ):
-                self.request(
-                    "POST",
-                    "/v1/agent-runtime/refresh",
-                    {"agent_runtime": runtime_type},
-                )
-                refresh.assert_called_once_with(runtime_type, force_provider_probe=True)
+        refresh.assert_called_once_with("hermes", force_provider_probe=True)
 
     def test_agent_runtime_refresh_endpoint_refreshes_all_runtimes_by_default(self) -> None:
         save_policy(
@@ -2995,7 +3218,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
             [
                 ("codex", {"force_provider_probe": True}),
                 ("claude_code", {"force_provider_probe": True}),
-                ("pi", {"force_provider_probe": True}),
+                ("hermes", {"force_provider_probe": True}),
             ],
         )
 
@@ -3012,7 +3235,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
             [
                 ("codex", {"force_provider_probe": True}),
                 ("claude_code", {"force_provider_probe": True}),
-                ("pi", {"force_provider_probe": False}),
+                ("hermes", {"force_provider_probe": False}),
             ],
         )
 
@@ -3221,7 +3444,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(response, {"status": "accepted"})
         self.assertEqual(
             refresh_status.call_args_list,
-            [call("pi")],
+            [call("hermes")],
         )
         replace.assert_called_once_with("AKIAOPERATORKEY00001", "S" * 40, "us-west-2")
 
@@ -3233,10 +3456,10 @@ class AdminApiIntegrationTests(unittest.TestCase):
         }
         state.save_bedrock_credential("AKIAOPERATORKEY00001", "S" * 40, "us-east-1")
         state.save_bedrock_account(account)
-        statuses = {"pi": {"status": "active"}, "hermes": {"status": "active"}}
+        statuses = {"hermes": {"status": "active"}}
         bedrock = admin_api._current_bedrock_account(statuses)
         self.assertEqual(bedrock["provider"], "bedrock")
-        self.assertEqual(bedrock["agent_runtimes"], ["pi", "hermes"])
+        self.assertEqual(bedrock["agent_runtimes"], ["hermes"])
         for key in ("account_id", "arn"):
             self.assertEqual(bedrock[key], account[key])
         self.assertEqual(
@@ -3248,12 +3471,11 @@ class AdminApiIntegrationTests(unittest.TestCase):
             },
         )
 
-    def test_bedrock_account_reports_live_per_runtime_usage(self) -> None:
+    def test_bedrock_account_reports_live_usage(self) -> None:
         # The proxy prices each response and stores the cost; the admin API
-        # sums the stored counters for the current month into one entry per
-        # runtime. 1M input at $0.62/M plus 100k output at $1.85/M is $0.805.
+        # sums the stored counters for the current month.
+        # 1M input at $0.62/M plus 100k output at $1.85/M is $0.805.
         state.record_bedrock_usage(
-            "pi",
             "deepseek.v3.2",
             {
                 "input_tokens": 1_000_000,
@@ -3263,32 +3485,25 @@ class AdminApiIntegrationTests(unittest.TestCase):
             },
             0.805,
         )
-        state.record_bedrock_usage("pi", "deepseek.v3.2", None, 0.0)
+        state.record_bedrock_usage("deepseek.v3.2", None, 0.0)
         # An unknown model was normalized to the shared 'other' bucket, priced
         # at 0 because it is outside the catalog.
         state.record_bedrock_usage(
-            "hermes",
             "other",
             {"input_tokens": 10, "output_tokens": 5, "cache_read_tokens": 0, "cache_write_tokens": 0},
             0.0,
         )
-        statuses = {"pi": {"status": "awaiting_login"}, "hermes": {"status": "awaiting_login"}}
+        statuses = {"hermes": {"status": "awaiting_login"}}
         usage = admin_api._current_bedrock_account(statuses)["bedrock_usage"]
-        self.assertEqual(sorted(usage), ["hermes", "pi"])
-        pi = usage["pi"]
-        self.assertEqual(pi["requests"], 2)
-        self.assertEqual(pi["metered_requests"], 1)
-        self.assertNotIn("unpriced_requests", pi)
-        self.assertEqual(pi["input_tokens"], 1_000_000)
-        self.assertEqual(pi["output_tokens"], 100_000)
-        self.assertAlmostEqual(pi["month_to_date"], 0.805)
-        self.assertEqual(pi["currency"], "USD")
-        hermes = usage["hermes"]
+        self.assertEqual(usage["requests"], 3)
+        self.assertEqual(usage["metered_requests"], 2)
+        self.assertNotIn("unpriced_requests", usage)
+        self.assertEqual(usage["input_tokens"], 1_000_010)
+        self.assertEqual(usage["output_tokens"], 100_005)
+        self.assertAlmostEqual(usage["month_to_date"], 0.805)
+        self.assertEqual(usage["currency"], "USD")
         # An unknown model keeps its tokens and requests visible but, being
         # unpriced, adds nothing to the cost.
-        self.assertEqual(hermes["requests"], 1)
-        self.assertEqual(hermes["input_tokens"], 10)
-        self.assertEqual(hermes["month_to_date"], 0.0)
 
     def test_connect_bedrock_credentials_validates_while_disabled(self) -> None:
         save_policy(
@@ -3342,7 +3557,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
                 "access_key_id": "AKIAOPERATORKEY00001",
                 "secret_access_key": "S" * 40,
                 "region": "us-east-1",
-                field: "pi",
+                field: "unsupported",
             }
             with self.subTest(field=field), self.assertRaises(admin_api.ApiError) as caught:
                 admin_api.connect_bedrock_credentials(body)
@@ -3393,7 +3608,7 @@ class AdminApiIntegrationTests(unittest.TestCase):
         self.assertEqual(response, {"status": "accepted"})
         self.assertEqual(
             [entry.args[0] for entry in stop_runtime_processes.call_args_list],
-            ["pi", "hermes"],
+            ["hermes"],
         )
 
         self.assertEqual(state.read_bedrock_account(), {})
@@ -3491,7 +3706,6 @@ class AdminApiIntegrationTests(unittest.TestCase):
             None,
             {},
             {"agent_runtime": "cursor"},
-            {"agent_runtime": "pi"},
             {"agent_runtime": "hermes"},
         ):
             with self.assertRaises(admin_api.ApiError) as error:

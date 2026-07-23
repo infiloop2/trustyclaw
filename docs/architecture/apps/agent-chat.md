@@ -8,7 +8,8 @@ tasks run.
 
 The admin shell hardwires Agent Chat as the host's main interface: the home
 tab opens with a "Begin chat" navigator and the app sits directly below Home
-in the navigation, above the Apps section.
+in the navigation. Its manifest still declares the required
+`release_stage: "stable"`; the hero placement is the shell's one special case.
 
 ## What The App Owns
 
@@ -39,6 +40,24 @@ summary and stays invisible.
 Sending a message either creates a new thread (picking the runtime with the
 first message) or appends a task to an existing one:
 
+- The composer accepts up to ten optional file attachments. Each file has its
+  own immediate Remove control. The app asks the
+  host-owned parent bridge to open the native file picker and retain the
+  selection in browser memory. When the operator sends the message, the app
+  asks the parent to upload each selection sequentially through
+  `POST /v1/agent-files/upload`, then creates the task after every upload
+  succeeds and appends one
+  `[User-uploaded file: user-files/<timestamp>_<name>]` line per file to
+  `input_message`.
+  The host's immutable agent instructions define that reference and the
+  `user-files/` directory for every runtime. Clearing or abandoning an
+  unsubmitted attachment creates no workspace file. Files over 25 MiB remain
+  visible with a per-item error and cannot be sent. If an upload fails, files
+  already uploaded keep their returned paths and a later Send retries only
+  unfinished files. If task creation fails after every upload, pressing Send
+  again reuses every returned path. Durable files remain available without
+  cleanup or reconciliation. There is no separate aggregate-byte limit; the
+  ten-file and 25 MiB-per-file bounds limit one message to 250 MiB.
 - `POST /tasks` creates a host task via the app-backend socket
   (`POST /v1/tasks`) with the thread's runtime and thread id, and records the
   returned task id in `thread_tasks`. A request without `thread_id` starts a

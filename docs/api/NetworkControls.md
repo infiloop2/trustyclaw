@@ -135,11 +135,9 @@ remains available for Claude Code startup.
 
 ## AWS Bedrock Integration
 
-The Pi and Hermes runtimes run through one AWS Bedrock integration in the
-operator's own AWS account. One connection holds their region and IAM
-credential; one `enabled` flag controls access. The linked account, network
-boundary, provider status, and billing record are also shared. Pi and Hermes
-remain distinct task runtimes with separate task counts. The `bedrock`
+The Hermes runtime runs through an AWS Bedrock integration in the operator's
+own AWS account. One connection holds its region and IAM credential; one
+`enabled` flag controls access. The `bedrock`
 integration owns and guards the `bedrock-runtime` apexes:
 
 ```json
@@ -150,7 +148,7 @@ integration owns and guards the `bedrock-runtime` apexes:
 
 | Field | Required | Type | Behavior |
 | --- | --- | --- | --- |
-| `enabled` | Yes | boolean | Enables the shared Bedrock integration for both Pi and Hermes. The validated AWS connection, including its region, remains stored independently when this is `false`. |
+| `enabled` | Yes | boolean | Enables the Bedrock integration for Hermes. The validated AWS connection, including its region, remains stored independently when this is `false`. |
 
 The stored Bedrock config is not expanded into a generic domain-policy entry.
 The managed-integration registry assigns every supported Bedrock Runtime apex
@@ -160,10 +158,10 @@ applies `^/model/[^/]+/(?:converse|converse-stream)$` directly. Every other
 supported region remains owned by Bedrock and denied, so it cannot fall through
 to a custom-domain rule.
 
-The Converse paths cover the request shapes used by both harnesses.
-The agent never holds the operator's AWS credential. Each harness receives its
-own fixed access-key id and a fixed dummy secret with no AWS capability. The
-proxy requires one of those dummy access-key ids, the configured region, SigV4
+The Converse paths cover the request shapes used by Hermes.
+The agent never holds the operator's AWS credential. Hermes receives a fixed
+access-key id and a fixed dummy secret with no AWS capability. The
+proxy requires that dummy access-key id, the configured region, SigV4
 service `bedrock`, and an allowed model invocation path, then discards the
 agent's signature and re-signs the exact request with the validated operator
 key. A request for another region is rejected at CONNECT; a request signed
@@ -173,10 +171,9 @@ Bedrock control plane and every other AWS service stay closed. Query-string
 (`X-Amz-Security-Token`) are always denied.
 
 Allowed invocations are also metered: the proxy passively parses the token
-usage AWS reports in each relayed response and counts it per runtime (selected
-by the signing harness's key id), model, and UTC day, which powers the live
-per-runtime cost estimates in the admin UI. Metering never alters or gates the
-relayed bytes.
+usage AWS reports in each relayed response and counts it per model and UTC day,
+which powers the live Hermes cost estimate in the admin UI. Metering never
+alters or gates the relayed bytes.
 
 ## GitHub Integration
 

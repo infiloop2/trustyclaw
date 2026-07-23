@@ -29,6 +29,12 @@ def mobile_smoke(page: Any) -> None:
 
 
 def _run_app_smokes(function_name: str, page: Any) -> None:
+    beta_toggle = page.locator("#sidebar-apps-toggle")
+    if beta_toggle.count() and beta_toggle.get_attribute("aria-expanded") == "false":
+        # Mobile app smokes open the drawer themselves. A DOM click expands
+        # the group before that without requiring the off-canvas control to be
+        # visually actionable.
+        beta_toggle.evaluate("element => element.click()")
     for app, module in _iter_app_smokes():
         smoke = getattr(module, function_name, None)
         if smoke is None:

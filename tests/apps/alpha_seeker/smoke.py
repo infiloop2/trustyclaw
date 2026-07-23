@@ -476,7 +476,7 @@ def desktop_smoke(page: Any) -> None:
     from playwright.sync_api import expect
 
     expect(page.locator("#sidebar-apps")).to_contain_text("Apps")
-    expect(page.locator("#sidebar-apps .sidebar-section-title > span").first).to_have_text("Apps (Beta)")
+    expect(page.get_by_role("button", name="Apps (Beta)", exact=True)).to_have_attribute("aria-expanded", "true")
     expect(page.locator(".sidebar-section-note")).to_have_count(0)
     expect(page.locator("#beta-info-popover")).to_be_hidden()
     page.get_by_role("button", name="About beta apps").focus()
@@ -484,7 +484,7 @@ def desktop_smoke(page: Any) -> None:
     expect(page.locator("#beta-info-popover")).to_have_text(
         "These apps are under development and may not function properly."
     )
-    page.locator("#app-tabs").get_by_role("button", name="Alpha Seeker", exact=True).click()
+    page.locator("#beta-app-tabs").get_by_role("button", name="Alpha Seeker", exact=True).click()
     expect(page.locator("#panel-app-alpha_seeker")).to_be_visible()
     frame = page.frame_locator('iframe[title="Alpha Seeker"]')
 
@@ -586,7 +586,7 @@ def mobile_smoke(page: Any) -> None:
     expect(page.locator("#sidebar-apps")).to_contain_text("Apps")
     page.locator("#mobile-nav-toggle").click()
     expect(page.locator("#nav-backdrop")).to_be_visible()
-    page.locator("#app-tabs").get_by_role("button", name="Alpha Seeker", exact=True).click()
+    page.locator("#beta-app-tabs").get_by_role("button", name="Alpha Seeker", exact=True).click()
     expect(page.locator("#nav-backdrop")).to_be_hidden()
     expect(page.locator("#panel-app-alpha_seeker")).to_be_visible()
     frame = page.frame_locator('iframe[title="Alpha Seeker"]')
@@ -596,7 +596,10 @@ def mobile_smoke(page: Any) -> None:
     _assert_outer_page_locked(page, "Alpha Seeker app (mobile)")
     page.once("dialog", lambda dialog: dialog.accept())
     frame.locator("#deactivate-app").click()
-    expect(frame.locator("#hero")).to_be_visible()
+    expect(frame.locator("#status")).to_contain_text("App deactivated.", timeout=12000)
+    # A concurrent five-second refresh may briefly repaint the pre-deactivation
+    # snapshot before the next poll converges on the preserved inactive state.
+    expect(frame.locator("#hero")).to_be_visible(timeout=12000)
     expect(frame.locator("#workspace")).to_be_hidden()
     expect(frame.locator("#hero-send")).to_contain_text("Reactivate")
     expect(frame.locator("#hero-hint")).to_contain_text("schedules stay paused")

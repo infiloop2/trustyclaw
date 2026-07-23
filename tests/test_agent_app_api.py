@@ -41,6 +41,7 @@ def write_app_package(root: Path, app_id: str, *, host_slot: int, agent_api: boo
     manifest: dict[str, object] = {
         "host_slot": host_slot,
         "title": f"{app_id.title()} App",
+        "release_stage": "stable",
         "backend": {"entrypoint": "backend.py"},
         "database": {"migrations": "migrations"},
         "ui": {"path": "ui"},

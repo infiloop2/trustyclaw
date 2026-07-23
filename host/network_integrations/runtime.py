@@ -146,7 +146,7 @@ def response_meter(
     """The owning integration's passive response observer for this allowed
     request (an object with ``feed(bytes)`` and ``finish()``), or None. Only
     Bedrock defines one: it turns the token usage AWS reports in each
-    response into the live per-runtime usage counters."""
+    response into the live usage counters."""
     guard, config = _selection(controls, host)
     if not config.enabled or guard.response_meter is None:
         return None

@@ -6,7 +6,6 @@ export const $ = id => document.getElementById(id);
 export const RUNTIME_PROVIDERS = {
   codex: { label: "Codex", provider: "openai", providerLabel: "OpenAI" },
   claude_code: { label: "Claude Code", provider: "claude", providerLabel: "Claude" },
-  pi: { label: "Pi", provider: "bedrock", providerLabel: "AWS Bedrock" },
   hermes: { label: "Hermes", provider: "bedrock", providerLabel: "AWS Bedrock" },
 };
 
@@ -171,11 +170,10 @@ export function formatTokenCount(value) {
   return String(value);
 }
 
-// Month-to-date usage the proxy metered live from Bedrock responses for one
-// runtime (see the bedrock_usage payload on the provider account), formatted
+// Month-to-date usage the proxy metered live from Bedrock responses, formatted
 // for display; null when the payload is absent.
-export function bedrockRuntimeUsage(account, runtime) {
-  const usage = account.bedrock_usage && account.bedrock_usage[runtime];
+export function bedrockUsage(account) {
+  const usage = account.bedrock_usage;
   const amount = usage && typeof usage === "object" ? Number(usage.month_to_date) : NaN;
   if (!Number.isFinite(amount)) return null;
   const currency = !usage.currency || usage.currency === "USD" ? "$" : `${usage.currency} `;

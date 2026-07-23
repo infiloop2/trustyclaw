@@ -14,7 +14,7 @@ from host.network_integrations.registry import NETWORK_INTEGRATIONS, managed_dom
 
 AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,50}$")
 EXACT_DOMAIN_RE = re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
-AGENT_RUNTIMES = {"codex", "claude_code", "pi", "hermes"}
+AGENT_RUNTIMES = {"codex", "claude_code", "hermes"}
 
 
 class ConfigError(ValueError):

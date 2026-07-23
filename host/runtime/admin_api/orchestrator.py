@@ -5,8 +5,8 @@ delegates here; nothing in this module speaks HTTP.
 Concurrency model: each runtime has its own ``WORKER_COUNT_PER_RUNTIME`` claim
 cap, and up to ``WORKER_COUNT`` total tasks can run at once across runtimes.
 Every task turn runs on a fresh runtime process: Codex turns resume their
-provider thread by id on a new app-server; Claude Code, Pi, and Hermes turns
-resume by recorded session id. Tasks on the same user thread are serialized,
+provider thread by id on a new app-server; Claude Code and Hermes turns resume
+by recorded session id. Tasks on the same user thread are serialized,
 while tasks on different threads run in parallel.
 
 How the synchronization fits together:
@@ -68,7 +68,6 @@ from host.runtime.admin_api import (
     github_credential,
     github_repo_audit,
     hermes_agent,
-    pi_agent,
     task_status,
 )
 from host.runtime.core.state import (
@@ -95,15 +94,11 @@ WORKER_WAKE = threading.Event()
 _MANAGED_PROVIDER_BY_RUNTIME = {
     "codex": "openai",
     "claude_code": "claude",
-    "pi": "bedrock",
     "hermes": "bedrock",
 }
 CLAUDE_IDENTITY_ATTESTATION = "anthropic_oauth_profile"
 OPENAI_OPERATOR_APPROVAL = "codex_device_login"
-RUNTIME_LABELS = {"codex": "Codex", "claude_code": "Claude Code", "pi": "Pi", "hermes": "Hermes"}
-# The Bedrock-backed harness runtimes have separate task processes and counters,
-# but one provider connection, validation verdict, and derived health status.
-BEDROCK_RUNTIMES = ("pi", "hermes")
+RUNTIME_LABELS = {"codex": "Codex", "claude_code": "Claude Code", "hermes": "Hermes"}
 OAUTH_RUNTIMES = ("codex", "claude_code")
 DEACTIVATED_REASON = "agent runtime deactivated because its managed network provider is disabled"
 
@@ -130,15 +125,12 @@ _LIVE_LOCK = threading.Lock()
 # persisting it would only serve stale answers across restarts (a fresh
 # process reports "loading" until the first poll). Writers replace whole
 # records under _RUNTIME_STATUS_LOCK and never hold it around database work.
-# Pi and Hermes both project the one ``bedrock`` record into their runtime
-# counters; no independent Bedrock harness activation state exists.
 # readers take the current record lock-free (records are never mutated in
 # place), so no path holds this lock while entering state.mutation() and the
 # lock graph stays acyclic.
 _RUNTIME_STATUSES: dict[str, dict[str, str]] = {}
 _RUNTIME_STATUS_LOCK = threading.Lock()
-# One in-flight refresh per runtime. Pi is the canonical Bedrock status target;
-# Hermes reads the same cached provider record and does not run its own poll.
+# One in-flight refresh per runtime.
 _REFRESH_LOCKS: dict[str, Any] = {runtime_type: threading.Lock() for runtime_type in AGENT_RUNTIMES}
 # Credential validation is slow and happens before the database mutation. Keep
 # connect and disconnect as ordered product actions so an older request cannot
@@ -173,8 +165,7 @@ def runtime_status(runtime_type: str) -> str:
 
 
 def runtime_status_record(runtime_type: str) -> dict[str, str]:
-    key = "bedrock" if runtime_type in BEDROCK_RUNTIMES else runtime_type
-    return _RUNTIME_STATUSES.get(key, {"status": "loading"})
+    return _RUNTIME_STATUSES.get(runtime_type, {"status": "loading"})
 
 
 def all_runtime_status_records() -> dict[str, dict[str, str]]:
@@ -186,10 +177,9 @@ def _set_runtime_status(runtime_type: str, status: str, error_message: str | Non
     record = {"status": status}
     if error_message is not None:
         record["error_message"] = error_message
-    key = "bedrock" if runtime_type in BEDROCK_RUNTIMES else runtime_type
     with _RUNTIME_STATUS_LOCK:
-        previous = _RUNTIME_STATUSES.get(key, {"status": "loading"})["status"]
-        _RUNTIME_STATUSES[key] = record
+        previous = _RUNTIME_STATUSES.get(runtime_type, {"status": "loading"})["status"]
+        _RUNTIME_STATUSES[runtime_type] = record
     return previous
 
 
@@ -219,7 +209,7 @@ def refresh_runtime_status(runtime_type: str, *, force_provider_probe: bool = Fa
     """Re-derive the agent runtime status and cache it in memory. Runs the
     provider check outside the state transaction so a slow runtime process
     never blocks requests. Serialized per provider connection by
-    _REFRESH_LOCKS; Pi and Hermes share the Bedrock lock."""
+    _REFRESH_LOCKS."""
     with _REFRESH_LOCKS[runtime_type]:
         return _refresh_runtime_status_serialized(
             runtime_type, force_provider_probe=force_provider_probe
@@ -285,7 +275,7 @@ def _refresh_runtime_status_serialized(runtime_type: str, *, force_provider_prob
                 if runtime_type == "claude_code":
                     state.set_oauth_login(cur, "claude", None)
                     save_claude_account(account_value, cur)
-                elif runtime_type in BEDROCK_RUNTIMES:
+                elif runtime_type == "hermes":
                     # The Bedrock account row is written once at credential
                     # submission and only cleared by a disconnect; the status
                     # refresh has nothing to store for it.
@@ -299,15 +289,12 @@ def _refresh_runtime_status_serialized(runtime_type: str, *, force_provider_prob
             if runtime_type in OAUTH_RUNTIMES and previous == "awaiting_login" and status == "active":
                 state.append_agent_event(cur, "agent_runtime.login_completed", None, {"agent_runtime": runtime_type})
             if previous != "active" and status == "active":
-                for changed_runtime in (
-                    BEDROCK_RUNTIMES if runtime_type in BEDROCK_RUNTIMES else (runtime_type,)
-                ):
-                    state.append_agent_event(
-                        cur,
-                        "agent_runtime.active",
-                        None,
-                        {"agent_runtime": changed_runtime},
-                    )
+                state.append_agent_event(
+                    cur,
+                    "agent_runtime.active",
+                    None,
+                    {"agent_runtime": runtime_type},
+                )
     if deactivated:
         deactivate_runtime(runtime_type, DEACTIVATED_REASON)
         return "deactivated"
@@ -814,21 +801,18 @@ def _mark_runtime_deactivated_in(cur: Any, runtime_type: str) -> None:
     if runtime_type in OAUTH_RUNTIMES:
         _sync_runtime_proxy_pin_in(cur, runtime_type, None)
     if previous != "deactivated":
-        for changed_runtime in (
-            BEDROCK_RUNTIMES if runtime_type in BEDROCK_RUNTIMES else (runtime_type,)
-        ):
-            state.append_agent_event(
-                cur,
-                "agent_runtime.deactivated",
-                None,
-                {"agent_runtime": changed_runtime},
-            )
+        state.append_agent_event(
+            cur,
+            "agent_runtime.deactivated",
+            None,
+            {"agent_runtime": runtime_type},
+        )
 
 
 def _clear_oauth_login_in(cur: Any, runtime_type: str) -> None:
-    # The Bedrock runtimes have no OAuth flow (their credential lives encrypted
+    # Hermes has no OAuth flow (its credential lives encrypted
     # in the database), so there is no login record to clear for them.
-    if runtime_type in BEDROCK_RUNTIMES:
+    if runtime_type == "hermes":
         return
     state.set_oauth_login(cur, "claude" if runtime_type == "claude_code" else "codex", None)
 
@@ -850,7 +834,7 @@ def reconcile_runtime_status_after_policy_change() -> None:
     CLI checks.
     """
     enabled: list[str] = []
-    for runtime_type in ("codex", "claude_code", "pi"):
+    for runtime_type in ("codex", "claude_code", "hermes"):
         if not _runtime_network_enabled(runtime_type):
             _mark_runtime_deactivated(runtime_type)
         else:
@@ -871,10 +855,7 @@ def deactivate_runtime(runtime_type: str, reason: str) -> None:
     """Stop every live process for a non-active runtime and fail its in-flight
     tasks. Queued tasks need no handling here: the next claim fails each one
     with the runtime's non-active status."""
-    for stopped_runtime in (
-        BEDROCK_RUNTIMES if runtime_type in BEDROCK_RUNTIMES else (runtime_type,)
-    ):
-        _stop_runtime_processes(stopped_runtime, reason)
+    _stop_runtime_processes(runtime_type, reason)
 
 
 def reset_linked_account(runtime_type: str) -> None:
@@ -916,7 +897,7 @@ def _reset_linked_account_in_state(runtime_type: str) -> None:
 
 
 def disconnect_bedrock_connection() -> None:
-    """Disconnect the one AWS connection and stop both harnesses' work."""
+    """Disconnect the AWS connection and stop Hermes work."""
     with _BEDROCK_CONNECTION_LOCK:
         with state.mutation() as cur:
             save_bedrock_account(None, cur)
@@ -925,19 +906,17 @@ def disconnect_bedrock_connection() -> None:
             enabled = cur.fetchone() is not None
             next_status = "awaiting_login" if enabled else "deactivated"
             error_message = None
-            _set_runtime_status("pi", next_status, error_message)
-            for runtime_type in BEDROCK_RUNTIMES:
-                state.append_agent_event(
-                    cur,
-                    "agent_runtime.linked_account_reset",
-                    None,
-                    {"agent_runtime": runtime_type},
-                )
-        for runtime_type in BEDROCK_RUNTIMES:
-            _stop_runtime_processes(
-                runtime_type,
-                "shared AWS Bedrock connection was reset by the operator",
+            _set_runtime_status("hermes", next_status, error_message)
+            state.append_agent_event(
+                cur,
+                "agent_runtime.linked_account_reset",
+                None,
+                {"agent_runtime": "hermes"},
             )
+        _stop_runtime_processes(
+            "hermes",
+            "AWS Bedrock connection was reset by the operator",
+        )
 
 
 def _close_login_flow(runtime_type: str) -> None:
@@ -948,7 +927,7 @@ def _close_login_flow(runtime_type: str) -> None:
             codex_app_server.close_login_server()
         elif runtime_type == "claude_code":
             claude_code.close_login_process()
-        # The Bedrock runtimes (pi, hermes) have no login process to close.
+        # Hermes has no login process to close.
     except Exception:
         pass
 
@@ -965,7 +944,7 @@ def _stop_runtime_processes(runtime_type: str, reason: str) -> None:
 
 
 def runtime_status_loop() -> None:
-    refresh_targets = ("codex", "claude_code", "pi")
+    refresh_targets = ("codex", "claude_code", "hermes")
     next_check_at = {runtime_type: 0.0 for runtime_type in refresh_targets}
     while True:
         now = time.monotonic()
@@ -1282,8 +1261,6 @@ def _task_number(task_id: str) -> int:
 def _provider_module(runtime_type: str | None = None) -> Any:
     if runtime_type == "claude_code":
         return claude_code
-    if runtime_type == "pi":
-        return pi_agent
     if runtime_type == "hermes":
         return hermes_agent
     return codex_app_server
@@ -1311,8 +1288,6 @@ def _new_agent_server(runtime_type: str, thread_id: str) -> Any:
     # before the same unit name can be used by its next turn.
     if runtime_type == "claude_code":
         return claude_code.ClaudeCodeSession(thread_id=thread_id)
-    if runtime_type == "pi":
-        return pi_agent.PiSession(thread_id=thread_id)
     if runtime_type == "hermes":
         return hermes_agent.HermesSession(thread_id=thread_id)
     return codex_app_server.CodexAppServer(thread_id=thread_id)

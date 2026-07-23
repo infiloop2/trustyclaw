@@ -57,7 +57,6 @@ def make_task(number: int, thread_id: str, status: str = "queued", runtime: str 
     model = {
         "codex": "gpt-5.6-terra",
         "claude_code": "opus",
-        "pi": "deepseek.v3.2",
         "hermes": "qwen.qwen3-coder-next",
     }[runtime]
     effort = "high"
@@ -324,9 +323,9 @@ class OrchestratorTests(unittest.TestCase):
             )
         self.assertEqual(FakeServer.instances, [])
 
-    def test_all_four_runtimes_have_independent_three_task_caps(self) -> None:
-        runtimes = ("codex", "claude_code", "pi", "hermes")
-        self.assertEqual(orchestrator.WORKER_COUNT, 12)
+    def test_all_three_runtimes_have_independent_three_task_caps(self) -> None:
+        runtimes = ("codex", "claude_code", "hermes")
+        self.assertEqual(orchestrator.WORKER_COUNT, 9)
         tasks = []
         number = 1
         for runtime in runtimes:
@@ -356,8 +355,8 @@ class OrchestratorTests(unittest.TestCase):
             for task in load_state()["tasks"]
             if task["status"] == "queued"
         }
-        self.assertEqual(len(running), 12)
-        self.assertEqual(queued, {"task_4", "task_8", "task_12", "task_16"})
+        self.assertEqual(len(running), 9)
+        self.assertEqual(queued, {"task_4", "task_8", "task_12"})
 
     def test_each_task_runs_on_a_fresh_server_that_is_closed_after_the_turn(self) -> None:
         self.seed_tasks(make_task(1, "chat"))
@@ -1646,7 +1645,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(background, [("codex",)])
         self.assertEqual(orchestrator.runtime_status("claude_code"), "deactivated")
 
-    # -- pi / hermes (AWS Bedrock) lifecycle ------------------------------------------
+    # -- Hermes (AWS Bedrock) lifecycle -----------------------------------------------
     # Credential POST validates STS before atomically storing the one shared
     # credential and its display metadata. Steady-state status is local; later
     # provider failures surface on the task that encounters them, and cost is
@@ -1655,7 +1654,7 @@ class OrchestratorTests(unittest.TestCase):
     IDENTITY = {
         "access_key_id": "AKIAOPERATORKEY00001",
         "account_id": "123456789012",
-        "arn": "arn:aws:iam::123456789012:user/pi-bedrock",
+        "arn": "arn:aws:iam::123456789012:user/hermes-bedrock",
         "user_id": "AIDAEXAMPLE",
     }
 
@@ -1823,11 +1822,11 @@ class OrchestratorTests(unittest.TestCase):
         # No credential stored: account_status awaits operator input and no
         # provider probe runs.
         with patch.object(
-            orchestrator.pi_agent,
+            orchestrator.hermes_agent,
             "account_status",
             return_value=("awaiting_login", None, None),
         ):
-            self.assertEqual(orchestrator.refresh_runtime_status("pi"), "awaiting_login")
+            self.assertEqual(orchestrator.refresh_runtime_status("hermes"), "awaiting_login")
         self.assertEqual(state.read_bedrock_account(), {})
         self.assertIsNone(state.read_bedrock_proxy_credential())
 
@@ -1842,8 +1841,8 @@ class OrchestratorTests(unittest.TestCase):
             "read_attested_identity",
             side_effect=AssertionError("a Bedrock refresh must not call STS"),
         ):
-            self.assertEqual(orchestrator.refresh_runtime_status("pi"), "active")
-            self.assertEqual(orchestrator.refresh_runtime_status("pi", force_provider_probe=True), "active")
+            self.assertEqual(orchestrator.refresh_runtime_status("hermes"), "active")
+            self.assertEqual(orchestrator.refresh_runtime_status("hermes", force_provider_probe=True), "active")
 
     def test_bedrock_disconnect_deletes_the_one_credential(self) -> None:
         self.enable_bedrock()
@@ -1854,13 +1853,13 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIsNone(state.read_bedrock_proxy_credential())
         self.assertIsNone(state.read_bedrock_credential_secret())
 
-    def test_bedrock_disabled_policy_deactivates_pi(self) -> None:
-        # setUp's policy has no pi integration, so the pi runtime deactivates
+    def test_bedrock_disabled_policy_deactivates_hermes(self) -> None:
+        # setUp's policy has no Bedrock integration, so Hermes deactivates
         # without any provider probe.
-        with patch.object(orchestrator.pi_agent, "account_status", side_effect=AssertionError("no probe")):
-            self.assertEqual(orchestrator.refresh_runtime_status("pi"), "deactivated")
+        with patch.object(orchestrator.hermes_agent, "account_status", side_effect=AssertionError("no probe")):
+            self.assertEqual(orchestrator.refresh_runtime_status("hermes"), "deactivated")
 
-    def test_pi_and_hermes_project_one_shared_provider_status(self) -> None:
+    def test_hermes_uses_the_bedrock_provider_status(self) -> None:
         save_policy(
             {
                 "network_integrations": {
@@ -1883,15 +1882,11 @@ class OrchestratorTests(unittest.TestCase):
             state.read_bedrock_proxy_credential(),
             ("AKIAHERMESOPERATOR01", "S" * 40, "us-east-1"),
         )
-        self.assertEqual(orchestrator.runtime_status("pi"), "active")
         self.assertEqual(orchestrator.runtime_status("hermes"), "active")
-        self.assertIn("bedrock", orchestrator._RUNTIME_STATUSES)
-        self.assertNotIn("pi", orchestrator._RUNTIME_STATUSES)
-        self.assertNotIn("hermes", orchestrator._RUNTIME_STATUSES)
+        self.assertIn("hermes", orchestrator._RUNTIME_STATUSES)
         orchestrator.disconnect_bedrock_connection()
         self.assertEqual(state.read_bedrock_account(), {})
         self.assertIsNone(state.read_bedrock_credential_secret())
-        self.assertEqual(orchestrator.runtime_status("pi"), "awaiting_login")
         self.assertEqual(orchestrator.runtime_status("hermes"), "awaiting_login")
 
 

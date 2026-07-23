@@ -8,7 +8,6 @@ cd /
 NODE_VERSION=22.12.0
 CODEX_CLI_VERSION=0.144.0
 CLAUDE_CODE_VERSION=2.1.206
-PI_CODING_AGENT_VERSION=0.80.10
 HERMES_AGENT_VERSION=0.18.2
 # hermes-agent requires Python 3.11-3.13; the base image ships 3.10, so uv
 # provisions a standalone interpreter for its dedicated venv.
@@ -604,12 +603,6 @@ echo "== installing Codex CLI =="
 npm install -g --no-fund --no-audit --loglevel=error "@openai/codex@${CODEX_CLI_VERSION}"
 echo "== installing Claude Code CLI =="
 npm install -g --no-fund --no-audit --loglevel=error "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
-echo "== installing Pi coding agent =="
-# --ignore-scripts is the package's own recommended install: no lifecycle
-# scripts run, and the optional native clipboard helper (unused headless) is
-# simply absent.
-npm install -g --no-fund --no-audit --loglevel=error --ignore-scripts "@earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION}"
-
 echo "== installing Hermes agent =="
 case "$arch" in
   amd64) uv_arch=x86_64-unknown-linux-gnu ;;
@@ -762,12 +755,12 @@ HELPER_NAMES=(
   read-codex-account-id
   run-claude-code
   read-claude-account
-  run-pi
   run-hermes
   stop-agent-thread
   read-aws-account
   clear-agent-auth
   read-agent-file
+  upload-agent-file
   reboot-host
   check-for-upgrade
   mint-github-app-token
@@ -863,11 +856,11 @@ cat > /etc/sudoers.d/trustyclaw-host <<'SUDOERS'
 # The admin service decrypts the connected AWS key pair and passes it to the
 # read-aws-account helper (STS attestation) through these environment
 # variables; the per-command env_keep preserves them across sudo's env reset
-# for exactly that helper and no other rule, so the Bedrock launchers
-# structurally never receive them. Each harness signs with its own fixed
-# routing identity and the proxy re-signs.
+# for exactly that helper and no other rule, so the Hermes launcher
+# structurally never receives them. Hermes signs with a fixed routing identity
+# and the proxy re-signs.
 Defaults!/usr/local/lib/trustyclaw-host/read-aws-account env_keep += "TRUSTYCLAW_BEDROCK_AWS_ACCESS_KEY_ID TRUSTYCLAW_BEDROCK_AWS_SECRET_ACCESS_KEY"
-trustyclaw-admin ALL=(root) NOPASSWD: /usr/local/lib/trustyclaw-host/reboot-host, /usr/local/lib/trustyclaw-host/run-codex-app-server, /usr/local/lib/trustyclaw-host/read-codex-account-id, /usr/local/lib/trustyclaw-host/run-claude-code, /usr/local/lib/trustyclaw-host/read-claude-account, /usr/local/lib/trustyclaw-host/run-pi, /usr/local/lib/trustyclaw-host/run-hermes, /usr/local/lib/trustyclaw-host/stop-agent-thread, /usr/local/lib/trustyclaw-host/read-aws-account, /usr/local/lib/trustyclaw-host/clear-agent-auth, /usr/local/lib/trustyclaw-host/read-agent-file, /usr/local/lib/trustyclaw-host/check-for-upgrade, /usr/local/lib/trustyclaw-host/mint-github-app-token, /usr/local/lib/trustyclaw-host/audit-github-repo, /usr/local/lib/trustyclaw-host/approve-github-push
+trustyclaw-admin ALL=(root) NOPASSWD: /usr/local/lib/trustyclaw-host/reboot-host, /usr/local/lib/trustyclaw-host/run-codex-app-server, /usr/local/lib/trustyclaw-host/read-codex-account-id, /usr/local/lib/trustyclaw-host/run-claude-code, /usr/local/lib/trustyclaw-host/read-claude-account, /usr/local/lib/trustyclaw-host/run-hermes, /usr/local/lib/trustyclaw-host/stop-agent-thread, /usr/local/lib/trustyclaw-host/read-aws-account, /usr/local/lib/trustyclaw-host/clear-agent-auth, /usr/local/lib/trustyclaw-host/read-agent-file, /usr/local/lib/trustyclaw-host/upload-agent-file, /usr/local/lib/trustyclaw-host/check-for-upgrade, /usr/local/lib/trustyclaw-host/mint-github-app-token, /usr/local/lib/trustyclaw-host/audit-github-repo, /usr/local/lib/trustyclaw-host/approve-github-push
 SUDOERS
 chmod 440 /etc/sudoers.d/trustyclaw-host
   # A malformed sudoers drop-in would otherwise surface only when the admin
@@ -888,12 +881,6 @@ claude_code_version="$(runuser -u trustyclaw-agent -- env HOME=/mnt/trustyclaw-a
   /usr/local/bin/claude --version)"
 if [ "$claude_code_version" != "${CLAUDE_CODE_VERSION} (Claude Code)" ]; then
   echo "unexpected Claude Code version: ${claude_code_version}" >&2
-  exit 1
-fi
-pi_version="$(runuser -u trustyclaw-agent -- env HOME=/mnt/trustyclaw-agent/agent-home PI_OFFLINE=1 \
-  /usr/local/bin/pi --version)"
-if [ "$pi_version" != "${PI_CODING_AGENT_VERSION}" ]; then
-  echo "unexpected Pi coding agent version: ${pi_version}" >&2
   exit 1
 fi
 # importlib.metadata is deterministic and network-free, unlike `hermes

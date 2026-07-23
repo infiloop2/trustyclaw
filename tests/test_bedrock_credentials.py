@@ -104,7 +104,7 @@ class BedrockCredentialsTests(unittest.TestCase):
             (
                 "import json, os; print(json.dumps({"
                 "'access_key_id': os.environ['TRUSTYCLAW_BEDROCK_AWS_ACCESS_KEY_ID'],"
-                " 'account_id': '123456789012', 'arn': 'arn:aws:iam::123456789012:user/pi'}))"
+                " 'account_id': '123456789012', 'arn': 'arn:aws:iam::123456789012:user/hermes'}))"
             ),
         ]
         with self._fake_env():
@@ -113,7 +113,7 @@ class BedrockCredentialsTests(unittest.TestCase):
                 {
                     "access_key_id": "AKIAEXAMPLEKEY000001",
                     "account_id": "123456789012",
-                    "arn": "arn:aws:iam::123456789012:user/pi",
+                    "arn": "arn:aws:iam::123456789012:user/hermes",
                 },
             )
 

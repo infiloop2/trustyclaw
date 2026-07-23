@@ -1,8 +1,7 @@
-"""The Bedrock provider's shared credential surface.
+"""The Hermes Bedrock provider credential surface.
 
-Pi and Hermes share one operator credential: an IAM access key pair stored
-encrypted in the admin database (secretbox), one STS liveness/identity read,
-and one shared database row.
+Hermes uses an IAM access key pair stored encrypted in the admin database
+(secretbox), one STS liveness/identity read, and one database row.
 
 There is no login flow and no on-disk credential: the operator pastes an IAM
 access key pair, AWS STS reports which account it belongs to, and the admin API
@@ -56,11 +55,11 @@ class BedrockAuthenticationError(BedrockCredentialsError):
 
 
 def credential_env(credential: tuple[str, str] | None = None) -> dict[str, str] | None:
-    """The environment additions that carry the shared connected key
+    """The environment additions that carry the connected key
     pair to the read-aws-account root helper, or None when nothing is
     connected. Decrypts in the admin process (which owns the secretbox key).
-    The agent-side launchers never receive these: both harnesses sign with the
-    shared routing identity and the proxy re-signs."""
+    The agent-side launcher never receives these: Hermes signs with the dummy
+    routing identity and the proxy re-signs."""
     if credential is None:
         credential = state.read_bedrock_credential_secret()
     if credential is None:

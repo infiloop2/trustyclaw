@@ -3,11 +3,11 @@
 // data-action buttons to feature handlers. Feature code lives in the sibling
 // modules; this file is the only place that wires them together.
 
-import { api, getPassword, setUnauthorizedHandler } from "./api.js";
+import { api, apiUpload, getPassword, setUnauthorizedHandler } from "./api.js";
 import { $, notice } from "./helpers.js";
 import {
-  completeClaudeLogin, refreshHealth, refreshProviderAccounts,
-  refreshProviderUsage, rebootHost, startLogin,
+  collapseRuntimeOverview, completeClaudeLogin, refreshHealth, refreshProviderAccounts,
+  refreshProviderUsage, rebootHost, startLogin, toggleRuntimeOverview,
 } from "./health.js";
 import {
   loadMoreTaskEvents, loadThreads, refreshSelectedThread,
@@ -43,6 +43,11 @@ const HERO_APP_ID = "agent_chat";
 const HERO_CTA = "Begin chat";
 const MOBILE_NAV_QUERY = "(max-width: 860px)";
 let mobileNavOpen = false;
+let uploadPickerOpen = false;
+let nextUploadSelectionId = 1;
+const APP_UPLOAD_SELECTION_LIMIT = 10;
+const pendingAppUploads = new Map();
+let betaAppsExpanded = false;
 
 function adminCookieAttributes(maxAge) {
   return `; path=/; max-age=${maxAge}; samesite=strict${location.protocol === "https:" ? "; secure" : ""}`;
@@ -195,22 +200,22 @@ async function loadApps() {
 }
 
 function renderAppTabs() {
-  const container = $("app-tabs");
-  container.innerHTML = "";
+  const stableContainer = $("stable-app-tabs");
+  const betaContainer = $("beta-app-tabs");
+  stableContainer.innerHTML = "";
+  betaContainer.innerHTML = "";
   $("hero-app-tab").innerHTML = "";
   document.querySelectorAll(".app-tab-panel").forEach(panel => panel.remove());
   appFrames.clear();
-  // Agent Chat is hardwired as the host's main interface: the home hero
-  // navigator carries its CTA, and its nav entry sits directly below Home
-  // instead of inside Apps (Beta). Every other installed app belongs to that
-  // beta section. Shell presentation only: app manifests and /v1/apps carry
-  // neither hero nor maturity fields.
+  // Agent Chat is the host's main interface: the home hero navigator carries
+  // its CTA, and its nav entry sits directly below Home.
   const heroApp = installedApps.find(app => app.id === HERO_APP_ID) || null;
   renderHomeHero(heroApp);
-  const listedApps = installedApps.filter(app => app !== heroApp);
-  if (!listedApps.length) {
-    container.innerHTML = `<div class="sidebar-empty">No apps installed</div>`;
-  }
+  const betaApps = installedApps.filter(app => app.release_stage === "beta");
+  $("sidebar-apps").hidden = !betaApps.length;
+  betaAppsExpanded = false;
+  $("sidebar-apps-toggle").setAttribute("aria-expanded", "false");
+  betaContainer.hidden = true;
   const main = document.querySelector("main");
   for (const app of installedApps) {
     const button = document.createElement("button");
@@ -225,7 +230,7 @@ function renderAppTabs() {
     } else {
       button.innerHTML = `${appIconSvg()}<span></span>`;
       button.querySelector("span").textContent = app.title || app.id;
-      container.appendChild(button);
+      (app.release_stage === "beta" ? betaContainer : stableContainer).appendChild(button);
     }
 
     const panel = document.createElement("div");
@@ -238,6 +243,12 @@ function renderAppTabs() {
     main.appendChild(panel);
     if (activeTab === `app:${app.id}`) loadAppFrame(app);
   }
+}
+
+function toggleBetaApps() {
+  betaAppsExpanded = !betaAppsExpanded;
+  $("sidebar-apps-toggle").setAttribute("aria-expanded", String(betaAppsExpanded));
+  $("beta-app-tabs").hidden = !betaAppsExpanded;
 }
 
 function loadAppFrame(app) {
@@ -283,7 +294,11 @@ function chatIconSvg() {
 
 window.addEventListener("message", event => {
   const message = event.data;
-  if (!message || !["trustyclaw-app-api", "trustyclaw-app-open-file"].includes(message.type)) return;
+  if (!message || ![
+    "trustyclaw-app-api",
+    "trustyclaw-app-open-file",
+    "trustyclaw-app-upload-file",
+  ].includes(message.type)) return;
   const app = installedApps.find(candidate => appFrames.get(candidate.id)?.contentWindow === event.source);
   if (!app) return;
   if (message.type === "trustyclaw-app-open-file") {
@@ -291,6 +306,17 @@ window.addEventListener("message", event => {
     if (!path.startsWith("/") || path.split("/").includes("..")) return;
     showTab("files");
     openAgentPath(path, "file").catch(error => notice(error.message, true));
+    return;
+  }
+  if (message.type === "trustyclaw-app-upload-file") {
+    handleAppUploadMessage(app, event.source, message).catch(error => {
+      event.source.postMessage({
+        type: "trustyclaw-app-upload-file-result",
+        request_id: String(message.request_id || ""),
+        ok: false,
+        error: error.message,
+      }, "*");
+    });
     return;
   }
   handleAppApiMessage(app, event.source, message).catch(error => {
@@ -302,6 +328,147 @@ window.addEventListener("message", event => {
     }, "*");
   });
 });
+
+async function handleAppUploadMessage(app, source, message) {
+  const action = message.action;
+  if (action === "select") {
+    const maximum = message.max_files === undefined ? APP_UPLOAD_SELECTION_LIMIT : message.max_files;
+    if (!Number.isInteger(maximum) || maximum < 1 || maximum > APP_UPLOAD_SELECTION_LIMIT) {
+      throw new Error(`an app can select between 1 and ${APP_UPLOAD_SELECTION_LIMIT} files`);
+    }
+    if (uploadPickerOpen) throw new Error("another file selection is already open");
+    uploadPickerOpen = true;
+    try {
+      const files = await chooseUploadFiles();
+      if (files === null) {
+        source.postMessage({
+          type: "trustyclaw-app-upload-file-result",
+          request_id: String(message.request_id || ""),
+          ok: true,
+          cancelled: true,
+        }, "*");
+        return;
+      }
+      const appSelections = appUploadSelections(app.id);
+      if (files.length > maximum || appSelections.size + files.length > APP_UPLOAD_SELECTION_LIMIT) {
+        throw new Error(`You can attach up to ${APP_UPLOAD_SELECTION_LIMIT} files.`);
+      }
+      const selections = files.map(file => {
+        const selectionId = String(nextUploadSelectionId++);
+        appSelections.set(selectionId, file);
+        return {
+          selection_id: selectionId,
+          original_name: file.name,
+          size_bytes: file.size,
+        };
+      });
+      source.postMessage({
+        type: "trustyclaw-app-upload-file-result",
+        request_id: String(message.request_id || ""),
+        ok: true,
+        body: { selections },
+      }, "*");
+    } finally {
+      uploadPickerOpen = false;
+    }
+    return;
+  }
+
+  const selectionId = String(message.selection_id || "");
+  const appSelections = pendingAppUploads.get(app.id);
+  const selected = appSelections && appSelections.get(selectionId);
+  if (!selected) {
+    throw new Error("file selection is no longer available");
+  }
+  if (action === "discard") {
+    removeAppUploadSelection(app.id, selectionId);
+    source.postMessage({
+      type: "trustyclaw-app-upload-file-result",
+      request_id: String(message.request_id || ""),
+      ok: true,
+      body: { discarded: true },
+    }, "*");
+    return;
+  }
+  if (action !== "upload") throw new Error("file upload action is not allowed");
+
+  // Consume the in-memory selection before starting I/O so duplicate bridge
+  // requests cannot publish the same local file twice. Restore it after a
+  // failed upload while keeping the per-app selection bound.
+  removeAppUploadSelection(app.id, selectionId);
+  let body;
+  try {
+    body = await apiUpload(selected);
+  } catch (error) {
+    const current = appUploadSelections(app.id);
+    if (current.size < APP_UPLOAD_SELECTION_LIMIT) current.set(selectionId, selected);
+    throw error;
+  }
+  source.postMessage({
+    type: "trustyclaw-app-upload-file-result",
+    request_id: String(message.request_id || ""),
+    ok: true,
+    body,
+  }, "*");
+}
+
+function appUploadSelections(appId) {
+  let selections = pendingAppUploads.get(appId);
+  if (!selections) {
+    selections = new Map();
+    pendingAppUploads.set(appId, selections);
+  }
+  return selections;
+}
+
+function removeAppUploadSelection(appId, selectionId) {
+  const selections = pendingAppUploads.get(appId);
+  if (!selections) return;
+  selections.delete(selectionId);
+  if (!selections.size) pendingAppUploads.delete(appId);
+}
+
+function chooseUploadFiles() {
+  return new Promise(resolve => {
+    // A file picker requires transient user activation. An app can post this
+    // message at any time, so settle a non-user-initiated request instead of
+    // leaving the global picker lock held when the browser ignores click().
+    if (navigator.userActivation && !navigator.userActivation.isActive) {
+      resolve(null);
+      return;
+    }
+    const input = document.createElement("input");
+    input.type = "file";
+    input.multiple = true;
+    input.className = "host-file-picker";
+    document.body.appendChild(input);
+    let settled = false;
+    const finish = files => {
+      if (settled) return;
+      settled = true;
+      input.remove();
+      resolve(files);
+    };
+    const currentFiles = () => {
+      const files = input.files ? Array.from(input.files) : [];
+      return files.length ? files : null;
+    };
+    input.addEventListener("change", () => finish(currentFiles()), { once: true });
+    input.addEventListener("cancel", () => finish(null), { once: true });
+    // Safari versions without the cancel event return focus to the page when
+    // the picker closes. Give a selected file's change event one tick to run.
+    window.addEventListener(
+      "focus",
+      () => setTimeout(() => finish(currentFiles()), 0),
+      { once: true },
+    );
+    try {
+      input.click();
+    } catch (_error) {
+      finish(null);
+    }
+  });
+}
 
 async function handleAppApiMessage(app, source, message) {
   // Friendly pre-check only: the admin API enforces the bridge scope
@@ -329,6 +496,9 @@ document.addEventListener("click", event => {
   if (!(target instanceof Element)) return;
   if (!target.closest(".info-button, #preset-info-popover")) closeIntegrationInfo();
   if (!target.closest(".guide-copy-button")) dismissCallbackCopyFeedback();
+  // The expanded usage panel is a floating overlay; a tap anywhere outside it
+  // (the pill's own tap is handled by its action) dismisses it like a menu.
+  if (!target.closest(".runtime-overview")) collapseRuntimeOverview();
   const button = target.closest("button[data-action]");
   if (!button) return;
   const { action } = button.dataset;
@@ -342,12 +512,14 @@ document.addEventListener("click", event => {
     "logout": () => logout(),
     "toggle-mobile-nav": () => toggleMobileNav(),
     "close-mobile-nav": () => setMobileNavOpen(false, true),
+    "toggle-beta-apps": () => toggleBetaApps(),
     "show-tab": () => showTab(button.dataset.tab),
-    "open-provider": () => { showTab("network"); openProvider(button.dataset.provider); },
+    "open-provider": () => { collapseRuntimeOverview(); showTab("network"); openProvider(button.dataset.provider); },
     "start-login": () => startLogin(runtime),
     "reset-linked-account": () => resetLinkedAccount(button.dataset.provider),
     "complete-claude-login": () => completeClaudeLogin(),
     "refresh-provider-usage": () => refreshProviderUsage(),
+    "toggle-runtime-overview": () => toggleRuntimeOverview(),
     "reboot-host": () => rebootHost(),
     "show-thread": () => showThread(threadId, runtime),
     "show-task-events": () => showTaskEvents(taskId),
@@ -404,6 +576,7 @@ setUnauthorizedHandler(showLogin);
 document.addEventListener("keydown", event => {
   if (event.key !== "Escape") return;
   closeIntegrationInfo();
+  collapseRuntimeOverview();
   if (mobileNavOpen) setMobileNavOpen(false, true);
 });
 window.addEventListener("resize", () => {

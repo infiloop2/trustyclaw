@@ -189,7 +189,7 @@ class AwsAccountHelperTests(unittest.TestCase):
         response = b"""<?xml version="1.0" encoding="UTF-8"?>
 <GetCallerIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
   <GetCallerIdentityResult>
-    <Arn>arn:aws:iam::123456789012:user/pi-bedrock</Arn>
+    <Arn>arn:aws:iam::123456789012:user/hermes-bedrock</Arn>
     <UserId>AIDAEXAMPLE</UserId>
     <Account>123456789012</Account>
   </GetCallerIdentityResult>
@@ -199,7 +199,7 @@ class AwsAccountHelperTests(unittest.TestCase):
                 aws_account._get_caller_identity(ACCESS_KEY_ID, SECRET_ACCESS_KEY),
                 {
                     "account_id": "123456789012",
-                    "arn": "arn:aws:iam::123456789012:user/pi-bedrock",
+                    "arn": "arn:aws:iam::123456789012:user/hermes-bedrock",
                     "user_id": "AIDAEXAMPLE",
                 },
             )

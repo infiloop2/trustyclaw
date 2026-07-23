@@ -1,6 +1,7 @@
 {
   "host_slot": 1,
   "title": "Mission Pursuit",
+  "release_stage": "beta",
   "agent": {
     "instructions": "agent.md",
     "api": true
