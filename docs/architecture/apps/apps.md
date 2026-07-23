@@ -154,13 +154,17 @@ caps installed apps at 100 so slot assignment, provisioning, and admin UI
 mounting stay inside an intentionally bounded surface. Bootstrap provisioning
 and `/v1/apps` metadata are generated from the validated package list.
 
-The host derives names from the app id:
+The host derives names from the app id and stable host slot. The app account is
+`trustyclaw-app-<app_id>` when that fits Linux's 32-byte account-name limit.
+Longer ids use `trustyclaw-app-<host_slot>`. The slot is unique and immutable,
+so the bounded fallback remains stable without changing existing short account
+names.
 
 | Host object | Derived value |
 | --- | --- |
-| Linux user | `trustyclaw-app-<app_id>` |
+| Linux user | app account |
 | Postgres schema | `app_<app_id>` |
-| Postgres role | `trustyclaw-app-<app_id>` |
+| Postgres role | app account |
 | systemd unit | `trustyclaw-app-<app_id>.service` |
 | app API route | `/v1/apps/<app_id>/api/` |
 | app UI route | `/v1/apps/<app_id>/ui/` |

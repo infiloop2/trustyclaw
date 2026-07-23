@@ -9,7 +9,7 @@
 | `trustyclaw-agent-app` | Runs the agent-app service; owns the agent-facing app API socket and proxies attributed `app_api` calls to app backends. | No sudo, database access, secrets, or egress. Its only network reach is opening loopback connections to installed app backend ports (the one uid besides `trustyclaw-admin` nftables allows there). |
 | `trustyclaw-proxy` | Runs the policy proxy; owns proxy TLS and Git quarantine files. | No sudo. A narrow Postgres role reads enforcement inputs and the working token/key, inserts network and pending-push records, and prunes network events. Only nftables-approved DNS and TCP 80/443 egress. |
 | `trustyclaw-agent` | Runs Codex, Claude Code, and Hermes runtime processes. | None. No sudo, no direct network, no database role. |
-| `trustyclaw-app-<app_id>` | Runs one installed app backend and owns that app's derived Postgres schema, `app_<app_id>`. | No sudo. Its matching Postgres role is confined to the app schema and has no host-table grants. It may answer established admin reverse-proxy connections on its assigned loopback port and call allowlisted host routes over the peer-authenticated app socket, but cannot initiate arbitrary TCP loopback or external connections. |
+| Per-app account | Runs one installed app backend and owns that app's derived Postgres schema, `app_<app_id>`. | No sudo. Its matching Postgres role is confined to the app schema and has no host-table grants. It may answer established admin reverse-proxy connections on its assigned loopback port and call allowlisted host routes over the peer-authenticated app socket, but cannot initiate arbitrary TCP loopback or external connections. |
 | `cloudflared` | Runs the optional Cloudflare Tunnel connector. | No sudo, no database role. Only nftables-approved DNS, TCP 443, and TCP/UDP 7844 egress. |
 | `postgres` | Runs the admin-state Postgres. | Database superuser over the local socket; no sudo, no network egress. |
 
@@ -22,8 +22,9 @@ before the PostgreSQL packages would assign a dynamic id),
 Installed app service
 users use the reserved UID/GID range `48000-48099`, matching the 100-app
 cap. Each app package declares one stable `host_slot`; the host generates the
-UID and GID as `48000 + host_slot` and creates
-`trustyclaw-app-<app_id>` from the validated package list.
+UID and GID as `48000 + host_slot`. The account is
+`trustyclaw-app-<app_id>` when it fits the Linux name limit, otherwise it is
+`trustyclaw-app-<host_slot>`.
 Stable IDs keep durable EBS ownership — including the preserved Postgres data
 directory and app-owned schemas/files — valid when the root volume and
 `/etc/passwd` are replaced.
